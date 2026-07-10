@@ -1,7 +1,7 @@
 {
   description = "Mobee";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
 
   outputs =
     { self, nixpkgs }:
@@ -21,17 +21,27 @@
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          default = pkgs.rustPlatform.buildRustPackage {
-            pname = "mobee";
-            version = "0.1.0";
+          default = pkgs.runCommand "mobee-0.1.0" {
+            nativeBuildInputs = [
+              pkgs.cargo
+              pkgs.rustc
+              pkgs.stdenv.cc
+            ];
             src = self;
-            cargoLock.lockFile = ./Cargo.lock;
 
             meta = {
               description = "Mobee";
               mainProgram = "mobee";
             };
-          };
+          } ''
+            cp -r "$src" source
+            chmod -R u+w source
+            cd source
+            export CARGO_HOME="$TMPDIR/cargo-home"
+            cargo build --release --locked --offline
+            mkdir -p "$out/bin"
+            cp target/release/mobee "$out/bin/"
+          '';
         }
       );
 
