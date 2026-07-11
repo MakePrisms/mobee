@@ -38,6 +38,7 @@ pub struct AcpDriver {
     stdin: Option<Arc<Mutex<ChildStdin>>>,
     responses: Option<mpsc::Receiver<RpcResponse>>,
     updates: Option<mpsc::Receiver<SessionUpdate>>,
+    update_tx: Option<mpsc::Sender<SessionUpdate>>,
     pending_permission_ids: Arc<Mutex<VecDeque<Value>>>,
     next_request_id: AtomicU64,
 }
@@ -56,6 +57,7 @@ impl AcpDriver {
             stdin: None,
             responses: None,
             updates: None,
+            update_tx: None,
             pending_permission_ids: Arc::new(Mutex::new(VecDeque::new())),
             next_request_id: AtomicU64::new(1),
         }
@@ -93,6 +95,7 @@ impl AcpDriver {
         let stdin = Arc::new(Mutex::new(stdin));
         let (response_tx, response_rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
+        let update_tx_for_reader = update_tx.clone();
         let pending_permission_ids = self.pending_permission_ids.clone();
 
         thread::spawn(move || {
@@ -104,13 +107,19 @@ impl AcpDriver {
                 let Ok(value) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
-                route_wire_message(&value, &response_tx, &update_tx, &pending_permission_ids);
+                route_wire_message(
+                    &value,
+                    &response_tx,
+                    &update_tx_for_reader,
+                    &pending_permission_ids,
+                );
             }
         });
 
         self.stdin = Some(stdin);
         self.responses = Some(response_rx);
         self.updates = Some(update_rx);
+        self.update_tx = Some(update_tx);
         self.child = Some(child);
         Ok(())
     }
@@ -219,7 +228,10 @@ impl Driver for AcpDriver {
         turn: PromptTurn,
     ) -> Result<UpdateStream, DriverError> {
         let id = self.send_request("session/prompt", prompt_params(session_id, turn))?;
-        let _ = self.wait_response(id)?;
+        let result = self.wait_response(id)?;
+        if let Some(update_tx) = &self.update_tx {
+            let _ = update_tx.send(SessionUpdate::TurnEnded(stop_reason_from_params(&result)));
+        }
         let receiver = self
             .updates
             .take()
@@ -334,8 +346,28 @@ fn response_value(id: Value, result: Value) -> Value {
 fn prompt_params(session_id: &str, turn: PromptTurn) -> Value {
     json!({
         "sessionId": session_id,
-        "prompt": turn.input,
+        "prompt": turn
+            .input
+            .into_iter()
+            .map(prompt_content_block)
+            .collect::<Vec<_>>(),
     })
+}
+
+fn prompt_content_block(block: crate::driver::ContentBlock) -> Value {
+    match block {
+        crate::driver::ContentBlock::Text { text } => json!({
+            "type": "text",
+            "text": text,
+        }),
+        crate::driver::ContentBlock::Artifact(artifact) => {
+            let mut value = serde_json::to_value(artifact).unwrap_or(Value::Null);
+            if let Value::Object(object) = &mut value {
+                object.insert("type".into(), Value::String("artifact".into()));
+            }
+            value
+        }
+    }
 }
 
 fn session_id_from_result(result: &Value) -> Result<SessionId, DriverError> {
@@ -396,12 +428,12 @@ fn stop_reason_from_params(params: &Value) -> StopReason {
         .or_else(|| params.get("stopReason"))
         .and_then(Value::as_str)
         .and_then(|reason| match reason {
-            "completed" => Some(StopReason::Completed),
+            "completed" | "end_turn" => Some(StopReason::Completed),
             "cancelled" | "canceled" => Some(StopReason::Cancelled),
             "failed" => Some(StopReason::Failed),
             _ => None,
         })
-        .unwrap_or(StopReason::Completed)
+        .unwrap_or(StopReason::Failed)
 }
 
 fn supports_negotiated_protocol(protocol_version: u32) -> bool {
@@ -454,9 +486,7 @@ mod tests {
                 "prompt": [
                     {
                         "type": "text",
-                        "data": {
-                            "text": "hi"
-                        }
+                        "text": "hi"
                     }
                 ]
             })
@@ -469,6 +499,26 @@ mod tests {
         assert!(supports_negotiated_protocol(PROTOCOL_VERSION));
         assert!(!supports_negotiated_protocol(0));
         assert!(!supports_negotiated_protocol(PROTOCOL_VERSION + 1));
+    }
+
+    #[test]
+    fn real_prompt_response_stop_reason_becomes_terminal_update() {
+        assert_eq!(
+            stop_reason_from_params(&json!({
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 1, "outputTokens": 1}
+            })),
+            StopReason::Completed
+        );
+        assert_eq!(
+            stop_reason_from_params(&json!({"stopReason": "cancelled"})),
+            StopReason::Cancelled
+        );
+        assert_eq!(
+            stop_reason_from_params(&json!({"stopReason": "unrecognized"})),
+            StopReason::Failed
+        );
+        assert_eq!(stop_reason_from_params(&json!({})), StopReason::Failed);
     }
 
     #[test]
