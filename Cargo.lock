@@ -19,6 +19,8 @@ name = "mobee"
 version = "0.1.0"
 dependencies = [
  "mobee-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

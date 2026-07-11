@@ -10,7 +10,7 @@ use crate::driver::{
     RuntimeId, SessionConfig, SessionId, SessionUpdate,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
 pub struct ScriptedSession {
     pub session_id: SessionId,
     pub updates: Vec<SessionUpdate>,

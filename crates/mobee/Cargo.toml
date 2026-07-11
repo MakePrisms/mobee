@@ -8,3 +8,5 @@ publish.workspace = true
 
 [dependencies]
 mobee-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
