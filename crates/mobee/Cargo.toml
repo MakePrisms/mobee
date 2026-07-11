@@ -6,6 +6,10 @@ description.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+acp = ["mobee-core/acp"]
+
 [dependencies]
 mobee-core.workspace = true
 serde.workspace = true

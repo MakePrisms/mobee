@@ -1,10 +1,16 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "acp")]
+use std::time::Duration;
 
 use mobee_core::EventLog;
+#[cfg(feature = "acp")]
+use mobee_core::driver::{AcpDriver, AgentCommand};
+#[cfg(feature = "acp")]
+use mobee_core::driver::{ContentBlock, PromptTurn, SessionConfig};
 use mobee_core::driver::{MockDriver, PermissionOutcome, ScriptedSession, SessionUpdate};
-use mobee_core::engine::{RunEvent, run_job};
+use mobee_core::engine::{RunEvent, RunParams, run_job};
 use mobee_core::event::{JobId, RuntimeId};
 use serde::Serialize;
 
@@ -25,6 +31,7 @@ where
         }
         Some("log") => run_log(&args[2..], out, err),
         Some("mock") => run_mock(&args[2..], out, err),
+        Some("run") => run_agent(&args[2..], out, err),
         _ => usage(err),
     }
 }
@@ -73,6 +80,86 @@ fn run_mock(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
 }
 
+#[cfg(not(feature = "acp"))]
+fn run_agent(_args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let _ = writeln!(
+        err,
+        "mobee run requires rebuilding with the acp feature: cargo run -p mobee --features acp -- run ..."
+    );
+    USAGE_ERROR
+}
+
+#[cfg(feature = "acp")]
+fn run_agent(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let options = match RunOptions::parse(args) {
+        Ok(options) => options,
+        Err(()) => return usage(err),
+    };
+    let mut driver = AcpDriver::new(
+        AgentCommand::new(
+            options.agent_command[0].clone(),
+            options.agent_command[1..].to_vec(),
+        ),
+        options.permission_policy.outcome(),
+        options.idle_timeout,
+    );
+    let mut log = match EventLog::open(&options.log) {
+        Ok(log) => log,
+        Err(error) => {
+            let _ = writeln!(err, "{error}");
+            return RUNTIME_ERROR;
+        }
+    };
+
+    let params = RunParams {
+        session_config: SessionConfig {
+            cwd: options.cwd,
+            mcp_servers: Vec::new(),
+            env: Vec::new(),
+        },
+        prompt: PromptTurn {
+            input: vec![ContentBlock::Text { text: options.task }],
+        },
+    };
+
+    let mut write_error = None;
+    let result = crate::exec::block_on(run_job(
+        &mut driver,
+        &mut log,
+        &options.job_id,
+        params,
+        &mut |event| match event {
+            RunEvent::Update(update) => {
+                if write_error.is_none()
+                    && let Err(error) = write_json_line(out, update)
+                {
+                    write_error = Some(error.to_string());
+                }
+            }
+            RunEvent::PermissionDecided { outcome, .. } => {
+                if write_error.is_none()
+                    && let Err(error) =
+                        write_json_line(out, &PermissionOutcomeLine::new(outcome.clone()))
+                {
+                    write_error = Some(error.to_string());
+                }
+            }
+        },
+    ));
+
+    match (result, write_error) {
+        (Ok(_), None) => SUCCESS,
+        (_, Some(error)) => {
+            let _ = writeln!(err, "{error}");
+            RUNTIME_ERROR
+        }
+        (Err(error), None) => {
+            let _ = writeln!(err, "{error}");
+            RUNTIME_ERROR
+        }
+    }
+}
+
 fn mock_run(options: MockRunOptions, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let script = match read_script(&options.script) {
         Ok(script) => script,
@@ -98,6 +185,7 @@ fn mock_run(options: MockRunOptions, out: &mut dyn Write, err: &mut dyn Write) -
         &mut driver,
         &mut log,
         &options.job_id,
+        RunParams::mock_defaults(),
         &mut |event| match event {
             RunEvent::Update(update) => {
                 if write_error.is_none()
@@ -156,7 +244,7 @@ fn write_json_line<T: Serialize + ?Sized>(out: &mut dyn Write, value: &T) -> std
 fn usage(err: &mut dyn Write) -> i32 {
     let _ = writeln!(
         err,
-        "Usage:\n  mobee version\n  mobee log replay <path>\n  mobee mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
+        "Usage:\n  mobee version\n  mobee log replay <path>\n  mobee mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  mobee run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
     );
     USAGE_ERROR
 }
@@ -208,9 +296,91 @@ impl MockRunOptions {
     }
 }
 
+#[cfg(feature = "acp")]
+struct RunOptions {
+    agent_command: Vec<String>,
+    task: String,
+    log: PathBuf,
+    cwd: PathBuf,
+    job_id: JobId,
+    permission_policy: PermissionPolicy,
+    idle_timeout: Duration,
+}
+
+#[cfg(feature = "acp")]
+impl RunOptions {
+    fn parse(args: &[String]) -> Result<Self, ()> {
+        let mut agent_command = None;
+        let mut task = None;
+        let mut log = None;
+        let mut cwd = None;
+        let mut job_id = JobId("job-1".into());
+        let mut permission_policy = PermissionPolicy::Allow;
+        let mut idle_timeout = Duration::from_secs(300);
+        let mut index = 0;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--agent-command" => {
+                    index += 1;
+                    agent_command = args.get(index).map(|value| {
+                        value
+                            .split_whitespace()
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    });
+                }
+                "--task" => {
+                    index += 1;
+                    task = args.get(index).cloned();
+                }
+                "--log" => {
+                    index += 1;
+                    log = args.get(index).map(PathBuf::from);
+                }
+                "--cwd" => {
+                    index += 1;
+                    cwd = args.get(index).map(PathBuf::from);
+                }
+                "--job-id" => {
+                    index += 1;
+                    job_id = JobId(args.get(index).ok_or(())?.clone());
+                }
+                "--permission-policy" => {
+                    index += 1;
+                    permission_policy = PermissionPolicy::parse(args.get(index).ok_or(())?)?;
+                }
+                "--idle-timeout" => {
+                    index += 1;
+                    idle_timeout =
+                        Duration::from_secs(args.get(index).ok_or(())?.parse().map_err(|_| ())?);
+                }
+                _ => return Err(()),
+            }
+            index += 1;
+        }
+
+        let agent_command = agent_command.ok_or(())?;
+        if agent_command.is_empty() {
+            return Err(());
+        }
+
+        Ok(Self {
+            agent_command,
+            task: task.ok_or(())?,
+            log: log.ok_or(())?,
+            cwd: cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into())),
+            job_id,
+            permission_policy,
+            idle_timeout,
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 enum PermissionPolicy {
     Allow,
+    AllowAlways,
     Deny,
 }
 
@@ -218,6 +388,7 @@ impl PermissionPolicy {
     fn parse(value: &str) -> Result<Self, ()> {
         match value {
             "allow" => Ok(Self::Allow),
+            "allow-always" => Ok(Self::AllowAlways),
             "deny" => Ok(Self::Deny),
             _ => Err(()),
         }
@@ -226,6 +397,7 @@ impl PermissionPolicy {
     fn outcome(self) -> PermissionOutcome {
         match self {
             Self::Allow => PermissionOutcome::Allow,
+            Self::AllowAlways => PermissionOutcome::AllowAlways,
             Self::Deny => PermissionOutcome::Deny,
         }
     }
@@ -500,6 +672,55 @@ mod tests {
                 status: JobExecutionStatus::Failed
             })
         );
+    }
+
+    #[cfg(feature = "acp")]
+    #[test]
+    #[ignore = "requires MOBEE_ACP_SMOKE=1 and MOBEE_ACP_SMOKE_CMD"]
+    fn acp_smoke_real_agent_command_writes_terminal_log() {
+        if std::env::var("MOBEE_ACP_SMOKE").ok().as_deref() != Some("1") {
+            eprintln!("set MOBEE_ACP_SMOKE=1 to run the ACP smoke test");
+            return;
+        }
+        let command = match std::env::var("MOBEE_ACP_SMOKE_CMD") {
+            Ok(command) => command,
+            Err(_) => {
+                eprintln!("set MOBEE_ACP_SMOKE_CMD to run the ACP smoke test");
+                return;
+            }
+        };
+        let log = test_path("acp-smoke-log");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            [
+                "mobee".to_owned(),
+                "run".to_owned(),
+                "--agent-command".to_owned(),
+                command,
+                "--task".to_owned(),
+                "say hello".to_owned(),
+                "--log".to_owned(),
+                log.to_string_lossy().into_owned(),
+                "--idle-timeout".to_owned(),
+                "30".to_owned(),
+            ],
+            &mut out,
+            &mut err,
+        );
+
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        assert!(replay_payloads(&log).iter().any(|event| {
+            matches!(
+                event,
+                Event::JobExecutionChanged {
+                    status: JobExecutionStatus::Completed
+                        | JobExecutionStatus::Failed
+                        | JobExecutionStatus::Cancelled,
+                    ..
+                }
+            )
+        }));
     }
 
     fn run_captured<const N: usize>(args: [&str; N]) -> (i32, String, String) {

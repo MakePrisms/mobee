@@ -1,8 +1,12 @@
 use std::path::PathBuf;
+#[cfg(feature = "acp")]
+use std::sync::mpsc;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(feature = "acp")]
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -120,38 +124,76 @@ pub enum StopReason {
     Failed,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct UpdateStream {
-    updates: Vec<SessionUpdate>,
-    next_index: usize,
-    cancelled: Arc<AtomicBool>,
-    emitted_cancelled: bool,
+    inner: UpdateStreamInner,
+}
+
+#[derive(Debug)]
+enum UpdateStreamInner {
+    Scripted {
+        updates: Vec<SessionUpdate>,
+        next_index: usize,
+        cancelled: Arc<AtomicBool>,
+        emitted_cancelled: bool,
+    },
+    #[cfg(feature = "acp")]
+    Live {
+        receiver: mpsc::Receiver<SessionUpdate>,
+        idle_timeout: Duration,
+    },
 }
 
 impl UpdateStream {
     pub(crate) fn new(updates: Vec<SessionUpdate>, cancelled: Arc<AtomicBool>) -> Self {
         Self {
-            updates,
-            next_index: 0,
-            cancelled,
-            emitted_cancelled: false,
+            inner: UpdateStreamInner::Scripted {
+                updates,
+                next_index: 0,
+                cancelled,
+                emitted_cancelled: false,
+            },
+        }
+    }
+
+    #[cfg(feature = "acp")]
+    pub(crate) fn live(receiver: mpsc::Receiver<SessionUpdate>, idle_timeout: Duration) -> Self {
+        Self {
+            inner: UpdateStreamInner::Live {
+                receiver,
+                idle_timeout,
+            },
         }
     }
 
     pub async fn next(&mut self) -> Option<SessionUpdate> {
-        if self.cancelled.load(Ordering::SeqCst) {
-            if self.emitted_cancelled {
-                None
-            } else {
-                self.emitted_cancelled = true;
-                Some(SessionUpdate::TurnEnded(StopReason::Cancelled))
+        match &mut self.inner {
+            UpdateStreamInner::Scripted {
+                updates,
+                next_index,
+                cancelled,
+                emitted_cancelled,
+            } => {
+                if cancelled.load(Ordering::SeqCst) {
+                    if *emitted_cancelled {
+                        None
+                    } else {
+                        *emitted_cancelled = true;
+                        Some(SessionUpdate::TurnEnded(StopReason::Cancelled))
+                    }
+                } else if *next_index >= updates.len() {
+                    None
+                } else {
+                    let update = updates[*next_index].clone();
+                    *next_index += 1;
+                    Some(update)
+                }
             }
-        } else if self.next_index >= self.updates.len() {
-            None
-        } else {
-            let update = self.updates[self.next_index].clone();
-            self.next_index += 1;
-            Some(update)
+            #[cfg(feature = "acp")]
+            UpdateStreamInner::Live {
+                receiver,
+                idle_timeout,
+            } => receiver.recv_timeout(*idle_timeout).ok(),
         }
     }
 }

@@ -1,4 +1,6 @@
 pub mod acp;
+#[cfg(feature = "acp")]
+pub mod acp_driver;
 pub mod mock;
 
 use std::error::Error;
@@ -11,6 +13,8 @@ pub use acp::{
     PermissionOutcome, PermissionRequest, PromptTurn, SessionConfig, SessionId, SessionUpdate,
     StopReason, UpdateStream,
 };
+#[cfg(feature = "acp")]
+pub use acp_driver::{AcpDriver, AgentCommand};
 pub use mock::{MockDriver, ScriptedSession};
 
 #[derive(Clone, Debug, PartialEq, Eq)]

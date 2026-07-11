@@ -1,13 +1,11 @@
-use std::error::Error;
-use std::fmt::{self, Display};
-use std::path::PathBuf;
-
 use crate::driver::{
     Artifact, ContentBlock, Driver, DriverError, PermissionOutcome, PermissionRequest, PromptTurn,
     SessionConfig, SessionUpdate, StopReason,
 };
 use crate::event::{ArtifactId, Envelope, Event, JobExecutionStatus, JobId};
 use crate::log::{EventLog, LogError};
+use std::error::Error;
+use std::fmt::{self, Display};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunEvent<'a> {
@@ -22,6 +20,29 @@ pub enum RunEvent<'a> {
 pub struct RunOutcome {
     pub terminal: JobExecutionStatus,
     pub artifacts: Vec<Artifact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunParams {
+    pub session_config: SessionConfig,
+    pub prompt: PromptTurn,
+}
+
+impl RunParams {
+    pub fn mock_defaults() -> Self {
+        Self {
+            session_config: SessionConfig {
+                cwd: std::env::current_dir().unwrap_or_else(|_| ".".into()),
+                mcp_servers: Vec::new(),
+                env: Vec::new(),
+            },
+            prompt: PromptTurn {
+                input: vec![ContentBlock::Text {
+                    text: "do the work".into(),
+                }],
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -67,6 +88,7 @@ pub async fn run_job<D: Driver>(
     driver: &mut D,
     log: &mut EventLog,
     job_id: &JobId,
+    params: RunParams,
     sink: &mut dyn FnMut(RunEvent<'_>),
 ) -> Result<RunOutcome, EngineError> {
     let readiness = driver.ready().await?;
@@ -77,8 +99,8 @@ pub async fn run_job<D: Driver>(
     append_execution(log, job_id, JobExecutionStatus::Queued)?;
     append_execution(log, job_id, JobExecutionStatus::Running)?;
 
-    let session_id = driver.start_session(session_config()).await?;
-    let mut stream = match driver.prompt(&session_id, prompt_turn()).await {
+    let session_id = driver.start_session(params.session_config).await?;
+    let mut stream = match driver.prompt(&session_id, params.prompt).await {
         Ok(stream) => stream,
         Err(error) => {
             append_execution(log, job_id, JobExecutionStatus::Failed)?;
@@ -141,22 +163,6 @@ fn terminal_status(reason: StopReason) -> JobExecutionStatus {
     }
 }
 
-fn session_config() -> SessionConfig {
-    SessionConfig {
-        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        mcp_servers: Vec::new(),
-        env: Vec::new(),
-    }
-}
-
-fn prompt_turn() -> PromptTurn {
-    PromptTurn {
-        input: vec![ContentBlock::Text {
-            text: "do the work".into(),
-        }],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -167,7 +173,7 @@ mod tests {
     use crate::driver::{
         Artifact, ContentBlock, MockDriver, ScriptedSession, SessionUpdate, StopReason,
     };
-    use crate::engine::{EngineError, RunEvent, RunOutcome, run_job};
+    use crate::engine::{EngineError, RunEvent, RunOutcome, RunParams, run_job};
     use crate::event::{ArtifactId, Event, JobExecutionStatus, JobId, RuntimeId};
     use crate::log::EventLog;
 
@@ -192,6 +198,7 @@ mod tests {
             &mut driver,
             &mut log,
             &JobId("job-1".into()),
+            RunParams::mock_defaults(),
             &mut |_| {},
         ))
         .expect("run job");
@@ -250,6 +257,7 @@ mod tests {
             &mut driver,
             &mut log,
             &JobId("job-1".into()),
+            RunParams::mock_defaults(),
             &mut |event| {
                 if let RunEvent::Update(update) = event {
                     updates.push(update.clone());
@@ -289,6 +297,7 @@ mod tests {
             &mut driver,
             &mut log,
             &JobId("job-1".into()),
+            RunParams::mock_defaults(),
             &mut |event| {
                 if let RunEvent::Update(update) = event {
                     updates.push(update.clone());

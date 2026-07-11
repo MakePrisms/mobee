@@ -17,7 +17,7 @@ use mobee_core::EventLog;
 use mobee_core::driver::{
     MockDriver, PermissionOutcome, PermissionRequest, ScriptedSession, SessionUpdate,
 };
-use mobee_core::engine::{RunEvent, run_job};
+use mobee_core::engine::{RunEvent, RunParams, run_job};
 use mobee_core::event::{Event, JobExecutionStatus, JobId, RuntimeId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -143,6 +143,7 @@ pub fn run_scenario(scenario: &Scenario) -> Result<Transcript, Vec<Finding>> {
         &mut driver,
         &mut log,
         &scenario.job_id,
+        RunParams::mock_defaults(),
         &mut |event| match event {
             RunEvent::Update(update) => updates.push(update.clone()),
             RunEvent::PermissionDecided { request, outcome } => {
