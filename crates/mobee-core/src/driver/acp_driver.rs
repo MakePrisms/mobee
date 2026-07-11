@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,7 +38,6 @@ pub struct AcpDriver {
     responses: Option<mpsc::Receiver<RpcResponse>>,
     updates: Option<mpsc::Receiver<SessionUpdate>>,
     update_tx: Option<mpsc::Sender<SessionUpdate>>,
-    pending_permission_ids: Arc<Mutex<VecDeque<Value>>>,
     next_request_id: AtomicU64,
 }
 
@@ -58,7 +56,6 @@ impl AcpDriver {
             responses: None,
             updates: None,
             update_tx: None,
-            pending_permission_ids: Arc::new(Mutex::new(VecDeque::new())),
             next_request_id: AtomicU64::new(1),
         }
     }
@@ -96,7 +93,8 @@ impl AcpDriver {
         let (response_tx, response_rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
         let update_tx_for_reader = update_tx.clone();
-        let pending_permission_ids = self.pending_permission_ids.clone();
+        let stdin_for_reader = stdin.clone();
+        let permission_policy = self.permission_policy.clone();
 
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
@@ -107,11 +105,15 @@ impl AcpDriver {
                 let Ok(value) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
+                let mut respond_permission = |id, result| {
+                    let _ = write_wire_to_stdin(&stdin_for_reader, &response_value(id, result));
+                };
                 route_wire_message(
                     &value,
                     &response_tx,
                     &update_tx_for_reader,
-                    &pending_permission_ids,
+                    &permission_policy,
+                    &mut respond_permission,
                 );
             }
         });
@@ -134,10 +136,6 @@ impl AcpDriver {
         });
         self.write_wire(&request)?;
         Ok(id)
-    }
-
-    fn send_response(&self, id: Value, result: Value) -> Result<(), DriverError> {
-        self.write_wire(&response_value(id, result))
     }
 
     fn write_wire(&self, value: &Value) -> Result<(), DriverError> {
@@ -240,19 +238,6 @@ impl Driver for AcpDriver {
     }
 
     async fn on_permission(&mut self, _req: PermissionRequest) -> PermissionOutcome {
-        let id = self
-            .pending_permission_ids
-            .lock()
-            .ok()
-            .and_then(|mut ids| ids.pop_front());
-        if let Some(id) = id {
-            let _ = self.send_response(
-                id,
-                json!({
-                    "outcome": self.permission_policy,
-                }),
-            );
-        }
         self.permission_policy.clone()
     }
 
@@ -301,7 +286,8 @@ fn route_wire_message(
     value: &Value,
     response_tx: &mpsc::Sender<RpcResponse>,
     update_tx: &mpsc::Sender<SessionUpdate>,
-    pending_permission_ids: &Arc<Mutex<VecDeque<Value>>>,
+    permission_policy: &PermissionOutcome,
+    respond_permission: &mut impl FnMut(Value, Value),
 ) {
     if value.get("method").is_none() {
         if let Some(id) = value.get("id").cloned() {
@@ -321,9 +307,9 @@ fn route_wire_message(
     let params = value.get("params").cloned().unwrap_or(Value::Null);
     if is_permission_method(method) {
         if let Some(id) = value.get("id").cloned()
-            && let Ok(mut ids) = pending_permission_ids.lock()
+            && let Some(result) = permission_response_result(&params, permission_policy)
         {
-            ids.push_back(id);
+            respond_permission(id, result);
         }
         if let Some(request) = permission_request_from_params(&params) {
             let _ = update_tx.send(SessionUpdate::PermissionRequest(request));
@@ -341,6 +327,18 @@ fn response_value(id: Value, result: Value) -> Value {
         "id": id,
         "result": result,
     })
+}
+
+fn write_wire_to_stdin(stdin: &Arc<Mutex<ChildStdin>>, value: &Value) -> Result<(), DriverError> {
+    let mut stdin = stdin
+        .lock()
+        .map_err(|_| DriverError::Other("ACP child stdin lock poisoned".into()))?;
+    serde_json::to_writer(&mut *stdin, value)
+        .map_err(|error| DriverError::Other(format!("failed to encode ACP JSON-RPC: {error}")))?;
+    stdin
+        .write_all(b"\n")
+        .and_then(|_| stdin.flush())
+        .map_err(|error| DriverError::Other(format!("failed to write ACP JSON-RPC: {error}")))
 }
 
 fn prompt_params(session_id: &str, turn: PromptTurn) -> Value {
@@ -391,6 +389,35 @@ fn permission_request_from_params(params: &Value) -> Option<PermissionRequest> {
     serde_json::from_value(params.clone())
         .ok()
         .or_else(|| serde_json::from_value(params.get("request")?.clone()).ok())
+}
+
+fn permission_response_result(params: &Value, policy: &PermissionOutcome) -> Option<Value> {
+    let wanted = match policy {
+        PermissionOutcome::Allow => "allow",
+        PermissionOutcome::AllowAlways => "allow_always",
+        PermissionOutcome::Deny => "reject",
+    };
+    let option_id = params
+        .get("options")
+        .or_else(|| params.get("request")?.get("options"))?
+        .as_array()?
+        .iter()
+        .filter_map(permission_option_id)
+        .find(|option_id| option_id == wanted)?;
+    Some(json!({
+        "outcome": {
+            "outcome": "selected",
+            "optionId": option_id,
+        }
+    }))
+}
+
+fn permission_option_id(option: &Value) -> Option<String> {
+    option
+        .get("optionId")
+        .or_else(|| option.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn session_update_from_method(method: &str, params: Value) -> SessionUpdate {
@@ -525,7 +552,7 @@ mod tests {
     fn fixture_lines_translate_to_updates() {
         let (response_tx, _response_rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
-        let ids = Arc::new(Mutex::new(VecDeque::new()));
+        let mut permission_responses = Vec::new();
 
         route_wire_message(
             &json!({
@@ -538,7 +565,8 @@ mod tests {
             }),
             &response_tx,
             &update_tx,
-            &ids,
+            &PermissionOutcome::Allow,
+            &mut |id, result| permission_responses.push(response_value(id, result)),
         );
         route_wire_message(
             &json!({
@@ -548,7 +576,8 @@ mod tests {
             }),
             &response_tx,
             &update_tx,
-            &ids,
+            &PermissionOutcome::Allow,
+            &mut |id, result| permission_responses.push(response_value(id, result)),
         );
 
         assert_eq!(
@@ -561,13 +590,14 @@ mod tests {
             update_rx.recv().expect("terminal"),
             SessionUpdate::TurnEnded(StopReason::Completed)
         );
+        assert!(permission_responses.is_empty());
     }
 
     #[test]
     fn unknown_methods_surface_as_ext() {
         let (response_tx, _response_rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
-        let ids = Arc::new(Mutex::new(VecDeque::new()));
+        let mut permission_responses = Vec::new();
         let params = json!({"x": 1});
 
         route_wire_message(
@@ -578,7 +608,8 @@ mod tests {
             }),
             &response_tx,
             &update_tx,
-            &ids,
+            &PermissionOutcome::Allow,
+            &mut |id, result| permission_responses.push(response_value(id, result)),
         );
 
         assert_eq!(
@@ -588,29 +619,49 @@ mod tests {
                 params,
             })
         );
+        assert!(permission_responses.is_empty());
     }
 
     #[test]
-    fn permission_request_parks_id_fifo() {
+    fn permission_request_replies_immediately_and_emits_observer_update() {
         let (response_tx, _response_rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
-        let ids = Arc::new(Mutex::new(VecDeque::new()));
+        let mut permission_responses = Vec::new();
 
         route_wire_message(
             &json!({
                 "jsonrpc": "2.0",
-                "id": 42,
-                "method": "session/permission/request",
+                "id": 0,
+                "method": "session/request_permission",
                 "params": {
                     "tool": "shell",
-                    "detail": {"cmd": "true"}
+                    "detail": {"cmd": "true"},
+                    "options": [
+                        {"id": "allow_always", "kind": "allow_always"},
+                        {"id": "allow", "kind": "allow_once"},
+                        {"id": "reject", "kind": "reject"}
+                    ]
                 }
             }),
             &response_tx,
             &update_tx,
-            &ids,
+            &PermissionOutcome::Allow,
+            &mut |id, result| permission_responses.push(response_value(id, result)),
         );
 
+        assert_eq!(
+            permission_responses,
+            vec![json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "result": {
+                    "outcome": {
+                        "outcome": "selected",
+                        "optionId": "allow"
+                    }
+                }
+            })]
+        );
         assert_eq!(
             update_rx.recv().expect("permission update"),
             SessionUpdate::PermissionRequest(PermissionRequest {
@@ -618,21 +669,41 @@ mod tests {
                 detail: json!({"cmd": "true"}),
             })
         );
-        assert_eq!(ids.lock().expect("ids").pop_front(), Some(json!(42)));
         assert_eq!(
-            response_value(
-                json!(42),
-                json!({
-                    "outcome": PermissionOutcome::Allow,
-                })
+            permission_response_result(
+                &json!({
+                    "options": [
+                        {"optionId": "allow_always"},
+                        {"optionId": "allow"},
+                        {"optionId": "reject"}
+                    ]
+                }),
+                &PermissionOutcome::AllowAlways
             ),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 42,
-                "result": {
-                    "outcome": "allow"
+            Some(json!({
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": "allow_always"
                 }
-            })
+            }))
+        );
+        assert_eq!(
+            permission_response_result(
+                &json!({
+                    "options": [
+                        {"optionId": "allow_always"},
+                        {"optionId": "allow"},
+                        {"optionId": "reject"}
+                    ]
+                }),
+                &PermissionOutcome::Deny
+            ),
+            Some(json!({
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": "reject"
+                }
+            }))
         );
 
         let mut driver = AcpDriver::new(
@@ -640,7 +711,6 @@ mod tests {
             PermissionOutcome::Allow,
             Duration::from_secs(1),
         );
-        driver.pending_permission_ids = ids;
         assert_eq!(
             futures_free_on_permission(
                 &mut driver,
