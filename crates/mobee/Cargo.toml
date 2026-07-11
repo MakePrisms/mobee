@@ -1,0 +1,10 @@
+[package]
+name = "mobee"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+mobee-core.workspace = true
