@@ -191,7 +191,7 @@ impl Driver for AcpDriver {
             .and_then(Value::as_u64)
             .map(|value| value as u32)
             .unwrap_or(PROTOCOL_VERSION);
-        if protocol_version != PROTOCOL_VERSION {
+        if !supports_negotiated_protocol(protocol_version) {
             return Err(DriverError::Other(format!(
                 "unsupported ACP protocol version {protocol_version}"
             )));
@@ -404,6 +404,10 @@ fn stop_reason_from_params(params: &Value) -> StopReason {
         .unwrap_or(StopReason::Completed)
 }
 
+fn supports_negotiated_protocol(protocol_version: u32) -> bool {
+    (1..=PROTOCOL_VERSION).contains(&protocol_version)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -457,6 +461,14 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn negotiated_protocol_accepts_real_acp_v1() {
+        assert!(supports_negotiated_protocol(1));
+        assert!(supports_negotiated_protocol(PROTOCOL_VERSION));
+        assert!(!supports_negotiated_protocol(0));
+        assert!(!supports_negotiated_protocol(PROTOCOL_VERSION + 1));
     }
 
     #[test]
