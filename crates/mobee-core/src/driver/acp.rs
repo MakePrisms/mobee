@@ -15,6 +15,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub type SessionId = String;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Initialize {
     pub protocol_version: u32,
     pub client_capabilities: Caps,
@@ -30,6 +31,7 @@ impl Initialize {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitializeResult {
     pub agent_capabilities: Caps,
 }
@@ -40,6 +42,7 @@ pub struct Caps {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionConfig {
     pub cwd: PathBuf,
     pub mcp_servers: Vec<McpServer>,
@@ -53,6 +56,7 @@ pub struct McpServer {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PromptTurn {
     pub input: Vec<ContentBlock>,
 }

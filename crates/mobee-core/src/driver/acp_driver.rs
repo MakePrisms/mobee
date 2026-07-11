@@ -218,14 +218,7 @@ impl Driver for AcpDriver {
         session_id: &SessionId,
         turn: PromptTurn,
     ) -> Result<UpdateStream, DriverError> {
-        let id = self.send_request(
-            "session/prompt",
-            json!({
-                "session_id": session_id,
-                "sessionId": session_id,
-                "turn": turn,
-            }),
-        )?;
+        let id = self.send_request("session/prompt", prompt_params(session_id, turn))?;
         let _ = self.wait_response(id)?;
         let receiver = self
             .updates
@@ -338,6 +331,13 @@ fn response_value(id: Value, result: Value) -> Value {
     })
 }
 
+fn prompt_params(session_id: &str, turn: PromptTurn) -> Value {
+    json!({
+        "sessionId": session_id,
+        "prompt": turn.input,
+    })
+}
+
 fn session_id_from_result(result: &Value) -> Result<SessionId, DriverError> {
     result
         .get("session_id")
@@ -410,6 +410,54 @@ mod tests {
 
     use super::*;
     use crate::driver::{ContentBlock, ExtMethod, PermissionOutcome};
+
+    #[test]
+    fn request_side_wire_uses_real_acp_camel_case() {
+        let initialize =
+            serde_json::to_value(Initialize::new(Caps::default())).expect("serialize initialize");
+        assert_eq!(
+            initialize,
+            json!({
+                "protocolVersion": 2,
+                "clientCapabilities": {
+                    "methods": []
+                }
+            })
+        );
+
+        let session = serde_json::to_value(SessionConfig {
+            cwd: "/tmp/mobee".into(),
+            mcp_servers: Vec::new(),
+            env: Vec::new(),
+        })
+        .expect("serialize session config");
+        assert_eq!(
+            session,
+            json!({
+                "cwd": "/tmp/mobee",
+                "mcpServers": [],
+                "env": []
+            })
+        );
+
+        let turn = PromptTurn {
+            input: vec![ContentBlock::Text { text: "hi".into() }],
+        };
+        assert_eq!(
+            prompt_params("session-1", turn),
+            json!({
+                "sessionId": "session-1",
+                "prompt": [
+                    {
+                        "type": "text",
+                        "data": {
+                            "text": "hi"
+                        }
+                    }
+                ]
+            })
+        );
+    }
 
     #[test]
     fn fixture_lines_translate_to_updates() {
