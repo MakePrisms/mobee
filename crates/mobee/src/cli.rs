@@ -2,12 +2,10 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use mobee_core::driver::{
-    ContentBlock, Driver, MockDriver, PermissionOutcome, PromptTurn, ScriptedSession,
-    SessionConfig, SessionUpdate, StopReason,
-};
-use mobee_core::event::{ArtifactId, Event, JobExecutionStatus, JobId, RuntimeId};
-use mobee_core::{Envelope, EventLog};
+use mobee_core::EventLog;
+use mobee_core::driver::{MockDriver, PermissionOutcome, ScriptedSession, SessionUpdate};
+use mobee_core::engine::{RunEvent, run_job};
+use mobee_core::event::{JobId, RuntimeId};
 use serde::Serialize;
 
 const SUCCESS: i32 = 0;
@@ -95,105 +93,40 @@ fn mock_run(options: MockRunOptions, out: &mut dyn Write, err: &mut dyn Write) -
         }
     };
 
-    match exec_mock_run(&mut driver, &mut log, &options.job_id, out) {
-        Ok(()) => SUCCESS,
-        Err(error) => {
+    let mut write_error = None;
+    let result = crate::exec::block_on(run_job(
+        &mut driver,
+        &mut log,
+        &options.job_id,
+        &mut |event| match event {
+            RunEvent::Update(update) => {
+                if write_error.is_none()
+                    && let Err(error) = write_json_line(out, update)
+                {
+                    write_error = Some(error.to_string());
+                }
+            }
+            RunEvent::PermissionDecided { outcome, .. } => {
+                if write_error.is_none()
+                    && let Err(error) =
+                        write_json_line(out, &PermissionOutcomeLine::new(outcome.clone()))
+                {
+                    write_error = Some(error.to_string());
+                }
+            }
+        },
+    ));
+
+    match (result, write_error) {
+        (Ok(_), None) => SUCCESS,
+        (_, Some(error)) => {
             let _ = writeln!(err, "{error}");
             RUNTIME_ERROR
         }
-    }
-}
-
-fn exec_mock_run(
-    driver: &mut MockDriver,
-    log: &mut EventLog,
-    job_id: &JobId,
-    out: &mut dyn Write,
-) -> Result<(), String> {
-    let readiness = crate::exec::block_on(driver.ready()).map_err(|error| error.to_string())?;
-    log.append(Event::DriverReady {
-        runtime_id: readiness.runtime_id,
-    })
-    .map_err(|error| error.to_string())?;
-
-    append_execution(log, job_id, JobExecutionStatus::Queued)?;
-    append_execution(log, job_id, JobExecutionStatus::Running)?;
-
-    let session_id = crate::exec::block_on(driver.start_session(session_config()))
-        .map_err(|error| error.to_string())?;
-    let mut stream =
-        crate::exec::block_on(driver.prompt(&session_id, prompt_turn())).map_err(|error| {
-            let message = error.to_string();
-            let _ = append_execution(log, job_id, JobExecutionStatus::Failed);
-            message
-        })?;
-
-    let mut terminal = None;
-    while let Some(update) = crate::exec::block_on(stream.next()) {
-        write_json_line(out, &update).map_err(|error| error.to_string())?;
-        if let SessionUpdate::PermissionRequest(request) = update.clone() {
-            let outcome = crate::exec::block_on(driver.on_permission(request));
-            write_json_line(out, &PermissionOutcomeLine::new(outcome))
-                .map_err(|error| error.to_string())?;
+        (Err(error), None) => {
+            let _ = writeln!(err, "{error}");
+            RUNTIME_ERROR
         }
-        if let SessionUpdate::TurnEnded(reason) = update {
-            let status = terminal_status(reason);
-            append_execution(log, job_id, status.clone())?;
-            terminal = Some(status);
-            break;
-        }
-    }
-
-    if terminal.is_none() {
-        append_execution(log, job_id, JobExecutionStatus::Failed)?;
-        return Err("mock update stream ended without turn_ended".into());
-    }
-
-    let artifacts =
-        crate::exec::block_on(driver.artifacts(&session_id)).map_err(|error| error.to_string())?;
-    for artifact in artifacts {
-        log.append(Event::ArtifactProduced {
-            artifact_id: ArtifactId(artifact.uri_or_path),
-        })
-        .map_err(|error| error.to_string())?;
-    }
-    crate::exec::block_on(driver.shutdown()).map_err(|error| error.to_string())?;
-    Ok(())
-}
-
-fn append_execution(
-    log: &mut EventLog,
-    job_id: &JobId,
-    status: JobExecutionStatus,
-) -> Result<Envelope, String> {
-    log.append(Event::JobExecutionChanged {
-        job_id: job_id.clone(),
-        status,
-    })
-    .map_err(|error| error.to_string())
-}
-
-fn terminal_status(reason: StopReason) -> JobExecutionStatus {
-    match reason {
-        StopReason::Completed => JobExecutionStatus::Completed,
-        StopReason::Failed => JobExecutionStatus::Failed,
-        StopReason::Cancelled => JobExecutionStatus::Cancelled,
-    }
-}
-
-fn session_config() -> SessionConfig {
-    SessionConfig {
-        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        mcp_servers: Vec::new(),
-        env: Vec::new(),
-    }
-}
-
-fn prompt_turn() -> PromptTurn {
-    PromptTurn {
-        input: vec![ContentBlock::Text {
-            text: "do the work".into(),
-        }],
     }
 }
 
@@ -321,6 +254,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use mobee_core::Envelope;
     use mobee_core::driver::{
         Artifact, ContentBlock, PermissionRequest, ScriptedSession, SessionUpdate, StopReason,
     };

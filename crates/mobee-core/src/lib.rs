@@ -1,4 +1,5 @@
 pub mod driver;
+pub mod engine;
 pub mod event;
 pub mod log;
 
