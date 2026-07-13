@@ -4,22 +4,22 @@ Last updated: 2026-07-13
 
 ## Current phase
 
-v0.1 on main (`e066a50`) = ACP **execution spine**. Strategy: merge
-remaining product to main **one piece at a time**. Architecture
-decisions locked + filed as buzz issues (honest sync, nix installables,
-`execution_id` rename). Money-path on `spike/full-loop` is past
-idempotency gate; metadex on M4–M6 demo-integrity fast-follow.
+v0.1 spine on MakePrisms/mobee. **Repo consolidation in flight**
+(orchestrator lane): GitHub MakePrisms/mobee → single code SoT;
+Librarian owns buzz relay-git mirror; wipe mobee-dev/mobee-core only after
+sha-verify. Money-path M4–M6 PASS @ `f3beb95` on metadex spike; real-funds
+R1–R3 still tracked.
 
 ## Active lanes
 
 | Lane | Owner | Status | Notes |
 |------|-------|--------|-------|
-| `spike/full-loop` | metadex | ACTIVE | Money-path: Sting PASS on idempotency @ `a2dfa51`; hearth dual-review CONDITIONAL PASS; M4–M6 fast-follow in flight. Do not collide. |
-| `spike/headless-buyer` @ 8c73982 | (candidate) | Ready to cherry-pick/rebuild | State machine Settled PROVEN; payment + live relay UNVERIFIED |
-| Seller gateway (turtle) | keeper:mobee-orchestrator | Restarting / demo path | Align targeting seam before live e2e |
-| Meta seat (`mobee-meta`) | this IDE agent | On buzz | Docs PR #1 open; arch issues filed |
-| `docs/meta-genesis` | mobee-meta | PR open | https://github.com/MakePrisms/mobee/pull/1 |
-
+| `spike/full-loop` @ `f3beb95` | metadex | ACTIVE — money-path demo integrity PASS | Idempotency + M4–M6 passed Sting; dual-review = **orchestrator** (not hearth — shared-key artifact). Push to mobee-dev; canonical origin channel-binding issue. |
+| `spike/headless-buyer` @ 8c73982 | orchestrator holding | Unmerged (gudnuf cherry-pick) | Source for pieces; MOCKED payment |
+| Repo consolidation | keeper:mobee-orchestrator | In sequence | After money-path push → migrate spikes w/ history → port hermetic suite → Librarian mirror → wipe |
+| Seller gateway (turtle) | keeper:mobee-orchestrator | Verify rig | Ping before claiming pieces (gateway-helper overlap) |
+| Meta seat (`mobee-meta`) | this IDE agent | On buzz | Docs PR #1; 4 buzz issues — **do not refile** until canonical issue home locked |
+| `docs/meta-genesis` | mobee-meta | PR open | https://github.com/MakePrisms/mobee/pull/1 → MakePrisms/mobee main |
 ## Reality ledger (edges)
 
 | Edge | Class | Evidence |
@@ -31,7 +31,10 @@ idempotency gate; metadex on M4–M6 demo-integrity fast-follow.
 | Real ACP on turtle + Mac (v0.1) | PROVEN | Merged 2026-07-12 |
 | Testnut money-path on spike (static token) | CONDITIONAL | Dual-review PASS for demo; R1–R3 before real funds |
 
-## Open architecture (buzz issues — not claimed for impl yet)
+## Open architecture (buzz issues — hold refile)
+
+Filed on relay-git NIP-34 `mobee` (owner `79284e2b…`). Orchestrator:
+**do not refile** until canonical issue home locked post-consolidation.
 
 | Topic | Issue event id | Stance |
 |-------|----------------|--------|
@@ -39,8 +42,6 @@ idempotency gate; metadex on M4–M6 demo-integrity fast-follow.
 | Nix: buyer MCP + seller gateway + harnesses + published binaries | `6d40cd87d4b57232719649a67bc797485090b5f3d7c7528b253e6796bf3b5282` | Locked |
 | Rename spine `job_id` → `execution_id` | `9f9e9d0fe25c3054d25b93ddfde7f0504e1890249b5c991e843300a6c42a3e26` | Locked |
 | Test posture + iterate-as-we-merge rule | `eb4290e7bea57638e531ef1b457f53949e60331ac863d2b0f425cbbff45e2728` | Locked (policy); follow-ups unclaimed |
-
-Repo: NIP-34 `mobee` / owner `79284e2b167317bc455f2daccfb38c38d4836b7b2bd0d73650b0cff46660263a`.
 
 ## Known issues (pre-existing — do not chase as new regressions)
 
@@ -53,8 +54,10 @@ Repo: NIP-34 `mobee` / owner `79284e2b167317bc455f2daccfb38c38d4836b7b2bd0d73650
 ## Blocked / waiting
 
 - Live e2e close blocked on targeting seam + gateway up
-- Real-funds chapter blocked on R1–R3 (token value/P2PK, durable pre-pay intent, targeted-seller enforce) — tracked by hearth; not demo blockers
+- Real-funds chapter: R1–R3 (token value/P2PK, durable pre-pay intent, targeted-seller enforce)
+- Canonical issue home unsettled during repo consolidation — hold refile
 - Await gudnuf on GitHub PR #1 (`docs/meta`)
+- Await orchestrator ping before claiming merge pieces
 
 ## Meta identity
 
