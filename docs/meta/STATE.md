@@ -79,9 +79,9 @@ reality-classed, gudnuf reviews, no self-merge.
 
 ## Next actions
 
-1. Await gudnuf review/merge of https://github.com/MakePrisms/mobee/pull/1
-2. Inventory spike-vs-main → draft ordered merge-piece sequence (incl. when to schedule execution_id rename / honest-sync / nix packages relative to marketplace merges)
-3. Hold impl claims on arch issues until operator assigns; do not collide with metadex M4–M6
+1. **Await buzz replies** on spike lessons (event `9e850c60…`) — fold into rebuild policy before claiming format+receipt
+2. Await gudnuf review/merge of https://github.com/MakePrisms/mobee/pull/1
+3. After lessons + claim ack from orchestrator: first rebuild PR = format + receipt on main
 
 ## Genesis
 
