@@ -15,7 +15,8 @@ R1–R3 still tracked.
 | Lane | Owner | Status | Notes |
 |------|-------|--------|-------|
 | `spike/full-loop` @ `f3beb95` | metadex | Money-path CLEAR | gudnuf cherry-pick waits on piece-1 (format/receipt) on main |
-| Piece 1 format+receipt | metadex (assigned by orchestrator) | Building | Off `main`; PR story locked; prerequisite for money-path |
+| Piece 1 format+receipt | metadex | MERGED PR #2 | main @ `b5003d4` |
+| Piece 2 gateway types | (unassigned) | Briefed | buzz brief posted; awaiting orchestrator assign |
 | Repo consolidation | orchestrator + Librarian | Mirror verified | Step-5 wipe held (no buzz repos delete) |
 | Meta seat (`mobee-meta`) | this IDE agent | Driving | Docs PR #1; GOOSE research; no product impl |
 | `docs/meta-genesis` | mobee-meta | PR open | https://github.com/MakePrisms/mobee/pull/1 → MakePrisms/mobee main |
