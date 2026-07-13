@@ -5,13 +5,19 @@ pub const RECEIPT_HASH_DOMAIN: &str = "mobee/v1/receipt";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiptHashInput {
-    /// Market/offer job id. Keep this tuple stable if execution ids are split out later.
+    /// Market/offer job id; this is part of the receipt hash tuple and must not change.
     pub job_id: String,
+    /// SHA-256 hex digest of the delivered result content.
     pub result_content_hash: String,
+    /// Integer payment amount for the receipt.
     pub price_int: u64,
+    /// Payment unit for `price_int`, such as `sat`.
     pub unit: String,
+    /// Cashu mint URL that issued the payment proofs.
     pub mint_url: String,
+    /// Hex-encoded buyer Nostr public key bound into the receipt.
     pub buyer_pubkey_hex: String,
+    /// Hex-encoded seller Nostr public key bound into the receipt.
     pub seller_pubkey_hex: String,
 }
 
