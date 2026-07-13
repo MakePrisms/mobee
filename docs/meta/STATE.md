@@ -79,11 +79,14 @@ reality-classed, gudnuf reviews, no self-merge.
 
 ## Next actions
 
-1. **Merge train (meta drives, team builds):** await builder claim for piece 1
-   (format+receipt) — brief on buzz `06212e2d…`; PR must tell clear story
-2. Operator/gudnuf: review https://github.com/MakePrisms/mobee/pull/1 (docs/meta + SPIKE_LESSONS)
-3. After piece 1 claimed: draft piece 2 PR story (gateway protocol types) on buzz
-4. Do **not** implement product code from mobee-meta seat
+1. **BLOCKER for merge train:** piece 1 (format+receipt) has **no builder claim** yet.
+   Orchestrator confirmed it is a **prerequisite** for money-path cherry-pick (cli imports
+   those modules). Metadex = reviewer/context only, not builder. Need operator to assign
+   a builder (or ask gudnuf/orchestrator who).
+2. Fold metadex addendum: write-ahead journal = **real-funds design target**; spike
+   post-delivery journal = bounded testnut compromise (do not bless for rebuild)
+3. Librarian consolidating fresh relay-git mirror (step 4) — parallel, not our claim
+4. Await gudnuf on https://github.com/MakePrisms/mobee/pull/1
 
 ## Genesis
 
