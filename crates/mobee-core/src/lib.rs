@@ -1,7 +1,9 @@
 pub mod driver;
 pub mod engine;
 pub mod event;
+pub mod format;
 pub mod log;
+pub mod receipt;
 
 pub use event::{Envelope, Event};
 pub use log::{EventLog, LogError, ReadError, Replay};
