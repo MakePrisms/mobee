@@ -4,11 +4,9 @@ Last updated: 2026-07-13
 
 ## Current phase
 
-v0.1 spine on MakePrisms/mobee. **Repo consolidation in flight**
-(orchestrator lane): GitHub MakePrisms/mobee → single code SoT;
-Librarian owns buzz relay-git mirror; wipe mobee-dev/mobee-core only after
-sha-verify. Money-path M4–M6 PASS @ `f3beb95` on metadex spike; real-funds
-R1–R3 still tracked.
+docs/meta on main (`4b8e29b`, PR #1 merged). v0.1 spine + merge-train
+process locked. **Piece 1** (format+receipt) in flight with metadex —
+prerequisite for money-path cherry-pick.
 
 ## Active lanes
 
@@ -17,8 +15,9 @@ R1–R3 still tracked.
 | `spike/full-loop` @ `f3beb95` | metadex | Money-path CLEAR | gudnuf cherry-pick waits on piece-1 (format/receipt) on main |
 | Piece 1 format+receipt | metadex (assigned by orchestrator) | Building | Off `main`; PR story locked; prerequisite for money-path |
 | Repo consolidation | orchestrator + Librarian | Mirror verified | Step-5 wipe held (no buzz repos delete) |
-| Meta seat (`mobee-meta`) | this IDE agent | Driving | Docs PR #1; GOOSE research; no product impl |
-| `docs/meta-genesis` | mobee-meta | PR open | https://github.com/MakePrisms/mobee/pull/1 → MakePrisms/mobee main |
+| Meta seat (`mobee-meta`) | this IDE agent | Driving | docs/meta on main; Goose locked harness-only pending fold; no product impl |
+| `docs/meta` | merged | Done | PR #1 → `4b8e29b` |
+
 ## Reality ledger (edges)
 
 | Edge | Class | Evidence |
@@ -53,10 +52,10 @@ Filed on relay-git NIP-34 `mobee` (owner `79284e2b…`). Orchestrator:
 ## Blocked / waiting
 
 - Live e2e close blocked on targeting seam + gateway up
-- Real-funds chapter: R1–R3 (token value/P2PK, durable pre-pay intent, targeted-seller enforce)
-- Canonical issue home unsettled during repo consolidation — hold refile
-- Await gudnuf on GitHub PR #1 (`docs/meta`)
-- Await orchestrator ping before claiming merge pieces
+- Real-funds chapter: R1–R3
+- Canonical issue home unsettled — hold refile of buzz issues
+- Piece 1 PR not yet opened (metadex building)
+- Money-path cherry-pick blocked on piece 1 landing
 
 ## Meta identity
 
@@ -78,13 +77,10 @@ reality-classed, gudnuf reviews, no self-merge.
 
 ## Next actions
 
-1. **Piece 1 IN FLIGHT:** metadex claimed (orchestrator assigned). Branch off main;
-   format+receipt only; PR story as briefed. Track PR URL when opened.
-2. Fold metadex SPIKE_LESSONS addendum (write-ahead = real-funds target) when convenient
-3. Goose: buzz ask out (`88cb2a87…`); independent note in [`GOOSE.md`](GOOSE.md) —
-   fold team replies when they land
-4. Librarian mirror verified; step-5 wipe held on delete mechanics (parallel)
-5. Await gudnuf on https://github.com/MakePrisms/mobee/pull/1
+1. **Piece 1 IN FLIGHT:** metadex — format+receipt PR; track URL; orchestrator verify
+2. Fold Sting lessons addenda + Goose harness-only lock into docs/meta (small follow-up PR)
+3. Draft piece 2 PR story (gateway protocol types) when piece 1 nears merge
+4. Money-path cherry-pick only after piece 1 on main
 
 ## Genesis
 
@@ -92,9 +88,6 @@ reality-classed, gudnuf reviews, no self-merge.
 
 ## Recent completions
 
+- 2026-07-13: **PR #1 merged** — docs/meta on main @ `4b8e29b`
+- 2026-07-13: genesis, SPIKE_LESSONS, Goose research, piece 1 assigned to metadex
 - 2026-07-12: v0.1 dual-reviewed, merged to main
-- 2026-07-13: genesis closed; buzz announce; docs PR #1
-- 2026-07-13: main tour + unclean-cut review with operator
-- 2026-07-13: locked A/nix/execution_id; filed 3 buzz issues; docs/meta sync
-- 2026-07-13: test posture feedback filed; standing iterate-tests rule in PROCESS
-- 2026-07-13: spike lessons from metadex + orchestrator → docs/meta/SPIKE_LESSONS.md
