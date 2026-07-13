@@ -61,7 +61,7 @@ reality-classed, gudnuf reviews, no self-merge.
 
 ## Next actions
 
-1. **Operator greenlight:** land `docs/meta/` as first PR to `main` (docs-only; no spike collision)
+1. Await gudnuf review/merge of https://github.com/MakePrisms/mobee/pull/1 (`docs/meta-genesis`)
 2. Inventory spike-vs-main → draft ordered merge-piece sequence for operator review
 3. Hold product claims until money-path gate clears or operator names a non-colliding piece
 
