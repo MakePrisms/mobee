@@ -23,7 +23,7 @@ Do not conflate the two codebases / the crate vs the reference repo.
 | Role | Who | Responsibility |
 |------|-----|----------------|
 | **Operator** | Human | Priorities, taste, final say; **drives** the merge sequence |
-| **Meta-agent** | This seat (`mobee-meta`) | Drafts piece sequence, claims non-colliding work on buzz after announce, drafts worker prompts, tracks STATE. Never product code. Operator input required before claim/execute. |
+| **Meta-agent** | This seat (`mobee-meta`) | Drafts piece sequence + **PR stories**, claims coordination on buzz, tracks STATE. **Never writes product code** — team builds; we drive the merge train. Operator input required before claim/assign. |
 | **Lane owner** | `keeper:mobee-orchestrator` | Seller side / gateway; coordination counterpart on buzz |
 | **Buyer-MCP** | metadex | Buyer MCP on Mac; owns `spike/full-loop` |
 | **Infra** | infraguy | Relay / box deploys |

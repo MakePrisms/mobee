@@ -79,10 +79,11 @@ reality-classed, gudnuf reviews, no self-merge.
 
 ## Next actions
 
-1. Operator review [`docs/meta/SPIKE_LESSONS.md`](SPIKE_LESSONS.md) (metadex + orchestrator; Sting/gudnuf optional)
-2. Greenlight first rebuild (format+receipt as pure core) against lesson constraints
-3. Await gudnuf on https://github.com/MakePrisms/mobee/pull/1 (now includes lessons doc once pushed)
-4. Ping orchestrator to claim when greenlit
+1. **Merge train (meta drives, team builds):** await builder claim for piece 1
+   (format+receipt) — brief on buzz `06212e2d…`; PR must tell clear story
+2. Operator/gudnuf: review https://github.com/MakePrisms/mobee/pull/1 (docs/meta + SPIKE_LESSONS)
+3. After piece 1 claimed: draft piece 2 PR story (gateway protocol types) on buzz
+4. Do **not** implement product code from mobee-meta seat
 
 ## Genesis
 
