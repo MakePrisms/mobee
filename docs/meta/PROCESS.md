@@ -90,6 +90,18 @@ behavior.
 | 2026-07-13 | **Honest sync:** drop faux-async on `Driver`/`run_job`; delete home-grown `block_on` until a real async I/O edge exists. Buzz issue `77c5ae79…`. |
 | 2026-07-13 | **Nix installables:** flake packages = buyer MCP + seller gateway (with ACP deps). Harnesses (`claude-acp`, `codex-acp`, …) via features/package split — no megabin bloat. Published binaries for non-technical users. Buzz issue `6d40cd87…`. |
 | 2026-07-13 | **Rename spine `job_id` → `execution_id`**; reserve `job_id` for market/offer. Buzz issue `9f9e9d0f…`. |
+| 2026-07-13 | **Test posture:** hermetic spine suite is solid; iterate tests with every merge; ACP/CI/market gaps tracked. Buzz issue `eb4290e7…`. |
+
+## Testing (standing rule)
+
+**Iterate on tests as we go.** Every piece merged to `main` must leave
+the suite stronger, or explicitly equal with a recorded reason — no
+"tests later." Prefer hermetic by default; gate real-network / real-agent
+behind features or env. Market pieces bring scenario/grader (or
+equivalent) coverage in the same PR or a paired blocking PR.
+
+Feedback snapshot + follow-ups: buzz issue
+`eb4290e7bea57638e531ef1b457f53949e60331ac863d2b0f425cbbff45e2728`.
 
 ## Conventions
 
@@ -100,3 +112,5 @@ behavior.
   of new work unless newly introduced
 - Default nix/product installables must include the ACP path users need —
   do not ship a default-features stub as the product
+- Architecture / tooling / test-policy feedback → buzz issues (NIP-34
+  `mobee`), not GitHub Issues, unless operator says otherwise

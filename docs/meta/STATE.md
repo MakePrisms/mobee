@@ -38,6 +38,7 @@ idempotency gate; metadex on M4–M6 demo-integrity fast-follow.
 | Honest sync (drop faux-async / `block_on`) | `77c5ae79cb2e223bac1ec1a007d54eb79dd6a718c5ffbe6f1fb13115f9bad54e` | Locked A |
 | Nix: buyer MCP + seller gateway + harnesses + published binaries | `6d40cd87d4b57232719649a67bc797485090b5f3d7c7528b253e6796bf3b5282` | Locked |
 | Rename spine `job_id` → `execution_id` | `9f9e9d0fe25c3054d25b93ddfde7f0504e1890249b5c991e843300a6c42a3e26` | Locked |
+| Test posture + iterate-as-we-merge rule | `eb4290e7bea57638e531ef1b457f53949e60331ac863d2b0f425cbbff45e2728` | Locked (policy); follow-ups unclaimed |
 
 Repo: NIP-34 `mobee` / owner `79284e2b167317bc455f2daccfb38c38d4836b7b2bd0d73650b0cff46660263a`.
 
@@ -89,3 +90,4 @@ reality-classed, gudnuf reviews, no self-merge.
 - 2026-07-13: genesis closed; buzz announce; docs PR #1
 - 2026-07-13: main tour + unclean-cut review with operator
 - 2026-07-13: locked A/nix/execution_id; filed 3 buzz issues; docs/meta sync
+- 2026-07-13: test posture feedback filed; standing iterate-tests rule in PROCESS
