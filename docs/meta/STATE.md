@@ -14,11 +14,10 @@ R1–R3 still tracked.
 
 | Lane | Owner | Status | Notes |
 |------|-------|--------|-------|
-| `spike/full-loop` @ `f3beb95` | metadex | ACTIVE — money-path demo integrity PASS | Idempotency + M4–M6 passed Sting; dual-review = **orchestrator** (not hearth — shared-key artifact). Push to mobee-dev; canonical origin channel-binding issue. |
-| `spike/headless-buyer` @ 8c73982 | orchestrator holding | Unmerged (gudnuf cherry-pick) | Source for pieces; MOCKED payment |
-| Repo consolidation | keeper:mobee-orchestrator | In sequence | After money-path push → migrate spikes w/ history → port hermetic suite → Librarian mirror → wipe |
-| Seller gateway (turtle) | keeper:mobee-orchestrator | Verify rig | Ping before claiming pieces (gateway-helper overlap) |
-| Meta seat (`mobee-meta`) | this IDE agent | On buzz | Docs PR #1; 4 buzz issues — **do not refile** until canonical issue home locked |
+| `spike/full-loop` @ `f3beb95` | metadex | Money-path CLEAR | gudnuf cherry-pick waits on piece-1 (format/receipt) on main |
+| Piece 1 format+receipt | metadex (assigned by orchestrator) | Building | Off `main`; PR story locked; prerequisite for money-path |
+| Repo consolidation | orchestrator + Librarian | Mirror verified | Step-5 wipe held (no buzz repos delete) |
+| Meta seat (`mobee-meta`) | this IDE agent | Driving | Docs PR #1; GOOSE research; no product impl |
 | `docs/meta-genesis` | mobee-meta | PR open | https://github.com/MakePrisms/mobee/pull/1 → MakePrisms/mobee main |
 ## Reality ledger (edges)
 
@@ -79,14 +78,13 @@ reality-classed, gudnuf reviews, no self-merge.
 
 ## Next actions
 
-1. **BLOCKER for merge train:** piece 1 (format+receipt) has **no builder claim** yet.
-   Orchestrator confirmed it is a **prerequisite** for money-path cherry-pick (cli imports
-   those modules). Metadex = reviewer/context only, not builder. Need operator to assign
-   a builder (or ask gudnuf/orchestrator who).
-2. Fold metadex addendum: write-ahead journal = **real-funds design target**; spike
-   post-delivery journal = bounded testnut compromise (do not bless for rebuild)
-3. Librarian consolidating fresh relay-git mirror (step 4) — parallel, not our claim
-4. Await gudnuf on https://github.com/MakePrisms/mobee/pull/1
+1. **Piece 1 IN FLIGHT:** metadex claimed (orchestrator assigned). Branch off main;
+   format+receipt only; PR story as briefed. Track PR URL when opened.
+2. Fold metadex SPIKE_LESSONS addendum (write-ahead = real-funds target) when convenient
+3. Goose: buzz ask out (`88cb2a87…`); independent note in [`GOOSE.md`](GOOSE.md) —
+   fold team replies when they land
+4. Librarian mirror verified; step-5 wipe held on delete mechanics (parallel)
+5. Await gudnuf on https://github.com/MakePrisms/mobee/pull/1
 
 ## Genesis
 
