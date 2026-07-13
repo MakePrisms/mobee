@@ -103,6 +103,9 @@ equivalent) coverage in the same PR or a paired blocking PR.
 Feedback snapshot + follow-ups: buzz issue
 `eb4290e7bea57638e531ef1b457f53949e60331ac863d2b0f425cbbff45e2728`.
 
+Spike rebuild constraints: [`SPIKE_LESSONS.md`](SPIKE_LESSONS.md)
+(must/should/nice + refuse-to-copy). Update when Sting/gudnuf addenda land.
+
 ## Conventions
 
 - Prefer small, reviewable PRs off `main`
