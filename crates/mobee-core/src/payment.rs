@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use cashu::{Amount, CurrencyUnit, MintUrl, PublicKey, Token};
+use nostr_sdk::PublicKey as NostrPublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -114,7 +115,8 @@ pub struct PaymentTerms {
     pub mint: MintUrl,
     pub amount: Amount,
     pub unit: CurrencyUnit,
-    pub seller_pubkey: PublicKey,
+    pub seller_nostr_pubkey: NostrPublicKey,
+    pub seller_p2pk_lock: PublicKey,
 }
 
 impl PaymentTerms {
@@ -123,13 +125,15 @@ impl PaymentTerms {
         mint: MintUrl,
         amount: Amount,
         unit: CurrencyUnit,
-        seller_pubkey: PublicKey,
+        seller_nostr_pubkey: NostrPublicKey,
+        seller_p2pk_lock: PublicKey,
     ) -> Self {
         Self {
             mint,
             amount,
             unit,
-            seller_pubkey,
+            seller_nostr_pubkey,
+            seller_p2pk_lock,
         }
     }
 }
@@ -141,7 +145,7 @@ pub struct PaymentKey {
     pub result_id: ResultId,
     pub content_hash: ContentHash,
     pub job_hash: JobHash,
-    pub seller_pubkey: PublicKey,
+    pub seller_pubkey: NostrPublicKey,
     pub amount: Amount,
     pub unit: CurrencyUnit,
     pub mint: MintUrl,
@@ -161,7 +165,7 @@ impl PaymentKey {
             result_id,
             content_hash,
             job_hash,
-            seller_pubkey: terms.seller_pubkey,
+            seller_pubkey: terms.seller_nostr_pubkey,
             amount: terms.amount,
             unit: terms.unit.clone(),
             mint: terms.mint.clone(),
@@ -494,6 +498,7 @@ pub trait PaymentEffects {
     /// Sends one newly locked and verified payment.
     fn send_payment(
         &mut self,
+        key: &PaymentKey,
         attempt_id: &AttemptId,
         terms: &PaymentTerms,
         locked: &LockedPayment,
@@ -545,6 +550,12 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
 
         if let Some(PaymentState::Intent { attempt_id }) = state.clone() {
             locked_payment = Some(effects.lock_or_reconcile(&attempt_id, terms)?);
+            require_locked_matches_terms(
+                locked_payment
+                    .as_ref()
+                    .expect("wallet lock was stored for this transition"),
+                terms,
+            )?;
             let locked = PaymentState::Locked { attempt_id };
             append_transition(&mut guard, key, state.as_ref(), &locked)?;
             state = Some(locked);
@@ -562,10 +573,9 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
             let locked = locked_payment.as_ref().ok_or_else(|| {
                 PaymentError::Refused("locked token is unavailable after reconciliation".into())
             })?;
-            require_locked_matches_terms(locked, terms)?;
             let verified = effects.verify_payment(&attempt_id, terms, locked)?;
             require_verified_matches_terms(&verified, terms)?;
-            let payment = effects.send_payment(&attempt_id, terms, locked, &verified)?;
+            let payment = effects.send_payment(key, &attempt_id, terms, locked, &verified)?;
             if payment.relay_success.is_empty() {
                 return Err(PaymentError::NoRelayAccepted);
             }
@@ -626,7 +636,7 @@ fn require_key_matches_terms(key: &PaymentKey, terms: &PaymentTerms) -> Result<(
     if key.mint != terms.mint
         || key.amount != terms.amount
         || key.unit != terms.unit
-        || key.seller_pubkey != terms.seller_pubkey
+        || key.seller_pubkey != terms.seller_nostr_pubkey
     {
         return Err(PaymentError::Refused(
             "payment key does not match typed payment terms".into(),
@@ -1039,11 +1049,9 @@ mod tests {
         let mut effects = FakeEffects::new(shared);
         effects.ordering_journal = Some(journal.clone());
 
-        assert!(
-            PaymentService::new(&journal)
-                .run(&key(), &terms(), &authority(), &mut effects)
-                .is_ok()
-        );
+        assert!(PaymentService::new(&journal)
+            .run(&key(), &terms(), &authority(), &mut effects)
+            .is_ok());
         assert_eq!(journal.sync_count(), 5);
     }
 
@@ -1054,9 +1062,11 @@ mod tests {
         let mut effects = FakeEffects::new(shared);
         effects.replay_sync_journal = Some(journal.clone());
 
-        assert!(PaymentService::new(&journal)
-            .run(&key(), &terms(), &authority(), &mut effects)
-            .is_ok());
+        assert!(
+            PaymentService::new(&journal)
+                .run(&key(), &terms(), &authority(), &mut effects)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1084,7 +1094,7 @@ mod tests {
             );
             assert!(matches!(
                 journal.records().last().map(|record| &record.value),
-                Some(PaymentState::Locked { .. })
+                Some(PaymentState::Intent { .. })
             ));
             assert_eq!(shared.verify_count.load(Ordering::SeqCst), 0);
             assert_eq!(shared.send_count.load(Ordering::SeqCst), 0);
@@ -1374,6 +1384,7 @@ mod tests {
 
         fn send_payment(
             &mut self,
+            _key: &PaymentKey,
             _attempt_id: &AttemptId,
             _terms: &PaymentTerms,
             _locked: &LockedPayment,
@@ -1435,6 +1446,7 @@ mod tests {
             MintUrl::from_str(MINT).unwrap(),
             Amount::from(7),
             CurrencyUnit::Sat,
+            nostr_public_key(2),
             public_key(2),
         )
     }
@@ -1466,6 +1478,11 @@ mod tests {
 
     fn public_key(byte: u8) -> PublicKey {
         SecretKey::from_slice(&[byte; 32]).unwrap().public_key()
+    }
+
+    fn nostr_public_key(byte: u8) -> NostrPublicKey {
+        let compressed = public_key(byte).to_string();
+        NostrPublicKey::from_hex(&compressed[2..]).unwrap()
     }
 
     fn locked_payment(terms: &PaymentTerms) -> LockedPayment {

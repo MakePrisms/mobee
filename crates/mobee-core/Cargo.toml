@@ -10,7 +10,7 @@ publish.workspace = true
 default = []
 acp = []
 gateway = ["dep:nostr-sdk"]
-wallet = ["dep:cashu", "dep:cdk"]
+wallet = ["dep:cashu", "dep:cdk", "dep:nostr-sdk", "dep:tokio"]
 test-support = []
 
 [dependencies]
@@ -21,7 +21,11 @@ nostr-sdk = { version = "0.44.1", features = ["nip59"], optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11.0"
+tokio = { version = "1.52.0", features = ["rt", "sync"], optional = true }
 
 [dev-dependencies]
 async-trait = "0.1.89"
+cdk-sqlite = "=0.17.2"
+tokio = { version = "1.52.0", features = ["macros", "rt"] }
 url = "2.5.8"
+uuid = "1.23.5"
