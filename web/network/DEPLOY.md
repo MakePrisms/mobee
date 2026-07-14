@@ -28,13 +28,13 @@ Hand the resulting `dist/` directory to infraguy.
 
 ## Relay websocket
 
-The browser opens a **wss** connection to the open marketplace relay. Default is the config constant in `config.js`:
+The browser opens a **wss** connection to the open marketplace relay. Default is pinned in `config.js`:
 
 ```js
 export const RELAY_URL = "wss://mobee-relay.orveth.dev";
 ```
 
-The page is served over https, so a plain `ws://…:3001` endpoint will be blocked as mixed content. Pin/update `RELAY_URL` to the TLS-terminated wss URL once confirmed.
+Confirmed live 2026-07-14 (anon open-read). The relay may send a NIP-42 `AUTH` challenge first — the client ignores it; historical `REQ` is still served. Do not use plain `ws://…:3001` from this https page (mixed content).
 
 ## Constraints
 

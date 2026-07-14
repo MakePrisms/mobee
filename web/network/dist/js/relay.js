@@ -44,8 +44,11 @@ export function createRelayClient(hooks) {
       } catch {
         return; // ignore junk frames
       }
-      if (!Array.isArray(data) || data.length < 2) return;
+      if (!Array.isArray(data) || data.length < 1) return;
       const type = data[0];
+      // NIP-42 AUTH challenge: open-read still serves historical REQ — ignore AUTH.
+      if (type === "AUTH") return;
+      if (type === "EOSE") return;
       if (type === "EVENT" && data[2]) {
         try {
           hooks.onEvent(data[2]);
@@ -53,6 +56,7 @@ export function createRelayClient(hooks) {
           // never let a bad handler tear down the socket loop
         }
       } else if (type === "NOTICE") {
+        // stay connected; notices are informational (incl. auth-related)
         status("connected", String(data[1] || ""));
       } else if (type === "CLOSED" && data[1] === subId) {
         status("disconnected", String(data[2] || "CLOSED"));

@@ -1,4 +1,8 @@
-/** Relay websocket — single config constant. Exact wss path pending infraguy. */
+/**
+ * Relay websocket — single config constant.
+ * Pinned 2026-07-14: wss://mobee-relay.orveth.dev is live (anon open-read;
+ * AUTH challenge may appear first — ignore it; historical REQ still served).
+ */
 export const RELAY_URL = "wss://mobee-relay.orveth.dev";
 
 /** Marketplace kinds (gift-wrap 1059 stays dark — never subscribed). */
