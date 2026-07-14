@@ -93,8 +93,13 @@ keeps Mobee to trade policy only. This reworks #8, not merges it.
 - manual `hash_to_curve` for `y` → `Proof::y()` (nut00/mod.rs:411) / `dhke::hash_to_curve`
   / batch `ProofsMethods::ys()`.
 - `Nut07State` mirror → `cashu` nut07 `State`/`ProofState`/`CheckStateRequest/Response`.
-- bespoke NUT-07 HttpClient → `cdk::wallet::MintConnector::post_check_state` (trait,
-  mockable — reuse cdk's shipped `MockMintConnector`, don't write our own).
+- bespoke NUT-07 HttpClient → `cdk::wallet::MintConnector::post_check_state` (trait). Core
+  stays generic over the public `MintConnector`; tests inject cdk's public generic
+  `BaseHttpClient<T>` with a tiny in-test `HttpTransport` fake returning `CheckStateResponse`
+  — this mocks the **transport** (exercising cdk's real connector impl), not the connector.
+  ⚠ Do NOT try to reuse cdk's `MockMintConnector`: at `=0.17.2` it is behind a module-level
+  `#![cfg(test)]`, so it is never compiled for a dependent and is not importable (E0432,
+  compiler-confirmed). The transport-fake is the source-compatible path.
 
 **KEEP in Mobee (pure core, `cashu`-only, zero I/O):** a thin
 `verify_trade_p2pk(token: &cashu::Token, lock: TradeLock, states) -> VerifiedPayment`
@@ -117,12 +122,12 @@ composition.
 **Feature / hermetic boundary:** `wallet = [cashu, cdk]` for the `MintConnector` trait +
 `HttpClient`, **no `cdk-sqlite`** (the #8 rule holds — cdk-sqlite is the only
 `WalletDatabase` impl and would drag rusqlite + tokio into core). Core policy is defined
-over the `MintConnector` trait; prod injects `HttpClient`, tests inject `MockMintConnector`
-— zero network/db. Default build has **no pay path** (safety gate).
+over the `MintConnector` trait; prod injects `HttpClient`, tests inject a
+`BaseHttpClient<T>` with an in-test transport fake (see DELETE list) — zero network/db. Default build has **no pay path** (safety gate).
 
 Acceptance:
-- Pure-core tests over a mocked `MintConnector`, zero I/O, no `cdk-sqlite`/tokio linked in
-  core (`cargo tree` clean, as #8 verified for cdk-sqlite).
+- Pure-core tests over an injected `BaseHttpClient<T>` + in-test transport fake, zero I/O,
+  no `cdk-sqlite`/tokio linked in core (`cargo tree` clean, as #8 verified for cdk-sqlite).
 - `verify_trade_p2pk` rejects: wrong mint, wrong amount, seller-lock absent, duplicate
   `y`/secret, amount-sum overflow, any proof reported spent — each with a test.
 - Both traps regression-covered (unsigned token → lock check via SpendingConditions passes/
