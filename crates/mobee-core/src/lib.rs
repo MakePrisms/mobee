@@ -4,6 +4,7 @@ pub mod event;
 pub mod format;
 pub mod gateway;
 pub mod log;
+pub mod payment_send;
 pub mod receipt;
 #[cfg(feature = "wallet")]
 pub mod wallet;

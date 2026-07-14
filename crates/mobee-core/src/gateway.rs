@@ -476,8 +476,7 @@ mod tests {
     #[test]
     fn targeting_helpers_fail_closed_for_targeted_offers() {
         let targeted = parse_offer(
-            &OfferDraft::new("task", "text/plain", 1, 2, TESTNUT_MINT_URL, SELLER)
-                .to_event_draft(),
+            &OfferDraft::new("task", "text/plain", 1, 2, TESTNUT_MINT_URL, SELLER).to_event_draft(),
         )
         .expect("targeted offer");
         let untargeted = parse_offer(
