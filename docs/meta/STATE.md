@@ -11,7 +11,9 @@ working plan.
 
 Merged to main: piece-1 (format + receipt, `b5003d4`, PR #2) and piece-2 (gateway protocol
 types, PR #5, merged `46499b5`). Through the full money bar and in the operator queue:
-piece-5 (PR #7, STANDARD), piece-4 (PR #6, stacked → retargeting to main), piece-3 (PR #8).
+piece-5 (PR #7, STANDARD), piece-3 (PR #8, **COMPOSED-DONE @ `5c596a69`** — CDK-first trade
+verification, draft + frozen for gudnuf's merge), piece-4 (PR #6, HELD for the rename +
+typed-`Token` rework before merge).
 Pieces 6–8 are specced, not yet built (piece-6 has a design doc:
 [PIECE-6-PAYMENT-SM.md](PIECE-6-PAYMENT-SM.md)).
 
@@ -97,3 +99,8 @@ gudnuf reviews all PRs; no persona self-merges.
   run record + payment-SM design merged; pieces 3/4/5 through the money bar (codex/Temper/
   composition gauntlet); piece-2 (PR #5) merged; usage-awareness schema locked + 2/3
   measurement legs; marketplace scope + fair-exchange settled by gudnuf.
+- 2026-07-14 (late): piece-3 reworked CDK-first (delete hand-rolled cashu mirrors, keep
+  `verify_trade_p2pk` trade policy) and **COMPOSED-DONE** on PR #8 @ `5c596a69` — four
+  fix-window items verified (strict per-proof seller-lock, currency-unit bind, rustdoc
+  trust-notch, no-DB dep-graph); Temper CLEAR + Anvil rev-parse + gh confirm; draft + frozen
+  for gudnuf's merge.

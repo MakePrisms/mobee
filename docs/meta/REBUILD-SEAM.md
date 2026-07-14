@@ -79,12 +79,14 @@ Landed / in flight:
 
 Then, in order:
 
-### piece-3 — trade-verification policy over cashu types · **MONEY** · **CDK-FIRST REWORK**
+### piece-3 — trade-verification policy over cashu types · **MONEY** · **CDK-FIRST · COMPOSED-DONE @ `5c596a69`**
 
 Superseded the original "lift `wallet.rs` mirrors" plan (operator direction + cdk-surface
 map, 2026-07-14, all source-verified at cdk/cashu `=0.17.2`). PR #8 lifted hand-rolled
 mirrors of things the `cashu` crate already owns; the rework **deletes the mirrors** and
-keeps Mobee to trade policy only. This reworks #8, not merges it.
+keeps Mobee to trade policy only. The rework landed in place on PR #8 (**COMPOSED-DONE
+2026-07-14 @ `5c596a69`**, draft + frozen, merge = gudnuf) — mirrors gone, Mobee holds only
+trade policy; the four fix-window items below are all verified on that head.
 
 **DELETE from Mobee (each has an exact `cashu` source-of-truth):**
 - `P2pkSecret` / `parse_p2pk_secret` / `p2pk_secret_json` → `cashu` `nut10::Secret` +
@@ -480,10 +482,13 @@ noted):
     once typed).
 
 **Sprint state (current 2026-07-14).** MERGED to main: PR #5 (piece-2 gateway types,
-`46499b5`) · PR #7 (piece-5 capture, `91adf41`). HELD for money-shape rework: **PR #8**
-(piece-3) reworking in place to CDK-first (`verify_trade_p2pk` over cashu types, mirrors
-deleted — Anvil building) · **PR #6** (piece-4) HELD for the rename + typed-`Token` rework
-before merge (operator override — see #6 REWORK section). Separate: PR #9 (network
+`46499b5`) · PR #7 (piece-5 capture, `91adf41`). **PR #8** (piece-3) **COMPOSED-DONE
+2026-07-14** at `5c596a69ade73656b1409a16876f336907e925dc` — CDK-first `verify_trade_p2pk`
+over cashu types (mirrors deleted); four fix-window items verified (strict per-proof
+seller-lock · currency-unit bind · rustdoc trust-notch · no-DB dep-graph); Temper #8 final
+re-pass CLEAR + Anvil rev-parse triple-match + gh head-confirm; draft + frozen, un-draft +
+merge = gudnuf alone. HELD for money-shape rework: **PR #6** (piece-4) — the rename +
+typed-`Token` rework before merge (operator override — see #6 REWORK section). Separate: PR #9 (network
 observatory, STANDARD) COMPOSED-DONE + un-drafted for gudnuf. Every money PR runs the full
 bar: independent-verifier mechanical + composition diff-read + Temper adversarial + codex
 deep; each fix a documented deliberate divergence. Piece-5 inventory erratum absorbed: the
