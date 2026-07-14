@@ -2,6 +2,7 @@ pub mod driver;
 pub mod engine;
 pub mod event;
 pub mod format;
+pub mod gateway;
 pub mod log;
 pub mod receipt;
 
