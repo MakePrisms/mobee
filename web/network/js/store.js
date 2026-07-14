@@ -14,23 +14,52 @@ export function createStore() {
   const receiptsByOffer = new Map();
   /** @type {Map<string, any>} */
   const handlers = new Map();
+  /** @type {Map<string, {pubkey:string, name:string|null, display_name:string|null, picture:string|null, about:string|null, created_at:number}>} */
+  const profiles = new Map();
   /** @type {any[]} */
   const liveTail = [];
   let parseSkips = 0;
 
+  /**
+   * @param {any} normalized
+   * @returns {{ ingested: boolean, newAuthor: string | null }}
+   */
   function ingest(normalized) {
     if (!normalized) {
       parseSkips += 1;
-      return false;
+      return { ingested: false, newAuthor: null };
     }
-    if (byId.has(normalized.id)) return false;
+
+    if (normalized.role === "profile") {
+      const prev = profiles.get(normalized.pubkey);
+      if (!prev || prev.created_at <= normalized.created_at) {
+        profiles.set(normalized.pubkey, {
+          pubkey: normalized.pubkey,
+          name: normalized.profile?.name ?? null,
+          display_name: normalized.profile?.display_name ?? null,
+          picture: normalized.profile?.picture ?? null,
+          about: normalized.profile?.about ?? null,
+          created_at: normalized.created_at,
+        });
+      }
+      // Profiles stay out of the live tail / funnel.
+      return { ingested: true, newAuthor: null };
+    }
+
+    if (byId.has(normalized.id)) {
+      return { ingested: false, newAuthor: null };
+    }
     byId.set(normalized.id, normalized);
-    liveTail.unshift(normalized);
+
+    // Newest-first: keep sorted by created_at desc (relay may deliver out of order).
+    liveTail.push(normalized);
+    liveTail.sort((a, b) => b.created_at - a.created_at || (a.id < b.id ? -1 : 1));
     if (liveTail.length > 200) liveTail.length = 200;
+
+    const newAuthor = profiles.has(normalized.pubkey) ? null : normalized.pubkey;
 
     switch (normalized.role) {
       case "offer":
-        // Funnel only counts plausible marketplace offers; junk 5109s stay in the tail.
         if (isPlausibleOffer(normalized)) {
           offers.set(normalized.id, normalized);
         }
@@ -53,7 +82,6 @@ export function createStore() {
         break;
       }
       case "handler": {
-        // d-tag or id as handler identity
         const key = normalized.handler?.d || normalized.id;
         const prev = handlers.get(key);
         if (!prev || prev.created_at <= normalized.created_at) {
@@ -64,7 +92,7 @@ export function createStore() {
       default:
         break;
     }
-    return true;
+    return { ingested: true, newAuthor };
   }
 
   function funnel() {
@@ -95,6 +123,7 @@ export function createStore() {
       leaks: { unclaimed, unresulted, unpaid },
       parseSkips,
       events: byId.size,
+      profiles: profiles.size,
     };
   }
 
@@ -177,11 +206,19 @@ export function createStore() {
       version: ev.handler?.version || "—",
       d: ev.handler?.d,
       k: ev.handler?.k || [],
+      profile: profiles.get(ev.pubkey) || null,
     }));
   }
 
   function tail(n = 50) {
-    return liveTail.slice(0, n);
+    return liveTail.slice(0, n).map((ev) => ({
+      ...ev,
+      profile: profiles.get(ev.pubkey) || null,
+    }));
+  }
+
+  function getProfile(pubkey) {
+    return profiles.get(pubkey) || null;
   }
 
   function snapshot() {
@@ -194,7 +231,7 @@ export function createStore() {
     };
   }
 
-  return { ingest, snapshot, funnel, latency, economics, census, tail };
+  return { ingest, snapshot, funnel, latency, economics, census, tail, getProfile };
 }
 
 function pushMap(map, key, value) {

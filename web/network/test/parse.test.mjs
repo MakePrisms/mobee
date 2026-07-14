@@ -3,7 +3,9 @@ import { createStore } from "../js/store.js";
 import {
   extractUsageAdjunct,
   parseEvent,
+  parseProfile,
   percentile,
+  PROFILE_CONTENT_MAX,
 } from "../js/parse.js";
 
 function ok(ev) {
@@ -198,5 +200,93 @@ assert.equal(lat.toResult.p50, 50);
 
 assert.equal(percentile([1, 2, 3, 4], 50), 2.5);
 assert.equal(percentile([], 50), null);
+
+// ——— v1.2: kind-0 profiles + newest-first tail + id dedupe ———
+
+const goodProfile = ok({
+  id: "c0".padEnd(64, "0"),
+  pubkey: "aa".repeat(32),
+  kind: 0,
+  created_at: 400,
+  tags: [],
+  content: JSON.stringify({
+    name: "ok-name",
+    display_name: "Ok Display",
+    picture: "https://example.com/a.png",
+    about: "hello",
+  }),
+});
+assert.equal(goodProfile.role, "profile");
+assert.equal(goodProfile.profile.name, "ok-name");
+assert.equal(goodProfile.profile.display_name, "Ok Display");
+assert.equal(goodProfile.profile.picture, "https://example.com/a.png");
+
+// Hostile 2MB content must not throw / blank.
+assert.doesNotThrow(() =>
+  parseProfile({
+    content: "Z".repeat(2_000_000),
+    created_at: 1,
+  }),
+);
+assert.equal(
+  parseProfile({
+    content: JSON.stringify({ picture: "javascript:alert(1)" }),
+    created_at: 1,
+  }).picture,
+  null,
+);
+// Oversized JSON: truncated then fail-closed to empty fields (page stays up).
+const oversized = parseProfile({
+  content: JSON.stringify({
+    name: "will-truncate",
+    junk: "Z".repeat(PROFILE_CONTENT_MAX),
+  }),
+  created_at: 1,
+});
+assert.equal(oversized.name, null);
+
+const v12 = createStore();
+const older = ok({
+  id: "d1".padEnd(64, "1"),
+  pubkey: "aa".repeat(32),
+  kind: 5109,
+  created_at: 10,
+  tags: [
+    ["i", "task"],
+    ["amount", "1", "sat"],
+    ["t", "mobee"],
+    ["v", "1"],
+  ],
+  content: "",
+});
+const newer = ok({
+  id: "d2".padEnd(64, "2"),
+  pubkey: "bb".repeat(32),
+  kind: 5109,
+  created_at: 20,
+  tags: [
+    ["i", "task"],
+    ["amount", "1", "sat"],
+    ["t", "mobee"],
+    ["v", "1"],
+  ],
+  content: "",
+});
+// Deliver out of order — tail must still be newest-first.
+assert.equal(v12.ingest(newer).ingested, true);
+assert.equal(v12.ingest(older).ingested, true);
+assert.equal(v12.ingest(newer).ingested, false, "id dedupe");
+const tail = v12.tail();
+assert.equal(tail[0].id, newer.id);
+assert.equal(tail[1].id, older.id);
+assert.equal(tail[0].profile, null);
+
+const profileIn = v12.ingest(goodProfile);
+assert.equal(profileIn.ingested, true);
+assert.equal(profileIn.newAuthor, null);
+assert.equal(v12.getProfile("aa".repeat(32))?.display_name, "Ok Display");
+assert.equal(v12.tail().length, 2, "profiles stay out of live tail");
+assert.equal(v12.funnel().profiles, 1);
+assert.equal(v12.tail()[1].profile?.name, "ok-name");
 
 console.log("ok — parse/store suite passed");

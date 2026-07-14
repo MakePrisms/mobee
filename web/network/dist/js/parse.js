@@ -31,6 +31,7 @@ export function parseEvent(raw) {
       contentJson: tryParseJson(content),
     };
 
+    if (kind === 0) return { ...base, role: "profile", profile: parseProfile(base) };
     if (kind === 5109) return { ...base, role: "offer", offer: parseOffer(base) };
     if (kind === 7000) return { ...base, role: "feedback", feedback: parseFeedback(base) };
     if (kind === 6109) return { ...base, role: "result", result: parseResult(base) };
@@ -39,6 +40,58 @@ export function parseEvent(raw) {
     return { ...base, role: "other" };
   } catch {
     return null;
+  }
+}
+
+/** Max kind-0 content bytes we will attempt to parse (hostile 10MB picture must not blank). */
+export const PROFILE_CONTENT_MAX = 64 * 1024;
+/** Max picture URL length retained for rendering. */
+export const PROFILE_PICTURE_MAX = 2048;
+
+/**
+ * Defensive NIP-01 kind-0 metadata parse.
+ * @param {{ content: string, created_at: number }} base
+ */
+export function parseProfile(base) {
+  const empty = {
+    name: null,
+    display_name: null,
+    picture: null,
+    about: null,
+  };
+  try {
+    let raw = typeof base.content === "string" ? base.content : "";
+    if (raw.length > PROFILE_CONTENT_MAX) {
+      raw = raw.slice(0, PROFILE_CONTENT_MAX);
+    }
+    const obj = tryParseJson(raw);
+    if (!obj || typeof obj !== "object") return empty;
+
+    const name = clampStr(obj.name, 128);
+    const display_name = clampStr(obj.display_name ?? obj.displayName, 128);
+    let picture = clampStr(obj.picture, PROFILE_PICTURE_MAX);
+    if (picture && !isSafePictureUrl(picture)) picture = null;
+    const about = clampStr(obj.about, 512);
+
+    return { name, display_name, picture, about };
+  } catch {
+    return empty;
+  }
+}
+
+function clampStr(v, max) {
+  if (typeof v !== "string") return null;
+  const t = v.trim();
+  if (!t) return null;
+  return t.length > max ? t.slice(0, max) : t;
+}
+
+function isSafePictureUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" || u.protocol === "http:";
+  } catch {
+    return false;
   }
 }
 
