@@ -240,6 +240,123 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn gift_wrap_never_leaks_token_or_payload_plaintext() {
+        use nostr_sdk::prelude::{JsonUtil, Keys, Kind, PublicKey};
+
+        // A recognizable, high-entropy secret so a substring match cannot collide by chance.
+        const SECRET_TOKEN: &str = "cashuAsecret-proof-DO-NOT-LEAK-9f3c1a7b0e5d4266";
+        const SECRET_JOB_ID: &str = "job-secret-corr-42";
+        const SECRET_RESULT_ID: &str = "result-secret-corr-42";
+
+        let sender = Keys::generate();
+        let receiver = Keys::generate();
+
+        // Secret-class fields ride ONLY inside the encrypted NIP-17 rumor:
+        //   * `token` is bearer ecash / proof material -> the hard money-safety requirement;
+        //     any plaintext leak is a spendable secret on a public relay.
+        //   * job_id / result_id / mint_url / amount / pubkeys travel inside the same
+        //     encrypted payload. Gift-wrap exists to keep that whole envelope private, so we
+        //     assert the entire canonical payload (and the correlation ids) are absent too.
+        let payload = TokenDeliveryPayload {
+            job_id: SECRET_JOB_ID.into(),
+            result_id: SECRET_RESULT_ID.into(),
+            mint_url: "https://testnut.cashu.space".into(),
+            amount_sats: 7,
+            token: SECRET_TOKEN.into(),
+            buyer_pubkey: receiver.public_key().to_hex(),
+            seller_pubkey: receiver.public_key().to_hex(),
+        };
+        let plaintext = payload.canonical_json();
+
+        // Non-vacuous guard: the token really is present in the plaintext we hand in, so its
+        // absence from the wire artifact below is a meaningful result, not a typo.
+        assert!(
+            plaintext.contains(SECRET_TOKEN),
+            "test setup broken: token missing from canonical payload"
+        );
+
+        let recipient = PublicKey::parse(&payload.seller_pubkey).expect("valid recipient pubkey");
+        let gift_wrap = block_on(token_delivery_gift_wrap(
+            &sender,
+            recipient,
+            plaintext.clone(),
+        ))
+        .expect("gift wrap builds without network");
+
+        // The publishable artifact is a NIP-59 gift wrap.
+        assert_eq!(gift_wrap.kind, Kind::GiftWrap);
+        assert_eq!(gift_wrap.kind.as_u16(), 1059);
+
+        // Serialize the ENTIRE publishable event (id, tags, content, sig) exactly as it goes
+        // on the wire, and search that whole artifact.
+        let wire = gift_wrap.as_json();
+
+        // Core money-safety property: no proof/token material and no plaintext payload
+        // survives on the wire.
+        assert!(
+            !wire.contains(SECRET_TOKEN),
+            "token/proof material leaked in plaintext on the wire: {wire}"
+        );
+        assert!(
+            !wire.contains(&plaintext),
+            "canonical payload leaked in plaintext on the wire: {wire}"
+        );
+        assert!(
+            !wire.contains(SECRET_JOB_ID) && !wire.contains(SECRET_RESULT_ID),
+            "job/result correlation ids leaked in plaintext on the wire: {wire}"
+        );
+
+        // Non-vacuous guard: there is real ciphertext and it is what got serialized, so the
+        // absence checks above ran against a non-empty artifact.
+        assert!(!gift_wrap.content.is_empty(), "gift wrap content is empty");
+        assert!(
+            wire.contains(&gift_wrap.content),
+            "serialized event does not contain its own encrypted content"
+        );
+
+        // Negative control: a second wrap of the SAME payload differs on the wire (ephemeral
+        // wrapping key + randomized nip44 nonce). A plaintext or deterministic-passthrough
+        // path would make these byte-identical, so this proves the absence assertions above
+        // are not passing vacuously against a constant or empty artifact.
+        let second = block_on(token_delivery_gift_wrap(
+            &sender,
+            recipient,
+            plaintext.clone(),
+        ))
+        .expect("second gift wrap builds without network");
+        assert_ne!(
+            wire,
+            second.as_json(),
+            "two wraps of the same payload are byte-identical; encryption is not randomized"
+        );
+    }
+
+    // Minimal single-threaded executor: the gift-wrap path is pure CPU crypto (no I/O), so a
+    // busy-poll with a no-op waker drives it to completion without pulling in an async runtime.
+    #[cfg(feature = "gateway")]
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        use std::pin::Pin;
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        unsafe fn noop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+        loop {
+            match Pin::new(&mut future).poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
     fn payload() -> TokenDeliveryPayload {
         TokenDeliveryPayload {
             job_id: "job".into(),
