@@ -5,7 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use cashu::{Amount, CurrencyUnit, MintUrl, PublicKey};
+use cashu::{Amount, CurrencyUnit, MintUrl, PublicKey, Token};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -417,6 +417,23 @@ impl ReceiptAuthority {
     }
 }
 
+/// Ephemeral wallet lock result; never persisted by the trade journal.
+pub struct LockedPayment {
+    token: Token,
+}
+
+impl LockedPayment {
+    /// Wraps the token returned by the wallet reconciliation edge.
+    pub fn new(token: Token) -> Self {
+        Self { token }
+    }
+
+    /// Returns the locked token for verify and send adapters.
+    pub fn token(&self) -> &Token {
+        &self.token
+    }
+}
+
 /// Injected wallet, verifier, send, and receipt effects.
 pub trait PaymentEffects {
     /// Creates or reconciles the wallet lock for an attempt.
@@ -424,13 +441,14 @@ pub trait PaymentEffects {
         &mut self,
         attempt_id: &AttemptId,
         terms: &PaymentTerms,
-    ) -> Result<(), EffectError>;
+    ) -> Result<LockedPayment, EffectError>;
 
     /// Produces a fresh typed payment verification.
     fn verify_payment(
         &mut self,
         attempt_id: &AttemptId,
         terms: &PaymentTerms,
+        locked: &LockedPayment,
     ) -> Result<VerifiedPayment, EffectError>;
 
     /// Sends one newly locked and verified payment.
@@ -438,6 +456,7 @@ pub trait PaymentEffects {
         &mut self,
         attempt_id: &AttemptId,
         terms: &PaymentTerms,
+        locked: &LockedPayment,
         verified: &VerifiedPayment,
     ) -> Result<PaymentSent, EffectError>;
 
@@ -473,6 +492,7 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
         let records = guard.replay()?;
         let mut state = PaymentMachine::fold(key, &records)?;
         let recovered_locked = matches!(state, Some(PaymentState::Locked { .. }));
+        let mut locked_payment = None;
 
         if state.is_none() {
             let intent = PaymentState::Intent {
@@ -483,7 +503,7 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
         }
 
         if let Some(PaymentState::Intent { attempt_id }) = state.clone() {
-            effects.lock_or_reconcile(&attempt_id, terms)?;
+            locked_payment = Some(effects.lock_or_reconcile(&attempt_id, terms)?);
             let locked = PaymentState::Locked { attempt_id };
             append_transition(&mut guard, key, state.as_ref(), &locked)?;
             state = Some(locked);
@@ -498,9 +518,13 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
                 .expect("locked state exists")
                 .attempt_id()
                 .clone();
-            let verified = effects.verify_payment(&attempt_id, terms)?;
+            let locked = locked_payment.as_ref().ok_or_else(|| {
+                PaymentError::Refused("locked token is unavailable after reconciliation".into())
+            })?;
+            require_locked_matches_terms(locked, terms)?;
+            let verified = effects.verify_payment(&attempt_id, terms, locked)?;
             require_verified_matches_terms(&verified, terms)?;
-            let payment = effects.send_payment(&attempt_id, terms, &verified)?;
+            let payment = effects.send_payment(&attempt_id, terms, locked, &verified)?;
             if payment.relay_success.is_empty() {
                 return Err(PaymentError::NoRelayAccepted);
             }
@@ -578,6 +602,25 @@ fn require_verified_matches_terms(
     {
         return Err(PaymentError::Refused(
             "verified payment does not match typed payment terms".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_locked_matches_terms(
+    locked: &LockedPayment,
+    terms: &PaymentTerms,
+) -> Result<(), PaymentError> {
+    let token = locked.token();
+    let amount = token
+        .value()
+        .map_err(|error| PaymentError::Refused(format!("invalid locked token: {error}")))?;
+    let mint = token
+        .mint_url()
+        .map_err(|error| PaymentError::Refused(format!("invalid locked token: {error}")))?;
+    if amount != terms.amount || mint != terms.mint || token.unit().as_ref() != Some(&terms.unit) {
+        return Err(PaymentError::Refused(
+            "locked token does not match typed payment terms".into(),
         ));
     }
     Ok(())
@@ -808,7 +851,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
-    use cashu::SecretKey;
+    use cashu::secret::Secret;
+    use cashu::{Id, Proof, SecretKey};
 
     use super::*;
     use crate::payment_send::PaymentRelayFailure;
@@ -947,6 +991,38 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(journal.sync_count(), 5);
+    }
+
+    #[test]
+    fn mismatched_locked_token_refuses_before_verify_or_send() {
+        let expected = terms();
+        let mut wrong_unit = expected.clone();
+        wrong_unit.unit = CurrencyUnit::Msat;
+        let mut wrong_amount = expected.clone();
+        wrong_amount.amount = Amount::from(8);
+        let mut wrong_mint = expected.clone();
+        wrong_mint.mint = MintUrl::from_str("https://other-mint.example").unwrap();
+
+        for locked_terms in [wrong_unit, wrong_amount, wrong_mint] {
+            let journal = MemoryPaymentJournal::default();
+            let shared = FakeShared::default();
+            let mut effects = FakeEffects::new(shared.clone());
+            effects.locked_terms = Some(locked_terms);
+
+            let error = PaymentService::new(&journal)
+                .run(&key(), &expected, &authority(), &mut effects)
+                .unwrap_err();
+
+            assert!(
+                matches!(error, PaymentError::Refused(message) if message.contains("locked token"))
+            );
+            assert!(matches!(
+                journal.records().last().map(|record| &record.value),
+                Some(PaymentState::Locked { .. })
+            ));
+            assert_eq!(shared.verify_count.load(Ordering::SeqCst), 0);
+            assert_eq!(shared.send_count.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]
@@ -1105,6 +1181,7 @@ mod tests {
         attempts: Arc<Mutex<Vec<AttemptId>>>,
         mint_count: Arc<AtomicUsize>,
         lock_calls: Arc<AtomicUsize>,
+        verify_count: Arc<AtomicUsize>,
         send_count: Arc<AtomicUsize>,
         receipt_count: Arc<AtomicUsize>,
     }
@@ -1113,6 +1190,7 @@ mod tests {
         shared: FakeShared,
         blind_lock: bool,
         crash_after_lock: bool,
+        locked_terms: Option<PaymentTerms>,
         empty_send: bool,
         fail_receipt: bool,
         forged_receipt: bool,
@@ -1125,6 +1203,7 @@ mod tests {
                 shared,
                 blind_lock: false,
                 crash_after_lock: false,
+                locked_terms: None,
                 empty_send: false,
                 fail_receipt: false,
                 forged_receipt: false,
@@ -1137,8 +1216,8 @@ mod tests {
         fn lock_or_reconcile(
             &mut self,
             attempt_id: &AttemptId,
-            _terms: &PaymentTerms,
-        ) -> Result<(), EffectError> {
+            terms: &PaymentTerms,
+        ) -> Result<LockedPayment, EffectError> {
             if let Some(journal) = &self.ordering_journal {
                 assert_eq!(journal.sync_count(), 1, "Intent must sync before lock");
             }
@@ -1153,17 +1232,19 @@ mod tests {
                 self.crash_after_lock = false;
                 return Err(EffectError::new("simulated crash after lock effect"));
             }
-            Ok(())
+            Ok(locked_payment(self.locked_terms.as_ref().unwrap_or(terms)))
         }
 
         fn verify_payment(
             &mut self,
             _attempt_id: &AttemptId,
             terms: &PaymentTerms,
+            _locked: &LockedPayment,
         ) -> Result<VerifiedPayment, EffectError> {
             if let Some(journal) = &self.ordering_journal {
                 assert_eq!(journal.sync_count(), 2, "Locked must sync before verify");
             }
+            self.shared.verify_count.fetch_add(1, Ordering::SeqCst);
             Ok(VerifiedPayment {
                 mint: terms.mint.clone(),
                 amount: terms.amount,
@@ -1176,6 +1257,7 @@ mod tests {
             &mut self,
             _attempt_id: &AttemptId,
             _terms: &PaymentTerms,
+            _locked: &LockedPayment,
             _verified: &VerifiedPayment,
         ) -> Result<PaymentSent, EffectError> {
             if let Some(journal) = &self.ordering_journal {
@@ -1265,5 +1347,21 @@ mod tests {
 
     fn public_key(byte: u8) -> PublicKey {
         SecretKey::from_slice(&[byte; 32]).unwrap().public_key()
+    }
+
+    fn locked_payment(terms: &PaymentTerms) -> LockedPayment {
+        let proof = Proof::new(
+            terms.amount,
+            Id::from_str("010000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap(),
+            Secret::new("payment-state-machine-fixture"),
+            public_key(42),
+        );
+        LockedPayment::new(Token::new(
+            terms.mint.clone(),
+            vec![proof],
+            None,
+            terms.unit.clone(),
+        ))
     }
 }
