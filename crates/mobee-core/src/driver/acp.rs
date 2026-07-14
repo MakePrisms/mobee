@@ -75,6 +75,8 @@ pub enum ContentBlock {
 pub enum SessionUpdate {
     #[serde(rename = "agent_message")]
     AgentMessage(Vec<ContentBlock>),
+    #[serde(rename = "agent_message_chunk")]
+    AgentMessageChunk(ContentBlock),
     #[serde(rename = "tool_call")]
     ToolCall {
         id: String,

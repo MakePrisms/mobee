@@ -9,8 +9,9 @@ use serde_json::{Value, json};
 
 use crate::driver::acp::{PROTOCOL_VERSION, UpdateStream};
 use crate::driver::{
-    Artifact, Caps, Driver, DriverError, Initialize, PermissionOutcome, PermissionRequest,
-    PromptTurn, Readiness, RuntimeId, SessionConfig, SessionId, SessionUpdate, StopReason,
+    Artifact, Caps, ContentBlock, Driver, DriverError, Initialize, PermissionOutcome,
+    PermissionRequest, PromptTurn, Readiness, RuntimeId, SessionConfig, SessionId, SessionUpdate,
+    StopReason,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -443,9 +444,32 @@ fn session_update_from_method(method: &str, params: Value) -> SessionUpdate {
 }
 
 fn session_update_from_params(params: &Value) -> Option<SessionUpdate> {
-    serde_json::from_value(params.clone())
-        .ok()
+    params
+        .get("update")
+        .and_then(session_update_from_wire_update)
+        .or_else(|| session_update_from_wire_update(params))
+        .or_else(|| serde_json::from_value(params.clone()).ok())
         .or_else(|| serde_json::from_value(params.get("update")?.clone()).ok())
+}
+
+fn session_update_from_wire_update(update: &Value) -> Option<SessionUpdate> {
+    match update.get("sessionUpdate")?.as_str()? {
+        "agent_message_chunk" => {
+            wire_content_block(update.get("content")?).map(SessionUpdate::AgentMessageChunk)
+        }
+        _ => None,
+    }
+}
+
+fn wire_content_block(value: &Value) -> Option<ContentBlock> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("text") | None => value
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| ContentBlock::Text { text: text.into() }),
+        Some("artifact") => serde_json::from_value(value.clone()).ok(),
+        _ => None,
+    }
 }
 
 fn stop_reason_from_params(params: &Value) -> StopReason {
@@ -589,6 +613,39 @@ mod tests {
         assert_eq!(
             update_rx.recv().expect("terminal"),
             SessionUpdate::TurnEnded(StopReason::Completed)
+        );
+        assert!(permission_responses.is_empty());
+    }
+
+    #[test]
+    fn real_agent_message_chunks_translate_to_updates() {
+        let (response_tx, _response_rx) = mpsc::channel();
+        let (update_tx, update_rx) = mpsc::channel();
+        let mut permission_responses = Vec::new();
+
+        route_wire_message(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "hello "}
+                    }
+                }
+            }),
+            &response_tx,
+            &update_tx,
+            &PermissionOutcome::Allow,
+            &mut |id, result| permission_responses.push(response_value(id, result)),
+        );
+
+        assert_eq!(
+            update_rx.recv().expect("chunk update"),
+            SessionUpdate::AgentMessageChunk(ContentBlock::Text {
+                text: "hello ".into()
+            })
         );
         assert!(permission_responses.is_empty());
     }
