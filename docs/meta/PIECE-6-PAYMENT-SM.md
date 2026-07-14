@@ -110,8 +110,22 @@ NUT-13 restore all exist). The split is explicit so core never reinvents what cd
   journal never manages proofs or duplicates wallet state.
 - **Wallet-level crash recovery = DELEGATED to cdk at the PR2 mint edge.**
   `lock_or_reconcile(attempt_id, terms)` is implemented by querying cdk `Wallet` persisted
-  state (pending proofs, quote status) — **not** mobee-written compensation logic. `attempt_id`
-  is the thread tying the trade journal to wallet state.
+  state — **not** mobee-written compensation logic. `attempt_id` is the thread tying the trade
+  journal to wallet state.
+- **CDK reconcile mechanism (ratified 2026-07-14 — codex + Temper + coordinator; cdk `0.17.2`
+  source-verified):** CDK `prepare_send` mints its **own** saga UUID and does **not** accept a
+  caller `attempt_id`; `SendOptions.metadata` carries `attempt_id` at prepare and binds durably
+  only at `confirm` → `Transaction.metadata`. So reconcile = **`list_transactions` + metadata
+  match that proves the exact attempt's token**; anything less **fails closed** (ambiguity stays
+  `Intent`/reconcilable — **never** amount/time inference, **never** a mobee compensation engine,
+  **never** persist `Locked`). This satisfies the locked `lock_or_reconcile` contract
+  (idempotency + fail-closed + never-blind-remint) — direct attempt→saga-id injection is **not**
+  a lock requirement and is absent from the pinned public API; no upstream ruling needed.
+  **Liveness residual (named, not a blocker):** a crash after `prepare` (proofs reserved) before
+  `confirm` leaves no durable `attempt_id` in CDK → reconcile fails closed → that attempt
+  **stalls** (stranded-but-safe `Intent`, observe/reconcile/human) rather than double-minting.
+  Acceptable at testnut scale; reclaim-and-retry is a later liveness enhancement. PR-body carries
+  this honesty line.
 - **Core only refuses-or-delegates** — no wallet-recovery machinery lives in `mobee-core`;
   reconcile is an **edge trait**. This *trims* PR1 (core carries the trade SM + journal, not a
   wallet-recovery engine).

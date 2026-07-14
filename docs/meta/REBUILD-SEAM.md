@@ -529,7 +529,7 @@ Q1–Q6 + `attempt_id`/reconcile locked). **PR1 (core hermetic double-pay/WAL) �
 `b741eaf` (PR #10)** — 3-leg bar (composition + Temper adv/durability + codex deep found+fixed
 3 HIGH crash-durability). **PR2 (edge authenticity) CHARTERED** — 4-leg bar (Temper primary +
 metadex second-adv + codex deep + composition), Anvil builder off `b741eaf` (scope in
-§piece-6). #6a Debug-redact (PR #11) open, my composition CLEAR. Separate: PR #9 (network
+§piece-6). #6a Debug-redact (PR #11) MERGED (my composition CLEAR + gudnuf). Separate: PR #9 (network
 observatory, STANDARD) COMPOSED-DONE + un-drafted for gudnuf. Every money PR runs the full
 bar: independent-verifier mechanical + composition diff-read + Temper adversarial + codex
 deep; each fix a documented deliberate divergence. Piece-5 inventory erratum absorbed: the

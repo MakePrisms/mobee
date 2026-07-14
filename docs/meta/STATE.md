@@ -18,7 +18,7 @@ verification, PR #8, squash `dee436e`)**, and **piece-4 (payment-send, PR #6, sq
 three-legged MONEY bar (composition + Temper adversarial/durability + codex deep found 3 HIGH
 crash-durability, fixed & verified). **PR2 (edge authenticity)** = next money cut: real
 buyer-mint `lock_or_reconcile` + seller receive/swap gate + NUT-07 connector + Temper R1/R2
-binds; not yet chartered. #6a Debug-redact (PR #11) open (composition CLEAR, awaits gudnuf).
+binds. #6a Debug-redact (PR #11) **MERGED** (composition CLEAR + gudnuf).
 (Observatory v1.1 = idle-only background per operator.)
 Pieces 6–8 are specced, not yet built (piece-6 has a design doc:
 [PIECE-6-PAYMENT-SM.md](PIECE-6-PAYMENT-SM.md)).
@@ -35,7 +35,7 @@ resolved v1-plaintext with the real-price exposure tracked as a deferred problem
 
 | Lane | Owner | Status | Notes |
 |------|-------|--------|-------|
-| Rebuild pieces → main | forge team (Scribe/Anvil/Temper/metadex) | merged: #2 #5 #6 #7 #8 #10 (piece-6 PR1 core `b741eaf`); **PR2 (piece-6 edge authenticity) = next money cut**; #6a Debug-redact = PR #11 open | each PR: composition + Temper adversarial + codex deep; piece-6 design = PIECE-6-PAYMENT-SM.md |
+| Rebuild pieces → main | forge team (Scribe/Anvil/Temper/metadex) | merged: #2 #5 #6 #7 #8 #10 (piece-6 PR1 core `b741eaf`); **PR2 (piece-6 edge authenticity) = next money cut**; #6a Debug-redact = PR #11 merged | each PR: composition + Temper adversarial + codex deep; piece-6 design = PIECE-6-PAYMENT-SM.md |
 | Usage-awareness matrix (checkpoint b) | Scribe (compose) + Anvil/Temper (legs) | 2/3 legs (codex ACP-native, cursor ACP-dark); claude leg pending seat pick | transport is harness-dependent — the headline finding |
 | Journal-v2 (live-stream) | Scribe (scoped) | design delivered; awaiting gudnuf's exposure pick | + latent finding: v1 journal already live+near-raw |
 | Skills/practice accessibility pass | Scribe | inventory done; composition behind checkpoint-b | founding gap: non-Claude kit = instructions.md only |
