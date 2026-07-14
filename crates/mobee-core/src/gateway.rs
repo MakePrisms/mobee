@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 
 pub const MOBEE_TAG: &str = "mobee";
 pub const PROTOCOL_VERSION: &str = "1";
-pub const TESTNUT_MINT_URL: &str = "https://testnut.cashu.space";
 
 pub const JOB_OFFER_KIND: u16 = 5109;
 pub const JOB_RESULT_KIND: u16 = 6109;
@@ -56,11 +55,12 @@ pub struct OfferDraft {
 }
 
 impl OfferDraft {
-    pub fn testnut(
+    pub fn new(
         task: impl Into<String>,
         output: impl Into<String>,
         amount_sats: u64,
         deadline_unix: u64,
+        mint_url: impl Into<String>,
         seller_pubkey: impl Into<String>,
     ) -> Self {
         Self {
@@ -68,23 +68,24 @@ impl OfferDraft {
             output: output.into(),
             amount_sats,
             deadline_unix,
-            mint_url: TESTNUT_MINT_URL.into(),
+            mint_url: mint_url.into(),
             seller_pubkey: Some(seller_pubkey.into()),
         }
     }
 
-    pub fn untargeted_testnut(
+    pub fn untargeted(
         task: impl Into<String>,
         output: impl Into<String>,
         amount_sats: u64,
         deadline_unix: u64,
+        mint_url: impl Into<String>,
     ) -> Self {
         Self {
             task: task.into(),
             output: output.into(),
             amount_sats,
             deadline_unix,
-            mint_url: TESTNUT_MINT_URL.into(),
+            mint_url: mint_url.into(),
             seller_pubkey: None,
         }
     }
@@ -397,11 +398,19 @@ mod tests {
     const BUYER: &str = "buyer";
     const SELLER: &str = "seller";
     const OTHER_SELLER: &str = "other-seller";
+    const TESTNUT_MINT_URL: &str = "https://testnut.cashu.space";
 
     #[test]
     fn offer_draft_uses_locked_job_microstandard_tags() {
-        let draft = OfferDraft::testnut("write hello.txt", "text/plain", 7, 1_800_000_000, SELLER)
-            .to_event_draft();
+        let draft = OfferDraft::new(
+            "write hello.txt",
+            "text/plain",
+            7,
+            1_800_000_000,
+            TESTNUT_MINT_URL,
+            SELLER,
+        )
+        .to_event_draft();
 
         assert_eq!(draft.kind, JOB_OFFER_KIND);
         assert_eq!(draft.content, "");
@@ -422,9 +431,14 @@ mod tests {
 
     #[test]
     fn untargeted_offer_draft_omits_seller_tag() {
-        let draft =
-            OfferDraft::untargeted_testnut("write hello.txt", "text/plain", 7, 1_800_000_000)
-                .to_event_draft();
+        let draft = OfferDraft::untargeted(
+            "write hello.txt",
+            "text/plain",
+            7,
+            1_800_000_000,
+            TESTNUT_MINT_URL,
+        )
+        .to_event_draft();
 
         assert_eq!(draft.kind, JOB_OFFER_KIND);
         assert!(!has_tag_value(&draft.tags, "p", SELLER));
@@ -436,8 +450,15 @@ mod tests {
 
     #[test]
     fn parse_offer_round_trips_locked_tags() {
-        let draft = OfferDraft::testnut("summarize", "application/json", 3, 1_800_000_001, SELLER)
-            .to_event_draft();
+        let draft = OfferDraft::new(
+            "summarize",
+            "application/json",
+            3,
+            1_800_000_001,
+            TESTNUT_MINT_URL,
+            SELLER,
+        )
+        .to_event_draft();
 
         assert_eq!(
             parse_offer(&draft).expect("parse offer"),
@@ -454,11 +475,13 @@ mod tests {
 
     #[test]
     fn targeting_helpers_fail_closed_for_targeted_offers() {
-        let targeted =
-            parse_offer(&OfferDraft::testnut("task", "text/plain", 1, 2, SELLER).to_event_draft())
-                .expect("targeted offer");
+        let targeted = parse_offer(
+            &OfferDraft::new("task", "text/plain", 1, 2, TESTNUT_MINT_URL, SELLER)
+                .to_event_draft(),
+        )
+        .expect("targeted offer");
         let untargeted = parse_offer(
-            &OfferDraft::untargeted_testnut("task", "text/plain", 1, 2).to_event_draft(),
+            &OfferDraft::untargeted("task", "text/plain", 1, 2, TESTNUT_MINT_URL).to_event_draft(),
         )
         .expect("untargeted offer");
 
