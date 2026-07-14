@@ -127,7 +127,11 @@ over the `MintConnector` trait; prod injects `HttpClient`, tests inject a
 
 Acceptance:
 - Pure-core tests over an injected `BaseHttpClient<T>` + in-test transport fake, zero I/O,
-  no `cdk-sqlite`/tokio linked in core (`cargo tree` clean, as #8 verified for cdk-sqlite).
+  **no `cdk-sqlite`/`rusqlite` linked (no database — `cargo tree` clean, #8-verified).**
+  ⚠ Correction (Anvil, #8, source-verified): cdk's `wallet` feature ITSELF pulls `tokio` in
+  0.17.2 (`wallet/mod.rs` uses `tokio::sync::RwLock`), so "no tokio" is not achievable behind
+  the wallet feature — the enforceable invariant is **no-DB**, not no-async-runtime. State it
+  precisely in the PR (don't claim the impossible).
 - `verify_trade_p2pk` rejects: wrong mint, wrong amount, seller-lock absent, duplicate
   `y`/secret, amount-sum overflow, any proof reported spent — each with a test.
 - Both traps regression-covered (unsigned token → lock check via SpendingConditions passes/
