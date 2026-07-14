@@ -11,6 +11,7 @@ default = []
 acp = []
 gateway = ["dep:nostr-sdk"]
 wallet = ["dep:cashu", "dep:cdk"]
+test-support = []
 
 [dependencies]
 cashu = { version = "=0.17.2", optional = true }

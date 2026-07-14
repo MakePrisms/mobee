@@ -2,27 +2,49 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TokenDeliveryPayload {
     pub job_id: String,
     pub result_id: String,
     pub mint_url: String,
     pub amount_sats: u64,
     pub token: String,
-    pub buyer_pubkey: String,
     pub seller_pubkey: String,
 }
 
 impl TokenDeliveryPayload {
-    pub fn canonical_json(&self) -> String {
-        serde_json::to_string(self).expect("token delivery payload is JSON-serializable")
+    pub fn canonical_json(&self, buyer_pubkey: &str) -> String {
+        use serde::ser::{SerializeMap, Serializer};
+
+        let mut json = Vec::new();
+        let mut serializer = serde_json::Serializer::new(&mut json);
+        let mut map = serializer
+            .serialize_map(Some(7))
+            .expect("token delivery payload starts a JSON map");
+        map.serialize_entry("job_id", &self.job_id)
+            .expect("job id is JSON-serializable");
+        map.serialize_entry("result_id", &self.result_id)
+            .expect("result id is JSON-serializable");
+        map.serialize_entry("mint_url", &self.mint_url)
+            .expect("mint URL is JSON-serializable");
+        map.serialize_entry("amount_sats", &self.amount_sats)
+            .expect("amount is JSON-serializable");
+        map.serialize_entry("token", &self.token)
+            .expect("token is JSON-serializable");
+        map.serialize_entry("buyer_pubkey", buyer_pubkey)
+            .expect("buyer pubkey is JSON-serializable");
+        map.serialize_entry("seller_pubkey", &self.seller_pubkey)
+            .expect("seller pubkey is JSON-serializable");
+        map.end()
+            .expect("token delivery payload closes its JSON map");
+
+        String::from_utf8(json).expect("JSON serializer emits UTF-8")
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveredToken {
     pub delivery_id: String,
-    pub payload: TokenDeliveryPayload,
     pub relay_success: Vec<String>,
     pub relay_failed: Vec<DeliveryRelayFailure>,
 }
@@ -56,12 +78,14 @@ pub trait TokenDelivery {
     ) -> Result<DeliveredToken, DeliveryError>;
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub struct MemoryTokenDelivery {
     next_id: u64,
     deliveries: Vec<DeliveredToken>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl MemoryTokenDelivery {
     pub fn deliveries(&self) -> &[DeliveredToken] {
         &self.deliveries
@@ -69,13 +93,12 @@ impl MemoryTokenDelivery {
 
     pub fn record_delivery(
         &mut self,
-        payload: TokenDeliveryPayload,
+        _payload: TokenDeliveryPayload,
     ) -> Result<DeliveredToken, DeliveryError> {
         self.next_id += 1;
         let delivered = DeliveredToken {
             delivery_id: format!("mem-delivery-{}", self.next_id),
-            payload,
-            relay_success: Vec::new(),
+            relay_success: vec!["memory://token-delivery".into()],
             relay_failed: Vec::new(),
         };
         self.deliveries.push(delivered.clone());
@@ -83,6 +106,7 @@ impl MemoryTokenDelivery {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl TokenDelivery for MemoryTokenDelivery {
     async fn deliver_token(
         &mut self,
@@ -124,8 +148,10 @@ impl TokenDelivery for NostrTokenDelivery {
                 "invalid seller pubkey for NIP-17 delivery: {error}"
             ))
         })?;
+        let buyer_pubkey = self.keys.public_key().to_hex();
         let gift_wrap =
-            token_delivery_gift_wrap(&self.keys, receiver, payload.canonical_json()).await?;
+            token_delivery_gift_wrap(&self.keys, receiver, payload.canonical_json(&buyer_pubkey))
+                .await?;
         let client = Client::new(self.keys.clone());
         client
             .add_relay(&self.relay)
@@ -140,15 +166,14 @@ impl TokenDelivery for NostrTokenDelivery {
                 DeliveryError::Transport(format!("failed to send NIP-17 token delivery: {error}"))
             })?;
 
-        Ok(DeliveredToken {
-            delivery_id: output.val.to_string(),
-            payload,
-            relay_success: output
+        delivered_token(
+            output.val.to_string(),
+            output
                 .success
                 .into_iter()
                 .map(|url| url.to_string())
                 .collect(),
-            relay_failed: output
+            output
                 .failed
                 .into_iter()
                 .map(|(url, error)| DeliveryRelayFailure {
@@ -156,8 +181,27 @@ impl TokenDelivery for NostrTokenDelivery {
                     error,
                 })
                 .collect(),
-        })
+        )
     }
+}
+
+#[cfg(any(test, feature = "gateway"))]
+fn delivered_token(
+    delivery_id: String,
+    relay_success: Vec<String>,
+    relay_failed: Vec<DeliveryRelayFailure>,
+) -> Result<DeliveredToken, DeliveryError> {
+    if relay_success.is_empty() {
+        return Err(DeliveryError::Transport(
+            "no relay accepted the NIP-17 token delivery".into(),
+        ));
+    }
+
+    Ok(DeliveredToken {
+        delivery_id,
+        relay_success,
+        relay_failed,
+    })
 }
 
 #[cfg(feature = "gateway")]
@@ -212,21 +256,56 @@ mod tests {
         let payload = payload();
 
         assert_eq!(
-            payload.canonical_json(),
+            payload.canonical_json("buyer"),
             "{\"job_id\":\"job\",\"result_id\":\"result\",\"mint_url\":\"https://testnut.cashu.space\",\"amount_sats\":7,\"token\":\"cashu-token\",\"buyer_pubkey\":\"buyer\",\"seller_pubkey\":\"seller\"}"
         );
     }
 
     #[test]
-    fn memory_delivery_records_token_payloads() {
+    fn memory_delivery_records_metadata_only() {
         let mut delivery = MemoryTokenDelivery::default();
 
         let delivered = delivery.record_delivery(payload()).unwrap();
 
         assert_eq!(delivered.delivery_id, "mem-delivery-1");
-        assert!(delivered.relay_success.is_empty());
+        assert_eq!(delivered.relay_success, ["memory://token-delivery"]);
         assert!(delivered.relay_failed.is_empty());
         assert_eq!(delivery.deliveries(), &[delivered]);
+    }
+
+    #[test]
+    fn delivery_fails_closed_when_no_relay_accepts() {
+        let error = delivered_token(
+            "event".into(),
+            Vec::new(),
+            vec![DeliveryRelayFailure {
+                relay: "wss://relay.example".into(),
+                error: "rejected".into(),
+            }],
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            DeliveryError::Transport("no relay accepted the NIP-17 token delivery".into())
+        );
+    }
+
+    #[test]
+    fn delivery_preserves_partial_relay_outcome() {
+        let failed = DeliveryRelayFailure {
+            relay: "wss://failed.example".into(),
+            error: "rejected".into(),
+        };
+        let delivered = delivered_token(
+            "event".into(),
+            vec!["wss://accepted.example".into()],
+            vec![failed.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(delivered.relay_success, ["wss://accepted.example"]);
+        assert_eq!(delivered.relay_failed, [failed]);
     }
 
     #[cfg(feature = "gateway")]
@@ -243,7 +322,10 @@ mod tests {
     #[cfg(feature = "gateway")]
     #[test]
     fn gift_wrap_never_leaks_token_or_payload_plaintext() {
-        use nostr_sdk::prelude::{JsonUtil, Keys, Kind, PublicKey};
+        use nostr_sdk::{
+            nips::nip59::UnwrappedGift,
+            prelude::{JsonUtil, Keys, Kind, PublicKey, Tag},
+        };
 
         // A recognizable, high-entropy secret so a substring match cannot collide by chance.
         const SECRET_TOKEN: &str = "cashuAsecret-proof-DO-NOT-LEAK-9f3c1a7b0e5d4266";
@@ -265,10 +347,9 @@ mod tests {
             mint_url: "https://testnut.cashu.space".into(),
             amount_sats: 7,
             token: SECRET_TOKEN.into(),
-            buyer_pubkey: receiver.public_key().to_hex(),
             seller_pubkey: receiver.public_key().to_hex(),
         };
-        let plaintext = payload.canonical_json();
+        let plaintext = payload.canonical_json(&sender.public_key().to_hex());
 
         // Non-vacuous guard: the token really is present in the plaintext we hand in, so its
         // absence from the wire artifact below is a meaningful result, not a typo.
@@ -288,6 +369,23 @@ mod tests {
         // The publishable artifact is a NIP-59 gift wrap.
         assert_eq!(gift_wrap.kind, Kind::GiftWrap);
         assert_eq!(gift_wrap.kind.as_u16(), 1059);
+
+        // Unwrap the exact publishable artifact as the recipient does. This proves the
+        // encrypted rumor is a decryptable kind-14 DM addressed to the seller, rather than
+        // merely checking that the outer event looks opaque.
+        let unwrapped = block_on(UnwrappedGift::from_gift_wrap(&receiver, &gift_wrap))
+            .expect("recipient decrypts and authenticates the gift wrap");
+        assert_eq!(unwrapped.sender, sender.public_key());
+        assert_eq!(unwrapped.rumor.kind, Kind::PrivateDirectMessage);
+        assert_eq!(unwrapped.rumor.content, plaintext);
+        assert!(
+            unwrapped
+                .rumor
+                .tags
+                .iter()
+                .any(|tag| tag == &Tag::public_key(receiver.public_key())),
+            "kind-14 rumor is missing its recipient p-tag"
+        );
 
         // Serialize the ENTIRE publishable event (id, tags, content, sig) exactly as it goes
         // on the wire, and search that whole artifact.
@@ -364,7 +462,6 @@ mod tests {
             mint_url: "https://testnut.cashu.space".into(),
             amount_sats: 7,
             token: "cashu-token".into(),
-            buyer_pubkey: "buyer".into(),
             seller_pubkey: "seller".into(),
         }
     }
