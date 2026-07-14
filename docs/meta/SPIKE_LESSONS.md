@@ -73,6 +73,19 @@ Spike is reference — do **not** re-import the scars listed under Refuse.
 - Tag-only receipt trust
 - `.scratch/` artifacts committed (`hello.txt`, `run.jsonl`, …)
 
+Added 2026-07-14 (seam recon @ spike `0e77669` — see [REBUILD-SEAM.md](REBUILD-SEAM.md)):
+
+- Spike's own `format.rs`/`receipt.rs` copies — they predate piece-1; `main`'s
+  re-extraction @ `b5003d4` is canonical. Never overwrite from spike.
+- Hand-rolled ref-pattern matcher as a lasting shape (`cli.rs:4210` mirrors
+  `buzz_core::git_perms::RefPattern` semantically) — rebuild imports the relay grammar or
+  conformance-tests against it (Sting M2 re-review residual).
+- `Cargo.lock` bulk copy (+3560 lines on spike) — regenerate per piece.
+- Inline magic policy constants in the binary (e.g. testnut fee headroom `= 8`,
+  `cli.rs:36`) — policy constants get a named core home with rationale.
+- `/target`-only `.gitignore` — the gap that admitted `.scratch/`; each piece PR carries
+  proper ignores.
+
 ## Implication for first rebuild PRs
 
 - **format + receipt** as pure core modules still correct first slice — but receipt/payment work after that must land as **state library**, not CLI helpers.
