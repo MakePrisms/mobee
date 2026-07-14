@@ -327,7 +327,7 @@ impl<R> CdkPaymentEffects<R> {
             .map_err(wallet_error)?;
         let (commands, mut requests) = tokio::sync::mpsc::channel(1);
         let worker = thread::Builder::new()
-            .name("mobee-payment-edge".into())
+            .name("mobee-payment-wallet".into())
             .spawn(move || {
                 runtime.block_on(async move {
                     while let Some(command) = requests.recv().await {
@@ -379,14 +379,14 @@ impl<R> CdkPaymentEffects<R> {
         let (response, result) = mpsc::sync_channel(1);
         self.commands
             .as_ref()
-            .ok_or_else(|| EffectError::new("payment edge worker is stopped"))?
+            .ok_or_else(|| EffectError::new("payment wallet worker is stopped"))?
             .try_send(command(response))
             .map_err(|error| {
-                EffectError::new(format!("payment edge worker unavailable: {error}"))
+                EffectError::new(format!("payment wallet worker unavailable: {error}"))
             })?;
         result
             .recv()
-            .map_err(|_| EffectError::new("payment edge worker dropped its response"))?
+            .map_err(|_| EffectError::new("payment wallet worker dropped its response"))?
             .map_err(|error| EffectError::new(error.to_string()))
     }
 }
