@@ -419,10 +419,15 @@ noted):
     a worse class — this guard is the buyer-side sibling of the seller's swap-on-receive
     (finding 8). Both builders independently converged on this fix; recorded so the rebuild
     inherits it as a gate, not a one-trade patch. **Root-cause fix (mobee-meta, 2026-07-14):
-    the payload should hold a typed `cashu::Token`, not a `String` (piece-4.1 typed-Token
-    harden) — the type makes the corrupt token unconstructable, subsuming this runtime guard.
-    The `Funded→Delivered` transition is renamed `Locked→Sent` per the payment-send
-    vocabulary.**
+    the payload should hold a typed `cashu::Token`, not a `String` — the type makes the
+    corrupt token unconstructable, subsuming this runtime guard. The `Funded→Delivered`
+    transition is renamed `Locked→Sent` per the payment-send vocabulary. STATUS (coordinator
+    ruling 2026-07-14): typed-Token lands as **piece-6 intake** (the payment SM owns the
+    payload), NOT a retrofit onto #6/#8. #6 ships its correct mechanism with the stringly
+    `token: String` payload; **main therefore carries this corruption vector until piece-6 —
+    accepted at PLAY/testnut** (a corrupt token blocks, never loses funds). When piece-6's
+    typed payload + a round-trip regression land, this finding closes as **SUBSUMED**;
+    metadex/Anvil need not hunt the original encode site unless it's cheap.**
 
 **Sprint state (pieces 3/4/5).** All four through the money bar and in the operator queue:
 PR #5 (piece-2 gateway types) · PR #7 (piece-5 capture, STANDARD) · PR #6 (piece-4
