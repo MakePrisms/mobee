@@ -475,6 +475,16 @@ impl<'a> CdkSellerReceive<'a> {
         terms: &PaymentTerms,
     ) -> Result<Amount, PaymentEdgeError> {
         require_wallet_matches(self.wallet, terms)?;
+        let token_mint = token.mint_url().map_err(wallet_error)?;
+        let token_amount = token.value().map_err(wallet_error)?;
+        if token_mint != terms.mint
+            || token.unit().as_ref() != Some(&terms.unit)
+            || token_amount != terms.amount
+        {
+            return Err(PaymentEdgeError::Policy(
+                "received token does not match payment terms".into(),
+            ));
+        }
         if self.seller_key.public_key().x_only_public_key()
             != terms.seller_pubkey.x_only_public_key()
         {
@@ -687,6 +697,31 @@ mod tests {
         assert!(matches!(result, Err(PaymentEdgeError::Wallet(_))));
         assert_eq!(swap_calls.load(Ordering::SeqCst), 1);
         assert_eq!(presented_amount.load(Ordering::SeqCst), 7);
+    }
+
+    #[tokio::test]
+    async fn seller_receive_rejects_an_authentic_underpay_before_the_mint_swap() {
+        let seller_key = secret_key(1);
+        let keyset = test_keyset();
+        let proof = p2pk_proof_for_keyset(1, seller_key.public_key(), keyset.id);
+        let proof_y = proof.y().unwrap();
+        let token = Token::new(mint(MINT), vec![proof], None, CurrencyUnit::Sat);
+        let transport = InflatedSwapTransport::new(proof_y, Amount::from(7));
+        let swap_calls = transport.swap_calls.clone();
+        let wallet = seller_wallet(transport, keyset).await;
+        let terms = PaymentTerms::new(
+            mint(MINT),
+            Amount::from(7),
+            CurrencyUnit::Sat,
+            seller_key.public_key(),
+        );
+
+        let result = CdkSellerReceive::new(&wallet, seller_key)
+            .receive(&token, &terms)
+            .await;
+
+        assert!(matches!(result, Err(PaymentEdgeError::Policy(_))));
+        assert_eq!(swap_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
