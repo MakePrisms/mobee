@@ -280,14 +280,32 @@ green on `main`; existing engine/event-log suite not regressed.
   (pieces 1/5, not serde field-order), Token/proofs/relays OUT (key exists at Intent).
 
 **Two clean MONEY cuts (Q5 = A):**
-- **PR1 (core, hermetic — Anvil, branch `rebuild/piece-6-payment-sm-pr1` off `cec8607`):**
-  reducer + Guard journal + attempt_id/reconcile + injected effect traits + `test-support`
-  fakes + hermetic tests (pay-counter ≤1 across retry/crash/concurrent, WAL ordering,
-  reconcile-or-refuse recovery, total-send-fail stays Locked, receipt-retry, torn-journal
-  refusal). **No runnable production pay path**; MONEY bar claims **double-pay closure ONLY**.
-- **PR2 (edge):** buyer-mint `lock_or_reconcile` (real Wallet) + seller receive/**swap
-  authenticity gate** (finding 8 / DP-2, inflated-amount-on-real-`y` regression) + NUT-07
-  connector + testnut wiring. Own full MONEY bar; undiluted authenticity review.
+- **PR1 (core, hermetic) — ✅ MERGED to main `b741eaf` (PR #10, 2026-07-14):** reducer + Guard
+  journal + attempt_id/reconcile + injected effect traits + `test-support` fakes + hermetic
+  tests (pay-counter ≤1 retry/crash/concurrent · WAL ordering · reconcile-or-refuse recovery ·
+  total-send-fail stays Locked · receipt-retry · torn-journal refusal · Token≡terms guard ·
+  journal durability: replay-sync + newline-commit-marker + parent-dir fsync). Three-legged
+  bar cleared (composition + Temper adversarial/durability + codex deep, which found+fixed 3
+  HIGH crash-durability). **No runnable pay path**; claims **double-pay closure ONLY**.
+- **PR2 (edge) — CHARTERED 2026-07-14** (next money cut; Anvil builder off `b741eaf`; **4-leg
+  bar**: Temper primary adversarial + metadex second-adv [seller-swap scars `741dcaab`] + codex
+  deep + my composition; each acceptance item = a named non-vacuous RED→GREEN on the frozen
+  head):
+  1. real cdk `lock_or_reconcile` (over Wallet persistence — pending proofs / quote state; **NO
+     mobee compensation**, cdk late-bind holds); **testnut allowlist at the mint edge**.
+  2. **R1** — validate minted `Token` ≡ terms *before* persisting `Locked` (mismatch stays
+     `Intent`/reconcilable, never bricks to `AmbiguousSendRefused`).
+  3. seller receive/**swap authenticity gate** — swap-at-mint (or full keyset + DLEQ) before
+     the SM advances at receive; **NUT-07 alone ≠ authenticity**; inflated-amount-on-real-`y`
+     MUST fail closed (finding 8 / DP-2).
+  4. **R2** — real `verify_trade_p2pk` on `locked.token()` with the real seller lock before send.
+  5. NIP-17 `PaymentSend` adapter wired as the real send effect + client-disconnect (#6a
+     pattern) + buyer_pubkey restore-on-parse + seal-sender ≡ envelope-buyer (audit finding-3).
+  6. one edge unit-constructor (offer → typed terms; CLI/adapters never parse units).
+  Optional R3 `unit=None` regression. Fence: no relay-repair/resend (Q3), no git-delivery
+  (piece-7), no CLI/MCP re-skin (piece-8); journal stays trade-state-only. Un-draft only on my
+  COMPOSED-DONE; merge = gudnuf. "Money-safe end-to-end on testnut" is claimable **only after
+  these probes clear on the frozen head** — not a happy-path demo.
 
 Depends on pieces 1–5 + #6 (all merged). R2 precondition ("durable pre-pay intent") on the
 real-funds path. Spike's `authorize_pay` (`cli.rs:1844`) + append-after-pay journal are
@@ -505,10 +523,13 @@ Anvil rev-parse + gh confirm), then a docs-only comment-trim hygiene pass (`172c
 verified comment-only vs `5c596a69`, trap knowledge moved to tests) merged by gudnuf.
 **PR #6** (piece-4) **✅ MERGED 2026-07-14** (squash `cec8607`, gudnuf rebased onto #8 + merged
 direct from his IDE — rename → `payment_send` + typed `cashu::Token`; finding-10
-CLOSED-SUBSUMED; Temper post-merge audit on `cec8607` = follow-up only). **Foreground now:
-piece-6 payment SM** — debate LOCKED (Q1–Q6 + `attempt_id`/reconcile), design folded to the
-source of truth [PIECE-6-PAYMENT-SM.md](PIECE-6-PAYMENT-SM.md); main pinned `cec8607`; PR1
-(core hermetic) = Anvil, PR2 (edge authenticity) follows. Separate: PR #9 (network
+CLOSED-SUBSUMED; Temper post-merge audit on `cec8607` = follow-up only). **Foreground:
+piece-6 payment SM** (design = source of truth [PIECE-6-PAYMENT-SM.md](PIECE-6-PAYMENT-SM.md);
+Q1–Q6 + `attempt_id`/reconcile locked). **PR1 (core hermetic double-pay/WAL) ✅ MERGED
+`b741eaf` (PR #10)** — 3-leg bar (composition + Temper adv/durability + codex deep found+fixed
+3 HIGH crash-durability). **PR2 (edge authenticity) CHARTERED** — 4-leg bar (Temper primary +
+metadex second-adv + codex deep + composition), Anvil builder off `b741eaf` (scope in
+§piece-6). #6a Debug-redact (PR #11) open, my composition CLEAR. Separate: PR #9 (network
 observatory, STANDARD) COMPOSED-DONE + un-drafted for gudnuf. Every money PR runs the full
 bar: independent-verifier mechanical + composition diff-read + Temper adversarial + codex
 deep; each fix a documented deliberate divergence. Piece-5 inventory erratum absorbed: the
