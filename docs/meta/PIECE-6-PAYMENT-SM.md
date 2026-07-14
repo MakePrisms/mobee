@@ -57,17 +57,15 @@ Intent  ──mint/lock──►  Locked  ──send──►  Sent  ──publi
 `pay_seller` fires **exactly once** across retry / crash / concurrent invocation. The
 merge gate proves it with a stubbed pay-counter (SPIKE_LESSONS).
 
-**Payment payload is typed, not stringly (operator intake, 2026-07-14 — the type-level fix
-for finding 10 / the c2 corruption):** in-process the payload holds `cashu::Token` (plus
-`MintUrl`/`Amount` where they fit), **not** a bare `String`; correlation fields (job_id,
-result_id, buyer/seller pubkeys) stay mobee types/newtypes (cashu doesn't own those). The
-token serializes to its canonical `cashuA`/`cashuB` string **only** at the NIP-17 envelope
-boundary, and the seller **parses `Token` first, fail-closed, before the SM advances** (this
-is the Locked→Sent pre-publish guard AND the receive-side gate, enforced by the type instead
-of a hand-rolled string check). Wire helpers stay behind the `wallet` (or `gateway+wallet`)
-feature so default builds never link cashu — same discipline as verify. Tradeoff: couples
-`payment_send` to the cashu version already pinned `=0.17.2` on #8; accepted — one `Token`
-type across mint/verify/send/receive beats re-parsing strings at every hop.
+**Payment payload is typed, not stringly — arrives via the #6 rework, NOT introduced here
+(operator override, 2026-07-14):** the typed `cashu::Token` payload (`PaymentPayload` holding
+`Token` + `MintUrl`/`Amount`, correlation fields as mobee newtypes, `cashuA`/`cashuB` string
+only at the NIP-17 boundary, seller parse-first fail-closed, feature-gated cashu-free
+default) lands in **piece-4's #6 rework before merge** — that is where finding-10 closes. The
+payment SM here simply **consumes** the already-typed payload: the `Locked→Sent` transition
+and the receive-side gate are enforced by the type `#6` provides, not by a hand-rolled string
+check in the SM. One `Token` type flows mint → verify → send → receive; the SM never
+re-parses a string.
 
 ## Write-ahead journal
 

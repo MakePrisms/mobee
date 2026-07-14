@@ -158,27 +158,45 @@ signing key (sender == buyer in v1; a delegated-sender flow arrives as a designe
 the plaintext-exclusion test is structural (unwrap via NIP-59, assert rumor kind 14 +
 decryptability), not substring-only.
 
-### piece-4.1 — payment-send rename + typed-Token harden · **STANDARD** (rename) / **MONEY** (typing)
+### #6 REWORK — rename + typed Token, IN-PR before merge · **MONEY** · **HELD**
 
-Operator note (mobee-meta, 2026-07-14): "delivery" is overloaded — git-delivery is the
-**work product**, the Cashu NIP-17 path is **payment send**, not fulfillment. Two follow-ups
-on the landed piece-4 (behavior unchanged by either — #6 lands its mechanism as-is):
+**Operator override (gudnuf/mobee-meta, 2026-07-14): merge #6 in the shape we want, not
+"land then rename/type later."** #6 is **HELD** — reworked before merge, then ships. This
+**supersedes** the earlier "#6 lands as-is; typed-Token = piece-6 intake" line; the separate
+4.1 rename-after-merge is **cancelled** (the rename is in this rework). Keep #6's proven
+mechanism (gift-wrap / fail-closed / metadata-only); do **not** pull piece-6 scope (payment
+SM, journal, buyer-mint Wallet, seller receive/swap) into it.
 
-1. **Rename (STANDARD, mechanical):** `token delivery → payment send` across the module —
-   `deliver_token → send_payment`, `TokenDelivery → PaymentSend`, `TokenDeliveryPayload →
-   PaymentPayload`, `DeliveredToken → PaymentSent` (metadata-only return unchanged). SM
-   vocabulary `intent → locked → sent → receipt-published → closed`; no "token delivered"
-   anywhere. Land as an immediate 4.1 rename PR after #6 merges (don't churn the
-   review-ready PR), or fold if gudnuf requests it inline during #6 review.
-2. **Typed-Token harden (MONEY):** payload holds `cashu::Token` (+ `MintUrl`/`Amount`)
-   in-process, not `token: String` — the stringly field is what let c2's corrupt token
-   reach the wire (finding 10). Serialize `Token → cashuA/cashuB` only at the NIP-17
-   envelope boundary; seller parses `Token` first, fail-closed, before the SM advances.
-   Correlation fields (job_id, result_id, pubkeys) stay mobee newtypes. Wire helpers behind
-   `wallet`/`gateway+wallet` so default builds stay cashu-free. This is the **type-level
-   form of finding 10's pre-publish guard** — corruption becomes unconstructable, not merely
-   caught. Couples payment_send to cashu `=0.17.2` (already pinned on #8); accepted.
-   Lands as piece-6 intake (the payment SM owns the typed payload).
+In scope for the #6 rework:
+1. **Rename** `token delivery → payment send`: `deliver_token → send_payment`,
+   `TokenDelivery → PaymentSend`, `TokenDeliveryPayload → PaymentPayload`, `DeliveredToken →
+   PaymentSent`, module/path names; SM vocab `intent → locked → sent → receipt-published →
+   closed`; **no "token delivered" residual** (reserve "delivery" for git work product).
+2. **Typed Token**: payload holds in-process `cashu::Token` (+ `MintUrl`/`Amount`), **not**
+   `token: String`; serialize `cashuA/cashuB` **only** at the NIP-17 envelope boundary;
+   seller **parses `Token` first, fail-closed, before any SM/state advance**; feature-gate so
+   default (no-wallet) builds stay cashu-free. Correlation fields stay mobee newtypes.
+   **This closes finding-10 in #6** — the corrupt token becomes unconstructable, not
+   deferred to piece-6.
+
+Acceptance (MONEY bar — composition + Temper adversarial + codex; the 5 traps Temper posted
+2026-07-14 are the money-adv checklist):
+- **blocker** — no public/`pub(crate)` path accepts a `String` token (CLI `--test-token`,
+  helpers, parse-skipping tests): a non-token string is **unconstructable** before NIP-17,
+  not merely rejected after unwrap.
+- **blocker** — default/no-wallet build compiles without cashu; `PaymentPayload` holding
+  `Token` must not force cashu into the default graph (`cargo check` default green).
+- **high** — cashuA/B string exists only inside the gift-wrap encoder; no plaintext
+  rumor/content/log/test echoes the token (the gift-wrap-bytes-carry-no-proof property, at
+  the bar #6 already set).
+- **high** — seller receive parses `Token` before SM/state advance; garbage after unwrap
+  fails closed with no side effects.
+- **medium** — rename completeness: grep-gate on `token_delivery` / `TokenDelivery` /
+  `deliver_token` residual in paths, re-exports, docs, error strings.
+
+Held until it lands in this shape; force-with-lease with old/new heads posted first (it
+rewrites the #6 branch again). Owner: coordinator re-charter (metadex + Temper eyes-on;
+Anvil is #8 unless explicitly re-chartered for #6 too).
 
 ### piece-5 — streamed result-content capture · **STANDARD**
 
@@ -423,29 +441,24 @@ noted):
     token merely blocks; at real value an *attacker-crafted* malformed-but-plausible token is
     a worse class — this guard is the buyer-side sibling of the seller's swap-on-receive
     (finding 8). Both builders independently converged on this fix; recorded so the rebuild
-    inherits it as a gate, not a one-trade patch. **Root-cause fix (mobee-meta, 2026-07-14):
-    the payload should hold a typed `cashu::Token`, not a `String` — the type makes the
-    corrupt token unconstructable, subsuming this runtime guard. The `Funded→Delivered`
-    transition is renamed `Locked→Sent` per the payment-send vocabulary. STATUS (coordinator
-    ruling 2026-07-14): typed-Token lands as **piece-6 intake** (the payment SM owns the
-    payload), NOT a retrofit onto #6/#8. #6 ships its correct mechanism with the stringly
-    `token: String` payload; **main therefore carries this corruption vector until piece-6 —
-    accepted at PLAY/testnut** (a corrupt token blocks, never loses funds). When piece-6's
-    typed payload + a round-trip regression land, this finding closes as **SUBSUMED**;
-    metadex/Anvil need not hunt the original encode site unless it's cheap.**
+    inherits it as a gate, not a one-trade patch. **CLOSES IN #6 (operator override,
+    gudnuf/mobee-meta 2026-07-14 — supersedes the earlier "piece-6 intake / subsumed"
+    status):** the fix is the typed `cashu::Token` payload landed in the **#6 rework before
+    merge** (see the #6 REWORK section) — the type makes the corrupt token unconstructable,
+    so the stringly hole never reaches main. Not deferred to piece-6, and main does NOT ship
+    a stringly payload. metadex/Anvil need not hunt the original encode site (unconstructable
+    once typed).
 
-**Sprint state (pieces 3/4/5).** All four through the money bar and in the operator queue:
-PR #5 (piece-2 gateway types) · PR #7 (piece-5 capture, STANDARD) · PR #6 (piece-4
-delivery, ready **stacked on #5** — retargets to main after #5 merges, that retarget commit
-carrying `.gitignore` refuse-#10 + the `canonical_json` public-signature tightening) · PR
-#8 (piece-3 wallet, ready). Every money-class PR passed independent-verifier mechanical
-re-run + composition diff-read + Temper adversarial + codex deep; each fix a documented
-deliberate divergence (`checked_add` + overflow regression de-vacuumed, cashu stack pinned
-`=0.17.2`, dup-`y`/secret guard, trust-boundary rustdoc, metadata-only delivery returns,
-fail-closed total-relay-failure, cfg-gated memory fake, derived `buyer_pubkey`, structural
-NIP-59 leak test). Piece-5 inventory erratum absorbed: the delta requires two 2-line enum
-variants (`driver/acp.rs`, `event.rs`) beyond the row's named files — inseparable,
-documented in PR #7.
+**Sprint state (current 2026-07-14).** MERGED to main: PR #5 (piece-2 gateway types,
+`46499b5`) · PR #7 (piece-5 capture, `91adf41`). HELD for money-shape rework: **PR #8**
+(piece-3) reworking in place to CDK-first (`verify_trade_p2pk` over cashu types, mirrors
+deleted — Anvil building) · **PR #6** (piece-4) HELD for the rename + typed-`Token` rework
+before merge (operator override — see #6 REWORK section). Separate: PR #9 (network
+observatory, STANDARD) COMPOSED-DONE + un-drafted for gudnuf. Every money PR runs the full
+bar: independent-verifier mechanical + composition diff-read + Temper adversarial + codex
+deep; each fix a documented deliberate divergence. Piece-5 inventory erratum absorbed: the
+delta requires two 2-line enum variants (`driver/acp.rs`, `event.rs`) beyond the row's
+named files — inseparable, documented in PR #7.
 
 ---
 
