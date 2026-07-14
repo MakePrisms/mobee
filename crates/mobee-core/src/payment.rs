@@ -494,6 +494,7 @@ pub trait PaymentEffects {
     /// Sends one newly locked and verified payment.
     fn send_payment(
         &mut self,
+        key: &PaymentKey,
         attempt_id: &AttemptId,
         terms: &PaymentTerms,
         locked: &LockedPayment,
@@ -545,6 +546,12 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
 
         if let Some(PaymentState::Intent { attempt_id }) = state.clone() {
             locked_payment = Some(effects.lock_or_reconcile(&attempt_id, terms)?);
+            require_locked_matches_terms(
+                locked_payment
+                    .as_ref()
+                    .expect("wallet lock was stored for this transition"),
+                terms,
+            )?;
             let locked = PaymentState::Locked { attempt_id };
             append_transition(&mut guard, key, state.as_ref(), &locked)?;
             state = Some(locked);
@@ -562,10 +569,9 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
             let locked = locked_payment.as_ref().ok_or_else(|| {
                 PaymentError::Refused("locked token is unavailable after reconciliation".into())
             })?;
-            require_locked_matches_terms(locked, terms)?;
             let verified = effects.verify_payment(&attempt_id, terms, locked)?;
             require_verified_matches_terms(&verified, terms)?;
-            let payment = effects.send_payment(&attempt_id, terms, locked, &verified)?;
+            let payment = effects.send_payment(key, &attempt_id, terms, locked, &verified)?;
             if payment.relay_success.is_empty() {
                 return Err(PaymentError::NoRelayAccepted);
             }
@@ -1084,7 +1090,7 @@ mod tests {
             );
             assert!(matches!(
                 journal.records().last().map(|record| &record.value),
-                Some(PaymentState::Locked { .. })
+                Some(PaymentState::Intent { .. })
             ));
             assert_eq!(shared.verify_count.load(Ordering::SeqCst), 0);
             assert_eq!(shared.send_count.load(Ordering::SeqCst), 0);
@@ -1374,6 +1380,7 @@ mod tests {
 
         fn send_payment(
             &mut self,
+            _key: &PaymentKey,
             _attempt_id: &AttemptId,
             _terms: &PaymentTerms,
             _locked: &LockedPayment,

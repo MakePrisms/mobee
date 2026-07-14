@@ -113,6 +113,7 @@ pub struct ParsedOffer {
     pub task: String,
     pub output: String,
     pub amount_sats: u64,
+    pub unit: String,
     pub deadline_unix: u64,
     pub mint_url: String,
     pub seller_pubkey: Option<String>,
@@ -247,6 +248,7 @@ pub fn parse_offer(event: &EventDraft) -> Result<ParsedOffer, OfferParseError> {
             .ok_or(OfferParseError::MissingTag("output"))?
             .to_owned(),
         amount_sats,
+        unit: unit.clone(),
         deadline_unix,
         mint_url: first_tag_value(&event.tags, "mint")
             .ok_or(OfferParseError::MissingTag("mint"))?
@@ -466,6 +468,7 @@ mod tests {
                 task: "summarize".into(),
                 output: "application/json".into(),
                 amount_sats: 3,
+                unit: "sat".into(),
                 deadline_unix: 1_800_000_001,
                 mint_url: TESTNUT_MINT_URL.into(),
                 seller_pubkey: Some(SELLER.into()),

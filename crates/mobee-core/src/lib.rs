@@ -6,6 +6,8 @@ pub mod gateway;
 pub mod log;
 #[cfg(feature = "wallet")]
 pub mod payment;
+#[cfg(feature = "wallet")]
+pub mod payment_edge;
 pub mod payment_send;
 pub mod receipt;
 #[cfg(feature = "wallet")]

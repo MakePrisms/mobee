@@ -49,12 +49,37 @@ impl PaymentPayload {
     }
 }
 
-#[cfg(all(any(test, feature = "gateway"), feature = "wallet"))]
-pub fn parse_nip17_payment_payload(json: &str) -> Result<PaymentPayload, PaymentSendError> {
+#[cfg(all(feature = "gateway", feature = "wallet"))]
+/// A parsed payment bound to its authenticated NIP-17 sender.
+pub struct ReceivedPayment {
+    /// The typed payment payload.
+    pub payload: PaymentPayload,
+    /// The buyer authenticated by the NIP-17 seal.
+    pub buyer_pubkey: nostr_sdk::prelude::PublicKey,
+}
+
+#[cfg(all(feature = "gateway", feature = "wallet"))]
+/// Parses a payment and requires its claimed buyer to match the seal sender.
+pub fn parse_nip17_payment_payload(
+    json: &str,
+    seal_sender: nostr_sdk::prelude::PublicKey,
+) -> Result<ReceivedPayment, PaymentSendError> {
     let envelope: PaymentEnvelope = serde_json::from_str(json).map_err(|error| {
         PaymentSendError::Transport(format!("invalid NIP-17 payment payload JSON: {error}"))
     })?;
-    envelope.try_into()
+    let buyer_pubkey =
+        nostr_sdk::prelude::PublicKey::parse(&envelope.buyer_pubkey).map_err(|error| {
+            PaymentSendError::Transport(format!("invalid buyer pubkey in NIP-17 payment: {error}"))
+        })?;
+    if buyer_pubkey != seal_sender {
+        return Err(PaymentSendError::Transport(
+            "NIP-17 seal sender does not match payment envelope buyer".into(),
+        ));
+    }
+    Ok(ReceivedPayment {
+        payload: envelope.try_into()?,
+        buyer_pubkey,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +293,7 @@ struct PaymentEnvelope {
     amount_sats: u64,
     #[serde(rename = "token")]
     serialized_token: String,
+    buyer_pubkey: String,
     seller_pubkey: String,
 }
 
@@ -395,28 +421,51 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "wallet")]
+    #[cfg(all(feature = "gateway", feature = "wallet"))]
     #[test]
     fn corrupt_wire_token_fails_closed_before_payload_construction() {
-        let json = "{\"job_id\":\"job\",\"result_id\":\"result\",\"mint_url\":\"https://testnut.cashu.space\",\"amount_sats\":7,\"token\":\"not-a-cashu-token\",\"buyer_pubkey\":\"buyer\",\"seller_pubkey\":\"seller\"}";
+        let buyer = nostr_sdk::prelude::Keys::generate().public_key();
+        let json = format!(
+            "{{\"job_id\":\"job\",\"result_id\":\"result\",\"mint_url\":\"https://testnut.cashu.space\",\"amount_sats\":7,\"token\":\"not-a-cashu-token\",\"buyer_pubkey\":\"{}\",\"seller_pubkey\":\"seller\"}}",
+            buyer.to_hex()
+        );
 
-        let error = parse_nip17_payment_payload(json).unwrap_err();
+        let result = parse_nip17_payment_payload(&json, buyer);
 
         assert!(
-            matches!(error, PaymentSendError::Transport(message) if message.contains("invalid Cashu token in NIP-17 payment"))
+            matches!(result, Err(PaymentSendError::Transport(message)) if message.contains("invalid Cashu token in NIP-17 payment"))
         );
     }
 
-    #[cfg(feature = "wallet")]
+    #[cfg(all(feature = "gateway", feature = "wallet"))]
     #[test]
     fn payment_payload_round_trips_token_identity_at_envelope_boundary() {
         let payload = payload();
-        let json = payload.canonical_json("buyer");
+        let buyer = nostr_sdk::prelude::Keys::generate().public_key();
+        let json = payload.canonical_json(&buyer.to_hex());
 
-        let parsed = parse_nip17_payment_payload(&json).unwrap();
+        let parsed = parse_nip17_payment_payload(&json, buyer).unwrap();
 
-        assert_eq!(parsed.token, payload.token);
-        assert_eq!(parsed.token.to_string(), VALID_CASHU_TOKEN);
+        assert_eq!(parsed.payload.token, payload.token);
+        assert_eq!(parsed.payload.token.to_string(), VALID_CASHU_TOKEN);
+        assert_eq!(parsed.buyer_pubkey, buyer);
+    }
+
+    #[cfg(all(feature = "gateway", feature = "wallet"))]
+    #[test]
+    fn payment_envelope_buyer_must_match_authenticated_seal_sender() {
+        let payload = payload();
+        let claimed_buyer = nostr_sdk::prelude::Keys::generate().public_key();
+        let seal_sender = nostr_sdk::prelude::Keys::generate().public_key();
+        let json = payload.canonical_json(&claimed_buyer.to_hex());
+
+        let result = parse_nip17_payment_payload(&json, seal_sender);
+
+        assert!(matches!(
+            result,
+            Err(PaymentSendError::Transport(message))
+                if message.contains("seal sender does not match payment envelope buyer")
+        ));
     }
 
     #[cfg(all(feature = "gateway", feature = "wallet"))]
