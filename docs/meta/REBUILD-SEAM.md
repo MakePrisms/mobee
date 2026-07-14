@@ -567,14 +567,39 @@ CLOSED-SUBSUMED; Temper post-merge audit on `cec8607` = follow-up only). **Foreg
 piece-6 payment SM** (design = source of truth [PIECE-6-PAYMENT-SM.md](PIECE-6-PAYMENT-SM.md);
 Q1–Q6 + `attempt_id`/reconcile locked). **PR1 (core hermetic double-pay/WAL) ✅ MERGED
 `b741eaf` (PR #10)** — 3-leg bar (composition + Temper adv/durability + codex deep found+fixed
-3 HIGH crash-durability). **PR2 (edge authenticity) CHARTERED** — 4-leg bar (Temper primary +
-metadex second-adv + codex deep + composition), Anvil builder off `b741eaf` (scope in
-§piece-6). #6a Debug-redact (PR #11) MERGED (my composition CLEAR + gudnuf). Separate: PR #9 (network
-observatory, STANDARD) COMPOSED-DONE + un-drafted for gudnuf. Every money PR runs the full
+3 HIGH crash-durability). **PR2 (edge authenticity) ✅ MERGED `a74726f6` (PR #12)** — 4-leg bar (Temper primary +
+metadex second-adv + codex deep + composition) cleared; landed byte-identical to reviewed
+`4e7f227`. **Piece-6 COMPLETE** (foreground → piece-7 git-delivery). #6a Debug-redact (PR #11)
+MERGED. Network observatory (#9/#13) now on the **web/network free-merge path** (operator
+ruling 2026-07-14 — no composition cycle; merge + redeploy). Every money PR runs the full
 bar: independent-verifier mechanical + composition diff-read + Temper adversarial + codex
 deep; each fix a documented deliberate divergence. Piece-5 inventory erratum absorbed: the
 delta requires two 2-line enum variants (`driver/acp.rs`, `event.rs`) beyond the row's
 named files — inseparable, documented in PR #7.
+
+### Operator field report — 1st real buyer session (2026-07-14)
+
+gudnuf ran the first real buyer session end-to-end; findings route to their piece.
+**Validation:** the payment path felt genuinely trustworthy (hash-bound authorization + P2PK
+lock + dual-signed receipt) — the money-first build order is confirmed by a real user.
+
+*Marketplace spec (extends simple-timeouts):*
+- **claim staleness** — surface claim `created_at` + supersede/expiry; a seller retry must
+  expire or reuse its own prior claim, not stack duplicates.
+- **accept-brick** — the seller MUST honor an accept against ANY live claim for the offer
+  (else the buyer re-accepts a newer one); a stale accepted-claim must not brick the trade.
+- **failure visibility** — the seller MUST publish a kind-7000 `status:error` on work failure
+  (feeds the observatory's unresulted-claims leak).
+
+*Piece-8 buyer-MCP UX:*
+- `get_job` returns claim/result `created_at` + flags the most-recent live claim.
+- long-poll `get_job(wait_for: claim|result, timeout)`.
+- ergonomic `authorize_pay(job_id)` — MCP binds the accepted seller's result itself
+  (hash-check unchanged); natural once the MCP sits on the piece-6 SM.
+
+*Observability (open question, not a MUST):* open-offer feedback — distinguish no-sellers vs
+seen-and-passed vs never-delivered. NIP-89 census answers no-sellers; a seen-ping carries a
+spam tradeoff.
 
 ---
 
@@ -610,6 +635,14 @@ now** so the flip never changes envelope shape (metadex, v1 values):
 The later flip changes `delivery_mode` + flags, not the envelope shape. Until then §2.5
 fetch-before-pay stands as the v1 invariant; this entry is the tracked to-do against it.
 
+**Second designed direction (design-bank, gudnuf 2026-07-14 — charter later): atomic
+pay-for-preimage, no escrow.** Cashu **NUT-14 HTLCs** enable the classic atomic
+data-for-payment construction — the seller encrypts the work and the payment is redeemable
+only by revealing the decryption key (preimage), so the buyer's payment and the seller's
+key-release are the same act. This is the escrow-free half of fair exchange, and the primitive
+is already in the cdk stack. Bank alongside the NIP-17-key-rail + PoPs-escrow direction; a
+future round picks the fit.
+
 ### DP-2 — proof authenticity at real value (see addendum finding 8)
 
 Deferred only in the sense that the closing gate is **piece-6's** swap-on-receive MUST, not
@@ -617,3 +650,14 @@ yet built; and **spec §4** shares the gap (HIGH-for-spec, spec owner). At testn
 inflated-amount attack costs nothing; at real value it is the same class of exposure as
 DP-1. Do not narrate "money-safe at real value" until both the code gate (piece-6) and the
 spec sentence (§4) land.
+
+### Design-bank (seeded 2026-07-14, not yet chartered)
+
+Two threads gudnuf asked to bank for a later charter:
+- **git delivery-data sharing** — a deep look at how delivery data is shared over the git rail
+  (piece-7 fetches the branch today); "do it best." Explore encrypted/keyed delivery,
+  large-artifact handling, and the DP-1 fair-exchange tie-in before the git rail hardens.
+- **NUT-18 as the terms/request representation** — from the #12 review: evaluate whether a
+  NUT-18 Cashu `PaymentRequest` (amount + unit + mints + spending conditions) should replace
+  the custom `PaymentTerms` at the offer/accept boundary. A piece-level decision, not an in-PR
+  change; decide before the terms surface hardens.
