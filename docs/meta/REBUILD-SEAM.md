@@ -75,8 +75,11 @@ Acceptance:
   `verify_accepts_amount_mint_lock_and_unspent_state`,
   `verify_rejects_wrong_lock_and_spent_state`,
   `cashu_proofs_from_v4_token_does_not_need_keyset_metadata`.
-- Plus a **fund-isolation test** (non-testnut mint → hard-fail) as the standing gate
-  SPIKE_LESSONS asks for.
+- Plus a **mint-binding test** (token mint ≠ the trade's expected mint → hard-fail).
+  Layering note (Temper money-adv, 2026-07-14): this proves the equality *mechanism* only.
+  The testnut *policy* gate — which mints a demo may ever expect — lives where
+  `expected_mint` is chosen, and is an explicit acceptance line on pieces 6 and 8 below;
+  an allowlist inside `wallet.rs` would smuggle policy into mechanism.
 - Reviewer diffs extracted module against spike `wallet.rs` — zero intended behavioral
   divergence; `Cargo.lock` regenerated.
 
@@ -120,6 +123,23 @@ pay-ok/receipt-fail, journal restart, malformed → fail-closed); hash-bind fail
 before pay; forged-receipt rejection (authority = author + signatures, not tags); empty
 `relay_success` = failure; no-wallet build has no pay path.
 
+Added from the 2026-07-14 money-adv pass (Temper) — the SM owns the policy/wire seams the
+piece-3/4 mechanism libraries deliberately do not:
+- **Testnut allowlist standing gate**: on the demo path, an `expected_mint` outside the
+  test-mint set is a hard-fail *before* any verify call (the buyer-MCP triple gate's
+  semantics, `cli.rs:1877-1920` at `0e77669`, become a core policy check + test here).
+- **NUT-07 wire contract named**: who fetches proof state and when (caller-injected map vs
+  composed fetch+verify) is an explicit, documented decision with a freshness bound —
+  not an accident of signatures.
+- **Duplicate-proof guard**: identical proof `y` values must not double-count toward the
+  sum (test with a duplicated proof).
+- **Mint-URL comparison normalization**: define exact-match vs normalized (trailing slash,
+  case, port) and test both sides of the decision.
+- **Token-sum arithmetic is checked** (`checked_add`, no wrap) — the #8 in-PR fix carries
+  the regression test; the SM must not reintroduce unchecked sums.
+- **Canonical-form naming**: the delivery payload's "canonical JSON" is a module-local
+  stable form, not RFC 8785 JCS — the SM's wire contract names it accurately.
+
 ### piece-7 — git-delivery gate library · **MONEY** · **HOLD**
 
 Library-ize the five `cli.rs` gate functions (inventory row above) behind the `gateway`
@@ -151,7 +171,11 @@ Acceptance: `buyer_mcp_tool_schema_exposes_exact_v0_surface` +
 `buyer_mcp_receipt_replay_requires_buyer_author_and_valid_signatures` +
 `buyer_mcp_journal_hit_without_receipt_requires_receipt_publish` green against the
 core-backed implementation; review asserts `cli.rs` carries no policy (parse/wire/print
-only); nix "boring targets" build.
+only); nix "boring targets" build; **testnut triple-gate semantics preserved end-to-end**
+(mint-token refusal + offer/options/token binds, with the fund-isolation test at this
+policy layer — see piece-6 note); **secret intake is env/file, never argv**
+(the c2 rig-delta finding made permanent: `--key`-style argv secrets are refuse-class in
+the rebuilt CLI).
 
 **Ordering logic.** 3/4/5 are independent extractions (any interleave is fine; 3 first —
 highest money leverage, no dependency on PR #5, unblocks 6). 6 needs 1+2+3+4. 7 trails the
