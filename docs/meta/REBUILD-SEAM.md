@@ -70,11 +70,12 @@ Landed / in flight:
     draft structs** — replace the single `EventDraft`/`OfferDraft` shape with per-kind draft
     types so each event kind's required fields are type-enforced, not runtime-checked.
     Class STANDARD; own PR(s) after #5 merges.
-  - **#6 stack note:** removing the testnut constructors changes piece-2's API; PR #6
-    stacks on this branch and `delivery.rs` tests may reference the testnut constructors, so
-    whoever lands the #5 item-2 fix confirms #6's stack still compiles (or flags it as a
-    retarget-time fix). This is now a standing condition on #6's retarget (alongside
-    `.gitignore` refuse-#10 + the `canonical_json` public-signature tightening).
+  - **#6 stack note — RESOLVED:** the #5 item-2 fix landed at `2ed25ea` (explicit-arg
+    ctors, `cfg(test)` testnut, grep-clean API removal, 29/29 both feature sets). The
+    coordinator ran the #6 stack-check against it — throwaway rebase compiles + 35/35, so
+    removing the testnut API did **not** break #6's stack; no API-removal carry needed on
+    the retarget. #6's retarget still carries only the two ride-alongs (`.gitignore`
+    refuse-#10 + the `canonical_json` public-signature tightening).
 
 Then, in order:
 
