@@ -9,19 +9,22 @@ piece at a time**, distilled from the spike (`spike/full-loop @ 0e77669`) — th
 source material, not a destination. The seam map ([REBUILD-SEAM.md](REBUILD-SEAM.md)) is the
 working plan.
 
-Merged to main: piece-1 (format + receipt, `b5003d4`, PR #2), piece-2 (gateway protocol
-types, PR #5, `46499b5`), piece-5 (capture, PR #7, `91adf41`), **piece-3 (CDK-first trade
-verification, PR #8, squash `dee436e`)**, and **piece-4 (payment-send, PR #6, squash
-`cec8607`)**. Foreground now: **piece-6 payment SM** (design = source of truth
-[PIECE-6-PAYMENT-SM.md](PIECE-6-PAYMENT-SM.md); Q1–Q6 + `attempt_id`/reconcile locked
-2026-07-14). **PR1 (core hermetic, double-pay/WAL closure) MERGED @ `b741eaf` (PR #10)** —
-three-legged MONEY bar (composition + Temper adversarial/durability + codex deep found 3 HIGH
-crash-durability, fixed & verified). **PR2 (edge authenticity)** = next money cut: real
-buyer-mint `lock_or_reconcile` + seller receive/swap gate + NUT-07 connector + Temper R1/R2
-binds. #6a Debug-redact (PR #11) **MERGED** (composition CLEAR + gudnuf).
-(Observatory v1.1 = idle-only background per operator.)
-Pieces 6–8 are specced, not yet built (piece-6 has a design doc:
-[PIECE-6-PAYMENT-SM.md](PIECE-6-PAYMENT-SM.md)).
+Merged to main: piece-1 (format + receipt, `b5003d4`, #2), piece-2 (gateway types, #5
+`46499b5`), piece-5 (capture, #7 `91adf41`), **piece-3 (CDK-first trade verification, #8
+`dee436e`)**, **piece-4 (payment-send, #6 `cec8607`)**, and **piece-6 payment SM — COMPLETE**
+(PR1 core/double-pay/WAL `b741eaf` #10 + PR2 edge authenticity `a74726f6` #12; design SoT
+[PIECE-6-PAYMENT-SM.md](PIECE-6-PAYMENT-SM.md)). PR2 landed real cdk `lock_or_reconcile`,
+seller receive/swap dual amount-bind, H1 typed Nostr/P2PK key split, R1 (`Token` ≡ terms
+before `Locked`), R2 (`verify_trade_p2pk` on `locked.token()`) — through the 4-leg MONEY bar
+(my composition + Temper primary adversarial + metadex second-adv + codex deep). #6a
+Debug-redact (#11) merged. Piece-6 reality: **BUILT-BUT-OFF** — hermetic edge, zero non-test
+callers; "money-safe live on testnut" awaits the composed full-loop-on-main spike.
+
+Foreground now: **piece-7 git-delivery** — simplified shape, operator-ruled 2026-07-14 (SoT
+[PIECE-7-GIT-DELIVERY.md](PIECE-7-GIT-DELIVERY.md); Anvil building off `a74726f6`, metadex
+adversarial-second): buyer fetch + exact tip-match = custody, receipt binds the commit OID,
+five-gate shape kept as named deferred hardening. **piece-8** (thin CLI + buyer-MCP re-skin)
+is specced, last. (Observatory v1.2 = STANDARD, my composition queued behind piece-7.)
 
 Two live spikes ran tonight on the real relay (spike-track, reality class PLAY):
 **checkpoint (c)** proved the full git-delivery money loop single-key; **checkpoint (c2)**
@@ -35,7 +38,7 @@ resolved v1-plaintext with the real-price exposure tracked as a deferred problem
 
 | Lane | Owner | Status | Notes |
 |------|-------|--------|-------|
-| Rebuild pieces → main | forge team (Scribe/Anvil/Temper/metadex) | merged: #2 #5 #6 #7 #8 #10 (piece-6 PR1 core `b741eaf`); **PR2 (piece-6 edge authenticity) = next money cut**; #6a Debug-redact = PR #11 merged | each PR: composition + Temper adversarial + codex deep; piece-6 design = PIECE-6-PAYMENT-SM.md |
+| Rebuild pieces → main | forge team (Scribe/Anvil/Temper/metadex) | merged: #2 #5 #6 #7 #8 #10 #11 #12 — **piece-6 COMPLETE** (PR1 `b741eaf` + PR2 `a74726f6`); **piece-7 git-delivery ACTIVE** (Anvil build, metadex adv-2) | each PR: 4-leg MONEY bar; SoT docs PIECE-6 / PIECE-7 |
 | Usage-awareness matrix (checkpoint b) | Scribe (compose) + Anvil/Temper (legs) | 2/3 legs (codex ACP-native, cursor ACP-dark); claude leg pending seat pick | transport is harness-dependent — the headline finding |
 | Journal-v2 (live-stream) | Scribe (scoped) | design delivered; awaiting gudnuf's exposure pick | + latent finding: v1 journal already live+near-raw |
 | Skills/practice accessibility pass | Scribe | inventory done; composition behind checkpoint-b | founding gap: non-Claude kit = instructions.md only |
@@ -50,6 +53,7 @@ resolved v1-plaintext with the real-price exposure tracked as a deferred problem
 | CDK-first trade verification (`verify_trade_p2pk`) on main | PROVEN | PR #8 merged `dee436e`; wallet core 38/38, default 30/30; mint/amount/unit/per-proof-P2PK-seller-lock/NUT-07-unspent; not mint authenticity |
 | Payment-send (typed `PaymentPayload` / `PaymentSend`) on main | PROVEN | PR #6 merged `cec8607`; typed `cashu::Token` payload, string only at NIP-17 envelope (parse-first `TryFrom`), gift-wrap, fail-closed on empty `relay_success`; finding-10 subsumed |
 | Payment SM: double-pay closure + WAL crash-safety (hermetic) on main | PROVEN | PR #10 merged `b741eaf`; pay-once across retry/crash/concurrent via `attempt_id`/reconcile, write-ahead journal (fsync + newline-commit-marker + parent-dir fsync + replay-sync), recovered-Locked refuse; 3-legged bar. NOT authenticity / live-mint (PR2) |
+| Payment SM: edge authenticity (real cdk `lock_or_reconcile`, seller receive/swap dual amount-bind, H1 typed Nostr/P2PK split, R1/R2) on main | PROVEN (hermetic) | PR #12 merged `a74726f6`; landed byte-identical to reviewed `4e7f227`; 4-leg bar; **BUILT-BUT-OFF** — no live caller, awaits full-loop-on-main spike |
 | Arms-length git-delivery trade (2 keys, 2 harnesses, testnut) | PROVEN (PLAY) | checkpoint (c2) — [RUNS-C2.md](RUNS-C2.md); 4 independent verify layers |
 | Single-key git-delivery money loop (testnut) | PROVEN (PLAY) | checkpoint (c) |
 | Usage transport uniform at the ACP boundary | REFUTED | codex ACP-native, cursor ACP-dark — [USAGE-MATRIX-CPB.md](USAGE-MATRIX-CPB.md) |
@@ -66,6 +70,8 @@ resolved v1-plaintext with the real-price exposure tracked as a deferred problem
 - [RUNS-C2.md](RUNS-C2.md) — the arms-length reference run (full event chain + verify layers).
 - [USAGE-MATRIX-CPB.md](USAGE-MATRIX-CPB.md) — cross-harness usage measurement (checkpoint b).
 - [PIECE-6-PAYMENT-SM.md](PIECE-6-PAYMENT-SM.md) — payment state-machine + write-ahead design.
+- [PIECE-7-GIT-DELIVERY.md](PIECE-7-GIT-DELIVERY.md) — git-delivery verification: simplified
+  shape (tip-match + fetch-as-custody + receipt-binds-OID) + five-gate deferred hardening.
 - [SPIKE_LESSONS.md](SPIKE_LESSONS.md) — rebuild constraints + refuse-to-copy list.
 - [PROCESS.md](PROCESS.md) — merge train, review authority, no self-merge.
 - [GOOSE.md](GOOSE.md) — Goose-embed research (harness-only).
@@ -86,12 +92,11 @@ delivery + PoPs escrow; envelope slot reserved). **DP-2 proof-authenticity at re
 ## Blocked / waiting
 
 - Usage matrix finalize: claude leg pending a coordination seat pick (claude-agent-acp).
-- piece-6 PR2 (edge authenticity): Anvil builder off `b741eaf` to the folded
-  PIECE-6-PAYMENT-SM.md § piece-6 → 4-leg bar (Temper primary adv + metadex second-adv + codex
-  deep + my composition) → COMPOSED-DONE → gudnuf merge. Scope: real cdk `lock_or_reconcile` +
-  R1 (Token≡terms before Locked) + seller swap gate + R2 (`verify_trade_p2pk` on locked.token)
-  + NIP-17 send discipline + one edge unit-constructor.
-- #6a Debug-redact (PR #11): composition CLEAR, awaits hearth mechanical + gudnuf merge.
+- piece-7 git-delivery (Anvil building off `a74726f6`; metadex adversarial-second): buyer
+  fetch + exact tip-match = custody, receipt binds the commit OID; 3-leg MONEY bar (my
+  composition + Temper adversarial + codex deep) → COMPOSED-DONE → gudnuf merge. SoT
+  PIECE-7-GIT-DELIVERY.md; five-gate shape held as named deferred hardening.
+- Observatory v1.2 (PR #13, STANDARD): my composition queued behind piece-7.
 - Codex-leg checkpoint settlement: buyer-side token-binding bug (delivered token unparseable);
   fix = pre-publish token-integrity guard (REBUILD-SEAM finding 10 / piece-6 gate); unclaimed.
 - Journal-v2: gudnuf's exposure-level pick + the v1-journal live-leak remediation.
@@ -131,3 +136,10 @@ gudnuf reviews all PRs; no persona self-merges.
   fsync); landed artifact verified byte-identical to reviewed head `2efb1e47`. **PR2 (edge
   authenticity) chartered** (real cdk reconcile + seller swap gate + R1/R2 binds; 4-leg bar).
   #6a Debug-redact (PR #11) composition CLEAR, in gudnuf's merge queue.
+- 2026-07-14 (late): **piece-6 PR2 (edge authenticity) MERGED @ `a74726f6` (PR #12) — PIECE-6
+  COMPLETE.** Real cdk `lock_or_reconcile` + seller receive/swap dual amount-bind + H1 typed
+  Nostr/P2PK key split + R1 (`Token` ≡ terms before `Locked`) + R2 + wire `amount`+`unit`
+  rename (`payment_edge` → `payment_wallet`). 4-leg MONEY bar (my composition CLEAR — independent
+  in-code — + Temper primary + metadex second-adv + codex deep CLOSED-all); landed verified
+  byte-identical to reviewed `4e7f227` (empty crate diff). Reality BUILT-BUT-OFF. Foreground →
+  **piece-7 git-delivery** (simplified shape, SoT PIECE-7-GIT-DELIVERY.md; Anvil building).

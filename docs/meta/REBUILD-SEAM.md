@@ -252,7 +252,7 @@ Acceptance: `agent_message_chunks_are_logged_for_audit`,
 `post_terminal_updates_are_dropped`, `stream_without_terminal_appends_failed_and_returns_err`
 green on `main`; existing engine/event-log suite not regressed.
 
-### piece-6 — payment state machine + write-ahead journal · **MONEY** (design piece)
+### piece-6 — payment state machine + write-ahead journal · **MONEY** · **✅ COMPLETE** (PR1 `b741eaf` #10 + PR2 `a74726f6` #12)
 
 **LOCKED 2026-07-14 — the design is the source of truth in
 [PIECE-6-PAYMENT-SM.md](PIECE-6-PAYMENT-SM.md)** (folded from the team Q1–Q6 debate + the
@@ -287,7 +287,7 @@ green on `main`; existing engine/event-log suite not regressed.
   journal durability: replay-sync + newline-commit-marker + parent-dir fsync). Three-legged
   bar cleared (composition + Temper adversarial/durability + codex deep, which found+fixed 3
   HIGH crash-durability). **No runnable pay path**; claims **double-pay closure ONLY**.
-- **PR2 (edge) — CHARTERED 2026-07-14** (next money cut; Anvil builder off `b741eaf`; **4-leg
+- **PR2 (edge) — ✅ MERGED to main `a74726f6` (PR #12, 2026-07-14)** — landed byte-identical to reviewed `4e7f227`. (Anvil built off `b741eaf`; **4-leg
   bar**: Temper primary adversarial + metadex second-adv [seller-swap scars `741dcaab`] + codex
   deep + my composition; each acceptance item = a named non-vacuous RED→GREEN on the frozen
   head):
@@ -317,20 +317,21 @@ authority (author+signatures; empty `relay_success` = failure), no-wallet-no-pay
 enumerated with their PR assignment in the doc's *Inherited gates* + *Acceptance* sections
 (source of truth; not duplicated here, to avoid drift).
 
-### piece-7 — git-delivery gate library · **MONEY** · **HOLD**
+### piece-7 — git-delivery verification · **MONEY** · **ACTIVE (Anvil building off `a74726f6`)**
 
-Library-ize the five `cli.rs` gate functions (inventory row above) behind the `gateway`
-feature. **Held deliberately:** spec §2.5 is the one section still explicitly spike-stage
-("additive, not yet locked") *and* checkpoint (c) is exercising exactly this surface live
-tonight — extracting now churns. Un-hold when §2.5 locks and checkpoint (c) lessons land.
-Resolve inside this piece: ref-pattern mirror → import `buzz_core::git_perms::RefPattern`
-or conformance-test against it (Sting residual); the M5 empty-commit SHOULD (§4 drift #1);
-seller-membership check (Sting's declared gate for "repo authorization complete").
+**Simplified shape ruled by the operator 2026-07-14 — SoT = [PIECE-7-GIT-DELIVERY.md](PIECE-7-GIT-DELIVERY.md).**
+Buyer-side verification that the advertised work is in the buyer's custody before pay: seller
+pushes + advertises the commit OID; buyer fetches the branch, requires the advertised OID to
+resolve **exactly** (tip-match), and that local fetch **is** custody; content verification is
+the buyer agent's job (reads the diff); receipt binds the OID as `delivery_integrity_hash`.
+Library in `mobee-core` (feature-gated, no default git dependency) returning typed
+`VerifiedDelivery{commit_oid}`; composes with piece-6 as an **injected effect fired before the
+first journal write** (refusal ⇒ empty journal + zero wallet effects), **no SM change**.
 
-Acceptance (when un-held): `relay_git_repo_identity_parses_authoritative_owner_and_repo_id`
-+ `repo_protection_ref_patterns_match_buzz_grammar` green in core + a conformance suite vs
-the relay grammar; fetch-before-pay and strict-descendant semantics byte-equivalent to the
-reviewed spike behavior (diff-reviewed); baseline oid journaled via the piece-6 journal.
+The spike's **five-gate** shape is preserved as **named deferred hardening** (not deleted):
+strict-descendant · kind-30617 identity-pin · buzz-protect/no-force-push — each with the attack
+it covers + the re-add condition (automated/blind verify · high-value · hostile-relay). Detail +
+acceptance in the SoT doc. Reality **BUILT-BUT-OFF** until the composed loop runs.
 
 ### piece-8 — thin CLI + buyer-MCP re-skin · **MONEY**
 
