@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use cashu::{Amount, CurrencyUnit, MintUrl, PublicKey, Token};
@@ -290,6 +290,8 @@ impl PaymentMachine {
 pub trait PaymentJournalGuard {
     /// Replays all records for the locked key.
     fn replay(&mut self) -> Result<Vec<PaymentRecord>, JournalError>;
+    /// Durably syncs replayed records before an effect trusts them.
+    fn sync_replay(&mut self) -> Result<(), JournalError>;
     /// Appends and durably syncs one record.
     fn append_sync(&mut self, record: &PaymentRecord) -> Result<(), JournalError>;
 
@@ -319,17 +321,29 @@ pub trait PaymentJournal {
 /// Append-only JSONL payment journal.
 pub struct FsPaymentJournal {
     path: PathBuf,
+    #[cfg(test)]
+    parent_sync_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FsPaymentJournal {
     /// Opens a journal at the given path when first locked.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            #[cfg(test)]
+            parent_sync_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
     }
 
     /// Returns the journal path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[cfg(test)]
+    fn parent_sync_count(&self) -> usize {
+        self.parent_sync_count
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -349,6 +363,10 @@ impl PaymentJournal for FsPaymentJournal {
             .append(true)
             .open(&self.path)?;
         file.lock()?;
+        sync_parent_directory(&self.path)?;
+        #[cfg(test)]
+        self.parent_sync_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(FsPaymentJournalGuard {
             file,
             key: key.clone(),
@@ -356,11 +374,28 @@ impl PaymentJournal for FsPaymentJournal {
     }
 }
 
+fn sync_parent_directory(path: &Path) -> Result<(), JournalError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 impl PaymentJournalGuard for FsPaymentJournalGuard {
     fn replay(&mut self) -> Result<Vec<PaymentRecord>, JournalError> {
         let mut input = self.file.try_clone()?;
         input.seek(SeekFrom::Start(0))?;
-        let reader = BufReader::new(input);
+        let mut bytes = Vec::new();
+        input.read_to_end(&mut bytes)?;
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            return Err(JournalError::Corrupt {
+                line: bytes.iter().filter(|byte| **byte == b'\n').count() + 1,
+                detail: "record is missing its commit newline".into(),
+            });
+        }
+        let reader = BufReader::new(bytes.as_slice());
         let mut records = Vec::new();
         for (index, line) in reader.lines().enumerate() {
             let line = line?;
@@ -375,6 +410,11 @@ impl PaymentJournalGuard for FsPaymentJournalGuard {
             }
         }
         Ok(records)
+    }
+
+    fn sync_replay(&mut self) -> Result<(), JournalError> {
+        self.file.sync_all()?;
+        Ok(())
     }
 
     fn append_sync(&mut self, record: &PaymentRecord) -> Result<(), JournalError> {
@@ -490,6 +530,7 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
         require_key_matches_terms(key, terms)?;
         let mut guard = self.journal.lock(key)?;
         let records = guard.replay()?;
+        guard.sync_replay()?;
         let mut state = PaymentMachine::fold(key, &records)?;
         let recovered_locked = matches!(state, Some(PaymentState::Locked { .. }));
         let mut locked_payment = None;
@@ -782,6 +823,7 @@ mod memory {
     pub struct MemoryPaymentJournal {
         records: Arc<Mutex<Vec<PaymentRecord>>>,
         sync_count: Arc<AtomicUsize>,
+        replay_sync_count: Arc<AtomicUsize>,
     }
 
     impl MemoryPaymentJournal {
@@ -797,6 +839,11 @@ mod memory {
         pub fn sync_count(&self) -> usize {
             self.sync_count.load(Ordering::SeqCst)
         }
+
+        /// Returns the number of replay durability syncs.
+        pub fn replay_sync_count(&self) -> usize {
+            self.replay_sync_count.load(Ordering::SeqCst)
+        }
     }
 
     /// Exclusive mutex-backed journal guard.
@@ -804,6 +851,7 @@ mod memory {
         records: MutexGuard<'a, Vec<PaymentRecord>>,
         key: PaymentKey,
         sync_count: &'a AtomicUsize,
+        replay_sync_count: &'a AtomicUsize,
     }
 
     impl PaymentJournal for MemoryPaymentJournal {
@@ -816,6 +864,7 @@ mod memory {
                 })?,
                 key: key.clone(),
                 sync_count: &self.sync_count,
+                replay_sync_count: &self.replay_sync_count,
             })
         }
     }
@@ -828,6 +877,11 @@ mod memory {
                 .filter(|record| record.key == self.key)
                 .cloned()
                 .collect())
+        }
+
+        fn sync_replay(&mut self) -> Result<(), JournalError> {
+            self.replay_sync_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
 
         fn append_sync(&mut self, record: &PaymentRecord) -> Result<(), JournalError> {
@@ -991,6 +1045,18 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(journal.sync_count(), 5);
+    }
+
+    #[test]
+    fn replay_is_synced_before_the_first_effect() {
+        let journal = MemoryPaymentJournal::default();
+        let shared = FakeShared::default();
+        let mut effects = FakeEffects::new(shared);
+        effects.replay_sync_journal = Some(journal.clone());
+
+        assert!(PaymentService::new(&journal)
+            .run(&key(), &terms(), &authority(), &mut effects)
+            .is_ok());
     }
 
     #[test]
@@ -1176,6 +1242,50 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[test]
+    fn fs_journal_rejects_complete_json_without_newline() {
+        let path = std::env::temp_dir().join(format!(
+            "mobee-payment-journal-complete-tail-{}-{}.jsonl",
+            std::process::id(),
+            key().attempt_id().as_str()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let record = PaymentRecord {
+            key: key(),
+            value: PaymentState::Intent {
+                attempt_id: key().attempt_id(),
+            },
+        };
+        serde_json::to_writer(File::create(&path).unwrap(), &record).unwrap();
+
+        let journal = FsPaymentJournal::new(&path);
+        let mut guard = journal.lock(&key()).unwrap();
+        assert!(matches!(
+            guard.replay(),
+            Err(JournalError::Corrupt { line: 1, .. })
+        ));
+        drop(guard);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fs_journal_syncs_parent_before_the_first_effect() {
+        let directory = std::env::temp_dir().join(format!(
+            "mobee-payment-journal-dir-{}-{}",
+            std::process::id(),
+            key().attempt_id().as_str()
+        ));
+        let path = directory.join("payments.jsonl");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let journal = FsPaymentJournal::new(&path);
+
+        let guard = journal.lock(&key()).unwrap();
+        assert_eq!(journal.parent_sync_count(), 1);
+        drop(guard);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[derive(Clone, Default)]
     struct FakeShared {
         attempts: Arc<Mutex<Vec<AttemptId>>>,
@@ -1195,6 +1305,7 @@ mod tests {
         fail_receipt: bool,
         forged_receipt: bool,
         ordering_journal: Option<MemoryPaymentJournal>,
+        replay_sync_journal: Option<MemoryPaymentJournal>,
     }
 
     impl FakeEffects {
@@ -1208,6 +1319,7 @@ mod tests {
                 fail_receipt: false,
                 forged_receipt: false,
                 ordering_journal: None,
+                replay_sync_journal: None,
             }
         }
     }
@@ -1218,6 +1330,13 @@ mod tests {
             attempt_id: &AttemptId,
             terms: &PaymentTerms,
         ) -> Result<LockedPayment, EffectError> {
+            if let Some(journal) = &self.replay_sync_journal {
+                assert_eq!(
+                    journal.replay_sync_count(),
+                    1,
+                    "replay must sync before lock"
+                );
+            }
             if let Some(journal) = &self.ordering_journal {
                 assert_eq!(journal.sync_count(), 1, "Intent must sync before lock");
             }
