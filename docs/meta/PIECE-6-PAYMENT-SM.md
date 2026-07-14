@@ -199,9 +199,11 @@ One payment-policy constructor in core, **before Intent**: `validated offer → 
 - **Testnut allowlist lives here** (the fund-isolation gate, at the buyer-mint edge where
   `expected_mint` is chosen — distinct from wallet.rs's mint-equality mechanism).
 - **Post-mint bind:** after `lock_or_reconcile`, the minted `Token`'s unit / amount / mint
-  must **equal `terms`** before `Locked→Sent`. (`PaymentPayload` on main still carries a
-  unit-less `amount_sats`; the edge must not reopen the Sat/Msat hole when composing key +
-  lock + payload.)
+  must **equal `terms`** before `Locked→Sent`. **This guard is PR1 transition legality**
+  (hermetically tested with a fake mint returning a mismatched Token → refuse; finding-2,
+  coordinator-ruled onto PR1); the *real* mint that produces the Token is PR2.
+  (`PaymentPayload` on main still carries a unit-less `amount_sats`; the boundary must not
+  reopen the Sat/Msat hole when composing key + lock + payload.)
 
 ## PR slices (Q5 lock) — two clean MONEY cuts
 
@@ -245,10 +247,16 @@ the module cut drawn now becomes the crate cut then. **Do not crate-split during
   also gives ≤ 1 and must not pass as recovery.**
 - WAL ordering: fsync-before-side-effect enforced; torn/malformed journal tail ⇒ fail-closed
   refusal on replay (not truncate-as-success).
-- Recovery suite by state: Intent-no-lock → reconcile; Locked/Sent-no-receipt → republish
-  only; ReceiptPublished → idempotent return.
+- Recovery suite by state: Intent-no-lock → reconcile; recovered-`Locked` → refuse auto-send;
+  `Sent`-no-receipt → republish receipt only; `ReceiptPublished` → idempotent return.
 - Total-send failure: empty `relay_success` ⇒ stays Locked (does not advance to Sent);
   existence of Sent ⇒ hard refuse re-mint/re-pay.
+- **Token ≡ terms guard (finding-2, coordinator-ruled onto PR1):** before `Locked→Sent` the SM
+  asserts the (in PR1, faked) minted `Token`'s unit / amount / mint **≡ `terms`**, fail-closed.
+  Hermetic mismatch regression, red-before-green: a fake mint returning a wrong
+  unit/amount/mint must make `Locked→Sent` **refuse**. Closes the Sat/Msat-confusion class
+  inside the double-pay PR; the *real* mint that produces the Token stays PR2. Pure transition
+  legality over data already at the boundary — not a runnable pay path.
 - Receipt retry idempotent; forged-receipt rejection (author + signatures, not tags).
 - Journal fake is behind `test-support`, not a shippable second path; tests run the real SM.
 - **No wallet-recovery machinery in core** — reconcile is an injected edge trait; core only
@@ -259,8 +267,9 @@ the module cut drawn now becomes the crate cut then. **Do not crate-split during
 
 **PR2 (edge) — its own MONEY bar:**
 - Authenticity: inflated-amount-on-real-`y` fails closed at the seller swap gate.
-- Post-mint bind: `Token` unit/amount/mint ≡ `terms` before Locked→Sent; unit parsed
-  fail-closed (unknown rejected, never defaulted).
+- Post-mint bind exercised against the **real** minted `Token` (the guard itself lands in
+  PR1 — see PR1 acceptance; PR2 runs it with real cashu Tokens from the concrete mint). Offer
+  unit parsed fail-closed (unknown rejected, never defaulted) at the one constructor.
 - Testnut allowlist: mint outside the test set → hard fail before any verify/mint.
 - No-wallet build still has no pay path.
 
