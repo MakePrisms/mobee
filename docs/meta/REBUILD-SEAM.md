@@ -262,3 +262,51 @@ fail-closed mode/echo/oid-slot/fetch-before-pay (§2.5 pay gates) ↔
 guard (H1); `branch` ≠ default-branch enforcement point; baseline-journal crash semantics
 (M6 passed at the `f3beb95` gate; mechanism is redesigned in piece-6 regardless); NIP-17
 default vs nutzap alternative coverage; §5 sign-order (seller-first) enforcement.
+
+---
+
+## Addendum — 2026-07-14 live runs (checkpoints c, c2) + sprint
+
+**Live-run status.** Checkpoint (c): full git-delivery loop live on the real relay,
+single-key configuration (buyer == seller == owner). Checkpoint (c2): **arms-length
+PROVEN** — distinct keys, distinct harnesses (metadex buyer / forge-team Anvil seller),
+member-derived push, testnut settlement, distinct-sig co-signed receipt; four independent
+verification layers; SETTLED-AND-VERIFIED at the coordinator gate. Reality class of both:
+PLAY (spike-track) — the *contract* holds; the code remains spike code. Full evidence
+chain: [RUNS-C2.md](RUNS-C2.md).
+
+**Findings → plan deltas** (each already reflected in the piece sections above where
+noted):
+
+1. argv-only secret intake in the spike CLI → piece-8 permanent must-fix (env/file-only —
+   already in piece-8 acceptance). A reviewed rig-local `--key-file` shim (0600-checked)
+   was the c2 workaround; its shape is the piece-8 starting point.
+2. Seller accept-window vs turn-based-buyer latency: the 300s default expired under a
+   live buyer's turn cadence; 900s cleared it. Piece-8 names a window-vs-latency-class
+   contract (offer deadlines and seller waits sized to the counterparty's declared class).
+3. Anonymous relay reads failed before EOSE ×3 — independent verification of a *public*
+   receipt chain currently requires authenticated reads, which is backwards. External to
+   this plan: relay-side thread (keeper:buzz).
+4. Member-push **positive** path proven (non-owner member pushed under `refs/heads/*`
+   protects); the **negative** path (non-member seller → protocol-visible refusal) remains
+   unproven — drift flag #2 and piece-7 unchanged.
+5. Seller-side git helpers (`prepare_git_job_workspace`, `commit_and_push_git_delivery`)
+   are dead code at `0e77669` — the seller git path is not first-class in the CLI; the c2
+   seller did the git work outside the CLI and published via the cwd-output path. Piece-8
+   scope note.
+6. **Recovery-positive evidence for piece-6:** after a receipt-gate stall, the buyer
+   reconstructed its journal from public events + the seller-verified delivery id and
+   idempotently published *only* the missing receipt — no second pay (seller observed
+   exactly one delivery). The paid-but-no-receipt recovery semantic held under a live
+   interruption.
+7. Repo commits carry git identities, not nostr identities — the receipt is the binding
+   between seller pubkey and paid commit. Marketplace attribution UX note.
+
+**Sprint state (pieces 3/4/5).** PR #7 (piece-5) READY. PR #8 (piece-3) and PR #6
+(piece-4): mechanical verification, adversarial pass (wrap overflow fixed via
+`checked_add` + regression; cashu stack pinned `=0.17.2` to the reviewed surface;
+gift-wrap plaintext-exclusion test added with non-vacuous control), and suite-verified
+hold clears all green — awaiting the codex cold leg (coordinator's call) and the operator
+gate. #6 remains stacked on #5 (retarget after #5 merges). Piece-5 inventory erratum
+absorbed: the delta requires two 2-line enum variants (`driver/acp.rs`, `event.rs`) beyond
+the row's named files — inseparable, documented in PR #7.
