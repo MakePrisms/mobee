@@ -7,7 +7,8 @@ pub struct PaymentPayload {
     pub job_id: String,
     pub result_id: String,
     pub mint_url: String,
-    pub amount_sats: u64,
+    pub amount: u64,
+    pub unit: String,
     #[cfg(feature = "wallet")]
     pub token: cashu::Token,
     pub seller_pubkey: String,
@@ -27,7 +28,7 @@ impl PaymentPayload {
         let mut json = Vec::new();
         let mut serializer = serde_json::Serializer::new(&mut json);
         let mut map = serializer
-            .serialize_map(Some(7))
+            .serialize_map(Some(8))
             .expect("payment payload starts a JSON map");
         map.serialize_entry("job_id", &self.job_id)
             .expect("job id is JSON-serializable");
@@ -35,8 +36,10 @@ impl PaymentPayload {
             .expect("result id is JSON-serializable");
         map.serialize_entry("mint_url", &self.mint_url)
             .expect("mint URL is JSON-serializable");
-        map.serialize_entry("amount_sats", &self.amount_sats)
+        map.serialize_entry("amount", &self.amount)
             .expect("amount is JSON-serializable");
+        map.serialize_entry("unit", &self.unit)
+            .expect("unit is JSON-serializable");
         map.serialize_entry("token", &self.token.to_string())
             .expect("token is JSON-serializable");
         map.serialize_entry("buyer_pubkey", buyer_pubkey)
@@ -290,7 +293,8 @@ struct PaymentEnvelope {
     job_id: String,
     result_id: String,
     mint_url: String,
-    amount_sats: u64,
+    amount: u64,
+    unit: String,
     #[serde(rename = "token")]
     serialized_token: String,
     buyer_pubkey: String,
@@ -311,7 +315,8 @@ impl TryFrom<PaymentEnvelope> for PaymentPayload {
             job_id: envelope.job_id,
             result_id: envelope.result_id,
             mint_url: envelope.mint_url,
-            amount_sats: envelope.amount_sats,
+            amount: envelope.amount,
+            unit: envelope.unit,
             token,
             seller_pubkey: envelope.seller_pubkey,
         })
@@ -338,7 +343,7 @@ mod tests {
         assert_eq!(
             payload.canonical_json("buyer"),
             format!(
-                "{{\"job_id\":\"job\",\"result_id\":\"result\",\"mint_url\":\"https://testnut.cashu.space\",\"amount_sats\":7,\"token\":\"{VALID_CASHU_TOKEN}\",\"buyer_pubkey\":\"buyer\",\"seller_pubkey\":\"seller\"}}"
+                "{{\"job_id\":\"job\",\"result_id\":\"result\",\"mint_url\":\"https://testnut.cashu.space\",\"amount\":7,\"unit\":\"sat\",\"token\":\"{VALID_CASHU_TOKEN}\",\"buyer_pubkey\":\"buyer\",\"seller_pubkey\":\"seller\"}}"
             )
         );
     }
@@ -426,7 +431,7 @@ mod tests {
     fn corrupt_wire_token_fails_closed_before_payload_construction() {
         let buyer = nostr_sdk::prelude::Keys::generate().public_key();
         let json = format!(
-            "{{\"job_id\":\"job\",\"result_id\":\"result\",\"mint_url\":\"https://testnut.cashu.space\",\"amount_sats\":7,\"token\":\"not-a-cashu-token\",\"buyer_pubkey\":\"{}\",\"seller_pubkey\":\"seller\"}}",
+            "{{\"job_id\":\"job\",\"result_id\":\"result\",\"mint_url\":\"https://testnut.cashu.space\",\"amount\":7,\"unit\":\"sat\",\"token\":\"not-a-cashu-token\",\"buyer_pubkey\":\"{}\",\"seller_pubkey\":\"seller\"}}",
             buyer.to_hex()
         );
 
@@ -494,7 +499,8 @@ mod tests {
             job_id: SECRET_JOB_ID.into(),
             result_id: SECRET_RESULT_ID.into(),
             mint_url: "https://testnut.cashu.space".into(),
-            amount_sats: 7,
+            amount: 7,
+            unit: "sat".into(),
             token: cashu::Token::from_str(VALID_CASHU_TOKEN).unwrap(),
             seller_pubkey: receiver.public_key().to_hex(),
         };
@@ -612,7 +618,8 @@ mod tests {
             job_id: "job".into(),
             result_id: "result".into(),
             mint_url: "https://testnut.cashu.space".into(),
-            amount_sats: 7,
+            amount: 7,
+            unit: "sat".into(),
             #[cfg(feature = "wallet")]
             token: cashu::Token::from_str(VALID_CASHU_TOKEN).unwrap(),
             seller_pubkey: "seller".into(),

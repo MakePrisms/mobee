@@ -1,4 +1,4 @@
-//! Wallet-backed payment policy and authenticity edges.
+//! Wallet-backed payment policy, adapters, and authenticity checks.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -24,15 +24,15 @@ use crate::wallet::{TradeLock, VerifiedPayment, verify_trade_p2pk_with_connector
 const ATTEMPT_METADATA: &str = "mobee_attempt_id";
 
 #[derive(Debug)]
-/// Failure at a wallet-backed payment edge.
-pub enum PaymentEdgeError {
+/// Failure in a wallet-backed payment operation.
+pub enum PaymentWalletError {
     Policy(String),
     Wallet(String),
     Reconcile(String),
     Verify(String),
 }
 
-impl std::fmt::Display for PaymentEdgeError {
+impl std::fmt::Display for PaymentWalletError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Policy(message) => write!(formatter, "payment policy rejected: {message}"),
@@ -45,7 +45,7 @@ impl std::fmt::Display for PaymentEdgeError {
     }
 }
 
-impl std::error::Error for PaymentEdgeError {}
+impl std::error::Error for PaymentWalletError {}
 
 /// Constructs typed payment terms under an explicit mint allowlist.
 pub struct PaymentPolicy {
@@ -65,40 +65,40 @@ impl PaymentPolicy {
         &self,
         offer: &ParsedOffer,
         accepted_seller: &str,
-    ) -> Result<PaymentTerms, PaymentEdgeError> {
+    ) -> Result<PaymentTerms, PaymentWalletError> {
         offer
             .assert_seller_matches(accepted_seller)
-            .map_err(|error| PaymentEdgeError::Policy(error.to_string()))?;
+            .map_err(|error| PaymentWalletError::Policy(error.to_string()))?;
         let mint = MintUrl::from_str(&offer.mint_url)
-            .map_err(|error| PaymentEdgeError::Policy(format!("invalid mint URL: {error}")))?;
+            .map_err(|error| PaymentWalletError::Policy(format!("invalid mint URL: {error}")))?;
         let unit = CurrencyUnit::from_str(&offer.unit).map_err(|error| {
-            PaymentEdgeError::Policy(format!(
+            PaymentWalletError::Policy(format!(
                 "unsupported payment unit {:?}: {error}",
                 offer.unit
             ))
         })?;
         if unit != CurrencyUnit::Sat {
-            return Err(PaymentEdgeError::Policy(format!(
+            return Err(PaymentWalletError::Policy(format!(
                 "unsupported payment unit {:?}",
                 offer.unit
             )));
         }
         if !self.allowed_mints.contains(&mint) {
-            return Err(PaymentEdgeError::Policy(format!(
+            return Err(PaymentWalletError::Policy(format!(
                 "mint {mint} is outside the test-mint allowlist"
             )));
         }
         let seller_nostr_pubkey = NostrPublicKey::parse(accepted_seller).map_err(|error| {
-            PaymentEdgeError::Policy(format!("invalid accepted seller key: {error}"))
+            PaymentWalletError::Policy(format!("invalid accepted seller key: {error}"))
         })?;
         let seller_p2pk_lock =
             CashuPublicKey::from_str(&format!("02{}", seller_nostr_pubkey.to_hex())).map_err(
-                |error| PaymentEdgeError::Policy(format!("invalid seller P2PK lock: {error}")),
+                |error| PaymentWalletError::Policy(format!("invalid seller P2PK lock: {error}")),
             )?;
 
         Ok(PaymentTerms::new(
             mint,
-            Amount::from(offer.amount_sats),
+            Amount::from(offer.amount),
             unit,
             seller_nostr_pubkey,
             seller_p2pk_lock,
@@ -122,7 +122,7 @@ impl<'a> CdkBuyerMint<'a> {
         &self,
         attempt_id: &AttemptId,
         terms: &PaymentTerms,
-    ) -> Result<LockedPayment, PaymentEdgeError> {
+    ) -> Result<LockedPayment, PaymentWalletError> {
         require_wallet_matches(self.wallet, terms)?;
         self.recover_unmapped_sagas().await?;
         if let Some(token) = self.reconcile(attempt_id, terms).await? {
@@ -148,7 +148,7 @@ impl<'a> CdkBuyerMint<'a> {
         &self,
         attempt_id: &AttemptId,
         terms: &PaymentTerms,
-    ) -> Result<Option<Token>, PaymentEdgeError> {
+    ) -> Result<Option<Token>, PaymentWalletError> {
         use cdk::wallet::types::TransactionDirection;
 
         let matches = self
@@ -169,7 +169,7 @@ impl<'a> CdkBuyerMint<'a> {
             [] => return Ok(None),
             [transaction] => transaction,
             _ => {
-                return Err(PaymentEdgeError::Reconcile(
+                return Err(PaymentWalletError::Reconcile(
                     "multiple wallet transactions claim the same payment attempt".into(),
                 ));
             }
@@ -178,7 +178,7 @@ impl<'a> CdkBuyerMint<'a> {
             || transaction.unit != terms.unit
             || transaction.amount != terms.amount
         {
-            return Err(PaymentEdgeError::Reconcile(
+            return Err(PaymentWalletError::Reconcile(
                 "persisted wallet transaction does not match payment terms".into(),
             ));
         }
@@ -194,7 +194,7 @@ impl<'a> CdkBuyerMint<'a> {
             .collect::<Result<HashSet<_>, _>>()
             .map_err(wallet_error)?;
         if actual_ys != expected_ys {
-            return Err(PaymentEdgeError::Reconcile(
+            return Err(PaymentWalletError::Reconcile(
                 "persisted payment proofs do not match the confirmed transaction".into(),
             ));
         }
@@ -205,14 +205,14 @@ impl<'a> CdkBuyerMint<'a> {
             transaction.unit.clone(),
         );
         if token.value().map_err(wallet_error)? != terms.amount {
-            return Err(PaymentEdgeError::Reconcile(
+            return Err(PaymentWalletError::Reconcile(
                 "persisted payment proofs do not match the confirmed amount".into(),
             ));
         }
         Ok(Some(token))
     }
 
-    async fn recover_unmapped_sagas(&self) -> Result<(), PaymentEdgeError> {
+    async fn recover_unmapped_sagas(&self) -> Result<(), PaymentWalletError> {
         if self
             .wallet
             .localstore
@@ -223,7 +223,7 @@ impl<'a> CdkBuyerMint<'a> {
         {
             return Ok(());
         }
-        Err(PaymentEdgeError::Reconcile(
+        Err(PaymentWalletError::Reconcile(
             "wallet has an incomplete operation with no matching confirmed attempt".into(),
         ))
     }
@@ -244,7 +244,7 @@ impl<C: MintConnector + ?Sized> CdkPaymentVerifier<'_, C> {
         &self,
         locked: &LockedPayment,
         terms: &PaymentTerms,
-    ) -> Result<VerifiedPayment, PaymentEdgeError> {
+    ) -> Result<VerifiedPayment, PaymentWalletError> {
         let lock = TradeLock {
             mint: terms.mint.clone(),
             amount: terms.amount,
@@ -253,7 +253,7 @@ impl<C: MintConnector + ?Sized> CdkPaymentVerifier<'_, C> {
         };
         verify_trade_p2pk_with_connector(self.connector, locked.token(), &lock)
             .await
-            .map_err(|error| PaymentEdgeError::Verify(error.to_string()))
+            .map_err(|error| PaymentWalletError::Verify(error.to_string()))
     }
 }
 
@@ -267,16 +267,16 @@ enum BuyerCommand {
     Lock {
         attempt_id: AttemptId,
         terms: PaymentTerms,
-        response: mpsc::SyncSender<Result<LockedPayment, PaymentEdgeError>>,
+        response: mpsc::SyncSender<Result<LockedPayment, PaymentWalletError>>,
     },
     Verify {
         token: Token,
         terms: PaymentTerms,
-        response: mpsc::SyncSender<Result<VerifiedPayment, PaymentEdgeError>>,
+        response: mpsc::SyncSender<Result<VerifiedPayment, PaymentWalletError>>,
     },
     Send {
         payload: PaymentPayload,
-        response: mpsc::SyncSender<Result<PaymentSent, PaymentEdgeError>>,
+        response: mpsc::SyncSender<Result<PaymentSent, PaymentWalletError>>,
     },
 }
 
@@ -289,7 +289,7 @@ pub struct CdkPaymentEffects<R> {
 
 impl<R> CdkPaymentEffects<R> {
     /// Starts a worker whose verifier is bound to the wallet mint.
-    pub fn spawn<S>(wallet: Wallet, payment_send: S, receipt: R) -> Result<Self, PaymentEdgeError>
+    pub fn spawn<S>(wallet: Wallet, payment_send: S, receipt: R) -> Result<Self, PaymentWalletError>
     where
         S: PaymentSend + Send + 'static,
     {
@@ -304,7 +304,7 @@ impl<R> CdkPaymentEffects<R> {
         connector: C,
         payment_send: S,
         receipt: R,
-    ) -> Result<Self, PaymentEdgeError>
+    ) -> Result<Self, PaymentWalletError>
     where
         C: MintConnector + Send + Sync + 'static,
         S: PaymentSend + Send + 'static,
@@ -317,7 +317,7 @@ impl<R> CdkPaymentEffects<R> {
         connector: C,
         mut payment_send: S,
         receipt: R,
-    ) -> Result<Self, PaymentEdgeError>
+    ) -> Result<Self, PaymentWalletError>
     where
         C: MintConnector + Send + Sync + 'static,
         S: PaymentSend + Send + 'static,
@@ -357,7 +357,7 @@ impl<R> CdkPaymentEffects<R> {
                                 let result = payment_send
                                     .send_payment(payload)
                                     .await
-                                    .map_err(|error| PaymentEdgeError::Wallet(error.to_string()));
+                                    .map_err(|error| PaymentWalletError::Wallet(error.to_string()));
                                 let _ = response.send(result);
                             }
                         }
@@ -374,7 +374,7 @@ impl<R> CdkPaymentEffects<R> {
 
     fn request<T>(
         &self,
-        command: impl FnOnce(mpsc::SyncSender<Result<T, PaymentEdgeError>>) -> BuyerCommand,
+        command: impl FnOnce(mpsc::SyncSender<Result<T, PaymentWalletError>>) -> BuyerCommand,
     ) -> Result<T, EffectError> {
         let (response, result) = mpsc::sync_channel(1);
         self.commands
@@ -446,7 +446,8 @@ where
             job_id: key.job_id.as_str().into(),
             result_id: key.result_id.as_str().into(),
             mint_url: terms.mint.to_string(),
-            amount_sats: terms.amount.to_u64(),
+            amount: terms.amount.to_u64(),
+            unit: terms.unit.to_string(),
             token: locked.token().clone(),
             seller_pubkey: terms.seller_nostr_pubkey.to_hex(),
         };
@@ -473,7 +474,7 @@ impl<'a> CdkSellerReceive<'a> {
         &self,
         token: &Token,
         terms: &PaymentTerms,
-    ) -> Result<Amount, PaymentEdgeError> {
+    ) -> Result<Amount, PaymentWalletError> {
         self.receive_with(token, terms, |options| async move {
             self.wallet
                 .receive(&token.to_string(), options)
@@ -488,10 +489,10 @@ impl<'a> CdkSellerReceive<'a> {
         token: &Token,
         terms: &PaymentTerms,
         receive: F,
-    ) -> Result<Amount, PaymentEdgeError>
+    ) -> Result<Amount, PaymentWalletError>
     where
         F: FnOnce(ReceiveOptions) -> Fut,
-        Fut: Future<Output = Result<Amount, PaymentEdgeError>>,
+        Fut: Future<Output = Result<Amount, PaymentWalletError>>,
     {
         require_wallet_matches(self.wallet, terms)?;
         let token_mint = token.mint_url().map_err(wallet_error)?;
@@ -500,14 +501,14 @@ impl<'a> CdkSellerReceive<'a> {
             || token.unit().as_ref() != Some(&terms.unit)
             || token_amount != terms.amount
         {
-            return Err(PaymentEdgeError::Policy(
+            return Err(PaymentWalletError::Policy(
                 "received token does not match payment terms".into(),
             ));
         }
         if self.seller_key.public_key().x_only_public_key()
             != terms.seller_p2pk_lock.x_only_public_key()
         {
-            return Err(PaymentEdgeError::Policy(
+            return Err(PaymentWalletError::Policy(
                 "seller receive key does not match payment terms".into(),
             ));
         }
@@ -523,26 +524,26 @@ impl<'a> CdkSellerReceive<'a> {
 fn require_received_amount(
     received: Amount,
     terms: &PaymentTerms,
-) -> Result<Amount, PaymentEdgeError> {
+) -> Result<Amount, PaymentWalletError> {
     if received != terms.amount {
-        return Err(PaymentEdgeError::Policy(
+        return Err(PaymentWalletError::Policy(
             "received amount does not match payment terms".into(),
         ));
     }
     Ok(received)
 }
 
-fn require_wallet_matches(wallet: &Wallet, terms: &PaymentTerms) -> Result<(), PaymentEdgeError> {
+fn require_wallet_matches(wallet: &Wallet, terms: &PaymentTerms) -> Result<(), PaymentWalletError> {
     if wallet.mint_url != terms.mint || wallet.unit != terms.unit {
-        return Err(PaymentEdgeError::Policy(
+        return Err(PaymentWalletError::Policy(
             "wallet mint or unit does not match payment terms".into(),
         ));
     }
     Ok(())
 }
 
-fn wallet_error(error: impl std::fmt::Display) -> PaymentEdgeError {
-    PaymentEdgeError::Wallet(error.to_string())
+fn wallet_error(error: impl std::fmt::Display) -> PaymentWalletError {
+    PaymentWalletError::Wallet(error.to_string())
 }
 
 #[cfg(test)]
@@ -584,7 +585,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            PaymentEdgeError::Policy(message) if message.contains("outside the test-mint allowlist")
+            PaymentWalletError::Policy(message) if message.contains("outside the test-mint allowlist")
         ));
     }
 
@@ -619,7 +620,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(PaymentEdgeError::Policy(message))
+            Err(PaymentWalletError::Policy(message))
                 if message.contains("unsupported payment unit")
         ));
     }
@@ -661,7 +662,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(PaymentEdgeError::Reconcile(message))
+            Err(PaymentWalletError::Reconcile(message))
                 if message.contains("proofs do not match the confirmed transaction")
         ));
     }
@@ -695,7 +696,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(PaymentEdgeError::Reconcile(message))
+            Err(PaymentWalletError::Reconcile(message))
                 if message.contains("incomplete operation with no matching confirmed attempt")
         ));
         assert!(
@@ -737,7 +738,7 @@ mod tests {
             .lock_or_reconcile(&attempt_id, &fixture.terms)
             .await;
 
-        assert!(matches!(result, Err(PaymentEdgeError::Reconcile(_))));
+        assert!(matches!(result, Err(PaymentWalletError::Reconcile(_))));
     }
 
     #[tokio::test]
@@ -763,7 +764,7 @@ mod tests {
             .receive(&token, &terms)
             .await;
 
-        assert!(matches!(result, Err(PaymentEdgeError::Wallet(_))));
+        assert!(matches!(result, Err(PaymentWalletError::Wallet(_))));
         assert_eq!(swap_calls.load(Ordering::SeqCst), 1);
         assert_eq!(presented_amount.load(Ordering::SeqCst), 7);
     }
@@ -790,7 +791,7 @@ mod tests {
             .receive(&token, &terms)
             .await;
 
-        assert!(matches!(result, Err(PaymentEdgeError::Policy(_))));
+        assert!(matches!(result, Err(PaymentWalletError::Policy(_))));
         assert_eq!(swap_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -805,7 +806,7 @@ mod tests {
             })
             .await;
 
-        assert!(matches!(result, Err(PaymentEdgeError::Policy(_))));
+        assert!(matches!(result, Err(PaymentWalletError::Policy(_))));
     }
 
     #[test]
@@ -905,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_rejects_a_wrong_seller_lock_through_the_real_verify_edge() {
+    fn worker_rejects_a_wrong_seller_lock_through_the_real_verify_adapter() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -1074,7 +1075,7 @@ mod tests {
         ParsedOffer {
             task: "task".into(),
             output: "text/plain".into(),
-            amount_sats: 7,
+            amount: 7,
             unit: "sat".into(),
             deadline_unix: 1,
             mint_url: mint_url.into(),

@@ -112,7 +112,7 @@ impl OfferDraft {
 pub struct ParsedOffer {
     pub task: String,
     pub output: String,
-    pub amount_sats: u64,
+    pub amount: u64,
     pub unit: String,
     pub deadline_unix: u64,
     pub mint_url: String,
@@ -223,7 +223,7 @@ pub fn parse_offer(event: &EventDraft) -> Result<ParsedOffer, OfferParseError> {
     if unit != "sat" {
         return Err(OfferParseError::UnsupportedUnit(unit.clone()));
     }
-    let amount_sats = amount_value
+    let amount = amount_value
         .parse()
         .map_err(|_| OfferParseError::InvalidAmount(amount_value.clone()))?;
 
@@ -247,7 +247,7 @@ pub fn parse_offer(event: &EventDraft) -> Result<ParsedOffer, OfferParseError> {
         output: first_tag_value(&event.tags, "output")
             .ok_or(OfferParseError::MissingTag("output"))?
             .to_owned(),
-        amount_sats,
+        amount,
         unit: unit.clone(),
         deadline_unix,
         mint_url: first_tag_value(&event.tags, "mint")
@@ -467,7 +467,7 @@ mod tests {
             ParsedOffer {
                 task: "summarize".into(),
                 output: "application/json".into(),
-                amount_sats: 3,
+                amount: 3,
                 unit: "sat".into(),
                 deadline_unix: 1_800_000_001,
                 mint_url: TESTNUT_MINT_URL.into(),
