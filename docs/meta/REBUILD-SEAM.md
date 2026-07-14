@@ -231,9 +231,16 @@ Acceptance (MONEY bar — composition + Temper adversarial + codex; the 5 traps 
 - **medium** — rename completeness: grep-gate on old token-send identifiers residual
   in paths, re-exports, docs, error strings.
 
-Held until it lands in this shape; force-with-lease with old/new heads posted first (it
-rewrites the #6 branch again). Owner: coordinator re-charter (metadex + Temper eyes-on;
-Anvil is #8 unless explicitly re-chartered for #6 too).
+✅ **MERGED to main 2026-07-14** (PR #6, squash `cec8607`) — gudnuf rebased onto current main
+(on top of #8) and merged direct from his IDE, carrying both clean-cut items (rename + typed
+`Token`). Landed shape verified on main: module `payment_send.rs`; `PaymentPayload { token:
+cashu::Token }` typed; the `String` lives only on `PaymentEnvelope.serialized_token` with
+`TryFrom<PaymentEnvelope>` parsing it first (corrupt token **unconstructable**). piece-4.1
+rename = **closed (landed in-PR)**, no separate rename PR. Temper runs a bounded post-merge
+audit on `cec8607` (5 traps + a `Token` round-trip regression); findings are follow-up PR
+material, not blockers — main is the operator's call. **Residual → piece-6:** offer/result
+unit → `TradeLock.unit` construction site (receipt `unit` is still `String`); this is Q4 of
+the piece-6 kickoff.
 
 ### piece-5 — streamed result-content capture · **STANDARD**
 
@@ -247,48 +254,50 @@ green on `main`; existing engine/event-log suite not regressed.
 
 ### piece-6 — payment state machine + write-ahead journal · **MONEY** (design piece)
 
-**Not an extraction.** New core module per SPIKE_LESSONS: explicit states
-`intent → token minted/locked → delivered → receipt published → closed`; durable **pre-pay
-intent (flock + fsync) before `pay_seller`**; stable idempotency key
-`(job_id, result_id, content_hash, job_hash, seller_pubkey, amount, mint)`; explicit
-paid-but-no-receipt recovery (republish, never second pay); injectable journal trait.
-Spike's `authorize_pay` (`cli.rs:1844`) and append-after-pay journal are **reference
-semantics only** — their shape is refuse-listed. Depends on pieces 1–4 (+5 for real content
-hashes). This piece is the R2 precondition ("durable pre-pay intent") on the real-funds
-path.
+**LOCKED 2026-07-14 — the design is the source of truth in
+[PIECE-6-PAYMENT-SM.md](PIECE-6-PAYMENT-SM.md)** (folded from the team Q1–Q6 debate + the
+`attempt_id`/reconcile money invariant; keeper:hearth locked the round; main pinned
+`cec8607`). Not an extraction. Lock highlights (full detail + acceptance in the doc):
+- **Three layers:** `PaymentMachine` pure reducer (`state = fold(replay())`, zero I/O) ·
+  `PaymentJournal::lock(key) -> Guard` critical section (flock/mutex held across
+  decide→effect→record, fsync-before-effect, torn-tail fail-closed, Memory fake behind
+  `test-support`) · `PaymentService` orchestrator holding the Guard + firing injected effects.
+- **Pay-once proof:** `attempt_id` at Intent + buyer-mint `lock_or_reconcile(attempt_id,
+  terms)`; ambiguous-crash recovery = reconcile or refuse, **never blind re-mint** (WAL alone
+  is insufficient).
+- **States (locked):** `Intent → Locked → Sent → ReceiptPublished → Closed`.
+- **NUT-07 (Q2):** reducer zero-I/O; edge fetches from the *token's* mint + `verify_trade_p2pk`
+  holding the Guard before every `Locked→Sent`, passes typed `VerifiedPayment` — never a raw
+  caller states-map; no TTL.
+- **Relay (Q3):** any non-empty `relay_success` ⇒ Sent; empty ⇒ Locked; **no auto-resend**
+  (gift-wrap non-deterministic, `PaymentSent` metadata-only); Sent ⇒ hard-refuse re-pay;
+  relay-repair deferred.
+- **One constructor (Q4):** validated offer → typed `terms{MintUrl, Amount, CurrencyUnit,
+  seller_key}` builds `TradeLock` + key + payload; testnut allowlist here; unit parsed
+  fail-closed; post-mint `Token` ≡ terms before `Locked→Sent`.
+- **Idempotency key (Q6):** `(job_id, result_id, content_hash, job_hash, seller_pubkey,
+  amount, unit, mint)` — typed fields (no raw-string compare), streamed content/job hashes
+  (pieces 1/5, not serde field-order), Token/proofs/relays OUT (key exists at Intent).
 
-Acceptance (SPIKE_LESSONS merge gates, verbatim targets): stubbed pay-counter proves
-`pay_seller` ≤ 1 across retry/crash/concurrent; idempotency suite (double request,
-pay-ok/receipt-fail, journal restart, malformed → fail-closed); hash-bind failures reject
-before pay; forged-receipt rejection (authority = author + signatures, not tags); empty
-`relay_success` = failure; no-wallet build has no pay path.
+**Two clean MONEY cuts (Q5 = A):**
+- **PR1 (core, hermetic — Anvil, branch `rebuild/piece-6-payment-sm-pr1` off `cec8607`):**
+  reducer + Guard journal + attempt_id/reconcile + injected effect traits + `test-support`
+  fakes + hermetic tests (pay-counter ≤1 across retry/crash/concurrent, WAL ordering,
+  reconcile-or-refuse recovery, total-send-fail stays Locked, receipt-retry, torn-journal
+  refusal). **No runnable production pay path**; MONEY bar claims **double-pay closure ONLY**.
+- **PR2 (edge):** buyer-mint `lock_or_reconcile` (real Wallet) + seller receive/**swap
+  authenticity gate** (finding 8 / DP-2, inflated-amount-on-real-`y` regression) + NUT-07
+  connector + testnut wiring. Own full MONEY bar; undiluted authenticity review.
 
-Added from the 2026-07-14 money-adv pass (Temper) — the SM owns the policy/wire seams the
-piece-3/4 mechanism libraries deliberately do not:
-- **Testnut allowlist standing gate**: on the demo path, an `expected_mint` outside the
-  test-mint set is a hard-fail *before* any verify call (the buyer-MCP triple gate's
-  semantics, `cli.rs:1877-1920` at `0e77669`, become a core policy check + test here).
-- **NUT-07 wire contract named**: who fetches proof state and when (caller-injected map vs
-  composed fetch+verify) is an explicit, documented decision with a freshness bound —
-  not an accident of signatures.
-- **Duplicate-proof guard**: fixed at mechanism level in #8 (duplicate `y`/secret rejected
-  before summing, regression in-PR — codex HIGH, 2026-07-14); the SM must not reintroduce
-  unchecked aggregation.
-- **Authenticity gate (MUST)**: the seller receive path SWAPS received proofs at the mint
-  (or fully crypto-verifies them: retained `C` + keyset + DLEQ) before the payment state
-  advances past *delivered*. `verify_p2pk_token` Ok is presented-proof checking only —
-  lock/amount/mint/spend-state — NOT redeemability; swap-on-receive is the authenticity +
-  exclusive-custody gate the mint itself enforces (codex HIGH-2; regression target:
-  Temper's inflated-amount token built on a real unspent `y`).
-- **Mint-URL comparison normalization**: define exact-match vs normalized (trailing slash,
-  case, port) and test both sides of the decision.
-- **Token-sum arithmetic is checked** (`checked_add`, no wrap) — the #8 in-PR fix carries
-  the regression test; the SM must not reintroduce unchecked sums.
-- **Canonical-form naming**: the delivery payload's "canonical JSON" is a module-local
-  stable form, not RFC 8785 JCS — the SM's wire contract names it accurately.
-- **Partial-relay policy**: total delivery failure (zero relays accepted) fails closed in
-  the piece-4 module itself (codex round 2026-07-14) — the SM owns only the PARTIAL case
-  (some accepted, some failed): retry, multi-relay quorum, and payment-state coupling.
+Depends on pieces 1–5 + #6 (all merged). R2 precondition ("durable pre-pay intent") on the
+real-funds path. Spike's `authorize_pay` (`cli.rs:1844`) + append-after-pay journal are
+reference semantics only — refuse-listed.
+
+The named MUST gates — testnut allowlist (mint edge), NUT-07 wire contract, **authenticity
+swap = PR2**, checked-arithmetic (landed piece-3, no regress), mint-URL normalization, receipt
+authority (author+signatures; empty `relay_success` = failure), no-wallet-no-pay-path — are
+enumerated with their PR assignment in the doc's *Inherited gates* + *Acceptance* sections
+(source of truth; not duplicated here, to avoid drift).
 
 ### piece-7 — git-delivery gate library · **MONEY** · **HOLD**
 
@@ -478,11 +487,12 @@ noted):
     token merely blocks; at real value an *attacker-crafted* malformed-but-plausible token is
     a worse class — this guard is the buyer-side sibling of the seller's swap-on-receive
     (finding 8). Both builders independently converged on this fix; recorded so the rebuild
-    inherits it as a gate, not a one-trade patch. **CLOSES IN #6 (operator override,
-    gudnuf/mobee-meta 2026-07-14 — supersedes the earlier "piece-6 intake / subsumed"
-    status):** the fix is the typed `cashu::Token` payload landed in the **#6 rework before
-    merge** (see the #6 REWORK section) — the type makes the corrupt token unconstructable,
-    so the stringly hole never reaches main. Not deferred to piece-6, and main does NOT ship
+    inherits it as a gate, not a one-trade patch. **✅ CLOSED-SUBSUMED on main (PR #6, squash
+    `cec8607`, 2026-07-14):** the fix is the typed `cashu::Token` payload that landed in the
+    **#6 rework** (see the #6 REWORK section) — `PaymentPayload` holds `cashu::Token`; the
+    string exists only on `PaymentEnvelope.serialized_token`, parsed first via `TryFrom`
+    (corrupt token unconstructable), so the stringly hole never reaches main. Only possible
+    follow-up = a `Token` round-trip regression (Temper post-merge check), test-only. Not deferred to piece-6, and main does NOT ship
     a stringly payload. metadex/Anvil need not hunt the original encode site (unconstructable
     once typed).
 
@@ -493,9 +503,12 @@ deleted); four fix-window items verified on behavior-CLEAR head `5c596a69` (stri
 seller-lock · currency-unit bind · rustdoc trust-notch · no-DB dep-graph; Temper CLEAR +
 Anvil rev-parse + gh confirm), then a docs-only comment-trim hygiene pass (`172cdeda`,
 verified comment-only vs `5c596a69`, trap knowledge moved to tests) merged by gudnuf.
-IN REWORK: **PR #6** (piece-4) — rename → `payment_send` + typed-`Token`; metadex
-**rebasing onto current main (`dee436e`)** (foreground / critical path) before push → Temper
-money-bar on the rebased tip → my composition (see #6 REWORK section). Separate: PR #9 (network
+**PR #6** (piece-4) **✅ MERGED 2026-07-14** (squash `cec8607`, gudnuf rebased onto #8 + merged
+direct from his IDE — rename → `payment_send` + typed `cashu::Token`; finding-10
+CLOSED-SUBSUMED; Temper post-merge audit on `cec8607` = follow-up only). **Foreground now:
+piece-6 payment SM** — debate LOCKED (Q1–Q6 + `attempt_id`/reconcile), design folded to the
+source of truth [PIECE-6-PAYMENT-SM.md](PIECE-6-PAYMENT-SM.md); main pinned `cec8607`; PR1
+(core hermetic) = Anvil, PR2 (edge authenticity) follows. Separate: PR #9 (network
 observatory, STANDARD) COMPOSED-DONE + un-drafted for gudnuf. Every money PR runs the full
 bar: independent-verifier mechanical + composition diff-read + Temper adversarial + codex
 deep; each fix a documented deliberate divergence. Piece-5 inventory erratum absorbed: the

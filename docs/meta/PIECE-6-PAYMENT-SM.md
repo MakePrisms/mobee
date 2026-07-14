@@ -1,153 +1,260 @@
 # Piece-6 design — payment state machine + write-ahead journal
 
-Rebuild-track **piece-6** (see [REBUILD-SEAM.md](REBUILD-SEAM.md) §2). This is a **design
-piece, not an extraction**: the spike proved the money path works, but its shape is
-refuse-listed. This doc is the spec the extraction round builds against. Class: **MONEY**
-(dual-review + codex + operator gate).
+Rebuild-track **piece-6** (see [REBUILD-SEAM.md](REBUILD-SEAM.md) § piece-6). This is a
+**design piece, not an extraction**: the spike proved the money path works, but its shape is
+refuse-listed. This doc is the **locked source of truth** the build round works against —
+folded from the piece-6 debate the team ran 2026-07-14 (Q1–Q6 + the `attempt_id`/reconcile
+money invariant), locked by keeper:hearth. Class: **MONEY** (composition + Temper adversarial
++ codex deep + operator gate). Main pinned for this train: `cec8607`.
 
-Grounded in the spike at `0e77669`. The reference implementation to learn from — and not
-copy — is `BuyerMcpServer::authorize_pay` (`crates/mobee/src/cli.rs:1844-2203`).
+Grounded in the spike at `0e77669`. The reference to learn from — and not copy — is
+`BuyerMcpServer::authorize_pay` (`crates/mobee/src/cli.rs:1844-2203`).
+
+**Consumes (already on main — call, do not rebuild):**
+- `verify_trade_p2pk` / `TradeLock` / `VerifiedPayment` (#8, `dee436e`) — trade-binding +
+  NUT-07 verify over cashu types; `Ok ≠ authenticity` (piece-3 rustdoc).
+- `PaymentSend` / typed `PaymentPayload` (holds `cashu::Token`) / `PaymentSent` (#6,
+  `cec8607`) — NIP-17 payment send, fail-closed on total relay failure, metadata-only return.
+- format + receipt H-tuple + streamed content/job hashes (pieces 1/5).
 
 ## Why this is a redesign, not a lift
 
 `authorize_pay` is a ~360-line god-function that, in one body, does: arg parse ·
 idempotency short-circuit · seller/offer/result fetch + validate · git-delivery verify ·
 integrity-hash compute + compare · receipt sign · journal write · pay · publish receipt ·
-remember. SPIKE_LESSONS refuse-lists it by name. Two concrete scars in that body:
+remember. SPIKE_LESSONS refuse-lists it by name. Two concrete scars:
 
 1. **Append-after-pay (the double-pay window).** `remember_buyer_payment` is called *after*
    `pay_seller` returns (`cli.rs:~2150` vs the pay at `~2140`). A crash between the pay
-   succeeding and the journal write leaves money moved with no durable record; the on-relay
-   receipt isn't published yet either, so recovery (`find_buyer_payment_record` /
-   `fetch_existing_receipt`) finds nothing and **pays again**. The window is small and real.
-2. **State smeared across a `serde_json` map + an in-memory `self.jobs` entry + an
-   idempotency log**, with no single type that names which state a job is in — so "paid but
-   no receipt", "receipt but no local mark", and "neither" are reconstructed ad hoc at three
-   different return points instead of being one enum the code switches on.
+   succeeding and the journal write leaves money moved with no durable record; recovery finds
+   nothing and **pays again**. Small and real.
+2. **State smeared** across a `serde_json` map + an in-memory `self.jobs` entry + an
+   idempotency log, with no single type naming which state a job is in.
 
-What the spike got *right* and piece-6 must preserve (good bones): the layered recovery
-short-circuits (`locally_paid && receipt` → return; journal record needs-receipt →
-republish-only; on-relay receipt fallback; locally-paid-but-no-record → **refuse**, never
-re-pay). c2 proved this recovery works under a live stall — the redesign keeps the
-behavior, gives it a spine.
+Good bones to preserve: the layered recovery short-circuits (`locally_paid && receipt` →
+return; needs-receipt → republish-only; on-relay receipt fallback; locally-paid-but-no-record
+→ **refuse**, never re-pay). c2 proved this recovery under a live stall — the redesign keeps
+the behavior and gives it a spine.
+
+## Architecture — three layers, never conflated
+
+The single most important structural lock. Three layers with hard boundaries:
+
+1. **`PaymentMachine` — pure reducer.** `state = fold(replay())`; `next = decide(state,
+   event)`. **Zero I/O.** Owns transition legality only. This is what stays hermetic and what
+   the pay-counter test pins. No stored-state API, no `load_state` to drift — state is always
+   a fold over the journal.
+2. **`PaymentJournal::lock(key) -> Guard` — the critical section.** The Guard holds
+   exclusivity for the whole transition and exposes `current()`/`replay()` + `append_sync()`.
+   Bare `append` + `replay` cannot express the lock lifetime (two callers could each replay
+   Intent, each decide, then serialize two appends → double); the Guard can. Transition
+   legality does **not** live here — only durability + mutual exclusion.
+3. **`PaymentService` — orchestrator.** Holds the Guard and, inside the guarded section, runs
+   the reducer and fires the **injected effects** (buyer-mint `lock_or_reconcile`, NUT-07
+   fetch + `verify_trade_p2pk`, `PaymentSend`, receipt publish). Effects never live in the
+   reducer or the journal.
+
+This reconciles "zero-I/O reducer" with "guard owns concurrency" — different layers, one
+guarded section.
 
 ## State machine
 
-One explicit type. States and the ONLY legal transitions (operator-locked vocabulary —
-"delivery" means the *work product* (git-delivery); the money leg is **payment send**, never
-"delivered"):
+States and the ONLY legal transitions (operator-locked vocabulary — "delivery" means the
+*work product* (git-delivery); the money leg is **payment send**, never "delivered"):
 
 ```
 Intent  ──mint/lock──►  Locked  ──send──►  Sent  ──publish──►  ReceiptPublished  ──►  Closed
    │                                                                                          
-   └── every transition is journaled write-ahead (flock + fsync) BEFORE its side effect ──┘
+   └── every transition journaled write-ahead (Guard: flock + fsync) BEFORE its side effect ─┘
 ```
 
 - **Intent** — durably recorded (write-ahead) *before* any token is minted or spent. Holds
-  the full idempotency key (below). This is the fix for scar #1: the record exists before
-  the pay, so a crash-after-pay is recoverable, not a re-pay.
-- **Locked** — token minted/locked to the seller (verify-not-spend; the gateway holds only
-  the public half).
-- **Sent** — payment token sent to the seller over the private NIP-17 DM path (piece-4,
-  `payment_send`); **total send failure fails closed** (piece-4's empty-relay-success ⇒ Err
-  — a token that reached zero relays is not sent).
+  the idempotency key (below) **and a stable `attempt_id`**. The record-before-effect is the
+  fix for scar #1.
+- **Locked** — token minted/locked to the seller via the buyer-mint edge's
+  `lock_or_reconcile(attempt_id, terms)` (verify-not-spend; gateway holds only the public
+  half).
+- **Sent** — payment token sent to the seller over the private NIP-17 DM path
+  (`payment_send`); **total send failure fails closed** (empty-relay-success ⇒ stays Locked).
 - **ReceiptPublished** — buyer-authored co-signed receipt on the relay.
 - **Closed** — receipt observed/confirmed.
 
-`pay_seller` fires **exactly once** across retry / crash / concurrent invocation. The
-merge gate proves it with a stubbed pay-counter (SPIKE_LESSONS).
+The five public states are locked. Persist `attempt_id` and the effect result the next state
+needs; do **not** invent an in-flight public state to hide crash ambiguity — the Guard plus
+reconcile handle it.
 
-**Payment payload is typed, not stringly — arrives via the #6 rework, NOT introduced here
-(operator override, 2026-07-14):** the typed `cashu::Token` payload (`PaymentPayload` holding
-`Token` + `MintUrl`/`Amount`, correlation fields as mobee newtypes, `cashuA`/`cashuB` string
-only at the NIP-17 boundary, seller parse-first fail-closed, feature-gated cashu-free
-default) lands in **piece-4's #6 rework before merge** — that is where finding-10 closes. The
-payment SM here simply **consumes** the already-typed payload: the `Locked→Sent` transition
-and the receive-side gate are enforced by the type `#6` provides, not by a hand-rolled string
-check in the SM. One `Token` type flows mint → verify → send → receive; the SM never
-re-parses a string.
+## The pay-once proof — `attempt_id` + `lock_or_reconcile`
 
-## Write-ahead journal
+WAL alone does **not** close double-mint across a crash *between* the Intent write and the
+mint effect. The proof is two parts:
 
-- **Idempotency key** (SPIKE_LESSONS, verbatim): `(job_id, result_id, content_hash,
-  job_hash, seller_pubkey, amount, mint)`.
-- **Discipline:** durable pre-pay **Intent** written with `flock` + `fsync` **before**
-  `pay_seller`; each subsequent transition marked under the same lock. Never
-  append-after-pay.
-- **Recovery is explicit, not incidental:** on any re-entry, load the journal, resolve the
-  job's state, and act by state — `Intent` with no confirmed pay → reconcile against the
-  mint/relay before deciding; `Locked`/`Sent` with no receipt → resume forward
-  (republish, never re-pay); `ReceiptPublished` → idempotent return. The "paid but no
-  record" case is a hard refuse, exactly as the spike does.
-- **Injectable journal trait** (SPIKE_LESSONS SHOULD): FS-JSONL for the demo, an interface
-  so tests drive it without the filesystem.
+- `attempt_id` is minted at **Intent** and written before any effect.
+- The buyer-mint edge exposes **`lock_or_reconcile(attempt_id, terms)`**: idempotent by
+  `attempt_id` — a second call with the same `attempt_id` **reconciles** to the existing
+  lock/mint result rather than minting again.
+- **Recovery at an ambiguous boundary (crash after effect, before the next append)
+  reconciles via `lock_or_reconcile(attempt_id, …)` or refuses — NEVER blind re-mint.**
+  Without `attempt_id`/reconcile, local WAL can prove safety only by permanent refusal, not
+  honest forward recovery.
 
-## Decomposition — what moves where
+`mint/lock` fires **exactly once** across retry / crash / concurrent invocation. PR1 proves
+it with a stubbed pay-counter (≤ 1).
 
-`cli.rs` keeps only: parse args, wire the runtime, print JSON. Everything below is
-`mobee-core`, testable without network/wallet/acp:
+## Scope split — trade state (ours) vs wallet recovery (cdk)
 
-- **`payment` (new):** the state machine above + the journal trait + recovery. Owns
-  transition legality and the once-only pay guarantee.
-- **`gateway`** (piece-2, landed): offer/result parse + validation, targeting.
-- **`wallet`** (piece-3): token verification mechanism — `verify_p2pk_token`
-  (lock/amount/mint/spend-state of *presented* proofs). **Its trust boundary is explicit
-  (piece-3 rustdoc): `Ok ≠ redeemable`.**
-- **`payment_send`** (piece-4, renamed from "token delivery"): payment token send over
-  NIP-17, fail-closed on total relay failure, metadata-only returns (`PaymentSent`), typed
-  `cashu::Token` in-process.
-- **`receipt`** (piece-1): H-tuple, dual-Schnorr.
-- **`buyer` / `seller` (role-specific SM modules):** the payment SM composes with role state
-  — the buyer drives offer→accept→pay→receipt; the seller drives claim→work→result→receive.
-  Shared protocol/money mechanisms (gateway/wallet/payment_send/receipt) sit under both.
+Source-verified at cdk `0.17.2` (wallet swap/melt sagas, compensation, pending-proof reclaim,
+NUT-13 restore all exist). The split is explicit so core never reinvents what cdk owns:
 
-**Crate boundary (operator, 2026-07-14):** near-term these are all **modules** in
-`mobee-core` + thin CLI/MCP skins. Promote `buyer`/`seller` to `mobee-buyer` / `mobee-seller`
-**crates** only when nix wants distinct installables — the module boundary drawn now becomes
-the crate cut then. **Do not crate-split mid #6/#8**; keep the cut clean at the module level
-so the later split is mechanical.
+- **mobee journal = TRADE state only** — the five states keyed by the 8-tuple. cdk cannot know
+  job / result / seller identity, so **double-pay closure at the trade level stays ours**. The
+  journal never manages proofs or duplicates wallet state.
+- **Wallet-level crash recovery = DELEGATED to cdk at the PR2 mint edge.**
+  `lock_or_reconcile(attempt_id, terms)` is implemented by querying cdk `Wallet` persisted
+  state (pending proofs, quote status) — **not** mobee-written compensation logic. `attempt_id`
+  is the thread tying the trade journal to wallet state.
+- **Core only refuses-or-delegates** — no wallet-recovery machinery lives in `mobee-core`;
+  reconcile is an **edge trait**. This *trims* PR1 (core carries the trade SM + journal, not a
+  wallet-recovery engine).
 
-## Inherited gates (baked in from tonight's reviews — each a named MUST)
+## Write-ahead journal (Q1 lock)
 
-- **Authenticity gate (codex #8 HIGH-2, the one that closes the real hole):** before the SM
-  advances past **Sent/receive**, the seller path **swaps the received proofs at the
-  mint** (or fully crypto-verifies: retained `C` + keyset + DLEQ). `verify_p2pk_token`
-  checks presented proofs only; NUT-07 "unspent" is advisory, not authenticity. Regression
-  target: **Temper's inflated-amount token** built on a real unspent `y` — sum/mint/lock/
-  NUT-07 all green while redeemable value ≠ presented value — MUST fail closed here.
-- **Spec §4 shares this gap** (addendum finding 8): the locked four-check gateway verify has
-  no authenticity check either. Flagged to the spec owner as HIGH-for-spec; piece-6's swap
-  gate is the code-side answer regardless of how §4 resolves.
-- **Testnut allowlist (policy layer):** `expected_mint` outside the test-mint set → hard
-  fail *before* any verify call. This is the fund-isolation gate (distinct from wallet.rs's
-  mint-equality mechanism); it lives here, where `expected_mint` is chosen.
-- **Checked arithmetic:** proof-amount aggregation uses `checked_add` (no wrap); duplicate
-  `y`/secret rejected before summing (both landed in piece-3, must not regress).
-- **NUT-07 wire contract:** who fetches proof state and when is explicit and documented,
-  with a freshness bound — not an artifact of signatures.
-- **Mint-URL comparison:** exact-match vs normalized (trailing slash / case / port) is a
-  named decision, tested both ways.
-- **Receipt authority = author + signatures, not tags; empty `relay_success` = failure**
-  for every money-path publish (SPIKE_LESSONS).
-- **No-wallet build has no pay path** (feature gate = safety).
+- **`PaymentJournal::lock(key) -> Guard`.** Guard = `current()`/`replay()` + `append_sync()`.
+- **FS guard (prod):** one append-only JSONL file; **`flock` held across decide → effect →
+  record**; **flush + fsync BEFORE the side effect**; a torn / malformed tail on replay is a
+  **fail-closed refusal**, never silent truncate-as-success.
+- **Memory guard (tests):** mutex-backed, same contract, behind a **`test-support` feature**
+  (`cfg(any(test, feature = "test-support"))`, matching #6's `MemoryPaymentSend`) — never bare
+  `cfg(test)`, never a second product path. Hermetic tests run on the *real* SM path.
+- **Recovery = pure fold over `replay()` filtered to the key**, then act by state: `Intent`
+  with no confirmed lock → reconcile (never blind re-mint); `Locked`/`Sent` with no receipt →
+  resume forward (re-publish receipt, never re-pay); `ReceiptPublished` → idempotent return.
+  "Locked/Sent but no record" is unreachable (record precedes effect); "effect but no record"
+  reconciles or refuses.
 
-## Acceptance (merge gate — the extraction PR proves all of these)
+**Idempotency key (Q6 lock)** — the seven SPIKE_LESSONS fields **+ `unit`**, all typed:
 
-- Stubbed pay-counter: `pay_seller` ≤ 1 across retry / crash / concurrent.
-- Idempotency suite: double request · pay-ok/receipt-fail · journal restart · malformed →
-  fail-closed.
-- Hash-bind failures reject **before** pay.
-- Authenticity: inflated-amount-on-real-`y` fails closed at the swap gate.
-- Payment send: zero-relay-success ⇒ the SM does not advance to Sent.
-- Payment payload holds typed `cashu::Token` in-process; a non-parseable token cannot be
-  constructed into the payload (the type-level form of finding 10's pre-publish guard).
-- Forged-receipt rejection (author + signatures, not tags); empty `relay_success` = failure.
-- No-wallet build: no pay path compiles.
+```
+(job_id, result_id, content_hash, job_hash, seller_pubkey, amount, unit, mint)
+```
+
+- Typed / canonical fields only: `CurrencyUnit` (not string), `Amount`, `MintUrl` (normalized),
+  seller pubkey normalized/typed — **no raw-string compares in the key** (the #8 Sat/Msat and
+  mint-normalization scars must not re-enter here). `amount` without `unit` is ambiguous.
+- `content_hash` / `job_hash` are the **streamed content/job hashes from pieces 1/5**, not a
+  serde field-order "canonical_json".
+- **Out of the key:** `Token`, proofs, serialized payload, `PaymentSent` id, relay set. The
+  key exists at **Intent, before any effect** — the token is an outcome, not an identity, and
+  secret-bearing / random transport material would destroy stable recovery. Buyer identity is
+  hard-bound by the authored-job / accepted flow *before* key construction, not duplicated in
+  the key.
+
+## NUT-07 freshness (Q2 lock) — pure reducer, pinned orchestration
+
+The reducer does **zero I/O**. Orchestration is pinned:
+
+- The injected edge fetches NUT-07 spend-state from the **token's mint** (never a
+  caller-chosen alternate) **while holding the Guard**, immediately before **every**
+  `Locked→Sent` attempt, and calls `verify_trade_p2pk`.
+- It passes a typed **`VerifiedPayment`** into the transition — **never a raw caller
+  states-map** (a caller-supplied map is a spoofable surface; `VerifiedPayment` is produced by
+  the verify, not asserted by the caller). No reuse across attempts, **no wall-clock TTL** —
+  fresh-for-this-transition only.
+- NUT-07 "unspent" is best-effort hygiene, **not** authenticity. The invariant that carries
+  real money is pay-once (journal + reconcile) **plus** the seller **swap-at-receive** gate
+  (PR2) — not fetch timing.
+
+## Payment send — relay rule (Q3 lock)
+
+- **Any non-empty `relay_success` ⇒ Sent**, and the complete `PaymentSent` metadata is
+  persisted. **Empty `relay_success` ⇒ stays Locked** (unchanged from #6).
+- **No auto-resend of the secret-bearing payment, ever.** Partial relay failures are
+  diagnostics. `PaymentSent` on main is metadata-only and gift-wrap is **non-deterministic**
+  (`custom_created_at` + ephemeral wrap key), so a payload-rebuilt "identical retry" is
+  impossible — re-wrapping yields a new event id, not the same delivery.
+- **Existence of `Sent` ⇒ hard refuse re-mint / re-pay**, regardless of incomplete relays.
+- **Relay-repair is future work, explicitly out of PR1**: it would require `PaymentSend` to
+  store/expose the exact signed event JSON and rebroadcast *that* — metadata is on-record as
+  insufficient for it.
+- **Residual (medium, logged not blocked):** if the single accepted relay drops the event
+  before the seller reads it, recovery is **observe / refuse / human**, not resend.
+
+## One constructor (Q4 lock) — terms are the single source
+
+One payment-policy constructor in core, **before Intent**: `validated offer → terms`.
+
+- `terms` is typed: `{ MintUrl, Amount, CurrencyUnit, seller_key }`. The **same** `terms`
+  builds `TradeLock`, the journal key, and the payload/lock checks — one mapper, nowhere else.
+- CLI / connector / `PaymentSend` **never parse unit strings**. The offer's wire unit-string
+  is parsed to `CurrencyUnit` **here, fail-closed** (reject unknown, never default to Sat).
+- **Testnut allowlist lives here** (the fund-isolation gate, at the buyer-mint edge where
+  `expected_mint` is chosen — distinct from wallet.rs's mint-equality mechanism).
+- **Post-mint bind:** after `lock_or_reconcile`, the minted `Token`'s unit / amount / mint
+  must **equal `terms`** before `Locked→Sent`. (`PaymentPayload` on main still carries a
+  unit-less `amount_sats`; the edge must not reopen the Sat/Msat hole when composing key +
+  lock + payload.)
+
+## PR slices (Q5 lock) — two clean MONEY cuts
+
+- **PR1 — core, hermetic (this build).** `PaymentMachine` reducer + `PaymentJournal` Guard +
+  `attempt_id`/reconcile contract + injected **effect interfaces** (traits) + `test-support`
+  fakes + hermetic tests. **No runnable production pay path.** Its MONEY bar claims
+  **double-pay closure only** — nobody says "money closed" at PR1.
+- **PR2 — edge, authenticity slice (follow-up).** Concrete buyer-mint `lock_or_reconcile`
+  (real `Wallet`) + seller **receive / swap authenticity gate** + concrete NUT-07 connector +
+  testnut wiring. Its own full MONEY bar; the authenticity review is undiluted here.
+
+Crate boundary (operator, 2026-07-14): near-term all **modules** in `mobee-core` + thin
+CLI/MCP skins. Promote `buyer`/`seller` to crates only when nix wants distinct installables —
+the module cut drawn now becomes the crate cut then. **Do not crate-split during piece-6.**
+
+## Inherited gates (named MUSTs)
+
+- **Authenticity gate (PR2 — codex #8 HIGH-2, closes the real hole):** before the SM advances
+  past **receive**, the seller path **swaps the received proofs at the mint** (or fully
+  crypto-verifies: retained `C` + keyset + DLEQ). `verify_trade_p2pk` checks presented proofs
+  only; NUT-07 "unspent" is advisory. Regression: **Temper's inflated-amount token** on a real
+  unspent `y` (sum/mint/lock/NUT-07 green, redeemable value ≠ presented) MUST fail closed.
+- **Spec §4 shares this gap** (addendum finding 8): the four-check gateway verify has no
+  authenticity check; PR2's swap gate is the code-side answer regardless of how §4 resolves.
+- **Checked arithmetic** (landed piece-3, must not regress): `checked_add`, duplicate
+  `y`/secret rejected before summing.
+- **Receipt authority = author + signatures, not tags; empty `relay_success` = failure** for
+  every money-path publish (SPIKE_LESSONS).
+- **No-wallet build has no pay path** (feature gate = safety); the `PaymentPayload`-holds-
+  `Token` type must not force cashu into the default graph.
+
+## Acceptance
+
+**PR1 (core, hermetic) — the merge gate proves all of these:**
+- Stubbed pay-counter: `mint/lock` ≤ 1 across retry / crash / concurrent.
+- `attempt_id` reconcile: crash-after-effect-before-record recovers by reconcile-or-refuse,
+  never blind re-mint (red-before-green: a blind-re-mint variant must fail the counter).
+- WAL ordering: fsync-before-side-effect enforced; torn/malformed journal tail ⇒ fail-closed
+  refusal on replay (not truncate-as-success).
+- Recovery suite by state: Intent-no-lock → reconcile; Locked/Sent-no-receipt → republish
+  only; ReceiptPublished → idempotent return.
+- Total-send failure: empty `relay_success` ⇒ stays Locked (does not advance to Sent);
+  existence of Sent ⇒ hard refuse re-mint/re-pay.
+- Receipt retry idempotent; forged-receipt rejection (author + signatures, not tags).
+- Journal fake is behind `test-support`, not a shippable second path; tests run the real SM.
+- **No wallet-recovery machinery in core** — reconcile is an injected edge trait; core only
+  refuses-or-delegates (cdk owns wallet recovery at the PR2 edge). The journal persists only
+  the five-state trade record + `attempt_id`, never proofs / quote state / compensation.
+- **No runnable production pay path compiles in PR1.**
 - `cli.rs` carries no payment policy (parse/wire/print only).
+
+**PR2 (edge) — its own MONEY bar:**
+- Authenticity: inflated-amount-on-real-`y` fails closed at the seller swap gate.
+- Post-mint bind: `Token` unit/amount/mint ≡ `terms` before Locked→Sent; unit parsed
+  fail-closed (unknown rejected, never defaulted).
+- Testnut allowlist: mint outside the test set → hard fail before any verify/mint.
+- No-wallet build still has no pay path.
 
 ## Refuse-to-copy (from the spike, this piece specifically)
 
-`authorize_pay` god-function shape · append-after-pay journal (no pre-intent / flock /
-fsync) · state smeared across json-map + in-mem + log with no state type · tag-only receipt
-trust · faux-async `block_on` woven through the pay path (honest-sync per the locked
-decision, issue `77c5ae79…`).
+`authorize_pay` god-function shape · append-after-pay journal (no pre-intent / flock / fsync)
+· state smeared across json-map + in-mem + log with no state type · tag-only receipt trust ·
+caller-supplied NUT-07 state map (spoofable) · payload-rebuilt "identical" gift-wrap resend
+(non-deterministic — impossible) · wallet-recovery / compensation machinery in `mobee-core`
+(cdk owns it at the edge; core only refuses-or-delegates) · faux-async `block_on` woven through the pay path
+(honest-sync per the locked decision, issue `77c5ae79…`).
