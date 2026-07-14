@@ -1,100 +1,99 @@
 # Mobee State
 
-Last updated: 2026-07-13
+Last updated: 2026-07-14
 
 ## Current phase
 
-v0.1 spine on MakePrisms/mobee. **Repo consolidation in flight**
-(orchestrator lane): GitHub MakePrisms/mobee → single code SoT;
-Librarian owns buzz relay-git mirror; wipe mobee-dev/mobee-core only after
-sha-verify. Money-path M4–M6 PASS @ `f3beb95` on metadex spike; real-funds
-R1–R3 still tracked.
+Rebuild track live on MakePrisms/mobee `main`. The full product is landing **one reviewed
+piece at a time**, distilled from the spike (`spike/full-loop @ 0e77669`) — the spike is
+source material, not a destination. The seam map ([REBUILD-SEAM.md](REBUILD-SEAM.md)) is the
+working plan.
+
+Merged to main: piece-1 (format + receipt, `b5003d4`, PR #2) and piece-2 (gateway protocol
+types, PR #5, merged `46499b5`). Through the full money bar and in the operator queue:
+piece-5 (PR #7, STANDARD), piece-4 (PR #6, stacked → retargeting to main), piece-3 (PR #8).
+Pieces 6–8 are specced, not yet built (piece-6 has a design doc:
+[PIECE-6-PAYMENT-SM.md](PIECE-6-PAYMENT-SM.md)).
+
+Two live spikes ran tonight on the real relay (spike-track, reality class PLAY):
+**checkpoint (c)** proved the full git-delivery money loop single-key; **checkpoint (c2)**
+proved it **arms-length** (distinct keys, distinct harnesses) — see [RUNS-C2.md](RUNS-C2.md).
+The **usage-awareness** primitive is mid-spike (cross-harness measurement matrix, 2 of 3
+legs — [USAGE-MATRIX-CPB.md](USAGE-MATRIX-CPB.md)). Marketplace scope is settled by gudnuf
+(NIP-89 self-announce, open projects, simple timeouts, price-only offers); fair-exchange is
+resolved v1-plaintext with the real-price exposure tracked as a deferred problem.
 
 ## Active lanes
 
 | Lane | Owner | Status | Notes |
 |------|-------|--------|-------|
-| `spike/full-loop` @ `f3beb95` | metadex | Money-path CLEAR | gudnuf cherry-pick waits on piece-1 (format/receipt) on main |
-| Piece 1 format+receipt | metadex (assigned by orchestrator) | Building | Off `main`; PR story locked; prerequisite for money-path |
-| Repo consolidation | orchestrator + Librarian | Mirror verified | Step-5 wipe held (no buzz repos delete) |
-| Meta seat (`mobee-meta`) | this IDE agent | Driving | Docs PR #1; GOOSE research; no product impl |
-| `docs/meta-genesis` | mobee-meta | PR open | https://github.com/MakePrisms/mobee/pull/1 → MakePrisms/mobee main |
+| Rebuild pieces → main | forge team (Scribe/Anvil/Temper) | pieces 1–2 merged; 5/6/7/8 through money bar → operator queue | each PR: independent-verifier + composition + Temper adversarial + codex deep |
+| Usage-awareness matrix (checkpoint b) | Scribe (compose) + Anvil/Temper (legs) | 2/3 legs (codex ACP-native, cursor ACP-dark); claude leg pending seat pick | transport is harness-dependent — the headline finding |
+| Journal-v2 (live-stream) | Scribe (scoped) | design delivered; awaiting gudnuf's exposure pick | + latent finding: v1 journal already live+near-raw |
+| Skills/practice accessibility pass | Scribe | inventory done; composition behind checkpoint-b | founding gap: non-Claude kit = instructions.md only |
+| Spike `spike/full-loop @ 0e77669` | metadex | source material | distilled piece-by-piece to main |
+
 ## Reality ledger (edges)
 
 | Edge | Class | Evidence |
 |------|-------|----------|
-| State machine + co-sign to Settled (in-memory Bus, payment mocked) | PROVEN | headless full-loop → `final state = settled` |
-| Live relay-mode headless (`MOBEE_HEADLESS_RELAY` / RelayBus) | BUILT-BUT-UNVERIFIED | Compile-only / unproven live |
-| Payment leg (NUT-11 / NUT-07) | BUILT-BUT-UNVERIFIED | Not exercised in headless; Settled ≠ money moved |
-| Open market relay anon write/read (5109/6109/7000/3400) | PROVEN | `wss://mobee-relay.orveth.dev` |
-| Real ACP on turtle + Mac (v0.1) | PROVEN | Merged 2026-07-12 |
-| Testnut money-path on spike (static token) | CONDITIONAL | Dual-review PASS for demo; R1–R3 before real funds |
+| Format + receipt hash contract on main | PROVEN | PR #2 @ `b5003d4`; hermetic tests |
+| Gateway protocol types on main | PROVEN | PR #5 merged `46499b5`; 29/29 both feature sets |
+| Arms-length git-delivery trade (2 keys, 2 harnesses, testnut) | PROVEN (PLAY) | checkpoint (c2) — [RUNS-C2.md](RUNS-C2.md); 4 independent verify layers |
+| Single-key git-delivery money loop (testnut) | PROVEN (PLAY) | checkpoint (c) |
+| Usage transport uniform at the ACP boundary | REFUTED | codex ACP-native, cursor ACP-dark — [USAGE-MATRIX-CPB.md](USAGE-MATRIX-CPB.md) |
+| Payment leg (NUT-11 / NUT-07) on real relay | PROVEN (PLAY) | c/c2 testnut settlement + co-signed receipts |
+| Open market relay anon write/read (5109/6109/7000/3400) | PROVEN | `wss://buzzrelay.orveth.dev` |
+| Real ACP on turtle + Mac (v0.1) | PROVEN | merged 2026-07-12 |
+| Proof authenticity at real value | UNPROVEN — deferred | REBUILD-SEAM DP-2 + finding 8; piece-6 swap gate + spec §4 |
+| Fair exchange at real prices | UNPROVEN — deferred | REBUILD-SEAM DP-1; v1 keeps plaintext fetch-before-pay |
 
-## Open architecture (buzz issues — hold refile)
+## docs/meta index (all current as of 2026-07-14)
 
-Filed on relay-git NIP-34 `mobee` (owner `79284e2b…`). Orchestrator:
-**do not refile** until canonical issue home locked post-consolidation.
+- [REBUILD-SEAM.md](REBUILD-SEAM.md) — the rebuild plan: inventory, ordered pieces 3–8 with
+  acceptance + review class, refuse-to-copy, spec drift, findings, deferred problems.
+- [RUNS-C2.md](RUNS-C2.md) — the arms-length reference run (full event chain + verify layers).
+- [USAGE-MATRIX-CPB.md](USAGE-MATRIX-CPB.md) — cross-harness usage measurement (checkpoint b).
+- [PIECE-6-PAYMENT-SM.md](PIECE-6-PAYMENT-SM.md) — payment state-machine + write-ahead design.
+- [SPIKE_LESSONS.md](SPIKE_LESSONS.md) — rebuild constraints + refuse-to-copy list.
+- [PROCESS.md](PROCESS.md) — merge train, review authority, no self-merge.
+- [GOOSE.md](GOOSE.md) — Goose-embed research (harness-only).
 
-| Topic | Issue event id | Stance |
-|-------|----------------|--------|
-| Honest sync (drop faux-async / `block_on`) | `77c5ae79cb2e223bac1ec1a007d54eb79dd6a718c5ffbe6f1fb13115f9bad54e` | Locked A |
-| Nix: buyer MCP + seller gateway + harnesses + published binaries | `6d40cd87d4b57232719649a67bc797485090b5f3d7c7528b253e6796bf3b5282` | Locked |
-| Rename spine `job_id` → `execution_id` | `9f9e9d0fe25c3054d25b93ddfde7f0504e1890249b5c991e843300a6c42a3e26` | Locked |
-| Test posture + iterate-as-we-merge rule | `eb4290e7bea57638e531ef1b457f53949e60331ac863d2b0f425cbbff45e2728` | Locked (policy); follow-ups unclaimed |
+## Open architecture (locked; landing via rebuild pieces)
 
-## Known issues (pre-existing — do not chase as new regressions)
+Locked A / honest-sync (drop faux-async `block_on`) → piece-8. Nix boring targets → piece-8.
+`job_id` → `execution_id` spine rename → piece-8. Test posture + iterate-as-we-merge →
+standing (PROCESS.md). Buzz-issue refile still held pending a canonical issue home.
 
-- `mobee-evals` `scenarios_pass_deterministic_graders` FAILS at older spike HEADs:
-  `$.log_payloads[3].data.status` expected `"failed"`/`"completed"`,
-  actual `null` — deterministic; predates recent money-path work.
-- Integration seam (open): buyer-MCP posts **UNTARGETED** offers; seller
-  gateway only claims **TARGETED** — must align before live e2e closes.
+## Deferred problems (tracked, not solved)
+
+See [REBUILD-SEAM.md](REBUILD-SEAM.md) § Deferred problems. **DP-1 fair-exchange** (v1
+plaintext fetch-before-pay; real exposure at real prices; fix = NIP-17 key-rail encrypted
+delivery + PoPs escrow; envelope slot reserved). **DP-2 proof-authenticity at real value**
+(piece-6 swap-on-receive gate + spec §4 fifth check). Plus real-funds R1–R3.
 
 ## Blocked / waiting
 
-- Live e2e close blocked on targeting seam + gateway up
-- Real-funds chapter: R1–R3 (token value/P2PK, durable pre-pay intent, targeted-seller enforce)
-- Canonical issue home unsettled during repo consolidation — hold refile
-- Await gudnuf on GitHub PR #1 (`docs/meta`)
-- Await orchestrator ping before claiming merge pieces
+- Usage matrix finalize: claude leg pending a coordination seat pick (claude-agent-acp).
+- gudnuf merges of #6 (post-retarget) / #7 / #8.
+- Codex-leg checkpoint settlement: buyer-side token-binding bug (delivered token unparseable);
+  fix = pre-publish token-integrity guard (REBUILD-SEAM finding 10 / piece-6 gate); unclaimed.
+- Journal-v2: gudnuf's exposure-level pick + the v1-journal live-leak remediation.
 
-## Meta identity
+## Meta / team
 
-| Field | Value |
-|-------|-------|
-| Key file | `~/.config/buzz/mobee-meta.key` |
-| Hex pubkey | `fe2ec5a8493b9484ad30d2e95115134d6e81e5cfe265f32f61a2ece5a6a2c1de` |
-| npub | `npub1lchvt2zf8w2gftfs6t54z9gnf4hgrew0ufjlxtmp5tkwtf4zc80q2dj77u` |
-| Membership | admitted 2026-07-13 |
-| Channel | `dd4821c9-c6dc-429f-8e0f-51fabb695c20` (`mobee`) |
-| Announce event | `f43596ea9c6c502376eb44f27f1f5f6d354b622a6626e7cd94445e9c4d95f865` |
-
-## Strategy (locked)
-
-Merge the full product to `main` **one piece at a time**. Spikes
-(`full-loop`, `headless-buyer`, etc.) are source material for that
-sequence — not long-lived destinations. Each PR: small, reviewable,
-reality-classed, gudnuf reviews, no self-merge.
-
-## Next actions
-
-1. **Piece 1 IN FLIGHT:** metadex claimed (orchestrator assigned). Branch off main;
-   format+receipt only; PR story as briefed. Track PR URL when opened.
-2. Fold metadex SPIKE_LESSONS addendum (write-ahead = real-funds target) when convenient
-3. Goose: buzz ask out (`88cb2a87…`); independent note in [`GOOSE.md`](GOOSE.md) —
-   fold team replies when they land
-4. Librarian mirror verified; step-5 wipe held on delete mechanics (parallel)
-5. Await gudnuf on https://github.com/MakePrisms/mobee/pull/1
-
-## Genesis
-
-**Closed 2026-07-13.** Q1–Q4 recorded in PROCESS.md Decisions.
+Genesis (mobee-meta, `mobee-meta` IDE seat) closed 2026-07-13 — decisions in
+[PROCESS.md](PROCESS.md). The turtle-resident forge builder team now runs the rebuild:
+**Scribe** (composition owner, Fable keeper), **Anvil** (builder, codex-acp / gpt-5.6-sol),
+**Temper** (red-team, cursor / grok-4.5). Coordination counterpart: keeper:mobee-orchestrator.
+gudnuf reviews all PRs; no persona self-merges.
 
 ## Recent completions
 
-- 2026-07-12: v0.1 dual-reviewed, merged to main
-- 2026-07-13: genesis closed; buzz announce; docs PR #1
-- 2026-07-13: main tour + unclean-cut review with operator
-- 2026-07-13: locked A/nix/execution_id; filed 3 buzz issues; docs/meta sync
-- 2026-07-13: test posture feedback filed; standing iterate-tests rule in PROCESS
-- 2026-07-13: spike lessons from metadex + orchestrator → docs/meta/SPIKE_LESSONS.md
+- 2026-07-12: v0.1 dual-reviewed, merged to main.
+- 2026-07-13: genesis closed; piece-1 (format+receipt) merged (PR #2); consolidation to one
+  canonical repo; money-path dual-review; SPIKE_LESSONS captured.
+- 2026-07-14: checkpoint (c) + (c2) live trades (arms-length proven); rebuild seam map +
+  run record + payment-SM design merged; pieces 3/4/5 through the money bar (codex/Temper/
+  composition gauntlet); piece-2 (PR #5) merged; usage-awareness schema locked + 2/3
+  measurement legs; marketplace scope + fair-exchange settled by gudnuf.
