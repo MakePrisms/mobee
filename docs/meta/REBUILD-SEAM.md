@@ -354,6 +354,19 @@ noted):
    ruling: token-bearing types do not derive `Debug`/`Serialize`; APIs whose names claim
    delivery fail closed on total relay failure. Both fixed in-PR (piece-4 amended
    acceptance above).
+10. **Token corruption reaches the wire uncaught** (live codex-leg trade, 2026-07-14): the
+    buyer pay path delivered a payload the seller parsed as neither V3 nor V4
+    (`Unsupported token`) — the saved `cashuB`/V4 token did not enter the delivery payload
+    intact (token-binding bug, buyer-side). The seller correctly fail-stopped (no receipt on
+    an unparseable token), so nothing was lost — but the pay path sent a corrupted token
+    with no pre-publish check. **Standing gate → piece-6:** the payment SM's Funded→Delivered
+    transition MUST assert the token about to enter the delivery payload is a well-formed
+    cashu token (`cashuA`/`cashuB` prefix + parses) **before** publish, fail-closed, logging
+    prefix-class + length + delivery-id only (never bearer material). At testnut a corrupt
+    token merely blocks; at real value an *attacker-crafted* malformed-but-plausible token is
+    a worse class — this guard is the buyer-side sibling of the seller's swap-on-receive
+    (finding 8). Both builders independently converged on this fix; recorded so the rebuild
+    inherits it as a gate, not a one-trade patch.
 
 **Sprint state (pieces 3/4/5).** All four through the money bar and in the operator queue:
 PR #5 (piece-2 gateway types) · PR #7 (piece-5 capture, STANDARD) · PR #6 (piece-4
