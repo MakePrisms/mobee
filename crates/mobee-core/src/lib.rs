@@ -1,3 +1,6 @@
+pub mod delivery;
+#[cfg(feature = "git-delivery")]
+pub mod delivery_git;
 pub mod driver;
 pub mod engine;
 pub mod event;
@@ -6,9 +9,9 @@ pub mod gateway;
 pub mod log;
 #[cfg(feature = "wallet")]
 pub mod payment;
+pub mod payment_send;
 #[cfg(feature = "wallet")]
 pub mod payment_wallet;
-pub mod payment_send;
 pub mod receipt;
 #[cfg(feature = "wallet")]
 pub mod wallet;

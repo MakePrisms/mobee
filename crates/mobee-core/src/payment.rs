@@ -10,6 +10,7 @@ use nostr_sdk::PublicKey as NostrPublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::delivery::{DeliveryError, DeliveryVerifier, GitDelivery};
 use crate::payment_send::PaymentSent;
 use crate::wallet::VerifiedPayment;
 
@@ -51,13 +52,24 @@ impl ResultId {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-/// Validated streamed result-content digest.
-pub struct ContentHash(String);
+/// Validated integrity identifier for delivered work.
+pub struct DeliveryIntegrityHash(String);
 
-impl ContentHash {
-    /// Parses a lowercase SHA-256 digest.
+impl DeliveryIntegrityHash {
+    /// Parses a full git commit oid or lowercase SHA-256 content digest.
     pub fn from_hex(value: impl Into<String>) -> Result<Self, PaymentError> {
-        digest_hex(value.into(), "content hash").map(Self)
+        let value = value.into();
+        let valid_length = value.len() == 40 || value.len() == 64;
+        let lowercase_hex = value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if valid_length && lowercase_hex {
+            Ok(Self(value))
+        } else {
+            Err(PaymentError::InvalidInput(
+                "delivery integrity hash must be full lowercase git or SHA-256 hex".into(),
+            ))
+        }
     }
 
     /// Returns the digest hex.
@@ -99,7 +111,7 @@ impl AttemptId {
         hasher.update(ATTEMPT_DOMAIN);
         hash_field(&mut hasher, key.job_id.as_str());
         hash_field(&mut hasher, key.result_id.as_str());
-        hash_field(&mut hasher, key.content_hash.as_str());
+        hash_field(&mut hasher, key.delivery_integrity_hash.as_str());
         hash_field(&mut hasher, key.job_hash.as_str());
         hash_field(&mut hasher, &key.seller_pubkey.to_string());
         hash_field(&mut hasher, &key.amount.to_string());
@@ -143,7 +155,8 @@ impl PaymentTerms {
 pub struct PaymentKey {
     pub job_id: JobId,
     pub result_id: ResultId,
-    pub content_hash: ContentHash,
+    #[serde(alias = "content_hash")]
+    pub delivery_integrity_hash: DeliveryIntegrityHash,
     pub job_hash: JobHash,
     pub seller_pubkey: NostrPublicKey,
     pub amount: Amount,
@@ -156,14 +169,14 @@ impl PaymentKey {
     pub fn new(
         job_id: JobId,
         result_id: ResultId,
-        content_hash: ContentHash,
+        delivery_integrity_hash: DeliveryIntegrityHash,
         job_hash: JobHash,
         terms: &PaymentTerms,
     ) -> Self {
         Self {
             job_id,
             result_id,
-            content_hash,
+            delivery_integrity_hash,
             job_hash,
             seller_pubkey: terms.seller_nostr_pubkey,
             amount: terms.amount,
@@ -524,8 +537,29 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
         Self { journal }
     }
 
-    /// Advances a payment as far as its current durable state permits.
-    pub fn run<E: PaymentEffects>(
+    /// Verifies buyer custody before allowing the first durable payment intent.
+    pub fn run<D: DeliveryVerifier, E: PaymentEffects>(
+        &self,
+        delivery: &GitDelivery,
+        delivery_verifier: &mut D,
+        key: &PaymentKey,
+        terms: &PaymentTerms,
+        authority: &ReceiptAuthority,
+        effects: &mut E,
+    ) -> Result<PaymentState, PaymentError> {
+        let verified = delivery_verifier
+            .verify(delivery)
+            .map_err(PaymentError::Delivery)?;
+        if key.delivery_integrity_hash.as_str() != verified.commit_oid().as_str() {
+            return Err(PaymentError::Refused(
+                "payment key does not bind the verified delivery commit".into(),
+            ));
+        }
+        self.advance(key, terms, authority, effects)
+    }
+
+    /// Advances an already delivery-gated payment inside the core crate.
+    pub(crate) fn advance<E: PaymentEffects>(
         &self,
         key: &PaymentKey,
         terms: &PaymentTerms,
@@ -781,6 +815,7 @@ pub enum PaymentError {
         to: &'static str,
     },
     Journal(JournalError),
+    Delivery(DeliveryError),
     Effect(EffectError),
     NoRelayAccepted,
     AmbiguousSendRefused,
@@ -796,6 +831,7 @@ impl fmt::Display for PaymentError {
                 write!(formatter, "illegal payment transition: {from} -> {to}")
             }
             Self::Journal(error) => error.fmt(formatter),
+            Self::Delivery(error) => write!(formatter, "delivery verification refused: {error}"),
             Self::Effect(error) => write!(formatter, "payment effect failed: {error}"),
             Self::NoRelayAccepted => formatter.write_str("no relay accepted the payment"),
             Self::AmbiguousSendRefused => {
@@ -958,6 +994,78 @@ mod tests {
     }
 
     #[test]
+    fn delivery_refusal_leaves_no_intent_and_fires_no_wallet_effect() {
+        let journal = MemoryPaymentJournal::default();
+        let shared = FakeShared::default();
+        let mut effects = FakeEffects::new(shared.clone());
+        let mut verifier = RejectDelivery;
+
+        let result = PaymentService::new(&journal).run(
+            &git_delivery(),
+            &mut verifier,
+            &git_key(),
+            &terms(),
+            &authority(),
+            &mut effects,
+        );
+
+        assert!(matches!(result, Err(PaymentError::Delivery(_))));
+        assert!(journal.records().is_empty());
+        assert_eq!(shared.lock_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(shared.mint_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn verified_delivery_commit_reaches_the_existing_payment_spine() {
+        let journal = MemoryPaymentJournal::default();
+        let shared = FakeShared::default();
+        let mut effects = FakeEffects::new(shared.clone());
+        let mut verifier = AcceptDelivery;
+
+        let state = PaymentService::new(&journal)
+            .run(
+                &git_delivery(),
+                &mut verifier,
+                &git_key(),
+                &terms(),
+                &authority(),
+                &mut effects,
+            )
+            .expect("verified delivery payment");
+
+        assert!(matches!(state, PaymentState::Closed { .. }));
+        assert_eq!(shared.mint_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn payment_key_must_bind_the_verified_commit_before_intent() {
+        let journal = MemoryPaymentJournal::default();
+        let shared = FakeShared::default();
+        let mut effects = FakeEffects::new(shared.clone());
+        let mut verifier = AcceptDelivery;
+        let wrong_key = PaymentKey::new(
+            JobId::new("job").unwrap(),
+            ResultId::new("result").unwrap(),
+            DeliveryIntegrityHash::from_hex("44".repeat(20)).unwrap(),
+            JobHash::from_hex("22".repeat(32)).unwrap(),
+            &terms(),
+        );
+
+        let result = PaymentService::new(&journal).run(
+            &git_delivery(),
+            &mut verifier,
+            &wrong_key,
+            &terms(),
+            &authority(),
+            &mut effects,
+        );
+
+        assert!(matches!(result, Err(PaymentError::Refused(_))));
+        assert!(journal.records().is_empty());
+        assert_eq!(shared.lock_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn service_mints_at_most_once_across_retry_and_concurrency() {
         let journal = Arc::new(MemoryPaymentJournal::default());
         let shared = FakeShared::default();
@@ -974,7 +1082,7 @@ mod tests {
                 let authority = Arc::clone(&authority);
                 thread::spawn(move || {
                     let mut effects = FakeEffects::new(shared);
-                    PaymentService::new(journal.as_ref()).run(
+                    PaymentService::new(journal.as_ref()).advance(
                         &key,
                         &terms,
                         &authority,
@@ -1000,7 +1108,7 @@ mod tests {
         crashing.crash_after_lock = true;
 
         let first =
-            PaymentService::new(&journal).run(&key(), &terms(), &authority(), &mut crashing);
+            PaymentService::new(&journal).advance(&key(), &terms(), &authority(), &mut crashing);
         assert!(matches!(first, Err(PaymentError::Effect(_))));
         assert!(matches!(
             journal.records().last().map(|record| &record.value),
@@ -1009,7 +1117,7 @@ mod tests {
 
         let mut recovered = FakeEffects::new(shared.clone());
         let result = PaymentService::new(&journal)
-            .run(&key(), &terms(), &authority(), &mut recovered)
+            .advance(&key(), &terms(), &authority(), &mut recovered)
             .unwrap();
 
         assert!(matches!(result, PaymentState::Closed { .. }));
@@ -1027,7 +1135,7 @@ mod tests {
 
         assert!(
             PaymentService::new(&journal)
-                .run(&key(), &terms(), &authority(), &mut crashing)
+                .advance(&key(), &terms(), &authority(), &mut crashing)
                 .is_err()
         );
 
@@ -1035,7 +1143,7 @@ mod tests {
         recovered.blind_lock = true;
         assert!(
             PaymentService::new(&journal)
-                .run(&key(), &terms(), &authority(), &mut recovered)
+                .advance(&key(), &terms(), &authority(), &mut recovered)
                 .is_ok()
         );
 
@@ -1049,9 +1157,11 @@ mod tests {
         let mut effects = FakeEffects::new(shared);
         effects.ordering_journal = Some(journal.clone());
 
-        assert!(PaymentService::new(&journal)
-            .run(&key(), &terms(), &authority(), &mut effects)
-            .is_ok());
+        assert!(
+            PaymentService::new(&journal)
+                .advance(&key(), &terms(), &authority(), &mut effects)
+                .is_ok()
+        );
         assert_eq!(journal.sync_count(), 5);
     }
 
@@ -1064,7 +1174,7 @@ mod tests {
 
         assert!(
             PaymentService::new(&journal)
-                .run(&key(), &terms(), &authority(), &mut effects)
+                .advance(&key(), &terms(), &authority(), &mut effects)
                 .is_ok()
         );
     }
@@ -1086,7 +1196,7 @@ mod tests {
             effects.locked_terms = Some(locked_terms);
 
             let error = PaymentService::new(&journal)
-                .run(&key(), &expected, &authority(), &mut effects)
+                .advance(&key(), &expected, &authority(), &mut effects)
                 .unwrap_err();
 
             assert!(
@@ -1108,7 +1218,8 @@ mod tests {
         let mut effects = FakeEffects::new(shared.clone());
         effects.empty_send = true;
 
-        let first = PaymentService::new(&journal).run(&key(), &terms(), &authority(), &mut effects);
+        let first =
+            PaymentService::new(&journal).advance(&key(), &terms(), &authority(), &mut effects);
         assert!(matches!(first, Err(PaymentError::NoRelayAccepted)));
         assert!(matches!(
             journal.records().last().map(|record| &record.value),
@@ -1117,7 +1228,7 @@ mod tests {
 
         let mut retry = FakeEffects::new(shared.clone());
         assert!(matches!(
-            PaymentService::new(&journal).run(&key(), &terms(), &authority(), &mut retry),
+            PaymentService::new(&journal).advance(&key(), &terms(), &authority(), &mut retry),
             Err(PaymentError::AmbiguousSendRefused)
         ));
         assert_eq!(shared.send_count.load(Ordering::SeqCst), 1);
@@ -1131,7 +1242,7 @@ mod tests {
         effects.fail_receipt = true;
 
         assert!(matches!(
-            PaymentService::new(&journal).run(&key(), &terms(), &authority(), &mut effects),
+            PaymentService::new(&journal).advance(&key(), &terms(), &authority(), &mut effects),
             Err(PaymentError::Effect(_))
         ));
         assert!(matches!(
@@ -1142,7 +1253,7 @@ mod tests {
         let mut retry = FakeEffects::new(shared.clone());
         assert!(matches!(
             PaymentService::new(&journal)
-                .run(&key(), &terms(), &authority(), &mut retry)
+                .advance(&key(), &terms(), &authority(), &mut retry)
                 .unwrap(),
             PaymentState::Closed { .. }
         ));
@@ -1190,7 +1301,7 @@ mod tests {
 
         assert!(matches!(
             PaymentService::new(&journal)
-                .run(&payment_key, &terms(), &authority(), &mut effects)
+                .advance(&payment_key, &terms(), &authority(), &mut effects)
                 .unwrap(),
             PaymentState::Closed { .. }
         ));
@@ -1207,7 +1318,7 @@ mod tests {
         effects.forged_receipt = true;
 
         assert!(matches!(
-            PaymentService::new(&journal).run(&key(), &terms(), &authority(), &mut effects),
+            PaymentService::new(&journal).advance(&key(), &terms(), &authority(), &mut effects),
             Err(PaymentError::ForgedReceipt)
         ));
         assert!(matches!(
@@ -1316,6 +1427,31 @@ mod tests {
         forged_receipt: bool,
         ordering_journal: Option<MemoryPaymentJournal>,
         replay_sync_journal: Option<MemoryPaymentJournal>,
+    }
+
+    struct RejectDelivery;
+
+    impl DeliveryVerifier for RejectDelivery {
+        fn verify(
+            &mut self,
+            _delivery: &GitDelivery,
+        ) -> Result<crate::delivery::VerifiedDelivery, DeliveryError> {
+            Err(DeliveryError::GitCommandFailed("fetch"))
+        }
+    }
+
+    struct AcceptDelivery;
+
+    impl DeliveryVerifier for AcceptDelivery {
+        fn verify(
+            &mut self,
+            delivery: &GitDelivery,
+        ) -> Result<crate::delivery::VerifiedDelivery, DeliveryError> {
+            crate::delivery::VerifiedDelivery::from_fetched_tip(
+                delivery,
+                delivery.commit_oid().clone(),
+            )
+        }
     }
 
     impl FakeEffects {
@@ -1455,7 +1591,26 @@ mod tests {
         PaymentKey::new(
             JobId::new("job").unwrap(),
             ResultId::new("result").unwrap(),
-            ContentHash::from_hex("11".repeat(32)).unwrap(),
+            DeliveryIntegrityHash::from_hex("11".repeat(32)).unwrap(),
+            JobHash::from_hex("22".repeat(32)).unwrap(),
+            &terms(),
+        )
+    }
+
+    fn git_delivery() -> GitDelivery {
+        GitDelivery::new(
+            "https://example.invalid/repo.git",
+            "mobee/job",
+            crate::delivery::CommitOid::parse("33".repeat(20)).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn git_key() -> PaymentKey {
+        PaymentKey::new(
+            JobId::new("job").unwrap(),
+            ResultId::new("result").unwrap(),
+            DeliveryIntegrityHash::from_hex("33".repeat(20)).unwrap(),
             JobHash::from_hex("22".repeat(32)).unwrap(),
             &terms(),
         )

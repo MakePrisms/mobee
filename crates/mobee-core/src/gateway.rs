@@ -2,6 +2,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::delivery::{CommitOid, DeliveryError, GitDelivery};
+
 pub const MOBEE_TAG: &str = "mobee";
 pub const PROTOCOL_VERSION: &str = "1";
 
@@ -182,6 +184,56 @@ pub enum OfferParseError {
     MissingMobeeTag,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitResultParseError {
+    WrongKind(u16),
+    MissingTag(&'static str),
+    UnsupportedDelivery(String),
+    InvalidDelivery(DeliveryError),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundGitDeliveryError {
+    WrongOfferKind(u16),
+    MissingOfferTag(&'static str),
+    UnsupportedOfferDelivery(String),
+    Result(GitResultParseError),
+    TargetMismatch,
+}
+
+impl fmt::Display for BoundGitDeliveryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongOfferKind(kind) => write!(f, "expected kind {JOB_OFFER_KIND}, got {kind}"),
+            Self::MissingOfferTag(tag) => write!(f, "missing required git offer tag {tag}"),
+            Self::UnsupportedOfferDelivery(delivery) => {
+                write!(f, "unsupported offer delivery {delivery:?}")
+            }
+            Self::Result(error) => error.fmt(f),
+            Self::TargetMismatch => {
+                f.write_str("git result repository or branch does not match the offer")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BoundGitDeliveryError {}
+
+impl fmt::Display for GitResultParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongKind(kind) => write!(f, "expected kind {JOB_RESULT_KIND}, got {kind}"),
+            Self::MissingTag(tag) => write!(f, "missing required git result tag {tag}"),
+            Self::UnsupportedDelivery(delivery) => {
+                write!(f, "unsupported result delivery {delivery:?}")
+            }
+            Self::InvalidDelivery(error) => write!(f, "invalid git result delivery: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for GitResultParseError {}
+
 impl fmt::Display for OfferParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -255,6 +307,54 @@ pub fn parse_offer(event: &EventDraft) -> Result<ParsedOffer, OfferParseError> {
             .to_owned(),
         seller_pubkey: first_tag_value(&event.tags, "p").map(str::to_owned),
     })
+}
+
+/// Parses the buyer-visible git delivery fields carried by a result event.
+pub fn parse_git_result_delivery(event: &EventDraft) -> Result<GitDelivery, GitResultParseError> {
+    if event.kind != JOB_RESULT_KIND {
+        return Err(GitResultParseError::WrongKind(event.kind));
+    }
+    let delivery = first_tag_value(&event.tags, "delivery")
+        .ok_or(GitResultParseError::MissingTag("delivery"))?;
+    if delivery != "git" {
+        return Err(GitResultParseError::UnsupportedDelivery(
+            delivery.to_owned(),
+        ));
+    }
+    let repo =
+        first_tag_value(&event.tags, "repo").ok_or(GitResultParseError::MissingTag("repo"))?;
+    let branch =
+        first_tag_value(&event.tags, "branch").ok_or(GitResultParseError::MissingTag("branch"))?;
+    let commit =
+        first_tag_value(&event.tags, "commit").ok_or(GitResultParseError::MissingTag("commit"))?;
+    let commit_oid = CommitOid::parse(commit).map_err(GitResultParseError::InvalidDelivery)?;
+    GitDelivery::new(repo, branch, commit_oid).map_err(GitResultParseError::InvalidDelivery)
+}
+
+/// Parses a result only when it targets the repository and branch named by the offer.
+pub fn parse_bound_git_delivery(
+    offer: &EventDraft,
+    result: &EventDraft,
+) -> Result<GitDelivery, BoundGitDeliveryError> {
+    if offer.kind != JOB_OFFER_KIND {
+        return Err(BoundGitDeliveryError::WrongOfferKind(offer.kind));
+    }
+    let delivery = first_tag_value(&offer.tags, "delivery")
+        .ok_or(BoundGitDeliveryError::MissingOfferTag("delivery"))?;
+    if delivery != "git" {
+        return Err(BoundGitDeliveryError::UnsupportedOfferDelivery(
+            delivery.to_owned(),
+        ));
+    }
+    let offer_repo = first_tag_value(&offer.tags, "repo")
+        .ok_or(BoundGitDeliveryError::MissingOfferTag("repo"))?;
+    let offer_branch = first_tag_value(&offer.tags, "branch")
+        .ok_or(BoundGitDeliveryError::MissingOfferTag("branch"))?;
+    let delivery = parse_git_result_delivery(result).map_err(BoundGitDeliveryError::Result)?;
+    if delivery.repo() != offer_repo || delivery.branch() != offer_branch {
+        return Err(BoundGitDeliveryError::TargetMismatch);
+    }
+    Ok(delivery)
 }
 
 pub fn claim_draft(offer_id: &str, buyer_pubkey: &str, seller_pubkey: &str) -> EventDraft {
@@ -581,6 +681,74 @@ mod tests {
         );
         assert!(has_tag_value_at(&receipt.tags, "sig", 1, "seller"));
         assert!(has_tag_value_at(&receipt.tags, "sig", 1, "buyer"));
+    }
+
+    #[test]
+    fn git_result_parses_repo_branch_and_full_commit_oid() {
+        let result = EventDraft::new(
+            JOB_RESULT_KIND,
+            vec![
+                TagSpec::new(["delivery", "git"]),
+                TagSpec::new(["repo", "https://example.invalid/repo.git"]),
+                TagSpec::new(["branch", "mobee/job"]),
+                TagSpec::new(["commit", &"a".repeat(40)]),
+            ],
+            "",
+        );
+
+        let delivery = parse_git_result_delivery(&result).expect("parse git delivery");
+        assert_eq!(delivery.repo(), "https://example.invalid/repo.git");
+        assert_eq!(delivery.branch(), "mobee/job");
+        assert_eq!(delivery.commit_oid().as_str(), "a".repeat(40));
+    }
+
+    #[test]
+    fn git_result_refuses_an_abbreviated_commit_oid() {
+        let result = EventDraft::new(
+            JOB_RESULT_KIND,
+            vec![
+                TagSpec::new(["delivery", "git"]),
+                TagSpec::new(["repo", "repo"]),
+                TagSpec::new(["branch", "work"]),
+                TagSpec::new(["commit", "abc123"]),
+            ],
+            "",
+        );
+
+        assert_eq!(
+            parse_git_result_delivery(&result),
+            Err(GitResultParseError::InvalidDelivery(
+                DeliveryError::InvalidCommitOid
+            ))
+        );
+    }
+
+    #[test]
+    fn git_result_cannot_redirect_away_from_the_offered_repo_or_branch() {
+        let offer = EventDraft::new(
+            JOB_OFFER_KIND,
+            vec![
+                TagSpec::new(["delivery", "git"]),
+                TagSpec::new(["repo", "https://example.invalid/offered.git"]),
+                TagSpec::new(["branch", "mobee/job"]),
+            ],
+            "",
+        );
+        let redirected = EventDraft::new(
+            JOB_RESULT_KIND,
+            vec![
+                TagSpec::new(["delivery", "git"]),
+                TagSpec::new(["repo", "https://attacker.invalid/other.git"]),
+                TagSpec::new(["branch", "mobee/job"]),
+                TagSpec::new(["commit", &"a".repeat(40)]),
+            ],
+            "",
+        );
+
+        assert_eq!(
+            parse_bound_git_delivery(&offer, &redirected),
+            Err(BoundGitDeliveryError::TargetMismatch)
+        );
     }
 
     fn has_tag_value_at(tags: &[TagSpec], name: &str, index: usize, value: &str) -> bool {

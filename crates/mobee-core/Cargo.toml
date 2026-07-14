@@ -10,6 +10,7 @@ publish.workspace = true
 default = []
 acp = []
 gateway = ["dep:nostr-sdk"]
+git-delivery = []
 wallet = ["dep:cashu", "dep:cdk", "dep:nostr-sdk", "dep:tokio"]
 test-support = []
 
