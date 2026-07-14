@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
-use cashu::{Amount, CheckStateRequest, MintUrl, ProofState, PublicKey, State, Token};
+use cashu::{
+    Amount, CheckStateRequest, MintUrl, ProofState, PublicKey, SpendingConditions, State, Token,
+};
 use cdk::wallet::MintConnector;
 
 /// The trade facts that a presented Cashu token must bind to before payment.
@@ -71,9 +73,10 @@ impl std::error::Error for WalletVerifyError {}
 /// - `Token::value()` performs checked amount aggregation and rejects duplicate
 ///   secrets.
 /// - `Token::mint_url()` supplies the mint binding.
-/// - `Token::p2pk_pubkeys()` reads unsigned pre-pay spending conditions; this
-///   must not be replaced with `Proof::verify_p2pk()`, which verifies witness
-///   signatures and rejects an unsigned pre-pay token.
+/// - each proof secret is parsed through native NUT-10 `SpendingConditions` and
+///   its primary P2PK key must equal the seller lock; this must not be replaced
+///   with `Proof::verify_p2pk()`, which verifies witness signatures and rejects
+///   an unsigned pre-pay token.
 /// - proof ys are derived with `Proof::y()` from token secrets without resolving
 ///   keysets.
 ///
@@ -105,14 +108,7 @@ pub fn verify_trade_p2pk(
         });
     }
 
-    let p2pk_pubkeys = token
-        .p2pk_pubkeys()
-        .map_err(|error| WalletVerifyError::InvalidToken(error.to_string()))?;
-    if !p2pk_pubkeys.contains(&lock.seller_lock) {
-        return Err(WalletVerifyError::LockMismatch {
-            expected: lock.seller_lock,
-        });
-    }
+    require_seller_lock(token, lock.seller_lock)?;
 
     let proof_ys = token_ys(token)?;
     reject_duplicate_ys(&proof_ys)?;
@@ -123,6 +119,48 @@ pub fn verify_trade_p2pk(
         amount: actual_amount,
         proof_ys,
     })
+}
+
+fn require_seller_lock(token: &Token, seller_lock: PublicKey) -> Result<(), WalletVerifyError> {
+    let secrets = token.token_secrets();
+    if secrets.is_empty() {
+        return Err(WalletVerifyError::LockMismatch {
+            expected: seller_lock,
+        });
+    }
+
+    for secret in secrets {
+        let nut10 = cashu::nuts::nut10::Secret::try_from(secret).map_err(|error| {
+            WalletVerifyError::InvalidToken(format!(
+                "proof secret is not a valid P2PK spending condition: {error}"
+            ))
+        })?;
+        let conditions = SpendingConditions::try_from(nut10.clone()).map_err(|error| {
+            WalletVerifyError::InvalidToken(format!(
+                "proof secret is not a valid P2PK spending condition: {error}"
+            ))
+        })?;
+        if conditions.kind() != cashu::nuts::Kind::P2PK {
+            return Err(WalletVerifyError::InvalidToken(
+                "proof secret is not a P2PK spending condition".to_owned(),
+            ));
+        }
+
+        // `SpendingConditions` intentionally exposes the effective pubkey set,
+        // not its primary `data` field. Read that field through cashu's native
+        // NUT-10 representation so an additional seller key cannot disguise a
+        // proof whose primary lock belongs to someone else.
+        let primary_lock = PublicKey::from_str(nut10.secret_data().data()).map_err(|error| {
+            WalletVerifyError::InvalidToken(format!("invalid primary P2PK key: {error}"))
+        })?;
+        if primary_lock != seller_lock {
+            return Err(WalletVerifyError::LockMismatch {
+                expected: seller_lock,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Fetches NUT-07 state through the injected CDK connector, then runs the pure
@@ -238,8 +276,8 @@ mod tests {
         let ys = token_ys(&token).unwrap();
 
         // The proof is deliberately unsigned. Calling Proof::verify_p2pk here
-        // would return SignaturesNotProvided; reading SpendingConditions through
-        // Token::p2pk_pubkeys is the correct pre-pay lock check.
+        // would return SignaturesNotProvided; native SpendingConditions are the
+        // correct pre-pay lock check.
         let proof = token_proofs(&token).remove(0);
         assert!(proof.witness.is_none());
         assert!(matches!(
@@ -287,6 +325,36 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn verify_rejects_mixed_seller_and_other_primary_locks() {
+        let seller = public_key(1);
+        let other = public_key(2);
+        let token = token(MINT, vec![proof(1, seller, 7), proof(1, other, 8)]);
+        let ys = token_ys(&token).unwrap();
+
+        assert!(matches!(
+            verify_trade_p2pk(&token, &trade_lock(MINT, 2, seller), &unspent(&ys)),
+            Err(WalletVerifyError::LockMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_non_nut10_sibling_proof() {
+        let seller = public_key(1);
+        let token = token(
+            MINT,
+            vec![proof(1, seller, 7), plain_secret_proof(1, "not-nut10")],
+        );
+        let ys = token_ys(&token).unwrap();
+
+        let error =
+            verify_trade_p2pk(&token, &trade_lock(MINT, 2, seller), &unspent(&ys)).unwrap_err();
+        assert!(
+            matches!(&error, WalletVerifyError::InvalidToken(message) if message.contains("P2PK")),
+            "non-NUT-10 proof reached the wrong guard: {error}"
+        );
     }
 
     #[test]
@@ -432,6 +500,15 @@ mod tests {
             Amount::from(amount),
             Id::from_str(KEYSET_ID).expect("valid v2 keyset id"),
             secret,
+            public_key(42),
+        )
+    }
+
+    fn plain_secret_proof(amount: u64, secret: &str) -> Proof {
+        Proof::new(
+            Amount::from(amount),
+            Id::from_str(KEYSET_ID).expect("valid v2 keyset id"),
+            Secret::new(secret),
             public_key(42),
         )
     }
