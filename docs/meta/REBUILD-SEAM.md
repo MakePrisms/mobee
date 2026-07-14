@@ -103,10 +103,16 @@ keeps Mobee to trade policy only. This reworks #8, not merges it.
 
 **KEEP in Mobee (pure core, `cashu`-only, zero I/O):** a thin
 `verify_trade_p2pk(token: &cashu::Token, lock: TradeLock, states) -> VerifiedPayment`
-composing `Token::value() == lock.amount` + `Token::mint_url() == lock.mint` +
-**every proof's secret is P2PK with primary `data == lock.seller_lock`** (reject non-P2PK /
-malformed) + **no duplicate `y`/secret + checked-amount** (the security we added on #8 —
-carry forward, do not regress);
+composing `Token::value() == lock.amount` + **`Token::unit() == lock.unit`** +
+`Token::mint_url() == lock.mint` + **every proof's secret is P2PK with primary
+`data == lock.seller_lock`** (reject non-P2PK / malformed) + **no duplicate `y`/secret +
+checked-amount** (the security we added on #8 — carry forward, do not regress);
+⚠ **CURRENCY UNIT MUST be bound (codex HIGH, 2026-07-14):** `TradeLock` carries a bare
+numeric amount; without a unit check, a same-mint token with `Token::unit() == Msat` and the
+equal NUMERIC amount satisfies value+mint+lock — a **1000× value hole**. `TradeLock` gains a
+`CurrencyUnit` (or hard-requires `Sat`); `verify_trade_p2pk` asserts `token.unit()` matches
+and **fails closed on `None`/other**. Regression: msat token, same number, same mint,
+seller-locked → REJECT.
 ⚠ **`Token::p2pk_pubkeys().contains(seller)` is INSUFFICIENT (Temper BLOCK, probe-reproduced
 on cashu 0.17.2, 2026-07-14):** that helper UNIONs pubkeys across proofs AND silently skips
 non-P2PK / non-Nut10 secrets, so a mixed token (1 seller-locked + 99 other) or hybrid
@@ -141,7 +147,13 @@ Acceptance:
   ⚠ Correction (Anvil, #8, source-verified): cdk's `wallet` feature ITSELF pulls `tokio` in
   0.17.2 (`wallet/mod.rs` uses `tokio::sync::RwLock`), so "no tokio" is not achievable behind
   the wallet feature — the enforceable invariant is **no-DB**, not no-async-runtime. State it
-  precisely in the PR (don't claim the impossible).
+  precisely in the PR (don't claim the impossible). **Seam ruling (Scribe, on codex MED,
+  2026-07-14): ACCEPT-DOCUMENTED for #8** — the money-safety property is that the DEFAULT
+  (no-wallet) graph stays tokio-free (evidence: `cargo tree` default shows no tokio); tokio
+  inside the opt-in `wallet` feature is cdk's unavoidable 0.17.2 shape and does not block two
+  money HIGHs on a dependency-hygiene debate. **piece-3.1 hygiene follow-up (deferred):** if
+  we later want the `wallet` graph itself tokio-free, define a narrow local check-state trait
+  instead of leaning on cdk's `MintConnector` — not blocking, tracked here so it doesn't rot.
 - `verify_trade_p2pk` rejects: wrong mint, wrong amount, seller-lock absent, duplicate
   `y`/secret, amount-sum overflow, any proof reported spent, **any proof not P2PK-locked to
   the seller** — each with a test. The last is the Temper-BLOCK strict rule: **mixed-lock**
