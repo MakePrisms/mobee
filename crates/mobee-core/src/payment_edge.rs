@@ -1,12 +1,17 @@
 //! Wallet-backed payment policy and authenticity edges.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::thread;
 
-use cashu::{Amount, CurrencyUnit, MintUrl, PublicKey, SecretKey, SpendingConditions, Token};
+use cashu::{
+    Amount, CurrencyUnit, MintUrl, PublicKey as CashuPublicKey, SecretKey, SpendingConditions,
+    Token,
+};
 use cdk::wallet::{HttpClient, MintConnector, ReceiveOptions, SendOptions, Wallet};
+use nostr_sdk::PublicKey as NostrPublicKey;
 
 use crate::gateway::ParsedOffer;
 use crate::payment::{
@@ -83,24 +88,20 @@ impl PaymentPolicy {
                 "mint {mint} is outside the test-mint allowlist"
             )));
         }
-        let seller_lock = match accepted_seller.len() {
-            64 => format!("02{accepted_seller}"),
-            66 => accepted_seller.to_owned(),
-            _ => {
-                return Err(PaymentEdgeError::Policy(
-                    "seller key must be a 64-hex Nostr key or 66-hex compressed P2PK key".into(),
-                ));
-            }
-        };
-        let seller_pubkey = PublicKey::from_str(&seller_lock).map_err(|error| {
+        let seller_nostr_pubkey = NostrPublicKey::parse(accepted_seller).map_err(|error| {
             PaymentEdgeError::Policy(format!("invalid accepted seller key: {error}"))
         })?;
+        let seller_p2pk_lock =
+            CashuPublicKey::from_str(&format!("02{}", seller_nostr_pubkey.to_hex())).map_err(
+                |error| PaymentEdgeError::Policy(format!("invalid seller P2PK lock: {error}")),
+            )?;
 
         Ok(PaymentTerms::new(
             mint,
             Amount::from(offer.amount_sats),
             unit,
-            seller_pubkey,
+            seller_nostr_pubkey,
+            seller_p2pk_lock,
         ))
     }
 }
@@ -123,13 +124,12 @@ impl<'a> CdkBuyerMint<'a> {
         terms: &PaymentTerms,
     ) -> Result<LockedPayment, PaymentEdgeError> {
         require_wallet_matches(self.wallet, terms)?;
+        self.recover_unmapped_sagas().await?;
         if let Some(token) = self.reconcile(attempt_id, terms).await? {
             return Ok(LockedPayment::new(token));
         }
-
-        self.recover_unmapped_sagas().await?;
         let mut options = SendOptions {
-            conditions: Some(SpendingConditions::new_p2pk(terms.seller_pubkey, None)),
+            conditions: Some(SpendingConditions::new_p2pk(terms.seller_p2pk_lock, None)),
             ..SendOptions::default()
         };
         options
@@ -249,7 +249,7 @@ impl<C: MintConnector + ?Sized> CdkPaymentVerifier<'_, C> {
             mint: terms.mint.clone(),
             amount: terms.amount,
             unit: terms.unit.clone(),
-            seller_lock: terms.seller_pubkey,
+            seller_lock: terms.seller_p2pk_lock,
         };
         verify_trade_p2pk_with_connector(self.connector, locked.token(), &lock)
             .await
@@ -448,7 +448,7 @@ where
             mint_url: terms.mint.to_string(),
             amount_sats: terms.amount.to_u64(),
             token: locked.token().clone(),
-            seller_pubkey: terms.seller_pubkey.to_string(),
+            seller_pubkey: terms.seller_nostr_pubkey.to_hex(),
         };
         self.request(|response| BuyerCommand::Send { payload, response })
     }
@@ -474,6 +474,25 @@ impl<'a> CdkSellerReceive<'a> {
         token: &Token,
         terms: &PaymentTerms,
     ) -> Result<Amount, PaymentEdgeError> {
+        self.receive_with(token, terms, |options| async move {
+            self.wallet
+                .receive(&token.to_string(), options)
+                .await
+                .map_err(wallet_error)
+        })
+        .await
+    }
+
+    async fn receive_with<F, Fut>(
+        &self,
+        token: &Token,
+        terms: &PaymentTerms,
+        receive: F,
+    ) -> Result<Amount, PaymentEdgeError>
+    where
+        F: FnOnce(ReceiveOptions) -> Fut,
+        Fut: Future<Output = Result<Amount, PaymentEdgeError>>,
+    {
         require_wallet_matches(self.wallet, terms)?;
         let token_mint = token.mint_url().map_err(wallet_error)?;
         let token_amount = token.value().map_err(wallet_error)?;
@@ -486,7 +505,7 @@ impl<'a> CdkSellerReceive<'a> {
             ));
         }
         if self.seller_key.public_key().x_only_public_key()
-            != terms.seller_pubkey.x_only_public_key()
+            != terms.seller_p2pk_lock.x_only_public_key()
         {
             return Err(PaymentEdgeError::Policy(
                 "seller receive key does not match payment terms".into(),
@@ -496,11 +515,21 @@ impl<'a> CdkSellerReceive<'a> {
             p2pk_signing_keys: vec![self.seller_key.clone()],
             ..ReceiveOptions::default()
         };
-        self.wallet
-            .receive(&token.to_string(), options)
-            .await
-            .map_err(wallet_error)
+        let received = receive(options).await?;
+        require_received_amount(received, terms)
     }
+}
+
+fn require_received_amount(
+    received: Amount,
+    terms: &PaymentTerms,
+) -> Result<Amount, PaymentEdgeError> {
+    if received != terms.amount {
+        return Err(PaymentEdgeError::Policy(
+            "received amount does not match payment terms".into(),
+        ));
+    }
+    Ok(received)
 }
 
 fn require_wallet_matches(wallet: &Wallet, terms: &PaymentTerms) -> Result<(), PaymentEdgeError> {
@@ -523,7 +552,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use cashu::secret::Secret;
-    use cashu::{Conditions, Id, KeySet, KeySetInfo, Keys, MintInfo, Proof, ProofState, State};
+    use cashu::{
+        Conditions, Id, KeySet, KeySetInfo, Keys, MintInfo, Proof, ProofState, PublicKey, State,
+    };
     use cdk::cdk_database::WalletDatabase;
     use cdk::wallet::types::{ProofInfo, Transaction, TransactionDirection, WalletSaga};
     use cdk::wallet::{BaseHttpClient, HttpTransport, Wallet, WalletBuilder};
@@ -559,7 +590,8 @@ mod tests {
 
     #[test]
     fn policy_maps_the_offer_once_into_typed_terms() {
-        let seller = secret_key(1).public_key().to_string();
+        let seller_lock = secret_key(1).public_key();
+        let seller = nostr_key_for_p2pk(seller_lock).to_hex();
         let policy = PaymentPolicy::new([mint(MINT)]);
 
         let terms = policy
@@ -569,7 +601,11 @@ mod tests {
         assert_eq!(terms.mint, mint(MINT));
         assert_eq!(terms.amount, Amount::from(7));
         assert_eq!(terms.unit, CurrencyUnit::Sat);
-        assert_eq!(terms.seller_pubkey.to_string(), seller);
+        assert_eq!(terms.seller_nostr_pubkey.to_hex(), seller);
+        assert_eq!(
+            terms.seller_p2pk_lock.x_only_public_key(),
+            seller_lock.x_only_public_key()
+        );
     }
 
     #[test]
@@ -673,6 +709,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmed_attempt_with_an_unrelated_incomplete_saga_refuses() {
+        let fixture = wallet_fixture().await;
+        let key = payment_key(&fixture.terms);
+        let attempt_id = key.attempt_id();
+        store_confirmed_attempt(&fixture.wallet, &attempt_id, &fixture.token).await;
+        let saga = WalletSaga::new(
+            uuid::Uuid::now_v7(),
+            cdk::wallet::types::WalletSagaState::Send(
+                cdk::wallet::types::SendSagaState::ProofsReserved,
+            ),
+            fixture.terms.amount,
+            fixture.terms.mint.clone(),
+            fixture.terms.unit.clone(),
+            cdk::wallet::types::OperationData::Send(cdk::wallet::types::SendOperationData {
+                amount: fixture.terms.amount,
+                memo: None,
+                counter_start: None,
+                counter_end: None,
+                token: None,
+                proofs: None,
+            }),
+        );
+        fixture.wallet.localstore.add_saga(saga).await.unwrap();
+
+        let result = CdkBuyerMint::new(&fixture.wallet)
+            .lock_or_reconcile(&attempt_id, &fixture.terms)
+            .await;
+
+        assert!(matches!(result, Err(PaymentEdgeError::Reconcile(_))));
+    }
+
+    #[tokio::test]
     async fn seller_receive_rejects_an_inflated_proof_at_the_mint_swap() {
         let seller_key = secret_key(1);
         let keyset = test_keyset();
@@ -687,6 +755,7 @@ mod tests {
             mint(MINT),
             Amount::from(7),
             CurrencyUnit::Sat,
+            nostr_key_for_p2pk(seller_key.public_key()),
             seller_key.public_key(),
         );
 
@@ -713,6 +782,7 @@ mod tests {
             mint(MINT),
             Amount::from(7),
             CurrencyUnit::Sat,
+            nostr_key_for_p2pk(seller_key.public_key()),
             seller_key.public_key(),
         );
 
@@ -722,6 +792,20 @@ mod tests {
 
         assert!(matches!(result, Err(PaymentEdgeError::Policy(_))));
         assert_eq!(swap_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn seller_receive_rejects_when_wallet_returns_a_mismatched_amount() {
+        let fixture = wallet_fixture().await;
+        let adapter = CdkSellerReceive::new(&fixture.wallet, secret_key(1));
+
+        let result = adapter
+            .receive_with(&fixture.token, &fixture.terms, |_| async {
+                Ok(Amount::from(1))
+            })
+            .await;
+
+        assert!(matches!(result, Err(PaymentEdgeError::Policy(_))));
     }
 
     #[test]
@@ -775,6 +859,84 @@ mod tests {
         assert_eq!(send_count.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn worker_sends_to_the_nostr_identity_not_the_odd_parity_p2pk_lock() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let seller_key = odd_secret_key();
+        let fixture = runtime.block_on(wallet_fixture_for_seller(seller_key.public_key()));
+        let key = payment_key(&fixture.terms);
+        runtime.block_on(store_confirmed_attempt(
+            &fixture.wallet,
+            &key.attempt_id(),
+            &fixture.token,
+        ));
+        let proof_y = fixture.proof.y().unwrap();
+        let connector = BaseHttpClient::with_transport(
+            mint(MINT),
+            CheckStateTransport::new(cashu::CheckStateResponse {
+                states: vec![ProofState::from((proof_y, State::Unspent))],
+            }),
+            None,
+        );
+        let authority = authority();
+        let receipt_authority = authority.clone();
+        let mut effects = CdkPaymentEffects::spawn_with_connector(
+            fixture.wallet.clone(),
+            connector,
+            NostrRecipientSend,
+            move |_: &PaymentKey, _: &PaymentSent| {
+                Ok(ReceiptEvidence {
+                    receipt_id: "receipt".into(),
+                    author: receipt_authority.buyer,
+                    valid_signers: vec![receipt_authority.buyer, receipt_authority.seller],
+                })
+            },
+        )
+        .unwrap();
+        let journal = MemoryPaymentJournal::default();
+
+        let state = PaymentService::new(&journal)
+            .run(&key, &fixture.terms, &authority, &mut effects)
+            .unwrap();
+
+        assert!(matches!(state, PaymentState::Closed { .. }));
+    }
+
+    #[test]
+    fn worker_rejects_a_wrong_seller_lock_through_the_real_verify_edge() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let fixture = runtime.block_on(wallet_fixture());
+        let proof_y = fixture.proof.y().unwrap();
+        let connector = BaseHttpClient::with_transport(
+            mint(MINT),
+            CheckStateTransport::new(cashu::CheckStateResponse {
+                states: vec![ProofState::from((proof_y, State::Unspent))],
+            }),
+            None,
+        );
+        let mut effects = CdkPaymentEffects::spawn_with_connector(
+            fixture.wallet.clone(),
+            connector,
+            CountingSend(Arc::new(AtomicUsize::new(0))),
+            |_: &PaymentKey, _: &PaymentSent| unreachable!(),
+        )
+        .unwrap();
+        let wrong_terms = wallet_terms(secret_key(2).public_key());
+        let locked = LockedPayment::new(fixture.token.clone());
+
+        let result = effects.verify_payment(
+            &payment_key(&wrong_terms).attempt_id(),
+            &wrong_terms,
+            &locked,
+        );
+
+        assert!(result.is_err());
+    }
+
     struct WalletFixture {
         wallet: Wallet,
         terms: PaymentTerms,
@@ -783,14 +945,17 @@ mod tests {
     }
 
     async fn wallet_fixture() -> WalletFixture {
-        let seller = secret_key(1).public_key();
+        wallet_fixture_for_seller(secret_key(1).public_key()).await
+    }
+
+    async fn wallet_fixture_for_seller(seller: PublicKey) -> WalletFixture {
         let proof = p2pk_proof(7, seller);
         let token = Token::new(mint(MINT), vec![proof.clone()], None, CurrencyUnit::Sat);
         let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
         let wallet = Wallet::new(MINT, CurrencyUnit::Sat, store, [7; 64], None).unwrap();
         WalletFixture {
             wallet,
-            terms: PaymentTerms::new(mint(MINT), Amount::from(7), CurrencyUnit::Sat, seller),
+            terms: wallet_terms(seller),
             token,
             proof,
         }
@@ -946,11 +1111,51 @@ mod tests {
         SecretKey::from_slice(&[byte; 32]).unwrap()
     }
 
+    fn odd_secret_key() -> SecretKey {
+        (1..=u8::MAX)
+            .map(secret_key)
+            .find(|key| key.public_key().to_string().starts_with("03"))
+            .expect("an odd-parity test key exists")
+    }
+
+    fn nostr_key_for_p2pk(key: PublicKey) -> NostrPublicKey {
+        let compressed = key.to_string();
+        NostrPublicKey::from_hex(&compressed[2..]).unwrap()
+    }
+
+    fn wallet_terms(seller: PublicKey) -> PaymentTerms {
+        PaymentTerms::new(
+            mint(MINT),
+            Amount::from(7),
+            CurrencyUnit::Sat,
+            nostr_key_for_p2pk(seller),
+            seller,
+        )
+    }
+
     fn mint(url: &str) -> MintUrl {
         MintUrl::from_str(url).unwrap()
     }
 
     struct CountingSend(Arc<AtomicUsize>);
+
+    struct NostrRecipientSend;
+
+    impl PaymentSend for NostrRecipientSend {
+        async fn send_payment(
+            &mut self,
+            payload: PaymentPayload,
+        ) -> Result<PaymentSent, PaymentSendError> {
+            nostr_sdk::PublicKey::parse(&payload.seller_pubkey).map_err(|error| {
+                PaymentSendError::Transport(format!("invalid Nostr recipient: {error}"))
+            })?;
+            Ok(PaymentSent {
+                payment_id: "payment".into(),
+                relay_success: vec!["memory://relay".into()],
+                relay_failed: Vec::new(),
+            })
+        }
+    }
 
     impl PaymentSend for CountingSend {
         async fn send_payment(

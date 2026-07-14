@@ -10,7 +10,7 @@ publish.workspace = true
 default = []
 acp = []
 gateway = ["dep:nostr-sdk"]
-wallet = ["dep:cashu", "dep:cdk", "dep:tokio"]
+wallet = ["dep:cashu", "dep:cdk", "dep:nostr-sdk", "dep:tokio"]
 test-support = []
 
 [dependencies]
