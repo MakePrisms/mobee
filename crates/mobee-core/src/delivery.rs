@@ -13,7 +13,8 @@ pub struct TokenDeliveryPayload {
 }
 
 impl TokenDeliveryPayload {
-    pub fn canonical_json(&self, buyer_pubkey: &str) -> String {
+    #[cfg(any(test, feature = "gateway"))]
+    fn canonical_json(&self, buyer_pubkey: &str) -> String {
         use serde::ser::{SerializeMap, Serializer};
 
         let mut json = Vec::new();
