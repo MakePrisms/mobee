@@ -125,11 +125,21 @@ NUT-13 restore all exist). The split is explicit so core never reinvents what cd
 - **Memory guard (tests):** mutex-backed, same contract, behind a **`test-support` feature**
   (`cfg(any(test, feature = "test-support"))`, matching #6's `MemoryPaymentSend`) — never bare
   `cfg(test)`, never a second product path. Hermetic tests run on the *real* SM path.
-- **Recovery = pure fold over `replay()` filtered to the key**, then act by state: `Intent`
-  with no confirmed lock → reconcile (never blind re-mint); `Locked`/`Sent` with no receipt →
-  resume forward (re-publish receipt, never re-pay); `ReceiptPublished` → idempotent return.
-  "Locked/Sent but no record" is unreachable (record precedes effect); "effect but no record"
-  reconciles or refuses.
+- **Recovery = pure fold over `replay()` filtered to the key**, then act by state:
+  - `Intent` with no confirmed lock → **reconcile** via `lock_or_reconcile(attempt_id, …)`,
+    never blind re-mint.
+  - **recovered (replayed) `Locked` → REFUSE to auto-send.** The crash-after-send-before-`Sent`
+    window is indistinguishable from never-sent (no event id is journaled until Sent), and
+    re-send is non-deterministic (gift-wrap), so core stops and defers to observe / reconcile /
+    human. A **newly reached** `Locked` (this run performed the lock, no send attempted yet)
+    may attempt send **once**; empty `relay_success` stays Locked.
+  - `Sent` → retry only the **idempotent receipt** leg (never re-pay, never re-send the DM).
+  - `ReceiptPublished` / `Closed` → idempotent return.
+  The newly-reached-vs-recovered distinction is a **runtime** fact (did *this* run attempt the
+  send), **not a persisted sixth state**. "Locked/Sent but no record" is unreachable (record
+  precedes effect). **Residual (known, PR2+/relay-repair):** a crash at `Locked` strands the
+  trade pending manual reconcile — same observe/refuse/human class as the single-relay-drop
+  residual; not a PR1 liveness bug.
 
 **Idempotency key (Q6 lock)** — the seven SPIKE_LESSONS fields **+ `unit`**, all typed:
 
@@ -228,7 +238,11 @@ the module cut drawn now becomes the crate cut then. **Do not crate-split during
 **PR1 (core, hermetic) — the merge gate proves all of these:**
 - Stubbed pay-counter: `mint/lock` ≤ 1 across retry / crash / concurrent.
 - `attempt_id` reconcile: crash-after-effect-before-record recovers by reconcile-or-refuse,
-  never blind re-mint (red-before-green: a blind-re-mint variant must fail the counter).
+  never blind re-mint. Red-before-green: a blind-re-mint variant must fail the counter, and a
+  truncate-tail-as-success variant must fail the torn-journal test (non-vacuous). **The
+  recovered-`Intent` test asserts `reconcile(attempt_id)` is INVOKED and yields the existing
+  lock (honest forward recovery) — not merely that the counter ≤ 1, since a refuse-always impl
+  also gives ≤ 1 and must not pass as recovery.**
 - WAL ordering: fsync-before-side-effect enforced; torn/malformed journal tail ⇒ fail-closed
   refusal on replay (not truncate-as-success).
 - Recovery suite by state: Intent-no-lock → reconcile; Locked/Sent-no-receipt → republish
