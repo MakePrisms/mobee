@@ -95,6 +95,17 @@ Acceptance: the 3 spike hermetic tests green
 memory fake and no network; review asserts proofs ride only the private DM path, never a
 public receipt (spec §4).
 
+Amended by the 2026-07-14 codex round (each a documented deliberate divergence from the
+lift): delivery returns METADATA ONLY — event id + relay success/failed lists, no bearer
+material in return types, and token-bearing types do not derive `Debug`/`Serialize`;
+total relay failure fails closed (`empty output.success ⇒ Err`, with regression — an Ok
+named "Delivered" that nobody received is the mechanism lying); the memory fake is gated
+`#[cfg(any(test, feature = "test-support"))]` (it constructed empty success as a happy
+path — a production-wireable silent no-op); `buyer_pubkey` derives from the delivery
+signing key (sender == buyer in v1; a delegated-sender flow arrives as a designed change);
+the plaintext-exclusion test is structural (unwrap via NIP-59, assert rumor kind 14 +
+decryptability), not substring-only.
+
 ### piece-5 — streamed result-content capture · **STANDARD**
 
 Lift the `engine.rs`/`acp_driver.rs` deltas: AgentMessageChunk text capture → result
@@ -146,6 +157,9 @@ piece-3/4 mechanism libraries deliberately do not:
   the regression test; the SM must not reintroduce unchecked sums.
 - **Canonical-form naming**: the delivery payload's "canonical JSON" is a module-local
   stable form, not RFC 8785 JCS — the SM's wire contract names it accurately.
+- **Partial-relay policy**: total delivery failure (zero relays accepted) fails closed in
+  the piece-4 module itself (codex round 2026-07-14) — the SM owns only the PARTIAL case
+  (some accepted, some failed): retry, multi-relay quorum, and payment-state coupling.
 
 ### piece-7 — git-delivery gate library · **MONEY** · **HOLD**
 
@@ -316,6 +330,13 @@ noted):
    `verify_p2pk_token` in #8; the closing gate is piece-6's swap-on-receive MUST (above);
    spec fix flagged to the spec owner (§4 wants a fifth check or an explicit
    trust-boundary sentence + the swap gate named at settlement).
+9. **Bearer material in return types** (codex #6 round, 2026-07-14): the delivery module
+   returned the full token payload with `Debug`+`Serialize` derived — any success-path log
+   or persistence of the return value writes spendable proofs to disk, and the module's
+   own test fake normalized zero-relay success as a happy path. Standing rule from the
+   ruling: token-bearing types do not derive `Debug`/`Serialize`; APIs whose names claim
+   delivery fail closed on total relay failure. Both fixed in-PR (piece-4 amended
+   acceptance above).
 
 **Sprint state (pieces 3/4/5).** PR #7 (piece-5) READY. PR #8 (piece-3) and PR #6
 (piece-4): mechanical verification, adversarial pass (wrap overflow fixed via
