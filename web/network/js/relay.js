@@ -1,15 +1,31 @@
 import { HISTORY_LIMIT, RELAY_URL, SUBSCRIBE_KINDS } from "../config.js";
 
 /**
- * Minimal NIP-01 client with reconnect + visible connection state.
- * @param {{ onEvent: (ev: unknown) => void, onStatus: (s: ConnectionStatus) => void }} hooks
+ * Single-owner NIP-01 websocket client.
+ * Persistent market subscription + lazy kind-0 profile subscription.
+ * Reconnect: capped exponential backoff, since-cursor resume (no replay flood).
+ *
+ * @param {{
+ *   onEvent: (ev: unknown) => void,
+ *   onStatus: (s: ConnectionStatus) => void,
+ * }} hooks
  */
 export function createRelayClient(hooks) {
   let ws = null;
   let intentionalClose = false;
   let attempt = 0;
   let retryTimer = null;
-  let subId = "mobee-network-1";
+  let subSeq = 0;
+  let marketSubId = "mobee-net-m-0";
+  let profileSubId = "mobee-net-p-0";
+
+  /** @type {number | null} max created_at seen — resume cursor */
+  let sinceCursor = null;
+
+  /** @type {Set<string>} authors we want kind-0 for */
+  const profileAuthors = new Set();
+  /** @type {Set<string>} authors already satisfied (cached upstream) */
+  const profileDone = new Set();
 
   function status(state, detail = "") {
     hooks.onStatus({ state, detail, url: RELAY_URL, attempt });
@@ -33,8 +49,8 @@ export function createRelayClient(hooks) {
     socket.onopen = () => {
       attempt = 0;
       status("connected");
-      const filter = { kinds: [...SUBSCRIBE_KINDS], limit: HISTORY_LIMIT };
-      safeSend(socket, ["REQ", subId, filter]);
+      openMarketSub(socket);
+      openProfileSub(socket);
     };
 
     socket.onmessage = (msg) => {
@@ -42,23 +58,27 @@ export function createRelayClient(hooks) {
       try {
         data = JSON.parse(msg.data);
       } catch {
-        return; // ignore junk frames
+        return;
       }
       if (!Array.isArray(data) || data.length < 1) return;
       const type = data[0];
-      // NIP-42 AUTH challenge: open-read still serves historical REQ — ignore AUTH.
+      // NIP-42 AUTH: open-read still serves REQ — ignore AUTH.
       if (type === "AUTH") return;
-      if (type === "EOSE") return;
+      if (type === "EOSE") return; // keep subscription open for live stream
       if (type === "EVENT" && data[2]) {
         try {
-          hooks.onEvent(data[2]);
+          const ev = data[2];
+          const created = typeof ev?.created_at === "number" ? ev.created_at : null;
+          if (created != null) {
+            sinceCursor = sinceCursor == null ? created : Math.max(sinceCursor, created);
+          }
+          hooks.onEvent(ev);
         } catch {
           // never let a bad handler tear down the socket loop
         }
       } else if (type === "NOTICE") {
-        // stay connected; notices are informational (incl. auth-related)
         status("connected", String(data[1] || ""));
-      } else if (type === "CLOSED" && data[1] === subId) {
+      } else if (type === "CLOSED" && (data[1] === marketSubId || data[1] === profileSubId)) {
         status("disconnected", String(data[2] || "CLOSED"));
         scheduleRetry();
       }
@@ -77,6 +97,59 @@ export function createRelayClient(hooks) {
         status("disconnected", "closed");
       }
     };
+  }
+
+  function openMarketSub(socket) {
+    subSeq += 1;
+    marketSubId = `mobee-net-m-${subSeq}`;
+    /** @type {Record<string, unknown>} */
+    const filter = { kinds: [...SUBSCRIBE_KINDS] };
+    if (sinceCursor != null) {
+      // Inclusive since — store dedupes by id; avoids gaps on same-second events.
+      filter.since = sinceCursor;
+    } else {
+      filter.limit = HISTORY_LIMIT;
+    }
+    safeSend(socket, ["REQ", marketSubId, filter]);
+  }
+
+  function openProfileSub(socket) {
+    const authors = [...profileAuthors].filter((a) => !profileDone.has(a));
+    if (!authors.length) return;
+    subSeq += 1;
+    profileSubId = `mobee-net-p-${subSeq}`;
+    // Cap authors per REQ to keep filter sane; remainder wait for next flush.
+    const batch = authors.slice(0, 100);
+    safeSend(socket, ["REQ", profileSubId, { kinds: [0], authors: batch }]);
+  }
+
+  /**
+   * Request kind-0 for authors not yet resolved. Deduped; no-op if already done/pending.
+   * @param {string[]} pubkeys
+   */
+  function requestProfiles(pubkeys) {
+    let added = false;
+    for (const pk of pubkeys) {
+      if (!pk || typeof pk !== "string") continue;
+      if (profileDone.has(pk) || profileAuthors.has(pk)) continue;
+      profileAuthors.add(pk);
+      added = true;
+    }
+    if (!added || !ws || ws.readyState !== WebSocket.OPEN) return;
+    // CLOSE prior profile sub then reopen with expanded author set.
+    try {
+      safeSend(ws, ["CLOSE", profileSubId]);
+    } catch {
+      /* ignore */
+    }
+    openProfileSub(ws);
+  }
+
+  /** Mark an author as resolved so we stop re-requesting. */
+  function markProfileDone(pubkey) {
+    if (!pubkey) return;
+    profileDone.add(pubkey);
+    profileAuthors.delete(pubkey);
   }
 
   function scheduleRetry() {
@@ -99,7 +172,8 @@ export function createRelayClient(hooks) {
     clearRetry();
     if (ws) {
       try {
-        safeSend(ws, ["CLOSE", subId]);
+        safeSend(ws, ["CLOSE", marketSubId]);
+        safeSend(ws, ["CLOSE", profileSubId]);
       } catch {
         /* ignore */
       }
@@ -113,7 +187,14 @@ export function createRelayClient(hooks) {
     status("disconnected", "manual");
   }
 
-  return { connect, disconnect, getUrl: () => RELAY_URL };
+  return {
+    connect,
+    disconnect,
+    requestProfiles,
+    markProfileDone,
+    getUrl: () => RELAY_URL,
+    getSinceCursor: () => sinceCursor,
+  };
 }
 
 function safeSend(ws, payload) {

@@ -68,7 +68,7 @@ function renderFunnel(f) {
     ]),
     el("p", { class: "meta" }, [
       text(
-        `${f.events} events ingested · ${f.parseSkips} parse skips (malformed dropped)`,
+        `${f.events} events ingested · ${f.profiles || 0} profiles · ${f.parseSkips} parse skips (malformed dropped)`,
       ),
     ]),
   ]);
@@ -162,7 +162,7 @@ function renderCensus(rows) {
     el("tr", {}, [
       td(r.harness_name),
       td(r.version),
-      td(shortId(r.pubkey)),
+      el("td", {}, [authorCell(r.pubkey, r.profile)]),
       td(r.k.join(", ") || "—"),
       td(fmtTime(r.created_at)),
     ]),
@@ -173,7 +173,7 @@ function renderCensus(rows) {
         el("tr", {}, [
           th("harness_name"),
           th("version"),
-          th("pubkey"),
+          th("seller"),
           th("k"),
           th("seen"),
         ]),
@@ -189,7 +189,7 @@ function renderTail(events) {
     const summary = el("button", { class: "tail-row", type: "button" }, [
       el("span", { class: "kind" }, [text(KIND_LABELS[ev.kind] || String(ev.kind))]),
       el("span", { class: "id" }, [text(shortId(ev.id))]),
-      el("span", { class: "pk" }, [text(shortId(ev.pubkey))]),
+      el("span", { class: "pk" }, [authorCell(ev.pubkey, ev.profile)]),
       el("span", { class: "ts" }, [text(fmtTime(ev.created_at))]),
     ]);
     const pre = el("pre", { class: "tail-json hidden" }, [
@@ -202,6 +202,13 @@ function renderTail(events) {
             created_at: ev.created_at,
             tags: ev.tags,
             content: ev.content,
+            profile: ev.profile
+              ? {
+                  name: ev.profile.name,
+                  display_name: ev.profile.display_name,
+                  picture: ev.profile.picture,
+                }
+              : null,
           },
           null,
           2,
@@ -217,6 +224,31 @@ function renderTail(events) {
     list.append(el("p", { class: "meta" }, [text("No events yet.")]));
   }
   return list;
+}
+
+/**
+ * Prefer display_name / name; fall back to short pubkey — never blank.
+ * @param {string} pubkey
+ * @param {{name?:string|null, display_name?:string|null, picture?:string|null}|null} profile
+ */
+function authorCell(pubkey, profile) {
+  const label = profile?.display_name || profile?.name || shortId(pubkey) || "—";
+  const kids = [];
+  if (profile?.picture) {
+    kids.push(
+      el("img", {
+        class: "avatar",
+        src: profile.picture,
+        alt: "",
+        width: "16",
+        height: "16",
+        loading: "lazy",
+        referrerpolicy: "no-referrer",
+      }),
+    );
+  }
+  kids.push(el("span", { class: "author-label", title: pubkey || "" }, [text(label)]));
+  return el("span", { class: "author" }, kids);
 }
 
 /* ——— DOM helpers ——— */

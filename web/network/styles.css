@@ -300,6 +300,28 @@ code {
   font-size: 0.85em;
 }
 
+.author {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.author .avatar {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex: 0 0 auto;
+  background: var(--line);
+}
+
+.author .author-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @media (max-width: 720px) {
   .tail-row {
     grid-template-columns: 1fr 1fr;

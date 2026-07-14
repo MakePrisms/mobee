@@ -24,7 +24,6 @@ function scheduleRender() {
       renderConnection(connNode, conn);
       renderAll(viewsRoot, store.snapshot(), conn);
     } catch (err) {
-      // last-resort: keep page alive
       console.error("render failed", err);
     }
   });
@@ -32,7 +31,13 @@ function scheduleRender() {
 
 const client = createRelayClient({
   onEvent(raw) {
-    store.ingest(parseEvent(raw));
+    const normalized = parseEvent(raw);
+    const { newAuthor } = store.ingest(normalized);
+    if (normalized?.role === "profile") {
+      client.markProfileDone(normalized.pubkey);
+    } else if (newAuthor) {
+      client.requestProfiles([newAuthor]);
+    }
     scheduleRender();
   },
   onStatus(s) {
