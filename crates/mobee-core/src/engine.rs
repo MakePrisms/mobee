@@ -111,6 +111,14 @@ pub async fn run_job<D: Driver>(
     let mut terminal = None;
     while let Some(update) = stream.next().await {
         sink(RunEvent::Update(&update));
+        if let Some(text) = update_text(&update)
+            && !text.trim().is_empty()
+        {
+            log.append(Event::AgentMessage {
+                job_id: job_id.clone(),
+                text,
+            })?;
+        }
         if let SessionUpdate::PermissionRequest(request) = update.clone() {
             let outcome = driver.on_permission(request.clone()).await;
             sink(RunEvent::PermissionDecided {
@@ -160,6 +168,26 @@ fn terminal_status(reason: StopReason) -> JobExecutionStatus {
         StopReason::Completed => JobExecutionStatus::Completed,
         StopReason::Failed => JobExecutionStatus::Failed,
         StopReason::Cancelled => JobExecutionStatus::Cancelled,
+    }
+}
+
+fn update_text(update: &SessionUpdate) -> Option<String> {
+    let text = match update {
+        SessionUpdate::AgentMessage(blocks) => blocks
+            .iter()
+            .filter_map(content_block_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        SessionUpdate::AgentMessageChunk(block) => content_block_text(block).unwrap_or_default(),
+        _ => String::new(),
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+fn content_block_text(block: &ContentBlock) -> Option<String> {
+    match block {
+        ContentBlock::Text { text } => Some(text.clone()),
+        ContentBlock::Artifact(_) => None,
     }
 }
 
@@ -274,6 +302,54 @@ mod tests {
                 status: JobExecutionStatus::Failed
             })
         );
+    }
+
+    #[test]
+    fn agent_message_chunks_are_logged_for_audit() {
+        let script = ScriptedSession {
+            session_id: "session-1".into(),
+            updates: vec![
+                SessionUpdate::AgentMessageChunk(ContentBlock::Text {
+                    text: "hello ".into(),
+                }),
+                SessionUpdate::AgentMessageChunk(ContentBlock::Text {
+                    text: "world".into(),
+                }),
+                SessionUpdate::TurnEnded(StopReason::Completed),
+            ],
+            artifacts: Vec::new(),
+        };
+        let mut driver = MockDriver::new(RuntimeId("mock".into()), vec![script]);
+        let path = test_path("agent-message-log");
+        let mut log = EventLog::open(&path).expect("open log");
+
+        block_on(run_job(
+            &mut driver,
+            &mut log,
+            &JobId("job-1".into()),
+            RunParams::mock_defaults(),
+            &mut |_| {},
+        ))
+        .expect("run job");
+
+        assert!(replay_payloads(&log).iter().any(|event| {
+            matches!(
+                event,
+                Event::AgentMessage {
+                    job_id: JobId(value),
+                    text
+                } if value == "job-1" && text == "hello "
+            )
+        }));
+        assert!(replay_payloads(&log).iter().any(|event| {
+            matches!(
+                event,
+                Event::AgentMessage {
+                    job_id: JobId(value),
+                    text
+                } if value == "job-1" && text == "world"
+            )
+        }));
     }
 
     #[test]

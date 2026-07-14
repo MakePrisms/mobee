@@ -38,6 +38,8 @@ pub enum Event {
     },
     #[serde(rename = "artifact.produced")]
     ArtifactProduced { artifact_id: ArtifactId },
+    #[serde(rename = "agent.message")]
+    AgentMessage { job_id: JobId, text: String },
     #[serde(rename = "receipt.signed")]
     ReceiptSigned { receipt_id: ReceiptId },
 }
