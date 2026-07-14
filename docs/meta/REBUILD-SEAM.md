@@ -355,6 +355,28 @@ mint-equality mechanism; see piece-6 note); **secret intake is env/file, never a
 (the c2 rig-delta finding made permanent: `--key`-style argv secrets are refuse-class in
 the rebuilt CLI).
 
+**UX spec (design-banked, NOT chartered — operator intake gudnuf 2026-07-14; protocol train
+keeps priority).** Buyer MCP manages keys + money under the **ALLOWANCE-NOT-BANK** principle:
+- **First-run autogen**: MCP generates its own Nostr key + a local cashu wallet at `~/.mobee/`
+  (env override). No human key-paste ever (the 7/14 kit bug: a leaked privkey came from a
+  human pasting it — the product must make that unnecessary, not merely discouraged).
+- **Human money actions = only two**: fund via a Lightning invoice + set **budget caps**
+  (per-job max + total max, **MCP-enforced**). The agent spends freely *inside* the caps,
+  never past them.
+- **Per-job minting inside the piece-6 pay flow** (never a manual mint-token step by the human).
+- **Vetted mint list** default (testnut + the piece-6 allowlist policy).
+- **`setup_wallet` tool** for conversational first-run.
+- **Packaging**: prebuilt binary + zero-arg `claude mcp add` (nix / brew / cargo-dist; MCP
+  bundle for Desktop later). No build/mint inside the process Claude launches for MCP.
+
+**MCP transport acceptance (kit-bug lesson made permanent).** MCP stdio is **newline-delimited
+JSON-RPC in BOTH directions** (read + write); diagnostics stderr-only; **no `Content-Length` /
+LSP framing** on responses. Regression: an `initialize` over newline-delimited stdio returns a
+single newline-delimited JSON-RPC result. (The spike's `write_mcp_response` emitted
+`Content-Length` and hung Claude Code's MCP client — healthy server, unreadable framing;
+uncaught because the spike never drove the server through Claude Code's MCP client. Never
+re-copy the Content-Length framing.)
+
 **Ordering logic.** 3/4/5 are independent extractions (any interleave is fine; 3 first —
 highest money leverage, no dependency on PR #5, unblocks 6). 6 needs 1+2+3+4. 7 trails the
 live spec on purpose. 8 is last because the skin can only be thin once core owns the policy.
