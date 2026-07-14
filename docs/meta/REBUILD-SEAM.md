@@ -131,8 +131,15 @@ piece-3/4 mechanism libraries deliberately do not:
 - **NUT-07 wire contract named**: who fetches proof state and when (caller-injected map vs
   composed fetch+verify) is an explicit, documented decision with a freshness bound —
   not an accident of signatures.
-- **Duplicate-proof guard**: identical proof `y` values must not double-count toward the
-  sum (test with a duplicated proof).
+- **Duplicate-proof guard**: fixed at mechanism level in #8 (duplicate `y`/secret rejected
+  before summing, regression in-PR — codex HIGH, 2026-07-14); the SM must not reintroduce
+  unchecked aggregation.
+- **Authenticity gate (MUST)**: the seller receive path SWAPS received proofs at the mint
+  (or fully crypto-verifies them: retained `C` + keyset + DLEQ) before the payment state
+  advances past *delivered*. `verify_p2pk_token` Ok is presented-proof checking only —
+  lock/amount/mint/spend-state — NOT redeemability; swap-on-receive is the authenticity +
+  exclusive-custody gate the mint itself enforces (codex HIGH-2; regression target:
+  Temper's inflated-amount token built on a real unspent `y`).
 - **Mint-URL comparison normalization**: define exact-match vs normalized (trailing slash,
   case, port) and test both sides of the decision.
 - **Token-sum arithmetic is checked** (`checked_add`, no wrap) — the #8 in-PR fix carries
@@ -173,7 +180,8 @@ Acceptance: `buyer_mcp_tool_schema_exposes_exact_v0_surface` +
 core-backed implementation; review asserts `cli.rs` carries no policy (parse/wire/print
 only); nix "boring targets" build; **testnut triple-gate semantics preserved end-to-end**
 (mint-token refusal + offer/options/token binds, with the fund-isolation test at this
-policy layer — see piece-6 note); **secret intake is env/file, never argv**
+policy layer — the testnut-allowlist gate, deliberately distinct from wallet.rs's
+mint-equality mechanism; see piece-6 note); **secret intake is env/file, never argv**
 (the c2 rig-delta finding made permanent: `--key`-style argv secrets are refuse-class in
 the rebuilt CLI).
 
@@ -301,6 +309,13 @@ noted):
    interruption.
 7. Repo commits carry git identities, not nostr identities — the receipt is the binding
    between seller pubkey and paid commit. Marketplace attribution UX note.
+8. **Proof authenticity is unverified in BOTH the spike code and spec §4's locked
+   four-check verify** (codex + Temper, 2026-07-14): a spec-conformant verifier accepts an
+   inflated-amount token built on a real unspent `y` — sum/mint/lock/NUT-07 all pass while
+   redeemable value ≠ presented value. Mechanism boundary documented on
+   `verify_p2pk_token` in #8; the closing gate is piece-6's swap-on-receive MUST (above);
+   spec fix flagged to the spec owner (§4 wants a fifth check or an explicit
+   trust-boundary sentence + the swap gate named at settlement).
 
 **Sprint state (pieces 3/4/5).** PR #7 (piece-5) READY. PR #8 (piece-3) and PR #6
 (piece-4): mechanical verification, adversarial pass (wrap overflow fixed via
