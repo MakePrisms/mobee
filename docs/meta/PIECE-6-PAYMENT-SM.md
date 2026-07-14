@@ -245,8 +245,22 @@ the module cut drawn now becomes the crate cut then. **Do not crate-split during
   recovered-`Intent` test asserts `reconcile(attempt_id)` is INVOKED and yields the existing
   lock (honest forward recovery) — not merely that the counter ≤ 1, since a refuse-always impl
   also gives ≤ 1 and must not pass as recovery.**
-- WAL ordering: fsync-before-side-effect enforced; torn/malformed journal tail ⇒ fail-closed
-  refusal on replay (not truncate-as-success).
+- **Journal durability — the WAL crash-safe claim (codex deep + Temper, 3 HIGH; each a
+  non-vacuous RED→GREEN regression on the pre-fix head `728ef628`):**
+  - **WAL ordering:** fsync-before-side-effect (Intent synced before the mint effect).
+  - **Replay durable before any effect:** after `replay()` under the Guard, fsync the journal
+    *before* firing an effect — a record another process wrote but never `sync_all`'d must not
+    drive a mint (power loss then drops the record). Provable via a sync-observing test hook.
+  - **Newline = commit marker:** a non-empty journal whose tail is a complete JSON record with
+    **no terminating `\n`** is **uncommitted → Corrupt / fail-closed** (a crash between
+    `to_writer` and the newline+fsync must not yield a "committed" `Sent`). Hermetic; the prior
+    torn-tail test (malformed JSON only) was vacuous for this case. Per-record length/checksum
+    is an acceptable stronger form.
+  - **Parent-dir fsync on create:** first journal creation fsyncs the parent directory before
+    any side effect, so power loss can't drop the dir entry (vanished journal → re-mint/re-send).
+  - Honesty: findings 1 & 3 bite only under *real power loss* (OS page cache survives a process
+    crash, so kill-9 won't show them) — but the charter is crash-**SAFE**, fsync discipline is
+    what makes this a WAL not a log, and we fix it before PR2 copies the pattern.
 - Recovery suite by state: Intent-no-lock → reconcile; recovered-`Locked` → refuse auto-send;
   `Sent`-no-receipt → republish receipt only; `ReceiptPublished` → idempotent return.
 - Total-send failure: empty `relay_success` ⇒ stays Locked (does not advance to Sent);
