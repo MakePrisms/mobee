@@ -338,11 +338,57 @@ noted):
    delivery fail closed on total relay failure. Both fixed in-PR (piece-4 amended
    acceptance above).
 
-**Sprint state (pieces 3/4/5).** PR #7 (piece-5) READY. PR #8 (piece-3) and PR #6
-(piece-4): mechanical verification, adversarial pass (wrap overflow fixed via
-`checked_add` + regression; cashu stack pinned `=0.17.2` to the reviewed surface;
-gift-wrap plaintext-exclusion test added with non-vacuous control), and suite-verified
-hold clears all green — awaiting the codex cold leg (coordinator's call) and the operator
-gate. #6 remains stacked on #5 (retarget after #5 merges). Piece-5 inventory erratum
-absorbed: the delta requires two 2-line enum variants (`driver/acp.rs`, `event.rs`) beyond
-the row's named files — inseparable, documented in PR #7.
+**Sprint state (pieces 3/4/5).** All four through the money bar and in the operator queue:
+PR #5 (piece-2 gateway types) · PR #7 (piece-5 capture, STANDARD) · PR #6 (piece-4
+delivery, ready **stacked on #5** — retargets to main after #5 merges, that retarget commit
+carrying `.gitignore` refuse-#10 + the `canonical_json` public-signature tightening) · PR
+#8 (piece-3 wallet, ready). Every money-class PR passed independent-verifier mechanical
+re-run + composition diff-read + Temper adversarial + codex deep; each fix a documented
+deliberate divergence (`checked_add` + overflow regression de-vacuumed, cashu stack pinned
+`=0.17.2`, dup-`y`/secret guard, trust-boundary rustdoc, metadata-only delivery returns,
+fail-closed total-relay-failure, cfg-gated memory fake, derived `buyer_pubkey`, structural
+NIP-59 leak test). Piece-5 inventory erratum absorbed: the delta requires two 2-line enum
+variants (`driver/acp.rs`, `event.rs`) beyond the row's named files — inseparable,
+documented in PR #7.
+
+---
+
+## Deferred problems (the to-do — named, not solved)
+
+Named here because they are real and out of v1 scope by explicit operator decision — not
+because they are closed. A future round picks each up from this list.
+
+### DP-1 — fair exchange: buyer fetches work before paying
+
+**Status:** gudnuf-ruled 2026-07-14. v1 keeps **plaintext fetch-before-pay** (shape (a)) —
+the buyer resolves and reads the git deliverable before `authorize_pay`. This is the
+documented, c2-proven money invariant (§2.5, [RUNS-C2.md](RUNS-C2.md)).
+
+**The problem (gudnuf's words: "remember this will be a problem later"):** fetch-before-pay
+is fine while prices are tiny (testnut, 1 sat) — the buyer's incentive to fetch-then-decline
+is negligible. At **real prices it is real exposure**: a buyer can acquire the deliverable
+and refuse to pay, and the seller has already surrendered the work. Fair exchange wants the
+opposite — work acquirable only *after* payment, and never lost by the honest party.
+
+**Designed fix (reserved, not built):** encrypted delivery over the **NIP-17 key rail** — the
+seller delivers the work encrypted; the decryption key is released only against payment, so
+neither party can strand the other. **PoPs escrow** covers the symmetric half (buyer's funds
+committed before the seller commits the key). The result envelope **reserves the schema slot
+now** so the flip never changes envelope shape (metadex, v1 values):
+
+```json
+{ "delivery_mode": "plaintext-fetch-before-pay",
+  "encrypted_delivery_supported": false,
+  "encrypted_delivery_required": false }
+```
+
+The later flip changes `delivery_mode` + flags, not the envelope shape. Until then §2.5
+fetch-before-pay stands as the v1 invariant; this entry is the tracked to-do against it.
+
+### DP-2 — proof authenticity at real value (see addendum finding 8)
+
+Deferred only in the sense that the closing gate is **piece-6's** swap-on-receive MUST, not
+yet built; and **spec §4** shares the gap (HIGH-for-spec, spec owner). At testnut the
+inflated-amount attack costs nothing; at real value it is the same class of exposure as
+DP-1. Do not narrate "money-safe at real value" until both the code gate (piece-6) and the
+spec sentence (§4) land.
