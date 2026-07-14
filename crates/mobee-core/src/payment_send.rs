@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PaymentPayload {
     pub job_id: String,
     pub result_id: String,
@@ -11,6 +11,12 @@ pub struct PaymentPayload {
     #[cfg(feature = "wallet")]
     pub token: cashu::Token,
     pub seller_pubkey: String,
+}
+
+impl fmt::Debug for PaymentPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PaymentPayload(<redacted>)")
+    }
 }
 
 impl PaymentPayload {
@@ -169,10 +175,11 @@ impl PaymentSend for NostrPaymentSend {
 
         let output = client
             .send_event_to([self.relay.as_str()], &gift_wrap)
-            .await
-            .map_err(|error| {
-                PaymentSendError::Transport(format!("failed to send NIP-17 payment: {error}"))
-            })?;
+            .await;
+        client.disconnect().await;
+        let output = output.map_err(|error| {
+            PaymentSendError::Transport(format!("failed to send NIP-17 payment: {error}"))
+        })?;
 
         payment_sent(
             output.val.to_string(),
@@ -320,6 +327,26 @@ mod tests {
         assert_eq!(delivered.relay_success, ["memory://payment-send"]);
         assert!(delivered.relay_failed.is_empty());
         assert_eq!(delivery.payments(), &[delivered]);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn payment_payload_debug_redacts_bearer_token_and_proof_secret() {
+        let payload = payload();
+        let token_debug = format!("{:?}", payload.token);
+        let payload_debug = format!("{payload:?}");
+
+        assert!(
+            token_debug
+                .contains("9a6dbb847bd232ba76db0df197216b29d3b8cc14553cd27827fc1cc942fedb4e"),
+            "negative control lost the known proof secret"
+        );
+        assert!(!payload_debug.contains(VALID_CASHU_TOKEN));
+        assert!(
+            !payload_debug
+                .contains("9a6dbb847bd232ba76db0df197216b29d3b8cc14553cd27827fc1cc942fedb4e")
+        );
+        assert_eq!(payload_debug, "PaymentPayload(<redacted>)");
     }
 
     #[test]
