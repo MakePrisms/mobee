@@ -338,9 +338,12 @@ Rebuild the binary surface as adapters over core: gateway subcommands + `BuyerMc
 exposing exactly the locked v0 five tools (post_job, get_job, accept_claim, authorize_pay,
 confirm_receipt). Lands the locked arch decisions that only make sense here: honest sync
 (kill faux-async `block_on`, issue `77c5ae79…`), `job_id`→`execution_id` spine rename
-(issue `9f9e9d0f…`), and the **targeting-seam alignment** (buyer-MCP posts untargeted;
-seller gateway claims only targeted — STATE.md known issue; checkpoint (c) may settle it
-earlier). Depends on all prior pieces.
+(issue `9f9e9d0f…`), and the **targeting-seam alignment** — RESOLVED
+direction (coordinator / NIP-89-open ruling 2026-07-14, confirmed live: gudnuf's test-kit job
+posted with **no p-tag**, correctly): buyers naturally post **untargeted (open)** offers, so
+**sellers claim open/untargeted offers** (price / amount / testnut-mint caps unchanged,
+fail-closed money rules identical) rather than targeted-only. Piece-8's seller adopts the
+open-offer default; the spike's targeted-only filter is what to loosen. Depends on all prior pieces.
 
 Acceptance: `buyer_mcp_tool_schema_exposes_exact_v0_surface` +
 `buyer_mcp_authorize_pay_requires_acceptance_and_observed_result` +
