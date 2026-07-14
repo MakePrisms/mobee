@@ -3,7 +3,8 @@ use std::fmt;
 use std::str::FromStr;
 
 use cashu::{
-    Amount, CheckStateRequest, MintUrl, ProofState, PublicKey, SpendingConditions, State, Token,
+    Amount, CheckStateRequest, CurrencyUnit, MintUrl, ProofState, PublicKey, SpendingConditions,
+    State, Token,
 };
 use cdk::wallet::MintConnector;
 
@@ -12,17 +13,21 @@ use cdk::wallet::MintConnector;
 pub struct TradeLock {
     pub mint: MintUrl,
     pub amount: Amount,
+    pub unit: CurrencyUnit,
     pub seller_lock: PublicKey,
 }
 
 /// Metadata proven by [`verify_trade_p2pk`].
 ///
 /// This is a trade-binding and spend-state result, not an authenticity or
-/// redeemability claim. The seller still owns the swap-on-receive gate.
+/// redeemability claim. The reported value is UNTRUSTED until a successful
+/// mint swap or full keyset + DLEQ verification. The seller still owns that
+/// receive-side authenticity gate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedPayment {
     pub mint: MintUrl,
     pub amount: Amount,
+    pub unit: CurrencyUnit,
     pub proof_ys: Vec<PublicKey>,
 }
 
@@ -31,6 +36,10 @@ pub enum WalletVerifyError {
     InvalidToken(String),
     AmountMismatch { expected: Amount, actual: Amount },
     MintMismatch { expected: MintUrl, actual: MintUrl },
+    UnitMismatch {
+        expected: CurrencyUnit,
+        actual: Option<CurrencyUnit>,
+    },
     LockMismatch { expected: PublicKey },
     DuplicateProofY(PublicKey),
     DuplicateState(PublicKey),
@@ -49,8 +58,15 @@ impl fmt::Display for WalletVerifyError {
             Self::MintMismatch { expected, actual } => {
                 write!(f, "mint mismatch: expected {expected}, got {actual}")
             }
+            Self::UnitMismatch { expected, actual } => match actual {
+                Some(actual) => write!(
+                    f,
+                    "currency unit mismatch: expected {expected}, got {actual}"
+                ),
+                None => write!(f, "currency unit mismatch: expected {expected}, got none"),
+            },
             Self::LockMismatch { expected } => {
-                write!(f, "P2PK lock does not contain seller key {expected}")
+                write!(f, "P2PK lock does not match seller key {expected}")
             }
             Self::DuplicateProofY(y) => write!(f, "duplicate proof y {y}"),
             Self::DuplicateState(y) => write!(f, "duplicate NUT-07 state for proof {y}"),
@@ -108,6 +124,14 @@ pub fn verify_trade_p2pk(
         });
     }
 
+    let actual_unit = token.unit();
+    if actual_unit.as_ref() != Some(&lock.unit) {
+        return Err(WalletVerifyError::UnitMismatch {
+            expected: lock.unit.clone(),
+            actual: actual_unit,
+        });
+    }
+
     require_seller_lock(token, lock.seller_lock)?;
 
     let proof_ys = token_ys(token)?;
@@ -117,6 +141,7 @@ pub fn verify_trade_p2pk(
     Ok(VerifiedPayment {
         mint: actual_mint,
         amount: actual_amount,
+        unit: lock.unit.clone(),
         proof_ys,
     })
 }
@@ -289,6 +314,7 @@ mod tests {
             Ok(VerifiedPayment {
                 mint: mint(MINT),
                 amount: Amount::from(7),
+                unit: CurrencyUnit::Sat,
                 proof_ys: ys,
             })
         );
@@ -323,6 +349,21 @@ mod tests {
             Err(WalletVerifyError::NotUnspent {
                 state: State::Spent,
                 ..
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_equal_numeric_amount_in_wrong_currency_unit() {
+        let seller = public_key(1);
+        let token = token_with_unit(MINT, vec![proof(7, seller, 7)], CurrencyUnit::Msat);
+        let ys = token_ys(&token).unwrap();
+
+        assert!(matches!(
+            verify_trade_p2pk(&token, &trade_lock(MINT, 7, seller), &unspent(&ys)),
+            Err(WalletVerifyError::UnitMismatch {
+                expected: CurrencyUnit::Sat,
+                actual: Some(CurrencyUnit::Msat),
             })
         ));
     }
@@ -475,12 +516,17 @@ mod tests {
         TradeLock {
             mint: mint(mint_url),
             amount: Amount::from(amount),
+            unit: CurrencyUnit::Sat,
             seller_lock,
         }
     }
 
     fn token(mint_url: &str, proofs: Vec<Proof>) -> Token {
-        Token::new(mint(mint_url), proofs, None, CurrencyUnit::Sat)
+        token_with_unit(mint_url, proofs, CurrencyUnit::Sat)
+    }
+
+    fn token_with_unit(mint_url: &str, proofs: Vec<Proof>, unit: CurrencyUnit) -> Token {
+        Token::new(mint(mint_url), proofs, None, unit)
     }
 
     fn mint(url: &str) -> MintUrl {
