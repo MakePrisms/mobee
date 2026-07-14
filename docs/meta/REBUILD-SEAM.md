@@ -58,6 +58,23 @@ Landed / in flight:
 - **piece-2 ⏳ open** — gateway protocol types (PR #5 @ `c0e604c`; hermetic, fail-closed
   targeting, nostr builder feature-gated; scope explicitly excludes CLI/money). Awaiting
   gudnuf. STANDARD (types only, no money movement).
+  - **#5 operator-review, item 2 (BLOCKING merge, in flight 2026-07-14):** drop the public
+    testnut constructor surface from the library API — remove `pub TESTNUT_MINT_URL` +
+    `OfferDraft::testnut`/`::untargeted_testnut`; `OfferDraft::new`/`untargeted` take an
+    explicit `mint_url`; the testnut URL lives only in `#[cfg(test)]` fixtures; mint policy
+    stays out of gateway types. (This item rotted after a 01:38 claim was pulled onto
+    checkpoint-c — recorded here so it can't rot silently again.)
+  - **piece-2.1 follow-ups (gudnuf #5 review items 1 & 3, NOT merge-blocking, tracked so
+    they don't rot):** (1) an **SDK-boundary conversion pass** — where gateway types cross
+    into/out of the SDK surface, make the conversion explicit and tested; (3) **per-kind
+    draft structs** — replace the single `EventDraft`/`OfferDraft` shape with per-kind draft
+    types so each event kind's required fields are type-enforced, not runtime-checked.
+    Class STANDARD; own PR(s) after #5 merges.
+  - **#6 stack note:** removing the testnut constructors changes piece-2's API; PR #6
+    stacks on this branch and `delivery.rs` tests may reference the testnut constructors, so
+    whoever lands the #5 item-2 fix confirms #6's stack still compiles (or flags it as a
+    retarget-time fix). This is now a standing condition on #6's retarget (alongside
+    `.gitignore` refuse-#10 + the `canonical_json` public-signature tightening).
 
 Then, in order:
 
