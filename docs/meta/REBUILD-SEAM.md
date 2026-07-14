@@ -124,6 +124,28 @@ signing key (sender == buyer in v1; a delegated-sender flow arrives as a designe
 the plaintext-exclusion test is structural (unwrap via NIP-59, assert rumor kind 14 +
 decryptability), not substring-only.
 
+### piece-4.1 — payment-send rename + typed-Token harden · **STANDARD** (rename) / **MONEY** (typing)
+
+Operator note (mobee-meta, 2026-07-14): "delivery" is overloaded — git-delivery is the
+**work product**, the Cashu NIP-17 path is **payment send**, not fulfillment. Two follow-ups
+on the landed piece-4 (behavior unchanged by either — #6 lands its mechanism as-is):
+
+1. **Rename (STANDARD, mechanical):** `token delivery → payment send` across the module —
+   `deliver_token → send_payment`, `TokenDelivery → PaymentSend`, `TokenDeliveryPayload →
+   PaymentPayload`, `DeliveredToken → PaymentSent` (metadata-only return unchanged). SM
+   vocabulary `intent → locked → sent → receipt-published → closed`; no "token delivered"
+   anywhere. Land as an immediate 4.1 rename PR after #6 merges (don't churn the
+   review-ready PR), or fold if gudnuf requests it inline during #6 review.
+2. **Typed-Token harden (MONEY):** payload holds `cashu::Token` (+ `MintUrl`/`Amount`)
+   in-process, not `token: String` — the stringly field is what let c2's corrupt token
+   reach the wire (finding 10). Serialize `Token → cashuA/cashuB` only at the NIP-17
+   envelope boundary; seller parses `Token` first, fail-closed, before the SM advances.
+   Correlation fields (job_id, result_id, pubkeys) stay mobee newtypes. Wire helpers behind
+   `wallet`/`gateway+wallet` so default builds stay cashu-free. This is the **type-level
+   form of finding 10's pre-publish guard** — corruption becomes unconstructable, not merely
+   caught. Couples payment_send to cashu `=0.17.2` (already pinned on #8); accepted.
+   Lands as piece-6 intake (the payment SM owns the typed payload).
+
 ### piece-5 — streamed result-content capture · **STANDARD**
 
 Lift the `engine.rs`/`acp_driver.rs` deltas: AgentMessageChunk text capture → result
@@ -367,7 +389,11 @@ noted):
     token merely blocks; at real value an *attacker-crafted* malformed-but-plausible token is
     a worse class — this guard is the buyer-side sibling of the seller's swap-on-receive
     (finding 8). Both builders independently converged on this fix; recorded so the rebuild
-    inherits it as a gate, not a one-trade patch.
+    inherits it as a gate, not a one-trade patch. **Root-cause fix (mobee-meta, 2026-07-14):
+    the payload should hold a typed `cashu::Token`, not a `String` (piece-4.1 typed-Token
+    harden) — the type makes the corrupt token unconstructable, subsuming this runtime guard.
+    The `Funded→Delivered` transition is renamed `Locked→Sent` per the payment-send
+    vocabulary.**
 
 **Sprint state (pieces 3/4/5).** All four through the money bar and in the operator queue:
 PR #5 (piece-2 gateway types) · PR #7 (piece-5 capture, STANDARD) · PR #6 (piece-4

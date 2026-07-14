@@ -33,27 +33,41 @@ behavior, gives it a spine.
 
 ## State machine
 
-One explicit type. States and the ONLY legal transitions:
+One explicit type. States and the ONLY legal transitions (operator-locked vocabulary —
+"delivery" means the *work product* (git-delivery); the money leg is **payment send**, never
+"delivered"):
 
 ```
-Intent  ──mint/lock──►  Funded  ──deliver──►  Delivered  ──publish──►  ReceiptPublished  ──►  Closed
-   │                                                                                            
+Intent  ──mint/lock──►  Locked  ──send──►  Sent  ──publish──►  ReceiptPublished  ──►  Closed
+   │                                                                                          
    └── every transition is journaled write-ahead (flock + fsync) BEFORE its side effect ──┘
 ```
 
 - **Intent** — durably recorded (write-ahead) *before* any token is minted or spent. Holds
   the full idempotency key (below). This is the fix for scar #1: the record exists before
   the pay, so a crash-after-pay is recoverable, not a re-pay.
-- **Funded** — token minted/locked to the seller (verify-not-spend; the gateway holds only
+- **Locked** — token minted/locked to the seller (verify-not-spend; the gateway holds only
   the public half).
-- **Delivered** — token handed to the seller over the private DM path (piece-4); **total
-  delivery failure fails closed** (piece-4's empty-relay-success ⇒ Err — a token that
-  reached zero relays is not delivered).
+- **Sent** — payment token sent to the seller over the private NIP-17 DM path (piece-4,
+  `payment_send`); **total send failure fails closed** (piece-4's empty-relay-success ⇒ Err
+  — a token that reached zero relays is not sent).
 - **ReceiptPublished** — buyer-authored co-signed receipt on the relay.
 - **Closed** — receipt observed/confirmed.
 
 `pay_seller` fires **exactly once** across retry / crash / concurrent invocation. The
 merge gate proves it with a stubbed pay-counter (SPIKE_LESSONS).
+
+**Payment payload is typed, not stringly (operator intake, 2026-07-14 — the type-level fix
+for finding 10 / the c2 corruption):** in-process the payload holds `cashu::Token` (plus
+`MintUrl`/`Amount` where they fit), **not** a bare `String`; correlation fields (job_id,
+result_id, buyer/seller pubkeys) stay mobee types/newtypes (cashu doesn't own those). The
+token serializes to its canonical `cashuA`/`cashuB` string **only** at the NIP-17 envelope
+boundary, and the seller **parses `Token` first, fail-closed, before the SM advances** (this
+is the Locked→Sent pre-publish guard AND the receive-side gate, enforced by the type instead
+of a hand-rolled string check). Wire helpers stay behind the `wallet` (or `gateway+wallet`)
+feature so default builds never link cashu — same discipline as verify. Tradeoff: couples
+`payment_send` to the cashu version already pinned `=0.17.2` on #8; accepted — one `Token`
+type across mint/verify/send/receive beats re-parsing strings at every hop.
 
 ## Write-ahead journal
 
@@ -64,7 +78,7 @@ merge gate proves it with a stubbed pay-counter (SPIKE_LESSONS).
   append-after-pay.
 - **Recovery is explicit, not incidental:** on any re-entry, load the journal, resolve the
   job's state, and act by state — `Intent` with no confirmed pay → reconcile against the
-  mint/relay before deciding; `Funded`/`Delivered` with no receipt → resume forward
+  mint/relay before deciding; `Locked`/`Sent` with no receipt → resume forward
   (republish, never re-pay); `ReceiptPublished` → idempotent return. The "paid but no
   record" case is a hard refuse, exactly as the spike does.
 - **Injectable journal trait** (SPIKE_LESSONS SHOULD): FS-JSONL for the demo, an interface
@@ -81,14 +95,24 @@ merge gate proves it with a stubbed pay-counter (SPIKE_LESSONS).
 - **`wallet`** (piece-3): token verification mechanism — `verify_p2pk_token`
   (lock/amount/mint/spend-state of *presented* proofs). **Its trust boundary is explicit
   (piece-3 rustdoc): `Ok ≠ redeemable`.**
-- **`delivery`** (piece-4): token delivery, fail-closed on total relay failure,
-  metadata-only returns.
+- **`payment_send`** (piece-4, renamed from "token delivery"): payment token send over
+  NIP-17, fail-closed on total relay failure, metadata-only returns (`PaymentSent`), typed
+  `cashu::Token` in-process.
 - **`receipt`** (piece-1): H-tuple, dual-Schnorr.
+- **`buyer` / `seller` (role-specific SM modules):** the payment SM composes with role state
+  — the buyer drives offer→accept→pay→receipt; the seller drives claim→work→result→receive.
+  Shared protocol/money mechanisms (gateway/wallet/payment_send/receipt) sit under both.
+
+**Crate boundary (operator, 2026-07-14):** near-term these are all **modules** in
+`mobee-core` + thin CLI/MCP skins. Promote `buyer`/`seller` to `mobee-buyer` / `mobee-seller`
+**crates** only when nix wants distinct installables — the module boundary drawn now becomes
+the crate cut then. **Do not crate-split mid #6/#8**; keep the cut clean at the module level
+so the later split is mechanical.
 
 ## Inherited gates (baked in from tonight's reviews — each a named MUST)
 
 - **Authenticity gate (codex #8 HIGH-2, the one that closes the real hole):** before the SM
-  advances past **Delivered/receive**, the seller path **swaps the received proofs at the
+  advances past **Sent/receive**, the seller path **swaps the received proofs at the
   mint** (or fully crypto-verifies: retained `C` + keyset + DLEQ). `verify_p2pk_token`
   checks presented proofs only; NUT-07 "unspent" is advisory, not authenticity. Regression
   target: **Temper's inflated-amount token** built on a real unspent `y` — sum/mint/lock/
@@ -116,7 +140,9 @@ merge gate proves it with a stubbed pay-counter (SPIKE_LESSONS).
   fail-closed.
 - Hash-bind failures reject **before** pay.
 - Authenticity: inflated-amount-on-real-`y` fails closed at the swap gate.
-- Delivery: zero-relay-success ⇒ the SM does not advance to Delivered.
+- Payment send: zero-relay-success ⇒ the SM does not advance to Sent.
+- Payment payload holds typed `cashu::Token` in-process; a non-parseable token cannot be
+  constructed into the payload (the type-level form of finding 10's pre-publish guard).
 - Forged-receipt rejection (author + signatures, not tags); empty `relay_success` = failure.
 - No-wallet build: no pay path compiles.
 - `cli.rs` carries no payment policy (parse/wire/print only).
