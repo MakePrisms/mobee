@@ -79,14 +79,18 @@ Landed / in flight:
 
 Then, in order:
 
-### piece-3 — trade-verification policy over cashu types · **MONEY** · **CDK-FIRST · COMPOSED-DONE @ `5c596a69`**
+### piece-3 — trade-verification policy over cashu types · **MONEY** · **CDK-FIRST · ✅ MERGED to main @ `dee436e` (#8)**
 
 Superseded the original "lift `wallet.rs` mirrors" plan (operator direction + cdk-surface
 map, 2026-07-14, all source-verified at cdk/cashu `=0.17.2`). PR #8 lifted hand-rolled
 mirrors of things the `cashu` crate already owns; the rework **deletes the mirrors** and
-keeps Mobee to trade policy only. The rework landed in place on PR #8 (**COMPOSED-DONE
-2026-07-14 @ `5c596a69`**, draft + frozen, merge = gudnuf) — mirrors gone, Mobee holds only
-trade policy; the four fix-window items below are all verified on that head.
+keeps Mobee to trade policy only. The rework landed in place on PR #8 (**MERGED to main
+2026-07-14, squash `dee436e`**) — mirrors gone, Mobee holds only trade policy; the four
+fix-window items below all verified on the behavior-CLEAR head `5c596a69`, then a docs-only
+comment trim (operator hygiene ask: minimal API-contract rustdoc, trap knowledge in tests +
+PR body) landed at `172cdeda` and merged. `verify_trade_p2pk` + the typed `CurrencyUnit`
+`TradeLock`/`VerifiedPayment` are now **main API surface** (the offer-unit → `TradeLock.unit`
+wiring is the #6 residual, landing against these real types).
 
 **DELETE from Mobee (each has an exact `cashu` source-of-truth):**
 - `P2pkSecret` / `parse_p2pk_secret` / `p2pk_secret_json` → `cashu` `nut10::Secret` +
@@ -482,13 +486,15 @@ noted):
     once typed).
 
 **Sprint state (current 2026-07-14).** MERGED to main: PR #5 (piece-2 gateway types,
-`46499b5`) · PR #7 (piece-5 capture, `91adf41`). **PR #8** (piece-3) **COMPOSED-DONE
-2026-07-14** at `5c596a69ade73656b1409a16876f336907e925dc` — CDK-first `verify_trade_p2pk`
-over cashu types (mirrors deleted); four fix-window items verified (strict per-proof
-seller-lock · currency-unit bind · rustdoc trust-notch · no-DB dep-graph); Temper #8 final
-re-pass CLEAR + Anvil rev-parse triple-match + gh head-confirm; draft + frozen, un-draft +
-merge = gudnuf alone. HELD for money-shape rework: **PR #6** (piece-4) — the rename +
-typed-`Token` rework before merge (operator override — see #6 REWORK section). Separate: PR #9 (network
+`46499b5`) · PR #7 (piece-5 capture, `91adf41`) · **PR #8** (piece-3) **✅ MERGED
+2026-07-14** (squash `dee436e`) — CDK-first `verify_trade_p2pk` over cashu types (mirrors
+deleted); four fix-window items verified on behavior-CLEAR head `5c596a69` (strict per-proof
+seller-lock · currency-unit bind · rustdoc trust-notch · no-DB dep-graph; Temper CLEAR +
+Anvil rev-parse + gh confirm), then a docs-only comment-trim hygiene pass (`172cdeda`,
+verified comment-only vs `5c596a69`, trap knowledge moved to tests) merged by gudnuf.
+IN REWORK: **PR #6** (piece-4) — rename → `payment_send` + typed-`Token`; metadex
+**rebasing onto current main (`dee436e`)** (foreground / critical path) before push → Temper
+money-bar on the rebased tip → my composition (see #6 REWORK section). Separate: PR #9 (network
 observatory, STANDARD) COMPOSED-DONE + un-drafted for gudnuf. Every money PR runs the full
 bar: independent-verifier mechanical + composition diff-read + Temper adversarial + codex
 deep; each fix a documented deliberate divergence. Piece-5 inventory erratum absorbed: the

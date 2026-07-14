@@ -9,11 +9,12 @@ piece at a time**, distilled from the spike (`spike/full-loop @ 0e77669`) — th
 source material, not a destination. The seam map ([REBUILD-SEAM.md](REBUILD-SEAM.md)) is the
 working plan.
 
-Merged to main: piece-1 (format + receipt, `b5003d4`, PR #2) and piece-2 (gateway protocol
-types, PR #5, merged `46499b5`). Through the full money bar and in the operator queue:
-piece-5 (PR #7, STANDARD), piece-3 (PR #8, **COMPOSED-DONE @ `5c596a69`** — CDK-first trade
-verification, draft + frozen for gudnuf's merge), piece-4 (PR #6, HELD for the rename +
-typed-`Token` rework before merge).
+Merged to main: piece-1 (format + receipt, `b5003d4`, PR #2), piece-2 (gateway protocol
+types, PR #5, `46499b5`), piece-5 (capture, PR #7, `91adf41`), and **piece-3 (CDK-first trade
+verification, PR #8, squash `dee436e`)**. In rework: piece-4 (PR #6) — rename → `payment_send`
++ typed-`Token`; metadex rebasing onto current main before push → Temper money-bar → my
+composition. Next protocol piece after #6 = **piece-6 payment SM** (operator: protocol is
+foreground, observatory v1.1 is idle-only background).
 Pieces 6–8 are specced, not yet built (piece-6 has a design doc:
 [PIECE-6-PAYMENT-SM.md](PIECE-6-PAYMENT-SM.md)).
 
@@ -29,7 +30,7 @@ resolved v1-plaintext with the real-price exposure tracked as a deferred problem
 
 | Lane | Owner | Status | Notes |
 |------|-------|--------|-------|
-| Rebuild pieces → main | forge team (Scribe/Anvil/Temper) | pieces 1–2 merged; 5/6/7/8 through money bar → operator queue | each PR: independent-verifier + composition + Temper adversarial + codex deep |
+| Rebuild pieces → main | forge team (Scribe/Anvil/Temper/metadex) | merged: #2 #5 #7 #8 (piece-3 CDK-first `dee436e`); #6 in rework (rebase → money-bar → composition); piece-6 next | each PR: independent-verifier + composition + Temper adversarial + codex deep |
 | Usage-awareness matrix (checkpoint b) | Scribe (compose) + Anvil/Temper (legs) | 2/3 legs (codex ACP-native, cursor ACP-dark); claude leg pending seat pick | transport is harness-dependent — the headline finding |
 | Journal-v2 (live-stream) | Scribe (scoped) | design delivered; awaiting gudnuf's exposure pick | + latent finding: v1 journal already live+near-raw |
 | Skills/practice accessibility pass | Scribe | inventory done; composition behind checkpoint-b | founding gap: non-Claude kit = instructions.md only |
@@ -41,6 +42,7 @@ resolved v1-plaintext with the real-price exposure tracked as a deferred problem
 |------|-------|----------|
 | Format + receipt hash contract on main | PROVEN | PR #2 @ `b5003d4`; hermetic tests |
 | Gateway protocol types on main | PROVEN | PR #5 merged `46499b5`; 29/29 both feature sets |
+| CDK-first trade verification (`verify_trade_p2pk`) on main | PROVEN | PR #8 merged `dee436e`; wallet core 38/38, default 30/30; mint/amount/unit/per-proof-P2PK-seller-lock/NUT-07-unspent; not mint authenticity |
 | Arms-length git-delivery trade (2 keys, 2 harnesses, testnut) | PROVEN (PLAY) | checkpoint (c2) — [RUNS-C2.md](RUNS-C2.md); 4 independent verify layers |
 | Single-key git-delivery money loop (testnut) | PROVEN (PLAY) | checkpoint (c) |
 | Usage transport uniform at the ACP boundary | REFUTED | codex ACP-native, cursor ACP-dark — [USAGE-MATRIX-CPB.md](USAGE-MATRIX-CPB.md) |
@@ -77,7 +79,8 @@ delivery + PoPs escrow; envelope slot reserved). **DP-2 proof-authenticity at re
 ## Blocked / waiting
 
 - Usage matrix finalize: claude leg pending a coordination seat pick (claude-agent-acp).
-- gudnuf merges of #6 (post-retarget) / #7 / #8.
+- #6 rework: metadex rebases the held head onto current main (`dee436e`), reruns acceptance,
+  posts the rebased tip → Temper money-bar → my composition → gudnuf merge.
 - Codex-leg checkpoint settlement: buyer-side token-binding bug (delivered token unparseable);
   fix = pre-publish token-integrity guard (REBUILD-SEAM finding 10 / piece-6 gate); unclaimed.
 - Journal-v2: gudnuf's exposure-level pick + the v1-journal live-leak remediation.
@@ -100,7 +103,9 @@ gudnuf reviews all PRs; no persona self-merges.
   composition gauntlet); piece-2 (PR #5) merged; usage-awareness schema locked + 2/3
   measurement legs; marketplace scope + fair-exchange settled by gudnuf.
 - 2026-07-14 (late): piece-3 reworked CDK-first (delete hand-rolled cashu mirrors, keep
-  `verify_trade_p2pk` trade policy) and **COMPOSED-DONE** on PR #8 @ `5c596a69` — four
-  fix-window items verified (strict per-proof seller-lock, currency-unit bind, rustdoc
-  trust-notch, no-DB dep-graph); Temper CLEAR + Anvil rev-parse + gh confirm; draft + frozen
-  for gudnuf's merge.
+  `verify_trade_p2pk` trade policy) and **MERGED to main** on PR #8 (squash `dee436e`) — four
+  fix-window items verified on behavior-CLEAR head `5c596a69` (strict per-proof seller-lock,
+  currency-unit bind, rustdoc trust-notch, no-DB dep-graph; Temper CLEAR + Anvil rev-parse +
+  gh confirm), then a docs-only comment-trim hygiene pass (`172cdeda`, verified comment-only,
+  trap knowledge moved to tests) merged by gudnuf. `verify_trade_p2pk` + typed `CurrencyUnit`
+  `TradeLock` now main API surface (offer-unit → `TradeLock.unit` is the #6 residual).
