@@ -1,0 +1,10 @@
+{
+  "name": "mobee-network-observatory",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node test/parse.test.mjs",
+    "lint": "node --check js/parse.js && node --check js/store.js && node --check js/relay.js && node --check js/views.js && node --check js/app.js && node --check config.js && node --check scripts/build.mjs && node --check test/parse.test.mjs"
+  }
+}
