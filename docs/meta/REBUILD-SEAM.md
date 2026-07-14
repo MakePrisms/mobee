@@ -79,27 +79,56 @@ Landed / in flight:
 
 Then, in order:
 
-### piece-3 — wallet token-verification library · **MONEY**
+### piece-3 — trade-verification policy over cashu types · **MONEY** · **CDK-FIRST REWORK**
 
-Lift `mobee-core/src/wallet.rs` @ `0e77669` essentially as-is (it is already
-library-shaped): `verify_p2pk_token` + error taxonomy, mint hard-bind, keyset-free proof
-extraction, NUT-07 state fetch, NUT-11 P2PK secret shape. Feature `wallet=[cashu,cdk]`
-(no `cdk-sqlite` in core). Depends on nothing — proceeds even while PR #5 waits.
+Superseded the original "lift `wallet.rs` mirrors" plan (operator direction + cdk-surface
+map, 2026-07-14, all source-verified at cdk/cashu `=0.17.2`). PR #8 lifted hand-rolled
+mirrors of things the `cashu` crate already owns; the rework **deletes the mirrors** and
+keeps Mobee to trade policy only. This reworks #8, not merges it.
+
+**DELETE from Mobee (each has an exact `cashu` source-of-truth):**
+- `P2pkSecret` / `parse_p2pk_secret` / `p2pk_secret_json` → `cashu` `nut10::Secret` +
+  `impl TryFrom<&Secret> for SpendingConditions` (nut10/spending_conditions.rs:95).
+- `CashuProof` DTO → `cashu::Proof` (nut00/mod.rs:366).
+- manual `hash_to_curve` for `y` → `Proof::y()` (nut00/mod.rs:411) / `dhke::hash_to_curve`
+  / batch `ProofsMethods::ys()`.
+- `Nut07State` mirror → `cashu` nut07 `State`/`ProofState`/`CheckStateRequest/Response`.
+- bespoke NUT-07 HttpClient → `cdk::wallet::MintConnector::post_check_state` (trait,
+  mockable — reuse cdk's shipped `MockMintConnector`, don't write our own).
+
+**KEEP in Mobee (pure core, `cashu`-only, zero I/O):** a thin
+`verify_trade_p2pk(token: &cashu::Token, lock: TradeLock, states) -> VerifiedPayment`
+composing `Token::value() == lock.amount` + `Token::mint_url() == lock.mint` +
+`Token::p2pk_pubkeys()` (token.rs:163) contains `lock.seller_lock` + **no duplicate `y`/
+secret + checked-amount** (the security we added on #8 — carry forward, do not regress);
+DLEQ math via `Proof::verify_dleq(mint_pubkey)` (offline). No single cdk fn does
+"mint+amount+P2PK" in one call — `Wallet::verify_token_p2pk` is async + Wallet-bound +
+checks no amount, strictly worse for a hermetic core, so Mobee keeps this ~5-line pure
+composition.
+
+**Two load-bearing traps (cdk-surface map — acceptance MUST cover both):**
+1. The pre-pay lock check reads `SpendingConditions` / `Token::p2pk_pubkeys()` — **never
+   `Proof::verify_p2pk()`**, which verifies signatures already on the proof and returns
+   `SignaturesNotProvided` on an unsigned pre-pay token.
+2. Computing `ys` for the spent-check needs **only the secret** (in the token) — hermetic,
+   no keyset resolution. `Token::proofs(&keysets)` (which needs a mint keyset fetch) is
+   required only for the swap, not for parse/amount/P2PK/ys.
+
+**Feature / hermetic boundary:** `wallet = [cashu, cdk]` for the `MintConnector` trait +
+`HttpClient`, **no `cdk-sqlite`** (the #8 rule holds — cdk-sqlite is the only
+`WalletDatabase` impl and would drag rusqlite + tokio into core). Core policy is defined
+over the `MintConnector` trait; prod injects `HttpClient`, tests inject `MockMintConnector`
+— zero network/db. Default build has **no pay path** (safety gate).
 
 Acceptance:
-- Builds `--features wallet` and default (default build has **no pay path** — the gate is
-  the safety, SPIKE_LESSONS).
-- The 4 spike hermetic tests green on `main`: `p2pk_secret_json_matches_nut11_shape`,
-  `verify_accepts_amount_mint_lock_and_unspent_state`,
-  `verify_rejects_wrong_lock_and_spent_state`,
-  `cashu_proofs_from_v4_token_does_not_need_keyset_metadata`.
-- Plus a **mint-binding test** (token mint ≠ the trade's expected mint → hard-fail).
-  Layering note (Temper money-adv, 2026-07-14): this proves the equality *mechanism* only.
-  The testnut *policy* gate — which mints a demo may ever expect — lives where
-  `expected_mint` is chosen, and is an explicit acceptance line on pieces 6 and 8 below;
-  an allowlist inside `wallet.rs` would smuggle policy into mechanism.
-- Reviewer diffs extracted module against spike `wallet.rs` — zero intended behavioral
-  divergence; `Cargo.lock` regenerated.
+- Pure-core tests over a mocked `MintConnector`, zero I/O, no `cdk-sqlite`/tokio linked in
+  core (`cargo tree` clean, as #8 verified for cdk-sqlite).
+- `verify_trade_p2pk` rejects: wrong mint, wrong amount, seller-lock absent, duplicate
+  `y`/secret, amount-sum overflow, any proof reported spent — each with a test.
+- Both traps regression-covered (unsigned token → lock check via SpendingConditions passes/
+  fails correctly and never calls verify_p2pk; ys computed without a keyset fetch).
+- Testnut fund-isolation is NOT here — it lives at the buyer-**mint** edge where
+  `expected_mint` is chosen (piece-6/8); `verify_trade_p2pk` is mint-*matching* mechanism.
 
 ### piece-4 — token-delivery library · **MONEY**
 
