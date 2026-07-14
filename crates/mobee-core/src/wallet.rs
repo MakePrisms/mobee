@@ -1,0 +1,481 @@
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::str::FromStr;
+
+use cashu::{Amount, CheckStateRequest, MintUrl, ProofState, PublicKey, State, Token};
+use cdk::wallet::MintConnector;
+
+/// The trade facts that a presented Cashu token must bind to before payment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TradeLock {
+    pub mint: MintUrl,
+    pub amount: Amount,
+    pub seller_lock: PublicKey,
+}
+
+/// Metadata proven by [`verify_trade_p2pk`].
+///
+/// This is a trade-binding and spend-state result, not an authenticity or
+/// redeemability claim. The seller still owns the swap-on-receive gate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedPayment {
+    pub mint: MintUrl,
+    pub amount: Amount,
+    pub proof_ys: Vec<PublicKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WalletVerifyError {
+    InvalidToken(String),
+    AmountMismatch { expected: Amount, actual: Amount },
+    MintMismatch { expected: MintUrl, actual: MintUrl },
+    LockMismatch { expected: PublicKey },
+    DuplicateProofY(PublicKey),
+    DuplicateState(PublicKey),
+    MissingState(PublicKey),
+    NotUnspent { proof_y: PublicKey, state: State },
+    MintConnector(String),
+}
+
+impl fmt::Display for WalletVerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidToken(error) => write!(f, "invalid Cashu token: {error}"),
+            Self::AmountMismatch { expected, actual } => {
+                write!(f, "amount mismatch: expected {expected}, got {actual}")
+            }
+            Self::MintMismatch { expected, actual } => {
+                write!(f, "mint mismatch: expected {expected}, got {actual}")
+            }
+            Self::LockMismatch { expected } => {
+                write!(f, "P2PK lock does not contain seller key {expected}")
+            }
+            Self::DuplicateProofY(y) => write!(f, "duplicate proof y {y}"),
+            Self::DuplicateState(y) => write!(f, "duplicate NUT-07 state for proof {y}"),
+            Self::MissingState(y) => write!(f, "missing NUT-07 state for proof {y}"),
+            Self::NotUnspent { proof_y, state } => {
+                write!(f, "proof {proof_y} is not unspent: {state}")
+            }
+            Self::MintConnector(error) => write!(f, "NUT-07 spend-state check failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for WalletVerifyError {}
+
+/// Verifies trade binding and the supplied NUT-07 state for a presented token.
+///
+/// This intentionally composes the native `cashu` surface instead of mirroring
+/// Cashu DTOs or NUT parsing in Mobee:
+///
+/// - `Token::value()` performs checked amount aggregation and rejects duplicate
+///   secrets.
+/// - `Token::mint_url()` supplies the mint binding.
+/// - `Token::p2pk_pubkeys()` reads unsigned pre-pay spending conditions; this
+///   must not be replaced with `Proof::verify_p2pk()`, which verifies witness
+///   signatures and rejects an unsigned pre-pay token.
+/// - proof ys are derived with `Proof::y()` from token secrets without resolving
+///   keysets.
+///
+/// `Ok` does not authenticate mint signatures or prove redeemability. The
+/// seller receive path must swap at the mint (or perform full keyset + DLEQ
+/// verification) before advancing the payment state.
+pub fn verify_trade_p2pk(
+    token: &Token,
+    lock: &TradeLock,
+    states: &[ProofState],
+) -> Result<VerifiedPayment, WalletVerifyError> {
+    let actual_amount = token
+        .value()
+        .map_err(|error| WalletVerifyError::InvalidToken(error.to_string()))?;
+    if actual_amount != lock.amount {
+        return Err(WalletVerifyError::AmountMismatch {
+            expected: lock.amount,
+            actual: actual_amount,
+        });
+    }
+
+    let actual_mint = token
+        .mint_url()
+        .map_err(|error| WalletVerifyError::InvalidToken(error.to_string()))?;
+    if actual_mint != lock.mint {
+        return Err(WalletVerifyError::MintMismatch {
+            expected: lock.mint.clone(),
+            actual: actual_mint,
+        });
+    }
+
+    let p2pk_pubkeys = token
+        .p2pk_pubkeys()
+        .map_err(|error| WalletVerifyError::InvalidToken(error.to_string()))?;
+    if !p2pk_pubkeys.contains(&lock.seller_lock) {
+        return Err(WalletVerifyError::LockMismatch {
+            expected: lock.seller_lock,
+        });
+    }
+
+    let proof_ys = token_ys(token)?;
+    reject_duplicate_ys(&proof_ys)?;
+    require_unspent(&proof_ys, states)?;
+
+    Ok(VerifiedPayment {
+        mint: actual_mint,
+        amount: actual_amount,
+        proof_ys,
+    })
+}
+
+/// Fetches NUT-07 state through the injected CDK connector, then runs the pure
+/// trade verifier. Production can inject `HttpClient`; tests inject a hermetic
+/// transport into CDK's generic HTTP connector. No wallet database or concrete
+/// network client is owned by core policy.
+pub async fn verify_trade_p2pk_with_connector<C: MintConnector + ?Sized>(
+    connector: &C,
+    token: &Token,
+    lock: &TradeLock,
+) -> Result<VerifiedPayment, WalletVerifyError> {
+    let ys = token_ys(token)?;
+    reject_duplicate_ys(&ys)?;
+    let response = connector
+        .post_check_state(CheckStateRequest { ys })
+        .await
+        .map_err(|error| WalletVerifyError::MintConnector(error.to_string()))?;
+    verify_trade_p2pk(token, lock, &response.states)
+}
+
+fn token_ys(token: &Token) -> Result<Vec<PublicKey>, WalletVerifyError> {
+    // `Proof::y()` depends only on `secret`. Token V3/V4 store short keyset ids,
+    // but resolving those ids is required only when reconstructing spendable
+    // proofs for a swap. A placeholder native Id lets us call the cashu-owned
+    // `Proof::y()` without introducing a keyset fetch into the pre-pay check;
+    // no field other than `secret` participates in this calculation.
+    let y_only_id = cashu::Id::from_str("0000000000000000")
+        .map_err(|error| WalletVerifyError::InvalidToken(error.to_string()))?;
+
+    match token {
+        Token::TokenV3(token) => token
+            .token
+            .iter()
+            .flat_map(|entry| entry.proofs.iter())
+            .map(|proof| {
+                proof
+                    .into_proof(&y_only_id)
+                    .y()
+                    .map_err(|error| WalletVerifyError::InvalidToken(error.to_string()))
+            })
+            .collect(),
+        Token::TokenV4(token) => token
+            .token
+            .iter()
+            .flat_map(|entry| entry.proofs.iter())
+            .map(|proof| {
+                proof
+                    .into_proof(&y_only_id)
+                    .y()
+                    .map_err(|error| WalletVerifyError::InvalidToken(error.to_string()))
+            })
+            .collect(),
+    }
+}
+
+fn reject_duplicate_ys(ys: &[PublicKey]) -> Result<(), WalletVerifyError> {
+    let mut seen = HashSet::with_capacity(ys.len());
+    for y in ys {
+        if !seen.insert(*y) {
+            return Err(WalletVerifyError::DuplicateProofY(*y));
+        }
+    }
+    Ok(())
+}
+
+fn require_unspent(proof_ys: &[PublicKey], states: &[ProofState]) -> Result<(), WalletVerifyError> {
+    let mut by_y = HashMap::with_capacity(states.len());
+    for state in states {
+        if by_y.insert(state.y, state.state).is_some() {
+            return Err(WalletVerifyError::DuplicateState(state.y));
+        }
+    }
+
+    for y in proof_ys {
+        match by_y.get(y) {
+            Some(State::Unspent) => {}
+            Some(state) => {
+                return Err(WalletVerifyError::NotUnspent {
+                    proof_y: *y,
+                    state: *state,
+                });
+            }
+            None => return Err(WalletVerifyError::MissingState(*y)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    use cashu::secret::Secret;
+    use cashu::{
+        CheckStateResponse, Conditions, CurrencyUnit, Id, Proof, SecretKey, SpendingConditions,
+    };
+    use cdk::wallet::{BaseHttpClient, HttpTransport};
+    use serde::de::DeserializeOwned;
+    use serde::Serialize;
+    use url::Url;
+
+    const MINT: &str = "https://testnut.cashu.space";
+    const OTHER_MINT: &str = "https://mint.example";
+    const KEYSET_ID: &str = "010000000000000000000000000000000000000000000000000000000000000000";
+
+    #[test]
+    fn unsigned_prepay_token_uses_spending_conditions_not_witness_signatures() {
+        let seller = public_key(1);
+        let token = token(MINT, vec![proof(7, seller, 7)]);
+        let ys = token_ys(&token).unwrap();
+
+        // The proof is deliberately unsigned. Calling Proof::verify_p2pk here
+        // would return SignaturesNotProvided; reading SpendingConditions through
+        // Token::p2pk_pubkeys is the correct pre-pay lock check.
+        let proof = token_proofs(&token).remove(0);
+        assert!(proof.witness.is_none());
+        assert!(matches!(
+            proof.verify_p2pk(),
+            Err(cashu::nuts::nut11::Error::SignaturesNotProvided)
+        ));
+        assert_eq!(
+            verify_trade_p2pk(&token, &trade_lock(MINT, 7, seller), &unspent(&ys)),
+            Ok(VerifiedPayment {
+                mint: mint(MINT),
+                amount: Amount::from(7),
+                proof_ys: ys,
+            })
+        );
+    }
+
+    #[test]
+    fn verify_rejects_wrong_mint_amount_lock_and_spent_state() {
+        let seller = public_key(1);
+        let other = public_key(2);
+        let token = token(MINT, vec![proof(7, seller, 7)]);
+        let ys = token_ys(&token).unwrap();
+        let states = unspent(&ys);
+
+        assert!(matches!(
+            verify_trade_p2pk(&token, &trade_lock(OTHER_MINT, 7, seller), &states),
+            Err(WalletVerifyError::MintMismatch { .. })
+        ));
+        assert!(matches!(
+            verify_trade_p2pk(&token, &trade_lock(MINT, 8, seller), &states),
+            Err(WalletVerifyError::AmountMismatch { .. })
+        ));
+        assert!(matches!(
+            verify_trade_p2pk(&token, &trade_lock(MINT, 7, other), &states),
+            Err(WalletVerifyError::LockMismatch { .. })
+        ));
+        assert!(matches!(
+            verify_trade_p2pk(
+                &token,
+                &trade_lock(MINT, 7, seller),
+                &[ProofState::from((ys[0], State::Spent))],
+            ),
+            Err(WalletVerifyError::NotUnspent {
+                state: State::Spent,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn duplicate_secret_and_y_are_rejected_by_native_token_value() {
+        let seller = public_key(1);
+        let repeated = proof(1, seller, 7);
+        let token = token(MINT, vec![repeated.clone(), repeated]);
+
+        let error = verify_trade_p2pk(&token, &trade_lock(MINT, 2, seller), &[]).unwrap_err();
+        assert!(
+            matches!(&error, WalletVerifyError::InvalidToken(message) if message.to_ascii_lowercase().contains("duplicate")),
+            "duplicate secret/y reached the wrong guard: {error}"
+        );
+    }
+
+    #[test]
+    fn amount_overflow_is_rejected_by_native_checked_sum() {
+        let seller = public_key(1);
+        let token = token(
+            MINT,
+            vec![proof(u64::MAX - 3, seller, 7), proof(10, seller, 8)],
+        );
+
+        let error = verify_trade_p2pk(&token, &trade_lock(MINT, 6, seller), &[]).unwrap_err();
+        assert!(
+            matches!(&error, WalletVerifyError::InvalidToken(message) if message.to_ascii_lowercase().contains("overflow")),
+            "overflow fixture reached the wrong guard: {error}"
+        );
+    }
+
+    #[test]
+    fn connector_check_computes_ys_without_keyset_fetch() {
+        let seller = public_key(1);
+        // A v2 keyset id cannot be expanded from its token short-id without
+        // keyset metadata. The connector path accepts no keysets and configures
+        // only post_check_state, proving the pre-pay y calculation is
+        // secret-only and never calls Token::proofs(&keysets).
+        let token = token(MINT, vec![proof(7, seller, 7)]);
+        assert!(token.proofs(&[]).is_err());
+        let ys = vec![token_proofs(&token)[0].y().expect("valid proof secret")];
+        let connector = BaseHttpClient::with_transport(
+            mint(MINT),
+            CheckStateTransport::new(CheckStateResponse {
+                states: unspent(&ys),
+            }),
+            None,
+        );
+
+        let verified = block_on(verify_trade_p2pk_with_connector(
+            &connector,
+            &token,
+            &trade_lock(MINT, 7, seller),
+        ))
+        .expect("mocked NUT-07 check succeeds without keyset metadata");
+
+        assert_eq!(verified.proof_ys, ys);
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct CheckStateTransport {
+        response: serde_json::Value,
+    }
+
+    impl CheckStateTransport {
+        fn new(response: CheckStateResponse) -> Self {
+            Self {
+                response: serde_json::to_value(response).expect("serializable NUT-07 response"),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HttpTransport for CheckStateTransport {
+        fn with_proxy(
+            &mut self,
+            _proxy: Url,
+            _host_matcher: Option<&str>,
+            _accept_invalid_certs: bool,
+        ) -> Result<(), cdk::Error> {
+            Ok(())
+        }
+
+        async fn http_get<R>(
+            &self,
+            _url: Url,
+            _auth: Option<cashu::nuts::AuthToken>,
+        ) -> Result<R, cdk::Error>
+        where
+            R: DeserializeOwned,
+        {
+            Err(cdk::Error::Custom(
+                "unexpected GET in NUT-07 regression".to_owned(),
+            ))
+        }
+
+        async fn http_post<P, R>(
+            &self,
+            url: Url,
+            _auth: Option<cashu::nuts::AuthToken>,
+            _payload: &P,
+        ) -> Result<R, cdk::Error>
+        where
+            P: Serialize + ?Sized + Send + Sync,
+            R: DeserializeOwned,
+        {
+            if !url.path().ends_with("/v1/checkstate") {
+                return Err(cdk::Error::Custom(format!(
+                    "unexpected POST path in NUT-07 regression: {}",
+                    url.path()
+                )));
+            }
+            serde_json::from_value(self.response.clone())
+                .map_err(|error| cdk::Error::Custom(error.to_string()))
+        }
+    }
+
+    fn trade_lock(mint_url: &str, amount: u64, seller_lock: PublicKey) -> TradeLock {
+        TradeLock {
+            mint: mint(mint_url),
+            amount: Amount::from(amount),
+            seller_lock,
+        }
+    }
+
+    fn token(mint_url: &str, proofs: Vec<Proof>) -> Token {
+        Token::new(mint(mint_url), proofs, None, CurrencyUnit::Sat)
+    }
+
+    fn mint(url: &str) -> MintUrl {
+        MintUrl::from_str(url).expect("valid mint URL")
+    }
+
+    fn proof(amount: u64, seller: PublicKey, nonce: u8) -> Proof {
+        let secret = Secret::try_from(SpendingConditions::new_p2pk(
+            seller,
+            Some(Conditions {
+                pubkeys: Some(vec![public_key(nonce)]),
+                ..Default::default()
+            }),
+        ))
+        .expect("valid P2PK spending condition");
+        Proof::new(
+            Amount::from(amount),
+            Id::from_str(KEYSET_ID).expect("valid v2 keyset id"),
+            secret,
+            public_key(42),
+        )
+    }
+
+    fn token_proofs(token: &Token) -> Vec<Proof> {
+        match token {
+            Token::TokenV4(token) => token
+                .token
+                .iter()
+                .flat_map(|entry| entry.proofs.iter())
+                .map(|proof| proof.into_proof(&Id::from_str(KEYSET_ID).unwrap()))
+                .collect(),
+            Token::TokenV3(_) => panic!("test helper constructs v4 tokens"),
+        }
+    }
+
+    fn public_key(byte: u8) -> PublicKey {
+        SecretKey::from_slice(&[byte; 32])
+            .expect("valid secret key")
+            .public_key()
+    }
+
+    fn unspent(ys: &[PublicKey]) -> Vec<ProofState> {
+        ys.iter()
+            .copied()
+            .map(|y| ProofState::from((y, State::Unspent)))
+            .collect()
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        unsafe fn noop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+        loop {
+            match Pin::new(&mut future).poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+}

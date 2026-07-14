@@ -5,6 +5,8 @@ pub mod format;
 pub mod gateway;
 pub mod log;
 pub mod receipt;
+#[cfg(feature = "wallet")]
+pub mod wallet;
 
 pub use event::{Envelope, Event};
 pub use log::{EventLog, LogError, ReadError, Replay};
