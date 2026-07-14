@@ -2,18 +2,19 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct TokenDeliveryPayload {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaymentPayload {
     pub job_id: String,
     pub result_id: String,
     pub mint_url: String,
     pub amount_sats: u64,
-    pub token: String,
+    #[cfg(feature = "wallet")]
+    pub token: cashu::Token,
     pub seller_pubkey: String,
 }
 
-impl TokenDeliveryPayload {
-    #[cfg(any(test, feature = "gateway"))]
+impl PaymentPayload {
+    #[cfg(all(any(test, feature = "gateway"), feature = "wallet"))]
     fn canonical_json(&self, buyer_pubkey: &str) -> String {
         use serde::ser::{SerializeMap, Serializer};
 
@@ -21,7 +22,7 @@ impl TokenDeliveryPayload {
         let mut serializer = serde_json::Serializer::new(&mut json);
         let mut map = serializer
             .serialize_map(Some(7))
-            .expect("token delivery payload starts a JSON map");
+            .expect("payment payload starts a JSON map");
         map.serialize_entry("job_id", &self.job_id)
             .expect("job id is JSON-serializable");
         map.serialize_entry("result_id", &self.result_id)
@@ -30,95 +31,102 @@ impl TokenDeliveryPayload {
             .expect("mint URL is JSON-serializable");
         map.serialize_entry("amount_sats", &self.amount_sats)
             .expect("amount is JSON-serializable");
-        map.serialize_entry("token", &self.token)
+        map.serialize_entry("token", &self.token.to_string())
             .expect("token is JSON-serializable");
         map.serialize_entry("buyer_pubkey", buyer_pubkey)
             .expect("buyer pubkey is JSON-serializable");
         map.serialize_entry("seller_pubkey", &self.seller_pubkey)
             .expect("seller pubkey is JSON-serializable");
-        map.end()
-            .expect("token delivery payload closes its JSON map");
+        map.end().expect("payment payload closes its JSON map");
 
         String::from_utf8(json).expect("JSON serializer emits UTF-8")
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeliveredToken {
-    pub delivery_id: String,
-    pub relay_success: Vec<String>,
-    pub relay_failed: Vec<DeliveryRelayFailure>,
+#[cfg(all(any(test, feature = "gateway"), feature = "wallet"))]
+pub fn parse_nip17_payment_payload(json: &str) -> Result<PaymentPayload, PaymentSendError> {
+    let envelope: PaymentEnvelope = serde_json::from_str(json).map_err(|error| {
+        PaymentSendError::Transport(format!("invalid NIP-17 payment payload JSON: {error}"))
+    })?;
+    envelope.try_into()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeliveryRelayFailure {
+pub struct PaymentSent {
+    pub payment_id: String,
+    pub relay_success: Vec<String>,
+    pub relay_failed: Vec<PaymentRelayFailure>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaymentRelayFailure {
     pub relay: String,
     pub error: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DeliveryError {
+pub enum PaymentSendError {
     Transport(String),
 }
 
-impl fmt::Display for DeliveryError {
+impl fmt::Display for PaymentSendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Transport(message) => write!(f, "token delivery failed: {message}"),
+            Self::Transport(message) => write!(f, "payment send failed: {message}"),
         }
     }
 }
 
-impl std::error::Error for DeliveryError {}
+impl std::error::Error for PaymentSendError {}
 
 #[allow(async_fn_in_trait)]
-pub trait TokenDelivery {
-    async fn deliver_token(
+pub trait PaymentSend {
+    async fn send_payment(
         &mut self,
-        payload: TokenDeliveryPayload,
-    ) -> Result<DeliveredToken, DeliveryError>;
+        payload: PaymentPayload,
+    ) -> Result<PaymentSent, PaymentSendError>;
 }
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
-pub struct MemoryTokenDelivery {
+pub struct MemoryPaymentSend {
     next_id: u64,
-    deliveries: Vec<DeliveredToken>,
+    payments: Vec<PaymentSent>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
-impl MemoryTokenDelivery {
-    pub fn deliveries(&self) -> &[DeliveredToken] {
-        &self.deliveries
+impl MemoryPaymentSend {
+    pub fn payments(&self) -> &[PaymentSent] {
+        &self.payments
     }
 
-    pub fn record_delivery(
+    pub fn record_payment(
         &mut self,
-        _payload: TokenDeliveryPayload,
-    ) -> Result<DeliveredToken, DeliveryError> {
+        _payload: PaymentPayload,
+    ) -> Result<PaymentSent, PaymentSendError> {
         self.next_id += 1;
-        let delivered = DeliveredToken {
-            delivery_id: format!("mem-delivery-{}", self.next_id),
-            relay_success: vec!["memory://token-delivery".into()],
+        let sent = PaymentSent {
+            payment_id: format!("mem-payment-{}", self.next_id),
+            relay_success: vec!["memory://payment-send".into()],
             relay_failed: Vec::new(),
         };
-        self.deliveries.push(delivered.clone());
-        Ok(delivered)
+        self.payments.push(sent.clone());
+        Ok(sent)
     }
 }
 
 #[cfg(any(test, feature = "test-support"))]
-impl TokenDelivery for MemoryTokenDelivery {
-    async fn deliver_token(
+impl PaymentSend for MemoryPaymentSend {
+    async fn send_payment(
         &mut self,
-        payload: TokenDeliveryPayload,
-    ) -> Result<DeliveredToken, DeliveryError> {
-        self.record_delivery(payload)
+        payload: PaymentPayload,
+    ) -> Result<PaymentSent, PaymentSendError> {
+        self.record_payment(payload)
     }
 }
 
-#[cfg(feature = "gateway")]
-pub struct NostrTokenDelivery {
+#[cfg(all(feature = "gateway", feature = "wallet"))]
+pub struct NostrPaymentSend {
     relay: String,
     keys: nostr_sdk::prelude::Keys,
 }
@@ -126,8 +134,8 @@ pub struct NostrTokenDelivery {
 #[cfg(feature = "gateway")]
 const GIFT_WRAP_TIMESTAMP_TWEAK_MAX_SECS: u64 = 180;
 
-#[cfg(feature = "gateway")]
-impl NostrTokenDelivery {
+#[cfg(all(feature = "gateway", feature = "wallet"))]
+impl NostrPaymentSend {
     pub fn new(relay: impl Into<String>, keys: nostr_sdk::prelude::Keys) -> Self {
         Self {
             relay: relay.into(),
@@ -136,38 +144,37 @@ impl NostrTokenDelivery {
     }
 }
 
-#[cfg(feature = "gateway")]
-impl TokenDelivery for NostrTokenDelivery {
-    async fn deliver_token(
+#[cfg(all(feature = "gateway", feature = "wallet"))]
+impl PaymentSend for NostrPaymentSend {
+    async fn send_payment(
         &mut self,
-        payload: TokenDeliveryPayload,
-    ) -> Result<DeliveredToken, DeliveryError> {
+        payload: PaymentPayload,
+    ) -> Result<PaymentSent, PaymentSendError> {
         use nostr_sdk::prelude::{Client, PublicKey};
 
         let receiver = PublicKey::parse(&payload.seller_pubkey).map_err(|error| {
-            DeliveryError::Transport(format!(
-                "invalid seller pubkey for NIP-17 delivery: {error}"
+            PaymentSendError::Transport(format!(
+                "invalid seller pubkey for NIP-17 payment send: {error}"
             ))
         })?;
         let buyer_pubkey = self.keys.public_key().to_hex();
         let gift_wrap =
-            token_delivery_gift_wrap(&self.keys, receiver, payload.canonical_json(&buyer_pubkey))
+            payment_send_gift_wrap(&self.keys, receiver, payload.canonical_json(&buyer_pubkey))
                 .await?;
         let client = Client::new(self.keys.clone());
-        client
-            .add_relay(&self.relay)
-            .await
-            .map_err(|error| DeliveryError::Transport(format!("failed to add relay: {error}")))?;
+        client.add_relay(&self.relay).await.map_err(|error| {
+            PaymentSendError::Transport(format!("failed to add relay: {error}"))
+        })?;
         client.connect().await;
 
         let output = client
             .send_event_to([self.relay.as_str()], &gift_wrap)
             .await
             .map_err(|error| {
-                DeliveryError::Transport(format!("failed to send NIP-17 token delivery: {error}"))
+                PaymentSendError::Transport(format!("failed to send NIP-17 payment: {error}"))
             })?;
 
-        delivered_token(
+        payment_sent(
             output.val.to_string(),
             output
                 .success
@@ -177,7 +184,7 @@ impl TokenDelivery for NostrTokenDelivery {
             output
                 .failed
                 .into_iter()
-                .map(|(url, error)| DeliveryRelayFailure {
+                .map(|(url, error)| PaymentRelayFailure {
                     relay: url.to_string(),
                     error,
                 })
@@ -187,41 +194,43 @@ impl TokenDelivery for NostrTokenDelivery {
 }
 
 #[cfg(any(test, feature = "gateway"))]
-fn delivered_token(
-    delivery_id: String,
+fn payment_sent(
+    payment_id: String,
     relay_success: Vec<String>,
-    relay_failed: Vec<DeliveryRelayFailure>,
-) -> Result<DeliveredToken, DeliveryError> {
+    relay_failed: Vec<PaymentRelayFailure>,
+) -> Result<PaymentSent, PaymentSendError> {
     if relay_success.is_empty() {
-        return Err(DeliveryError::Transport(
-            "no relay accepted the NIP-17 token delivery".into(),
+        return Err(PaymentSendError::Transport(
+            "no relay accepted the NIP-17 payment".into(),
         ));
     }
 
-    Ok(DeliveredToken {
-        delivery_id,
+    Ok(PaymentSent {
+        payment_id,
         relay_success,
         relay_failed,
     })
 }
 
 #[cfg(feature = "gateway")]
-async fn token_delivery_gift_wrap(
+async fn payment_send_gift_wrap(
     keys: &nostr_sdk::prelude::Keys,
     receiver: nostr_sdk::prelude::PublicKey,
     message: String,
-) -> Result<nostr_sdk::prelude::Event, DeliveryError> {
+) -> Result<nostr_sdk::prelude::Event, PaymentSendError> {
     use nostr_sdk::nostr::nips::nip44;
     use nostr_sdk::prelude::{EventBuilder, JsonUtil, Kind, Tag};
 
     let rumor = EventBuilder::private_msg_rumor(receiver, message).build(keys.public_key());
     let seal = EventBuilder::seal(keys, &receiver, rumor)
         .await
-        .map_err(|error| DeliveryError::Transport(format!("failed to build NIP-17 seal: {error}")))?
+        .map_err(|error| {
+            PaymentSendError::Transport(format!("failed to build NIP-17 seal: {error}"))
+        })?
         .sign(keys)
         .await
         .map_err(|error| {
-            DeliveryError::Transport(format!("failed to sign NIP-17 seal: {error}"))
+            PaymentSendError::Transport(format!("failed to sign NIP-17 seal: {error}"))
         })?;
     let wrapping_keys = nostr_sdk::prelude::Keys::generate();
     let content = nip44::encrypt(
@@ -231,7 +240,7 @@ async fn token_delivery_gift_wrap(
         nip44::Version::default(),
     )
     .map_err(|error| {
-        DeliveryError::Transport(format!("failed to encrypt NIP-17 gift wrap: {error}"))
+        PaymentSendError::Transport(format!("failed to encrypt NIP-17 gift wrap: {error}"))
     })?;
 
     EventBuilder::new(Kind::GiftWrap, content)
@@ -239,8 +248,41 @@ async fn token_delivery_gift_wrap(
         .custom_created_at(fresh_gift_wrap_created_at())
         .sign_with_keys(&wrapping_keys)
         .map_err(|error| {
-            DeliveryError::Transport(format!("failed to sign NIP-17 gift wrap: {error}"))
+            PaymentSendError::Transport(format!("failed to sign NIP-17 gift wrap: {error}"))
         })
+}
+
+#[cfg(all(any(test, feature = "gateway"), feature = "wallet"))]
+#[derive(Deserialize)]
+struct PaymentEnvelope {
+    job_id: String,
+    result_id: String,
+    mint_url: String,
+    amount_sats: u64,
+    #[serde(rename = "token")]
+    serialized_token: String,
+    seller_pubkey: String,
+}
+
+#[cfg(all(any(test, feature = "gateway"), feature = "wallet"))]
+impl TryFrom<PaymentEnvelope> for PaymentPayload {
+    type Error = PaymentSendError;
+
+    fn try_from(envelope: PaymentEnvelope) -> Result<Self, Self::Error> {
+        use std::str::FromStr;
+
+        let token = cashu::Token::from_str(&envelope.serialized_token).map_err(|error| {
+            PaymentSendError::Transport(format!("invalid Cashu token in NIP-17 payment: {error}"))
+        })?;
+        Ok(Self {
+            job_id: envelope.job_id,
+            result_id: envelope.result_id,
+            mint_url: envelope.mint_url,
+            amount_sats: envelope.amount_sats,
+            token,
+            seller_pubkey: envelope.seller_pubkey,
+        })
+    }
 }
 
 #[cfg(feature = "gateway")]
@@ -252,34 +294,40 @@ fn fresh_gift_wrap_created_at() -> nostr_sdk::prelude::Timestamp {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "wallet")]
+    const VALID_CASHU_TOKEN: &str = "cashuBpGFtdWh0dHA6Ly9sb2NhbGhvc3Q6MzMzOGF1Y3NhdGFkaVRoYW5rIHlvdWF0gaJhaUgArSaMTR9YJmFwgaRhYQFhc3hAOWE2ZGJiODQ3YmQyMzJiYTc2ZGIwZGYxOTcyMTZiMjlkM2I4Y2MxNDU1M2NkMjc4MjdmYzFjYzk0MmZlZGI0ZWFjWCEDhhhUP_trhpXfStS6vN6So0qWvc2X3O4NfM-Y1HISZ5JhZPY=";
+
+    #[cfg(feature = "wallet")]
     #[test]
-    fn token_delivery_payload_canonical_json_is_stable() {
+    fn payment_send_payload_canonical_json_is_stable() {
         let payload = payload();
 
         assert_eq!(
             payload.canonical_json("buyer"),
-            "{\"job_id\":\"job\",\"result_id\":\"result\",\"mint_url\":\"https://testnut.cashu.space\",\"amount_sats\":7,\"token\":\"cashu-token\",\"buyer_pubkey\":\"buyer\",\"seller_pubkey\":\"seller\"}"
+            format!(
+                "{{\"job_id\":\"job\",\"result_id\":\"result\",\"mint_url\":\"https://testnut.cashu.space\",\"amount_sats\":7,\"token\":\"{VALID_CASHU_TOKEN}\",\"buyer_pubkey\":\"buyer\",\"seller_pubkey\":\"seller\"}}"
+            )
         );
     }
 
     #[test]
-    fn memory_delivery_records_metadata_only() {
-        let mut delivery = MemoryTokenDelivery::default();
+    fn memory_payment_records_metadata_only() {
+        let mut delivery = MemoryPaymentSend::default();
 
-        let delivered = delivery.record_delivery(payload()).unwrap();
+        let delivered = delivery.record_payment(payload()).unwrap();
 
-        assert_eq!(delivered.delivery_id, "mem-delivery-1");
-        assert_eq!(delivered.relay_success, ["memory://token-delivery"]);
+        assert_eq!(delivered.payment_id, "mem-payment-1");
+        assert_eq!(delivered.relay_success, ["memory://payment-send"]);
         assert!(delivered.relay_failed.is_empty());
-        assert_eq!(delivery.deliveries(), &[delivered]);
+        assert_eq!(delivery.payments(), &[delivered]);
     }
 
     #[test]
-    fn delivery_fails_closed_when_no_relay_accepts() {
-        let error = delivered_token(
+    fn payment_send_fails_closed_when_no_relay_accepts() {
+        let error = payment_sent(
             "event".into(),
             Vec::new(),
-            vec![DeliveryRelayFailure {
+            vec![PaymentRelayFailure {
                 relay: "wss://relay.example".into(),
                 error: "rejected".into(),
             }],
@@ -288,17 +336,17 @@ mod tests {
 
         assert_eq!(
             error,
-            DeliveryError::Transport("no relay accepted the NIP-17 token delivery".into())
+            PaymentSendError::Transport("no relay accepted the NIP-17 payment".into())
         );
     }
 
     #[test]
-    fn delivery_preserves_partial_relay_outcome() {
-        let failed = DeliveryRelayFailure {
+    fn payment_send_preserves_partial_relay_outcome() {
+        let failed = PaymentRelayFailure {
             relay: "wss://failed.example".into(),
             error: "rejected".into(),
         };
-        let delivered = delivered_token(
+        let delivered = payment_sent(
             "event".into(),
             vec!["wss://accepted.example".into()],
             vec![failed.clone()],
@@ -320,16 +368,40 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "gateway")]
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn corrupt_wire_token_fails_closed_before_payload_construction() {
+        let json = "{\"job_id\":\"job\",\"result_id\":\"result\",\"mint_url\":\"https://testnut.cashu.space\",\"amount_sats\":7,\"token\":\"not-a-cashu-token\",\"buyer_pubkey\":\"buyer\",\"seller_pubkey\":\"seller\"}";
+
+        let error = parse_nip17_payment_payload(json).unwrap_err();
+
+        assert!(
+            matches!(error, PaymentSendError::Transport(message) if message.contains("invalid Cashu token in NIP-17 payment"))
+        );
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn payment_payload_round_trips_token_identity_at_envelope_boundary() {
+        let payload = payload();
+        let json = payload.canonical_json("buyer");
+
+        let parsed = parse_nip17_payment_payload(&json).unwrap();
+
+        assert_eq!(parsed.token, payload.token);
+        assert_eq!(parsed.token.to_string(), VALID_CASHU_TOKEN);
+    }
+
+    #[cfg(all(feature = "gateway", feature = "wallet"))]
     #[test]
     fn gift_wrap_never_leaks_token_or_payload_plaintext() {
+        use std::str::FromStr;
+
         use nostr_sdk::{
             nips::nip59::UnwrappedGift,
             prelude::{JsonUtil, Keys, Kind, PublicKey, Tag},
         };
 
-        // A recognizable, high-entropy secret so a substring match cannot collide by chance.
-        const SECRET_TOKEN: &str = "cashuAsecret-proof-DO-NOT-LEAK-9f3c1a7b0e5d4266";
         const SECRET_JOB_ID: &str = "job-secret-corr-42";
         const SECRET_RESULT_ID: &str = "result-secret-corr-42";
 
@@ -342,12 +414,12 @@ mod tests {
         //   * job_id / result_id / mint_url / amount / pubkeys travel inside the same
         //     encrypted payload. Gift-wrap exists to keep that whole envelope private, so we
         //     assert the entire canonical payload (and the correlation ids) are absent too.
-        let payload = TokenDeliveryPayload {
+        let payload = PaymentPayload {
             job_id: SECRET_JOB_ID.into(),
             result_id: SECRET_RESULT_ID.into(),
             mint_url: "https://testnut.cashu.space".into(),
             amount_sats: 7,
-            token: SECRET_TOKEN.into(),
+            token: cashu::Token::from_str(VALID_CASHU_TOKEN).unwrap(),
             seller_pubkey: receiver.public_key().to_hex(),
         };
         let plaintext = payload.canonical_json(&sender.public_key().to_hex());
@@ -355,12 +427,12 @@ mod tests {
         // Non-vacuous guard: the token really is present in the plaintext we hand in, so its
         // absence from the wire artifact below is a meaningful result, not a typo.
         assert!(
-            plaintext.contains(SECRET_TOKEN),
+            plaintext.contains(VALID_CASHU_TOKEN),
             "test setup broken: token missing from canonical payload"
         );
 
         let recipient = PublicKey::parse(&payload.seller_pubkey).expect("valid recipient pubkey");
-        let gift_wrap = block_on(token_delivery_gift_wrap(
+        let gift_wrap = block_on(payment_send_gift_wrap(
             &sender,
             recipient,
             plaintext.clone(),
@@ -395,7 +467,7 @@ mod tests {
         // Core money-safety property: no proof/token material and no plaintext payload
         // survives on the wire.
         assert!(
-            !wire.contains(SECRET_TOKEN),
+            !wire.contains(VALID_CASHU_TOKEN),
             "token/proof material leaked in plaintext on the wire: {wire}"
         );
         assert!(
@@ -419,7 +491,7 @@ mod tests {
         // wrapping key + randomized nip44 nonce). A plaintext or deterministic-passthrough
         // path would make these byte-identical, so this proves the absence assertions above
         // are not passing vacuously against a constant or empty artifact.
-        let second = block_on(token_delivery_gift_wrap(
+        let second = block_on(payment_send_gift_wrap(
             &sender,
             recipient,
             plaintext.clone(),
@@ -456,13 +528,17 @@ mod tests {
         }
     }
 
-    fn payload() -> TokenDeliveryPayload {
-        TokenDeliveryPayload {
+    fn payload() -> PaymentPayload {
+        #[cfg(feature = "wallet")]
+        use std::str::FromStr;
+
+        PaymentPayload {
             job_id: "job".into(),
             result_id: "result".into(),
             mint_url: "https://testnut.cashu.space".into(),
             amount_sats: 7,
-            token: "cashu-token".into(),
+            #[cfg(feature = "wallet")]
+            token: cashu::Token::from_str(VALID_CASHU_TOKEN).unwrap(),
             seller_pubkey: "seller".into(),
         }
     }

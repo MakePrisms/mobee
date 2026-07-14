@@ -38,7 +38,7 @@ delta vs main: 21 commits (2026-07-12→13), 17 files, +10182/−8.
 | Format check + receipt H-tuple | ✅ piece-1 @ `b5003d4` (`format.rs` 270, `receipt.rs` 93 — clean re-extraction) | spike's own older copies (+221/+86, predate piece-1) | done; spike copies = refuse-list |
 | Gateway protocol types (kinds 5109/6109/7000/3400, MOBEE_TAG, v1, `TESTNUT_MINT_URL`, TagSpec/EventDraft/OfferDraft/ParsedOffer, targeting) | ⏳ arriving as piece-2 (PR #5 @ `c0e604c`, +567 distilled) | `mobee-core/src/gateway.rs` +603 (source material) | piece-2 in flight |
 | Token verification (wallet) | — | `mobee-core/src/wallet.rs` +413: `verify_p2pk_token` :109 (sum==amount, NUT-11 P2PK lock, NUT-07 per-proof unspent), mint hard-bind :121, `cashu_proofs_from_token` :176 (V3/V4, keyset-free), `fetch_nut07_states_for_proofs` :217. Feature `wallet=[cashu,cdk]`. 4 hermetic tests | **piece-3 (recommended next)** |
-| Token delivery | — | `mobee-core/src/delivery.rs` +254: canonical-JSON payload, `TokenDelivery` trait + memory fake, `NostrTokenDelivery` (NIP-17 14→13→1059), gift-wrap timestamp clamp 180 s (:102, :202) | piece-4 |
+| Payment send | — | `mobee-core/src/payment_send.rs` +254: canonical-JSON payload, `PaymentSend` trait + memory fake, `NostrPaymentSend` (NIP-17 14→13→1059), gift-wrap timestamp clamp 180 s (:102, :202) | piece-4 |
 | Payment state machine + idempotency journal | — | none as a library — semantics live inside `authorize_pay` (`cli.rs:1844`) + append-after-pay journal | piece-6 (design, not extraction) |
 | Git-delivery gates | — | all in `cli.rs`: `verify_git_delivery` :4388 (fetch-before-pay, branch→oid equality), `verify_git_descendant` :4412 (strict descendant, rejects commit==baseline), `ensure_repo_job_protection` :2779 (authoritative kind:30617 by owner+`d`, clone/web echo, buzz-channel bind, no-force-push cover), `parse_relay_git_repo_identity` :4123, ref-pattern grammar mirror :4210 | piece-7 (HOLD — see §2) |
 | Buyer MCP + seller gateway loop | — | `crates/mobee/src/cli.rs` +4862 god-file: `BuyerMcpServer` :1389, locked v0 five-tool surface :1579-1583, idempotency journal (`--idempotency-log`/env :1278), `confirm_receipt` :2205, `require_relay_success` :2489, accept idempotency :1754, testnut fee headroom `=8` :36, mint-token non-testnut refusal :1320, gateway subcommands :491 | piece-8 (thin re-skin, last) |
@@ -167,14 +167,14 @@ Acceptance:
 - Testnut fund-isolation is NOT here — it lives at the buyer-**mint** edge where
   `expected_mint` is chosen (piece-6/8); `verify_trade_p2pk` is mint-*matching* mechanism.
 
-### piece-4 — token-delivery library · **MONEY**
+### piece-4 — payment-send library · **MONEY**
 
-Lift `mobee-core/src/delivery.rs` @ `0e77669`: payload canonical JSON, `TokenDelivery`
-trait + memory fake, `NostrTokenDelivery` NIP-17, gift-wrap timestamp clamp. Depends on
+Lift `mobee-core/src/payment_send.rs` @ `0e77669`: payload canonical JSON, `PaymentSend`
+trait + memory fake, `NostrPaymentSend` NIP-17, gift-wrap timestamp clamp. Depends on
 piece-2 (core `gateway` feature / nostr dep).
 
 Acceptance: the 3 spike hermetic tests green
-(`token_delivery_payload_canonical_json_is_stable`, `memory_delivery_records_token_payloads`,
+(`payment_send_payload_canonical_json_is_stable`, `memory_payment_records_metadata_only`,
 `gift_wrap_timestamp_tweak_stays_inside_relay_freshness_window`); trait consumable with the
 memory fake and no network; review asserts proofs ride only the private DM path, never a
 public receipt (spec §4).
@@ -200,10 +200,11 @@ mechanism (gift-wrap / fail-closed / metadata-only); do **not** pull piece-6 sco
 SM, journal, buyer-mint Wallet, seller receive/swap) into it.
 
 In scope for the #6 rework:
-1. **Rename** `token delivery → payment send`: `deliver_token → send_payment`,
-   `TokenDelivery → PaymentSend`, `TokenDeliveryPayload → PaymentPayload`, `DeliveredToken →
-   PaymentSent`, module/path names; SM vocab `intent → locked → sent → receipt-published →
-   closed`; **no "token delivered" residual** (reserve "delivery" for git work product).
+1. **Rename** token-send vocabulary to payment-send vocabulary: old send verb →
+   `send_payment`, old delivery trait/payload/result names → `PaymentSend` /
+   `PaymentPayload` / `PaymentSent`, plus module/path names; SM vocab
+   `intent → locked → sent → receipt-published → closed`; **no payment-token
+   delivery residual** (reserve "delivery" for git work product).
 2. **Typed Token**: payload holds in-process `cashu::Token` (+ `MintUrl`/`Amount`), **not**
    `token: String`; serialize `cashuA/cashuB` **only** at the NIP-17 envelope boundary;
    seller **parses `Token` first, fail-closed, before any SM/state advance**; feature-gate so
@@ -223,8 +224,8 @@ Acceptance (MONEY bar — composition + Temper adversarial + codex; the 5 traps 
   the bar #6 already set).
 - **high** — seller receive parses `Token` before SM/state advance; garbage after unwrap
   fails closed with no side effects.
-- **medium** — rename completeness: grep-gate on `token_delivery` / `TokenDelivery` /
-  `deliver_token` residual in paths, re-exports, docs, error strings.
+- **medium** — rename completeness: grep-gate on old token-send identifiers residual
+  in paths, re-exports, docs, error strings.
 
 Held until it lands in this shape; force-with-lease with old/new heads posted first (it
 rewrites the #6 branch again). Owner: coordinator re-charter (metadex + Temper eyes-on;
