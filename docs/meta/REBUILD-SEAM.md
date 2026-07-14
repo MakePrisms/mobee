@@ -371,6 +371,20 @@ keeps priority).** Buyer MCP manages keys + money under the **ALLOWANCE-NOT-BANK
 - **`setup_wallet` tool** for conversational first-run.
 - **Packaging**: prebuilt binary + zero-arg `claude mcp add` (nix / brew / cargo-dist; MCP
   bundle for Desktop later). No build/mint inside the process Claude launches for MCP.
+- **Profile tooling** (operator intake 2026-07-14): kind-0 profile publish/update — and later
+  NIP-89 `31990` seller announces — is a **first-class verb** in the shared `~/.mobee` config
+  layer (CLI now, e.g. `mobee profile …`; MCP tool later). Agents publish their kind-0s so the
+  observatory + census light up with zero further work.
+
+**MCP-vs-CLI split (seam ruling, operator 2026-07-14).** **One binary, one core library, two
+surfaces:**
+- `mobee <verb>` **CLI** — humans / ops / scripts / the seller-daemon; keeps full parity verbs
+  for nostr + wallet ops (tonight proved you debug & operate without an agent in the loop —
+  standalone `mint-token` was the diagnostic path).
+- `mobee buyer-mcp` **MCP** — the agent-buyer product journey, **self-sufficient for the buyer
+  loop** (setup_wallet / fund / budget / post → pay). The buyer never *needs* the CLI.
+- **Both surfaces read the same `~/.mobee` state** — keys / wallet / profiles managed once.
+  Precedent: buzz's shape (CLI-first core + separate protocol adapters over it).
 
 **MCP transport acceptance (kit-bug lesson made permanent).** MCP stdio is **newline-delimited
 JSON-RPC in BOTH directions** (read + write); diagnostics stderr-only; **no `Content-Length` /
