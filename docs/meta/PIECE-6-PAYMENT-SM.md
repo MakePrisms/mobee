@@ -270,7 +270,17 @@ the module cut drawn now becomes the crate cut then. **Do not crate-split during
 - Post-mint bind exercised against the **real** minted `Token` (the guard itself lands in
   PR1 — see PR1 acceptance; PR2 runs it with real cashu Tokens from the concrete mint). Offer
   unit parsed fail-closed (unknown rejected, never defaulted) at the one constructor.
+- **Validate minted `Token` ≡ terms *before persisting `Locked`* (Temper residual-1):** a
+  mismatch must leave the key at `Intent` (reconcilable), NOT journal `Locked` then refuse.
+  PR1's guard runs *after* the `Locked` append (`run` §Locked block), so a mismatch is
+  money-safe but **bricks the key** to `AmbiguousSendRefused` on re-entry; PR2 reorders the
+  validate before the `Locked`-journal so a bad mint result is recoverable, not bricked.
+- **Seller-P2PK authenticity bind (Temper residual-2):** the real `verify_payment` adapter
+  calls `verify_trade_p2pk` on `locked.token()` with the real seller lock before send. PR1's
+  fake `verify_payment` ignores `locked`; the SM already threads `locked` through every
+  effect, so PR2 only wires the real #8 verify — no SM change.
 - Testnut allowlist: mint outside the test set → hard fail before any verify/mint.
+- Optional: extend the mismatch regression with a `unit = None` case (Temper residual-3).
 - No-wallet build still has no pay path.
 
 ## Refuse-to-copy (from the spike, this piece specifically)
