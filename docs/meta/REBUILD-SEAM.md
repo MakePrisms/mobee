@@ -104,8 +104,18 @@ keeps Mobee to trade policy only. This reworks #8, not merges it.
 **KEEP in Mobee (pure core, `cashu`-only, zero I/O):** a thin
 `verify_trade_p2pk(token: &cashu::Token, lock: TradeLock, states) -> VerifiedPayment`
 composing `Token::value() == lock.amount` + `Token::mint_url() == lock.mint` +
-`Token::p2pk_pubkeys()` (token.rs:163) contains `lock.seller_lock` + **no duplicate `y`/
-secret + checked-amount** (the security we added on #8 — carry forward, do not regress);
+**every proof's secret is P2PK with primary `data == lock.seller_lock`** (reject non-P2PK /
+malformed) + **no duplicate `y`/secret + checked-amount** (the security we added on #8 —
+carry forward, do not regress);
+⚠ **`Token::p2pk_pubkeys().contains(seller)` is INSUFFICIENT (Temper BLOCK, probe-reproduced
+on cashu 0.17.2, 2026-07-14):** that helper UNIONs pubkeys across proofs AND silently skips
+non-P2PK / non-Nut10 secrets, so a mixed token (1 seller-locked + 99 other) or hybrid
+(1 seller-P2PK + 99 non-Nut10) yields `contains(seller)=true` → a false Ok. The `Ok` must
+mean "every sat is seller-keyed," not "seller appears somewhere." Parse per-secret
+`SpendingConditions` and require ALL to be P2PK-locked to the seller. Not a fund-loss under
+piece-6's swap-on-receive (which fails closed on non-seller-spendable proofs) — but piece-6
+is UNBUILT, so shipping the oversell parks a footgun for any consumer treating `Ok` as
+trade-complete. Strict is still pure (cashu types), so there's no hermetic cost.
 DLEQ math via `Proof::verify_dleq(mint_pubkey)` (offline). No single cdk fn does
 "mint+amount+P2PK" in one call — `Wallet::verify_token_p2pk` is async + Wallet-bound +
 checks no amount, strictly worse for a hermetic core, so Mobee keeps this ~5-line pure
@@ -133,7 +143,11 @@ Acceptance:
   the wallet feature — the enforceable invariant is **no-DB**, not no-async-runtime. State it
   precisely in the PR (don't claim the impossible).
 - `verify_trade_p2pk` rejects: wrong mint, wrong amount, seller-lock absent, duplicate
-  `y`/secret, amount-sum overflow, any proof reported spent — each with a test.
+  `y`/secret, amount-sum overflow, any proof reported spent, **any proof not P2PK-locked to
+  the seller** — each with a test. The last is the Temper-BLOCK strict rule: **mixed-lock**
+  (1 seller + N other-pubkey P2PK proofs) and **hybrid** (1 seller-P2PK + N non-Nut10
+  secrets) tokens MUST be REJECTED — observe RED on the union-contains head, GREEN after the
+  per-proof fix (red-before-green).
 - Both traps regression-covered (unsigned token → lock check via SpendingConditions passes/
   fails correctly and never calls verify_p2pk; ys computed without a keyset fetch).
 - Testnut fund-isolation is NOT here — it lives at the buyer-**mint** edge where
