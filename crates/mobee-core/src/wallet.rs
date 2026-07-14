@@ -8,7 +8,7 @@ use cashu::{
 };
 use cdk::wallet::MintConnector;
 
-/// The trade facts that a presented Cashu token must bind to before payment.
+/// Trade facts the token must match before payment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TradeLock {
     pub mint: MintUrl,
@@ -17,12 +17,7 @@ pub struct TradeLock {
     pub seller_lock: PublicKey,
 }
 
-/// Metadata proven by [`verify_trade_p2pk`].
-///
-/// This is a trade-binding and spend-state result, not an authenticity or
-/// redeemability claim. The reported value is UNTRUSTED until a successful
-/// mint swap or full keyset + DLEQ verification. The seller still owns that
-/// receive-side authenticity gate.
+/// Trade binding and unspent state; not mint authenticity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedPayment {
     pub mint: MintUrl,
@@ -81,24 +76,7 @@ impl fmt::Display for WalletVerifyError {
 
 impl std::error::Error for WalletVerifyError {}
 
-/// Verifies trade binding and the supplied NUT-07 state for a presented token.
-///
-/// This intentionally composes the native `cashu` surface instead of mirroring
-/// Cashu DTOs or NUT parsing in Mobee:
-///
-/// - `Token::value()` performs checked amount aggregation and rejects duplicate
-///   secrets.
-/// - `Token::mint_url()` supplies the mint binding.
-/// - each proof secret is parsed through native NUT-10 `SpendingConditions` and
-///   its primary P2PK key must equal the seller lock; this must not be replaced
-///   with `Proof::verify_p2pk()`, which verifies witness signatures and rejects
-///   an unsigned pre-pay token.
-/// - proof ys are derived with `Proof::y()` from token secrets without resolving
-///   keysets.
-///
-/// `Ok` does not authenticate mint signatures or prove redeemability. The
-/// seller receive path must swap at the mint (or perform full keyset + DLEQ
-/// verification) before advancing the payment state.
+/// Verifies mint, amount, unit, per-proof seller lock, and unspent state; not authenticity.
 pub fn verify_trade_p2pk(
     token: &Token,
     lock: &TradeLock,
@@ -171,10 +149,6 @@ fn require_seller_lock(token: &Token, seller_lock: PublicKey) -> Result<(), Wall
             ));
         }
 
-        // `SpendingConditions` intentionally exposes the effective pubkey set,
-        // not its primary `data` field. Read that field through cashu's native
-        // NUT-10 representation so an additional seller key cannot disguise a
-        // proof whose primary lock belongs to someone else.
         let primary_lock = PublicKey::from_str(nut10.secret_data().data()).map_err(|error| {
             WalletVerifyError::InvalidToken(format!("invalid primary P2PK key: {error}"))
         })?;
@@ -188,10 +162,7 @@ fn require_seller_lock(token: &Token, seller_lock: PublicKey) -> Result<(), Wall
     Ok(())
 }
 
-/// Fetches NUT-07 state through the injected CDK connector, then runs the pure
-/// trade verifier. Production can inject `HttpClient`; tests inject a hermetic
-/// transport into CDK's generic HTTP connector. No wallet database or concrete
-/// network client is owned by core policy.
+/// Fetches NUT-07 state through an injected connector, then runs the pure verifier.
 pub async fn verify_trade_p2pk_with_connector<C: MintConnector + ?Sized>(
     connector: &C,
     token: &Token,
@@ -207,11 +178,6 @@ pub async fn verify_trade_p2pk_with_connector<C: MintConnector + ?Sized>(
 }
 
 fn token_ys(token: &Token) -> Result<Vec<PublicKey>, WalletVerifyError> {
-    // `Proof::y()` depends only on `secret`. Token V3/V4 store short keyset ids,
-    // but resolving those ids is required only when reconstructing spendable
-    // proofs for a swap. A placeholder native Id lets us call the cashu-owned
-    // `Proof::y()` without introducing a keyset fetch into the pre-pay check;
-    // no field other than `secret` participates in this calculation.
     let y_only_id = cashu::Id::from_str("0000000000000000")
         .map_err(|error| WalletVerifyError::InvalidToken(error.to_string()))?;
 
