@@ -76,7 +76,7 @@ impl fmt::Display for WalletVerifyError {
 
 impl std::error::Error for WalletVerifyError {}
 
-/// Verifies mint, amount, unit, per-proof seller lock, and unspent state; not authenticity.
+/// Verifies mint, amount, unit, per-proof seller lock, and unspent state; not mint authenticity.
 pub fn verify_trade_p2pk(
     token: &Token,
     lock: &TradeLock,
