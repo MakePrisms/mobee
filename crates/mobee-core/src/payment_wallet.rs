@@ -323,6 +323,7 @@ impl<R> CdkPaymentEffects<R> {
         S: PaymentSend + Send + 'static,
     {
         let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .map_err(wallet_error)?;
         let (commands, mut requests) = tokio::sync::mpsc::channel(1);
