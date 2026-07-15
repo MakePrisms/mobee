@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cdk::nuts::{CurrencyUnit, PaymentMethod};
+use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod};
 use cdk::wallet::Wallet;
 use cdk::Amount;
 use cdk_sqlite::wallet::WalletSqliteDatabase;
@@ -142,14 +142,31 @@ pub async fn fund_testnut_wallet(
         .await
         .map_err(|error| FundError::Wallet(error.to_string()))?;
     let invoice = quote.request.clone();
+    let quote_id = quote.id.clone();
+
+    // Poll HTTP quote status — do not use wait_and_mint_quote (WS stream hung against
+    // testnut in this environment). FakeWallet marks bolt11 paid; poll until Paid/Issued.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        let status = wallet
+            .check_mint_quote(&quote_id)
+            .await
+            .map_err(|error| FundError::Wallet(error.to_string()))?;
+        match status.state {
+            MintQuoteState::Paid | MintQuoteState::Issued => break,
+            MintQuoteState::Unpaid => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(FundError::Wallet(format!(
+                        "timed out waiting for testnut mint quote {quote_id} to become paid"
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
 
     let proofs = wallet
-        .wait_and_mint_quote(
-            quote,
-            Default::default(),
-            None,
-            Duration::from_secs(60),
-        )
+        .mint(&quote_id, Default::default(), None)
         .await
         .map_err(|error| FundError::Wallet(error.to_string()))?;
     let funded = proofs
