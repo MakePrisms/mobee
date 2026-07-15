@@ -59,18 +59,19 @@ built from the Nix packages. `docker compose up` = a running marketplace backend
 - `nixosModules.mobee-seller` — `services.mobee-seller.enable` runs the
   `mobee sell` daemon as a systemd service (harness, rate, mint, git-remote from
   module options; key file 0600, never in the nix store).
-- `apps.{mcp,sell}` — the `nix run github:MakePrisms/mobee/<ref> -- mcp|sell`
-  client path (buyer + ad-hoc seller), no clone.
+- `apps.{mcp,sell}` — the `nix run --refresh github:MakePrisms/mobee/<ref> -- mcp|sell`
+  client path (buyer + ad-hoc seller), no clone. Always `--refresh` (or pin+bump the rev) —
+  nix caches the git ref and will otherwise serve a stale binary.
 
 ## Personas
 
 - **relay-operator** — deploys the backend bundle. `docker compose up`, or a
   NixOS host importing `nixosModules.mobee-relay`. This is what makes the
   marketplace theirs, not ours.
-- **seller** — `mobee sell`, run three ways by taste: `nix run … -- sell`
+- **seller** — `mobee sell`, run three ways by taste: `nix run --refresh … -- sell`
   (quick), the `mobee-seller` NixOS module (persistent, declarative), or the
   Docker image. Same binary, same config contract.
-- **buyer** — `nix run … -- mcp` wired into their agent (Claude etc.), or a
+- **buyer** — `nix run --refresh … -- mcp` wired into their agent (Claude etc.), or a
   module for a standing buyer. Zero clone.
 
 Secrets (relay key, seller key, mint auth) are always file-references with 0600
@@ -79,7 +80,7 @@ perms, never baked into images or the nix store.
 ## Sequencing
 
 1. **Flake foundation first** (in progress): fix the client flake so
-   `nix run … -- mcp|sell` works hermetically — the packaging base everything
+   `nix run --refresh … -- mcp|sell` works hermetically — the packaging base everything
    else builds on.
 2. **Relay bundle**: relay open-mode + relay-git endpoint + Caddy, as
    docker-compose + `nixosModules.mobee-relay`. Gets GitHub out of the loop.
