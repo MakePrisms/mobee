@@ -566,7 +566,7 @@ mod tests {
     use super::*;
     use crate::gateway::ParsedOffer;
     use crate::payment::{
-        ContentHash, JobHash, JobId, MemoryPaymentJournal, PaymentKey, PaymentService,
+        DeliveryIntegrityHash, JobHash, JobId, MemoryPaymentJournal, PaymentKey, PaymentService,
         PaymentState, ReceiptAuthority, ResultId,
     };
     use crate::payment_send::{PaymentSendError, PaymentSent};
@@ -853,7 +853,7 @@ mod tests {
         let journal = MemoryPaymentJournal::default();
 
         let state = PaymentService::new(&journal)
-            .run(&key, &fixture.terms, &authority, &mut effects)
+            .advance(&key, &fixture.terms, &authority, &mut effects)
             .unwrap();
 
         assert!(matches!(state, PaymentState::Closed { .. }));
@@ -899,7 +899,7 @@ mod tests {
         let journal = MemoryPaymentJournal::default();
 
         let state = PaymentService::new(&journal)
-            .run(&key, &fixture.terms, &authority, &mut effects)
+            .advance(&key, &fixture.terms, &authority, &mut effects)
             .unwrap();
 
         assert!(matches!(state, PaymentState::Closed { .. }));
@@ -1065,7 +1065,7 @@ mod tests {
         PaymentKey::new(
             JobId::new("job").unwrap(),
             ResultId::new("result").unwrap(),
-            ContentHash::from_hex("11".repeat(32)).unwrap(),
+            DeliveryIntegrityHash::from_hex("11".repeat(32)).unwrap(),
             JobHash::from_hex("22".repeat(32)).unwrap(),
             terms,
         )

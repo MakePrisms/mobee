@@ -7,8 +7,8 @@ pub const RECEIPT_HASH_DOMAIN: &str = "mobee/v1/receipt";
 pub struct ReceiptHashInput {
     /// Market/offer job id; this is part of the receipt hash tuple and must not change.
     pub job_id: String,
-    /// SHA-256 hex digest of the delivered result content.
-    pub result_content_hash: String,
+    /// Integrity identifier for the delivered work (commit oid for git delivery).
+    pub delivery_integrity_hash: String,
     /// Integer payment amount for the receipt.
     pub price_int: u64,
     /// Payment unit for `price_int`, such as `sat`.
@@ -26,7 +26,7 @@ impl ReceiptHashInput {
         serde_json::to_string(&serde_json::json!([
             RECEIPT_HASH_DOMAIN,
             self.job_id,
-            self.result_content_hash,
+            self.delivery_integrity_hash,
             self.price_int,
             self.unit,
             self.mint_url,
@@ -56,7 +56,7 @@ mod tests {
     fn input() -> ReceiptHashInput {
         ReceiptHashInput {
             job_id: "job".into(),
-            result_content_hash: "result-content-hash".into(),
+            delivery_integrity_hash: "delivery-integrity-hash".into(),
             price_int: 7,
             unit: "sat".into(),
             mint_url: "https://testnut.cashu.space".into(),
@@ -69,7 +69,7 @@ mod tests {
     fn canonical_json_matches_locked_receipt_tuple_order() {
         assert_eq!(
             input().canonical_json(),
-            "[\"mobee/v1/receipt\",\"job\",\"result-content-hash\",7,\"sat\",\"https://testnut.cashu.space\",\"buyer\",\"seller\"]"
+            "[\"mobee/v1/receipt\",\"job\",\"delivery-integrity-hash\",7,\"sat\",\"https://testnut.cashu.space\",\"buyer\",\"seller\"]"
         );
     }
 
@@ -89,5 +89,41 @@ mod tests {
 
         assert_ne!(base, changed.hash_hex());
         assert_eq!(base.len(), 64);
+    }
+
+    #[test]
+    fn receipt_hash_binds_the_verified_delivery_oid() {
+        let first = input();
+        let mut second = first.clone();
+        second.delivery_integrity_hash = "b".repeat(40);
+
+        assert_ne!(first.hash_hex(), second.hash_hex());
+    }
+
+    #[test]
+    fn legacy_result_content_hash_field_name_refuses_to_deserialize() {
+        let legacy = serde_json::json!({
+            "job_id": "job",
+            "result_content_hash": "legacy-hash",
+            "price_int": 7,
+            "unit": "sat",
+            "mint_url": "https://testnut.cashu.space",
+            "buyer_pubkey_hex": "buyer",
+            "seller_pubkey_hex": "seller"
+        });
+
+        assert!(serde_json::from_value::<ReceiptHashInput>(legacy).is_err());
+    }
+
+    #[test]
+    fn receipt_delivery_integrity_hash_round_trips() {
+        let original = input();
+        let json = serde_json::to_value(&original).expect("serialize receipt");
+        assert!(json.get("delivery_integrity_hash").is_some());
+        assert!(json.get("result_content_hash").is_none());
+
+        let parsed: ReceiptHashInput =
+            serde_json::from_value(json).expect("deserialize receipt");
+        assert_eq!(parsed, original);
     }
 }
