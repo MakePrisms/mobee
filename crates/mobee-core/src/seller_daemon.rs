@@ -304,7 +304,8 @@ impl SellerDaemon {
         // Amount in terms == offer.amount (NOT rate_sats).
         let secret = home::read_secret_key_hex(&self.home)?;
         let cashu_key = cashu_secret_from_nostr_hex(&secret)?;
-        let wallet = buyer_fund::open_testnut_wallet_blocking(&self.home)?;
+        // Must await — seller loop already owns a tokio runtime; blocking open nests block_on → panic.
+        let wallet = buyer_fund::open_testnut_wallet_async(&self.home).await?;
         let adapter = CdkSellerReceive::new(&wallet, cashu_key);
         let amount = adapter.receive(&received.payload.token, &terms).await?;
         let amount_received = amount.to_u64();
@@ -616,16 +617,83 @@ pub fn run_forever_blocking(daemon: SellerDaemon) -> Result<(), DaemonError> {
     runtime.block_on(run_forever(daemon))
 }
 
-/// Long-running seller loop: subscribe 5109+1059 from START.
+/// Drain `notifications` until NIP-42 AUTH succeeds (or fail closed).
+///
+/// Caller must subscribe `relay.notifications()` **before** `connect` so the
+/// `Authenticated` event cannot be missed.
+///
+/// mobee-relay p-gates kind-1059: unauthenticated `REQ kinds:[1059] #p:self` is
+/// `CLOSED` with `restricted:` (not `auth-required:`). nostr-sdk 0.44 treats
+/// `restricted:` as `Remove` — the sub is dropped, so the post-auth
+/// `resubscribe()` never restores it. Auth **before** the 1059 subscribe is
+/// therefore load-bearing for seller receive.
+async fn wait_for_nip42_auth(
+    notifications: &mut tokio::sync::broadcast::Receiver<nostr_sdk::pool::RelayNotification>,
+    timeout: std::time::Duration,
+) -> Result<(), DaemonError> {
+    use nostr_sdk::pool::RelayNotification;
+
+    tokio::time::timeout(timeout, async {
+        loop {
+            match notifications.recv().await {
+                Ok(RelayNotification::Authenticated) => return Ok(()),
+                Ok(RelayNotification::AuthenticationFailed) => {
+                    return Err(DaemonError::Relay(
+                        "NIP-42 authentication failed (required for kind-1059 p-gated receive)"
+                            .into(),
+                    ));
+                }
+                Ok(RelayNotification::Shutdown) => {
+                    return Err(DaemonError::Relay(
+                        "relay shutdown before NIP-42 authentication".into(),
+                    ));
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    return Err(DaemonError::Relay(
+                        "relay notification channel closed before NIP-42 authentication".into(),
+                    ));
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        DaemonError::Relay(
+            "timed out waiting for NIP-42 authentication (required for kind-1059 receive)".into(),
+        )
+    })?
+}
+
+/// Long-running seller loop: NIP-42 AUTH, then subscribe 5109+1059 from START.
 pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
-    use nostr_sdk::prelude::{Client, Filter, Kind, RelayPoolNotification};
+    use std::time::Duration;
+    use nostr_sdk::prelude::{Client, Filter, Kind, RelayPoolNotification, RelayUrl};
 
     let client = Client::new(daemon.keys.clone());
+    // Default is true; set explicitly — seller receive depends on it.
+    client.automatic_authentication(true);
+
+    let relay_url_str = daemon.home.config.relay_url.clone();
     client
-        .add_relay(&daemon.home.config.relay_url)
+        .add_relay(&relay_url_str)
         .await
         .map_err(|error| DaemonError::Relay(format!("add relay: {error}")))?;
+
+    let relay_url = RelayUrl::parse(&relay_url_str)
+        .map_err(|error| DaemonError::Relay(format!("parse relay url: {error}")))?;
+    let relay = client
+        .relays()
+        .await
+        .get(&relay_url)
+        .cloned()
+        .ok_or_else(|| DaemonError::Relay("relay missing after add_relay".into()))?;
+
+    // MUST subscribe before connect — Authenticated is not re-emitted.
+    let mut relay_notifications = relay.notifications();
     client.connect().await;
+    client.wait_for_connection(Duration::from_secs(20)).await;
+    wait_for_nip42_auth(&mut relay_notifications, Duration::from_secs(20)).await?;
 
     let offer_filter = Filter::new()
         .kind(Kind::Custom(JOB_OFFER_KIND))
@@ -645,7 +713,7 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
 
     // Status line: never echo secrets.
     eprintln!(
-        "seller daemon online pubkey={} relay={} mint={}",
+        "seller daemon online pubkey={} relay={} mint={} nip42=authenticated",
         daemon.seller_pubkey(),
         daemon.home.config.relay_url,
         daemon.home.config.mint_url
