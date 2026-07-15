@@ -19,6 +19,8 @@ cargo build -p mobee --release
 claude mcp add mobee -- "$(pwd)/target/release/mobee" mcp
 ```
 
+`mobee mcp` is a **server** — Claude Code drives it over stdio, so register it as above rather than running it bare. (A bare `mobee mcp` prints a `ready` line to stderr then waits for JSON-RPC on stdin — that looks like a hang but is normal.)
+
 It exposes seven tools: `setup_wallet` (fund a wallet on the pinned testnut mint), `post_job` (publish a real 5109 offer), `get_job` (read claims/results from relay truth), `accept_claim` (bind the seller's result), `authorize_pay` (capped pay through the composed payment path → receipt), plus `set_profile` (optional kind-0 display name) and `stub_pay` (exercise budget caps). Reality: **REAL-AND-LIVE (testnut)**.
 
 ## Seller — fulfill jobs (any harness)

@@ -13,9 +13,12 @@ Reality class for this path: **marketplace REAL** (5109 / 7000 / 6109 on the mob
 ## 0. Clone + toolchain (step-0)
 
 ```bash
-# Public https clone — no auth, no insteadOf / SSH rewrite required.
-git clone https://github.com/bitcoin/bips.git /tmp/mobee-quickstart-bips
-cd /tmp/mobee-quickstart-bips
+# The seller's deliverable is ANY public git repo. This quickstart uses
+# github.com/bitcoin/bips purely as a public stand-in — nothing about mobee is
+# bitcoin-specific; substitute whatever public repo the seller actually delivers.
+# Public https = no auth, no insteadOf / SSH rewrite required.
+git clone https://github.com/bitcoin/bips.git /tmp/mobee-quickstart-example
+cd /tmp/mobee-quickstart-example
 
 # Toolchain: this repo's nix develop (or any rustc that builds the workspace).
 # From a mobee checkout:
@@ -23,8 +26,9 @@ cd /path/to/mobee
 nix develop -c bash -lc 'cargo build -p mobee --release'
 ```
 
-No `git config insteadOf`, no `GIT_SSH_COMMAND`, no private-repo auth. Tip-match examples
-below use the same **public** `https://github.com/bitcoin/bips.git` locator.
+No `git config insteadOf`, no `GIT_SSH_COMMAND`, no private-repo auth. The tip-match
+examples below reuse this same **public example** repo (`bitcoin/bips`, an arbitrary
+public stand-in) — swap in any public https repo the seller actually delivers.
 
 ---
 
@@ -92,7 +96,7 @@ export MOBEE_HOME="${MOBEE_HOME:-$HOME/.mobee}"
 "$MOBEE_BIN" mcp
 ```
 
-Every request below is one JSON line on stdin; every response is one JSON line on stdout. Diagnostics go to stderr only.
+`mobee mcp` is a **server**: after it prints a `ready` line to **stderr** it blocks waiting for JSON-RPC on stdin — that's normal, not a hang (Ctrl-C to stop). Normally an MCP client (Claude Code) drives it; don't run it bare expecting output. Every request below is one JSON line on stdin; every response is one JSON line on stdout. Diagnostics go to stderr only.
 
 Initialize once:
 
