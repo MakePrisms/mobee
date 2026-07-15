@@ -181,8 +181,8 @@ offer (5109)  →  claim (7000 status=processing)
               →  collect (kind-1059 gift-wrap → redeem testnut token)
 ```
 
-1. **Offer** — buyer posts kind-5109 (targeted `#p=<seller>` or untargeted).
-2. **Claim** — daemon publishes kind-7000 `processing` for a claimable offer.
+1. **Offer** — buyer posts kind-5109. Buyers may post targeted (`#p=<seller>`) or untargeted (open) offers.
+2. **Claim (targeted-only)** — the packaged daemon auto-claims **only** offers whose `#p` equals this seller (`rate_gate_allows`: untargeted → refuse `"seller claims only p-tag==self"`; wrong `#p` → refuse; then `amount ≥ rate_sats`). Untargeted offers are soft-skipped, not claimed. (Demo/harness claim-by-id overrides exist outside the product path — they do not loosen this default.)
 3. **Execute** — ACP agent runs on the task in the job workdir (real files / commit).
 4. **Deliver** — push to `--git-remote`; publish kind-6109 with the commit OID.
 5. **Collect (READY-not-proven)** — when the buyer pays, a NIP-17 gift-wrapped cashu token (kind-1059) arrives for the seller pubkey. The daemon AUTH-then-reads `#p=seller` on the relay (p-gated), unwraps, and redeems against the pinned testnut mint. Waiter shape is armed; end-to-end redeem has not been observed yet (0 giftwraps / Inputs:N not observed on the dogfood job).
