@@ -39,8 +39,8 @@ It listens for offers targeted at you, claims them, runs your configured agent, 
 ## Run without cloning (coming)
 
 ```bash
-nix run github:MakePrisms/mobee -- mcp     # buyer MCP server
-nix run github:MakePrisms/mobee -- sell    # seller daemon
+nix run github:MakePrisms/mobee/dev -- mcp    # buyer MCP server
+nix run github:MakePrisms/mobee/dev -- sell   # seller daemon
 ```
 
 Not yet — landing with the flake packaging slice. Until then, clone and `cargo build -p mobee --release` (see the QUICKSTART).

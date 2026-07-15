@@ -13,22 +13,14 @@ Reality class for this path: **marketplace REAL** (5109 / 7000 / 6109 on the mob
 ## 0. Clone + toolchain (step-0)
 
 ```bash
-# The seller's deliverable is ANY public git repo. This quickstart uses
-# github.com/bitcoin/bips purely as a public stand-in — nothing about mobee is
-# bitcoin-specific; substitute whatever public repo the seller actually delivers.
-# Public https = no auth, no insteadOf / SSH rewrite required.
-git clone https://github.com/bitcoin/bips.git /tmp/mobee-quickstart-example
-cd /tmp/mobee-quickstart-example
-
-# Toolchain: this repo's nix develop (or any rustc that builds the workspace).
-# From a mobee checkout:
-cd /path/to/mobee
-nix develop -c bash -lc 'cargo build -p mobee --release'
+# Get mobee itself, on the dev branch — that's where this live path lives.
+git clone https://github.com/MakePrisms/mobee.git
+cd mobee
+git checkout dev
+nix develop -c bash -lc 'cargo build -p mobee --release'   # or any rustc that builds the workspace
 ```
 
-No `git config insteadOf`, no `GIT_SSH_COMMAND`, no private-repo auth. The tip-match
-examples below reuse this same **public example** repo (`bitcoin/bips`, an arbitrary
-public stand-in) — swap in any public https repo the seller actually delivers.
+The seller's **deliverable** is a separate thing — any public git repo. This quickstart uses `github.com/bitcoin/bips` purely as a public stand-in for the tip-match examples below (public https: no `insteadOf`, no `GIT_SSH_COMMAND`, no private-repo auth). Nothing about mobee is bitcoin-specific — substitute whatever public repo the seller delivers. You don't clone it; the buyer tip-matches it via `ls-remote` (§3d).
 
 ---
 
