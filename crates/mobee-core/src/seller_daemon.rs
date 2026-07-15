@@ -345,16 +345,28 @@ impl SellerDaemon {
         }
 
         let seller_cfg = require_seller_config(&self.home)?.clone();
-        // Gate #10: capture HEAD before agent; deliver only if agent advanced it.
-        let before_oid = seller_git::try_head_oid(&active.workdir, &self.home.root);
-        let run_result = run_agent_job(&seller_cfg.agent_command, &active.offer.task, &active.workdir).await;
+        // Gate #10 (empty-base): stamp delivery identity into a fresh git workdir (no
+        // harness commit). Deliver only if every commit is agent-authored + non-empty tree.
+        // Do NOT capture before-OID on empty / require advancement — dogfood is agent-from-empty.
+        let identity = seller_git::DeliveryAgentIdentity::for_seller(&self.seller_pubkey);
+        if let Err(error) =
+            seller_git::init_empty_delivery_workdir(&active.workdir, &self.home.root, &identity)
+        {
+            self.fail_active(&error.to_string()).await?;
+            return Err(error.into());
+        }
+        let run_result =
+            run_agent_job(&seller_cfg.agent_command, &active.offer.task, &active.workdir, &identity)
+                .await;
         if let Err(error) = run_result {
             self.fail_active(&error.to_string()).await?;
             return Err(error);
         }
         let after_oid = seller_git::try_head_oid(&active.workdir, &self.home.root);
-        let _advanced = match seller_git::require_agent_advanced_head(
-            before_oid.as_deref(),
+        let _advanced = match seller_git::require_agent_authored_delivery(
+            &active.workdir,
+            &self.home.root,
+            &identity,
             after_oid.as_deref(),
         ) {
             Ok(oid) => oid,
@@ -480,6 +492,7 @@ async fn run_agent_job(
     agent_command: &[String],
     task: &str,
     workdir: &Path,
+    identity: &seller_git::DeliveryAgentIdentity,
 ) -> Result<(), DaemonError> {
     use std::time::Duration;
 
@@ -503,7 +516,7 @@ async fn run_agent_job(
         session_config: SessionConfig {
             cwd: workdir.to_path_buf(),
             mcp_servers: Vec::new(),
-            env: Vec::new(),
+            env: identity.git_env(),
         },
         prompt: PromptTurn {
             input: vec![ContentBlock::Text {
@@ -531,6 +544,7 @@ async fn run_agent_job(
     _agent_command: &[String],
     _task: &str,
     _workdir: &Path,
+    _identity: &seller_git::DeliveryAgentIdentity,
 ) -> Result<(), DaemonError> {
     Err(DaemonError::AcpRequired)
 }
@@ -841,7 +855,9 @@ mod tests {
     #[cfg(not(feature = "acp"))]
     #[tokio::test]
     async fn agent_run_fail_closed_without_acp_feature() {
-        let err = run_agent_job(&["echo".into()], "task", Path::new(".")).await
+        let identity = seller_git::DeliveryAgentIdentity::for_seller(&"aa".repeat(32));
+        let err = run_agent_job(&["echo".into()], "task", Path::new("."), &identity)
+            .await
             .expect_err("acp required");
         assert!(matches!(err, DaemonError::AcpRequired));
         assert!(err.to_string().contains("acp"));
