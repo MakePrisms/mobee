@@ -24,7 +24,11 @@ use crate::gateway::{
 use crate::home::{self, HomeError, MobeeHome};
 
 const JOBS_DIR: &str = "jobs";
-const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 12;
+/// Per-relay-fetch budget. Kept well under [`WAIT_FOR_CAP_SECS`] / MCP tool deadline.
+const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 5;
+/// Cap for `get_job(wait_for=…)` long-poll. Must stay < MCP tool deadline (~15s) so
+/// cap-hit returns PENDING for re-poll instead of starving the client read-timeout (~60s).
+const WAIT_FOR_CAP_SECS: u64 = 10;
 const DEFAULT_DEADLINE_SECS: u64 = 3_600;
 
 /// Inputs for posting a kind-5109 offer.
@@ -93,6 +97,10 @@ pub struct JobView {
     pub results: Vec<ResultView>,
     pub live_claim_id: Option<String>,
     pub accepted: Option<AcceptedBind>,
+    /// True when `wait_for` was set and the wait cap hit before the condition —
+    /// buyer should re-poll (PENDING), not treat as failure.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -282,21 +290,63 @@ pub fn post_job(home: &MobeeHome, request: PostJobRequest) -> Result<PostJobOutc
 
 /// Read offer / claims / results from the relay. Local accept-bind is attached if present.
 pub fn get_job(home: &MobeeHome, request: GetJobRequest) -> Result<JobView, JobLifecycleError> {
-    let timeout = Duration::from_secs(request.timeout_secs.unwrap_or(DEFAULT_FETCH_TIMEOUT_SECS));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| JobLifecycleError::Relay(error.to_string()))?;
+    runtime.block_on(get_job_async(home, request))
+}
+
+/// Async `get_job` for callers already on a Tokio runtime (MCP dispatch).
+///
+/// `wait_for` is capped at [`WAIT_FOR_CAP_SECS`]. Cap-hit with condition unmet returns
+/// `pending: true` (re-poll) — never an error.
+pub async fn get_job_async(
+    home: &MobeeHome,
+    request: GetJobRequest,
+) -> Result<JobView, JobLifecycleError> {
     let keys = buyer_keys(home)?;
-    let deadline = std::time::Instant::now() + timeout;
+    let fetch_timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+
+    let Some(wait_for) = request.wait_for else {
+        let mut view = fetch_job_view_async(home, &keys, &request.job_id, fetch_timeout).await?;
+        view.pending = false;
+        return Ok(view);
+    };
+
+    let wait_cap_secs = request
+        .timeout_secs
+        .unwrap_or(WAIT_FOR_CAP_SECS)
+        .min(WAIT_FOR_CAP_SECS);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_cap_secs);
 
     loop {
-        let view = fetch_job_view(home, &keys, &request.job_id, timeout)?;
-        let ready = match request.wait_for {
-            None => true,
-            Some(WaitFor::Claim) => view.live_claim_id.is_some(),
-            Some(WaitFor::Result) => !view.results.is_empty(),
-        };
-        if ready || std::time::Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            let mut view =
+                fetch_job_view_async(home, &keys, &request.job_id, fetch_timeout).await?;
+            let ready = match wait_for {
+                WaitFor::Claim => view.live_claim_id.is_some(),
+                WaitFor::Result => !view.results.is_empty(),
+            };
+            view.pending = !ready;
             return Ok(view);
         }
-        std::thread::sleep(Duration::from_millis(400));
+        let this_fetch = fetch_timeout.min(remaining);
+        let mut view = fetch_job_view_async(home, &keys, &request.job_id, this_fetch).await?;
+        let ready = match wait_for {
+            WaitFor::Claim => view.live_claim_id.is_some(),
+            WaitFor::Result => !view.results.is_empty(),
+        };
+        if ready {
+            view.pending = false;
+            return Ok(view);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            view.pending = true;
+            return Ok(view);
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
     }
 }
 
@@ -305,9 +355,21 @@ pub fn accept_claim(
     home: &MobeeHome,
     request: AcceptClaimRequest,
 ) -> Result<AcceptClaimOutcome, JobLifecycleError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| JobLifecycleError::Relay(error.to_string()))?;
+    runtime.block_on(accept_claim_async(home, request))
+}
+
+/// Async `accept_claim` for callers already on a Tokio runtime (MCP dispatch).
+pub async fn accept_claim_async(
+    home: &MobeeHome,
+    request: AcceptClaimRequest,
+) -> Result<AcceptClaimOutcome, JobLifecycleError> {
     let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
     let keys = buyer_keys(home)?;
-    let view = fetch_job_view(home, &keys, &request.job_id, timeout)?;
+    let view = fetch_job_view_async(home, &keys, &request.job_id, timeout).await?;
     let offer = view
         .offer
         .as_ref()
@@ -360,7 +422,7 @@ pub fn accept_claim(
         &buyer_pubkey,
         &claim.seller_pubkey,
     );
-    let accept_event_id = publish_draft(home, &keys, &draft)?;
+    let accept_event_id = publish_draft_async(home, &keys, &draft).await?;
     let accepted_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -702,6 +764,7 @@ async fn fetch_job_view_async(
         results,
         live_claim_id,
         accepted,
+        pending: false,
     };
     attach_display_names_async(home, &mut view).await;
     Ok(view)

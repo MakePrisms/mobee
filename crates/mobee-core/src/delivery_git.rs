@@ -2,9 +2,14 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::Duration;
 
 use crate::delivery::{CommitOid, DeliveryError, DeliveryVerifier, GitDelivery, VerifiedDelivery};
 use crate::delivery_transport::AllowlistedDeliveryVerifier;
+
+/// Hard cap for pay-path `git fetch` — timeout fails CLOSED (no pay / zero burn).
+/// Kept under MCP tool deadline (15s) and Claude-Code client read-timeout (~60s).
+const GIT_FETCH_TIMEOUT_SECS: u64 = 10;
 
 /// Real git-backed verifier that retains fetched objects in a buyer-owned repository.
 ///
@@ -79,16 +84,21 @@ impl GitDeliveryVerifier {
     fn fetch(&self, delivery: &GitDelivery) -> Result<CommitOid, DeliveryError> {
         let fetched_ref = format!("refs/mobee/deliveries/{}", delivery.commit_oid().as_str());
         let refspec = format!("+refs/heads/{}:{fetched_ref}", delivery.branch());
-        let output = git_output([
-            OsStr::new("-C"),
-            self.repository.as_os_str(),
-            OsStr::new("fetch"),
-            OsStr::new("--no-tags"),
-            OsStr::new("--force"),
-            OsStr::new("--end-of-options"),
-            OsStr::new(delivery.repo()),
-            OsStr::new(&refspec),
-        ])?;
+        // Timed: a hung fetch must not own the MCP stdio loop past the client timeout,
+        // and must fail CLOSED before authorize_pay burns budget (verify-before-pay).
+        let output = git_output_timed(
+            [
+                OsStr::new("-C"),
+                self.repository.as_os_str(),
+                OsStr::new("fetch"),
+                OsStr::new("--no-tags"),
+                OsStr::new("--force"),
+                OsStr::new("--end-of-options"),
+                OsStr::new(delivery.repo()),
+                OsStr::new(&refspec),
+            ],
+            Duration::from_secs(GIT_FETCH_TIMEOUT_SECS),
+        )?;
         require_success("fetch", output)?;
 
         let fetched_object = format!("{fetched_ref}^{{commit}}");
@@ -177,6 +187,28 @@ where
         .env("GCM_INTERACTIVE", "never")
         .output()
         .map_err(|_| DeliveryError::GitUnavailable)
+}
+
+/// Like [`git_output`], but kills the child on `timeout` via `timeout(1)` (fail-closed).
+fn git_output_timed<I, S>(args: I, timeout: Duration) -> Result<Output, DeliveryError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let secs = timeout.as_secs().max(1);
+    let mut command = Command::new("timeout");
+    command
+        .arg(format!("{secs}s"))
+        .arg("git")
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never");
+    let output = command.output().map_err(|_| DeliveryError::GitUnavailable)?;
+    // GNU timeout: 124 = command timed out; 137 = killed by SIGKILL after grace.
+    if matches!(output.status.code(), Some(124) | Some(137)) {
+        return Err(DeliveryError::GitCommandFailed("fetch-timeout"));
+    }
+    Ok(output)
 }
 
 fn require_success(operation: &'static str, output: Output) -> Result<(), DeliveryError> {

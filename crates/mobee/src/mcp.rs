@@ -2,9 +2,14 @@
 //!
 //! Writes are newline-delimited JSON-RPC. Reads accept newline JSON *or* legacy
 //! `Content-Length` framing (spike scar — Claude Code hung on LSP-only writes).
+//!
+//! Crash-class fix: relay-reading tools run as async work under one runtime with a
+//! hard tool deadline (< Claude-Code client read-timeout ~60s). Slow/failed work
+//! returns a graceful tool-error — the server never exits.
 
 use std::io::{BufRead, Write};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use mobee_core::authorize_pay::{self, AuthorizePayRequest};
 use mobee_core::budget::BudgetGate;
@@ -18,6 +23,10 @@ use serde_json::{Value, json};
 
 const SUCCESS: i32 = 0;
 const RUNTIME_ERROR: i32 = 2;
+
+/// Hard cap per `tools/call`. Confirmed under Claude-Code MCP client default (~60s)
+/// with margin (Scribe ★1). Cap-hit → graceful tool-error; server stays up.
+const TOOL_DEADLINE_SECS: u64 = 15;
 
 #[derive(Debug, Deserialize)]
 struct McpRequest {
@@ -45,12 +54,28 @@ pub fn run(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     };
     let _ = writeln!(
         err,
-        "mobee mcp ready (home={}, key_created={}, mint={}, relay={})",
+        "mobee mcp ready (home={}, key_created={}, mint={}, relay={}, tool_deadline_secs={})",
         state.home.root.display(),
         state.home.key_created,
         state.home.config.mint_url,
-        state.home.config.relay_url
+        state.home.config.relay_url,
+        TOOL_DEADLINE_SECS
     );
+
+    // Multi-thread so sync verify/pay inside authorize_pay_async does not starve
+    // the runtime while still honoring the outer tool deadline.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .thread_name("mobee-mcp")
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(err, "mcp runtime: {error}");
+            return RUNTIME_ERROR;
+        }
+    };
 
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
@@ -71,7 +96,7 @@ pub fn run(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             let _ = writeln!(err, "ignoring MCP notification {}", request.method);
             continue;
         }
-        let response = dispatch(&state, &request);
+        let response = runtime.block_on(dispatch_async(&state, &request));
         if let Err(error) = write_mcp_response(out, &response) {
             let _ = writeln!(err, "{error}");
             return RUNTIME_ERROR;
@@ -86,7 +111,17 @@ fn bootstrap_state() -> Result<McpState, String> {
     Ok(McpState { home, gate })
 }
 
+#[cfg(test)]
 fn dispatch(state: &McpState, request: &McpRequest) -> Value {
+    // Sync entry for unit tests that don't hold a runtime.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test mcp runtime");
+    runtime.block_on(dispatch_async(state, request))
+}
+
+async fn dispatch_async(state: &McpState, request: &McpRequest) -> Value {
     let id = request.id.clone().unwrap_or(Value::Null);
     match request.method.as_str() {
         "initialize" => ok(
@@ -102,10 +137,23 @@ fn dispatch(state: &McpState, request: &McpRequest) -> Value {
         ),
         "ping" => ok(id, json!({})),
         "tools/list" => ok(id, json!({ "tools": tools() })),
-        "tools/call" => match call_tool(state, &request.params) {
-            Ok(result) => ok(id, result),
-            Err(message) => tool_error(id, message),
-        },
+        "tools/call" => {
+            match tokio::time::timeout(
+                Duration::from_secs(TOOL_DEADLINE_SECS),
+                call_tool_async(state, &request.params),
+            )
+            .await
+            {
+                Ok(Ok(result)) => ok(id, result),
+                Ok(Err(message)) => tool_error(id, message),
+                Err(_) => tool_error(
+                    id,
+                    format!(
+                        "tool deadline exceeded ({TOOL_DEADLINE_SECS}s); server still alive — retry or narrow the call"
+                    ),
+                ),
+            }
+        }
         other => error_response(id, -32601, format!("method not found: {other}")),
     }
 }
@@ -237,7 +285,7 @@ fn tools() -> Value {
     ])
 }
 
-fn call_tool(state: &McpState, params: &Value) -> Result<Value, String> {
+async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, String> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -247,10 +295,28 @@ fn call_tool(state: &McpState, params: &Value) -> Result<Value, String> {
         "setup_wallet" => setup_wallet_fund(&state.home),
         "set_profile" => set_profile_tool(state, &arguments),
         "post_job" => post_job_tool(state, &arguments),
-        "get_job" => get_job_tool(state, &arguments),
-        "accept_claim" => accept_claim_tool(state, &arguments),
+        "get_job" => {
+            #[cfg(feature = "wallet")]
+            {
+                get_job_tool_async(state, &arguments).await
+            }
+            #[cfg(not(feature = "wallet"))]
+            {
+                get_job_tool(state, &arguments)
+            }
+        }
+        "accept_claim" => {
+            #[cfg(feature = "wallet")]
+            {
+                accept_claim_tool_async(state, &arguments).await
+            }
+            #[cfg(not(feature = "wallet"))]
+            {
+                accept_claim_tool(state, &arguments)
+            }
+        }
         "stub_pay" => stub_pay(&state.gate, &arguments),
-        "authorize_pay" => authorize_pay_tool(state, &arguments),
+        "authorize_pay" => authorize_pay_tool_async(state, &arguments).await,
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -341,7 +407,7 @@ fn set_profile_tool(_state: &McpState, _arguments: &Value) -> Result<Value, Stri
 ///   is never auto-filled from the claim/result oid.
 /// - **explicit:** all nine fields (harness / stub path). If an accept-bind exists for
 ///   job_id, seller/result/commit must match (Gate D).
-fn authorize_pay_tool(state: &McpState, arguments: &Value) -> Result<Value, String> {
+async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
     let require_str = |key: &str| -> Result<String, String> {
         arguments
             .get(key)
@@ -423,7 +489,8 @@ fn authorize_pay_tool(state: &McpState, arguments: &Value) -> Result<Value, Stri
         .lock()
         .map_err(|_| "budget gate lock poisoned".to_owned())?;
 
-    let outcome = authorize_pay::authorize_pay(&state.home, &mut gate, request)
+    let outcome = authorize_pay::authorize_pay_async(&state.home, &mut gate, request)
+        .await
         .map_err(|error| error.to_string())?;
 
     let body = json!({
@@ -515,7 +582,7 @@ fn post_job_tool(_state: &McpState, _arguments: &Value) -> Result<Value, String>
 }
 
 #[cfg(feature = "wallet")]
-fn get_job_tool(state: &McpState, arguments: &Value) -> Result<Value, String> {
+async fn get_job_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
     let job_id = arguments
         .get("job_id")
         .and_then(Value::as_str)
@@ -526,7 +593,7 @@ fn get_job_tool(state: &McpState, arguments: &Value) -> Result<Value, String> {
         None => None,
     };
     let timeout_secs = arguments.get("timeout_secs").and_then(Value::as_u64);
-    let view = job_lifecycle::get_job(
+    let view = job_lifecycle::get_job_async(
         &state.home,
         GetJobRequest {
             job_id,
@@ -534,12 +601,16 @@ fn get_job_tool(state: &McpState, arguments: &Value) -> Result<Value, String> {
             timeout_secs,
         },
     )
+    .await
     .map_err(|error| error.to_string())?;
     let body = serde_json::to_value(&view).map_err(|error| error.to_string())?;
     let mut body = body;
     if let Some(obj) = body.as_object_mut() {
         obj.insert("ok".into(), json!(true));
         obj.insert("source".into(), json!("relay"));
+        if view.pending {
+            obj.insert("status".into(), json!("pending"));
+        }
     }
     Ok(tool_ok(body))
 }
@@ -550,7 +621,7 @@ fn get_job_tool(_state: &McpState, _arguments: &Value) -> Result<Value, String> 
 }
 
 #[cfg(feature = "wallet")]
-fn accept_claim_tool(state: &McpState, arguments: &Value) -> Result<Value, String> {
+async fn accept_claim_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
     let require_str = |key: &str| -> Result<String, String> {
         arguments
             .get(key)
@@ -562,7 +633,7 @@ fn accept_claim_tool(state: &McpState, arguments: &Value) -> Result<Value, Strin
         .get("result_id")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let outcome = job_lifecycle::accept_claim(
+    let outcome = job_lifecycle::accept_claim_async(
         &state.home,
         AcceptClaimRequest {
             job_id: require_str("job_id")?,
@@ -570,6 +641,7 @@ fn accept_claim_tool(state: &McpState, arguments: &Value) -> Result<Value, Strin
             result_id,
         },
     )
+    .await
     .map_err(|error| error.to_string())?;
     let body = json!({
         "ok": true,

@@ -118,6 +118,22 @@ pub fn authorize_pay(
     gate: &mut BudgetGate,
     request: AuthorizePayRequest,
 ) -> Result<AuthorizePayOutcome, AuthorizePayError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| AuthorizePayError::Effects(error.to_string()))?;
+    runtime.block_on(authorize_pay_async(home, gate, request))
+}
+
+/// Async authorize_pay for callers already on a Tokio runtime (MCP dispatch).
+///
+/// LOGIC identical to the sync path — only wallet open is `await` (no nested
+/// `block_on`). Verify-fetch timeout still fails CLOSED (no pay / zero burn).
+pub async fn authorize_pay_async(
+    home: &MobeeHome,
+    gate: &mut BudgetGate,
+    request: AuthorizePayRequest,
+) -> Result<AuthorizePayOutcome, AuthorizePayError> {
     if home.config.mint_url != DEFAULT_MINT_URL {
         return Err(FundError::MintPinned {
             configured: home.config.mint_url.clone(),
@@ -184,7 +200,7 @@ pub fn authorize_pay(
         seller: seller_cashu,
     };
 
-    let wallet = buyer_fund::open_testnut_wallet_blocking(home)?;
+    let wallet = buyer_fund::open_testnut_wallet_async(home).await?;
     let payment_send = NostrPaymentSend::new(home.config.relay_url.clone(), keys);
     let mut effects = CdkPaymentEffects::spawn(
         wallet,
