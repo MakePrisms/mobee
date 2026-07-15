@@ -216,6 +216,8 @@ fn fetch_names(
     home: &MobeeHome,
     pubkeys: &HashSet<String>,
 ) -> Result<HashMap<String, Option<String>>, ProfileError> {
+    // Sync entry only — must not be called from inside an existing Tokio runtime
+    // (nested block_on panics). Async callers use [`fetch_names_async`].
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -223,7 +225,8 @@ fn fetch_names(
     runtime.block_on(fetch_names_async(home, pubkeys))
 }
 
-async fn fetch_names_async(
+/// Async kind-0 name fetch for callers already on a Tokio runtime (e.g. `get_job`).
+pub async fn fetch_names_async(
     home: &MobeeHome,
     pubkeys: &HashSet<String>,
 ) -> Result<HashMap<String, Option<String>>, ProfileError> {

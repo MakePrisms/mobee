@@ -703,12 +703,12 @@ async fn fetch_job_view_async(
         live_claim_id,
         accepted,
     };
-    attach_display_names(home, &mut view);
+    attach_display_names_async(home, &mut view).await;
     Ok(view)
 }
 
-/// Cosmetic kind-0 enrichment only — never feeds accept-bind / targeting / pay.
-fn attach_display_names(home: &MobeeHome, view: &mut JobView) {
+/// Collect hex pubkeys for cosmetic kind-0 enrichment (never for pay/targeting).
+fn display_name_pubkeys(view: &JobView) -> Vec<String> {
     let mut pubkeys: Vec<String> = Vec::new();
     if let Some(offer) = &view.offer {
         pubkeys.push(offer.author_pubkey.clone());
@@ -722,8 +722,10 @@ fn attach_display_names(home: &MobeeHome, view: &mut JobView) {
     for result in &view.results {
         pubkeys.push(result.seller_pubkey.clone());
     }
+    pubkeys
+}
 
-    let names = crate::profile::resolve_display_names(home, pubkeys);
+fn apply_display_names(view: &mut JobView, names: &std::collections::HashMap<String, Option<String>>) {
     let lookup = |hex: &str| -> Option<String> {
         names
             .get(&hex.to_ascii_lowercase())
@@ -743,6 +745,27 @@ fn attach_display_names(home: &MobeeHome, view: &mut JobView) {
     for result in &mut view.results {
         result.display_name = lookup(&result.seller_pubkey);
     }
+}
+
+/// Cosmetic kind-0 enrichment only — never feeds accept-bind / targeting / pay.
+/// Async so `get_job`'s existing runtime does not nest `block_on` (panic).
+async fn attach_display_names_async(home: &MobeeHome, view: &mut JobView) {
+    let pubkeys = display_name_pubkeys(view);
+    let mut unique = std::collections::HashSet::new();
+    for key in pubkeys {
+        let hex = key.trim().to_ascii_lowercase();
+        if hex.len() == 64 && hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            unique.insert(hex);
+        }
+    }
+    if unique.is_empty() {
+        return;
+    }
+    let names = match crate::profile::fetch_names_async(home, &unique).await {
+        Ok(map) => map,
+        Err(_) => unique.into_iter().map(|k| (k, None)).collect(),
+    };
+    apply_display_names(view, &names);
 }
 
 fn select_result<'a>(
