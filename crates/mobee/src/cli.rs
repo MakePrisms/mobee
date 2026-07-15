@@ -30,6 +30,7 @@ where
             SUCCESS
         }
         Some("mcp") if args.len() == 2 => crate::mcp::run(out, err),
+        Some("sell") => crate::sell::run(&args[2..], out, err),
         Some("log") => run_log(&args[2..], out, err),
         Some("mock") => run_mock(&args[2..], out, err),
         Some("run") => run_agent(&args[2..], out, err),
@@ -245,7 +246,7 @@ fn write_json_line<T: Serialize + ?Sized>(out: &mut dyn Write, value: &T) -> std
 fn usage(err: &mut dyn Write) -> i32 {
     let _ = writeln!(
         err,
-        "Usage:\n  mobee version\n  mobee mcp\n  mobee log replay <path>\n  mobee mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  mobee run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
+        "Usage:\n  mobee version\n  mobee mcp\n  mobee sell [--non-interactive --agent-argv <prog> ... --rate-sats <n> --git-remote <url>]\n  mobee log replay <path>\n  mobee mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  mobee run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
     );
     USAGE_ERROR
 }

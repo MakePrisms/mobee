@@ -57,6 +57,62 @@ pub struct ProfileConfig {
     pub about: Option<String>,
 }
 
+/// Seller daemon config (`[seller]` in config.toml). Key never lives here.
+///
+/// `agent_command` MUST be an argv array — a TOML string/shell value is refused at parse
+/// (no-shell by construction).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SellerConfig {
+    #[serde(deserialize_with = "deserialize_agent_command_argv")]
+    pub agent_command: Vec<String>,
+    pub rate_sats: u64,
+    pub git_remote: String,
+    /// Job deadline override (seconds). Default: offer `deadline_unix`, else ~600s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_timeout_secs: Option<u64>,
+}
+
+fn deserialize_agent_command_argv<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct ArgvVisitor;
+
+    impl<'de> Visitor<'de> for ArgvVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("argv array (not a shell string)")
+        }
+
+        fn visit_str<E: de::Error>(self, _value: &str) -> Result<Self::Value, E> {
+            Err(E::custom(
+                "agent_command must be an argv array, not a string/shell value",
+            ))
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+            self.visit_str(&value)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                out.push(item);
+            }
+            if out.is_empty() {
+                return Err(de::Error::custom("agent_command argv must be non-empty"));
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_any(ArgvVisitor)
+}
+
 /// Buyer-facing packaged config (`~/.mobee/config.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobeeConfig {
@@ -67,6 +123,9 @@ pub struct MobeeConfig {
     /// Optional `[profile] name / about`. Skipped when absent so fresh homes stay unnamed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfileConfig>,
+    /// Optional `[seller]` daemon config. Absent until `mobee sell` setup writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seller: Option<SellerConfig>,
 }
 
 impl Default for MobeeConfig {
@@ -77,6 +136,7 @@ impl Default for MobeeConfig {
             per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,
             total_budget_sats: DEFAULT_TOTAL_BUDGET_SATS,
             profile: None,
+            seller: None,
         }
     }
 }

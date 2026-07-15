@@ -1,6 +1,7 @@
 mod cli;
 mod exec;
 mod mcp;
+mod sell;
 
 fn main() {
     let code = cli::run(

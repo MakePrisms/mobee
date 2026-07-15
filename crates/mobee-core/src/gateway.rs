@@ -385,6 +385,15 @@ pub fn accept_draft(
     )
 }
 
+/// Optional git delivery tags on a kind-6109 result (`delivery=git` + repo/branch/commit).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitResultTags<'a> {
+    pub repo: &'a str,
+    pub branch: &'a str,
+    pub commit_sha: &'a str,
+}
+
+/// Kind-6109 result draft. Pass `Some(git)` to attach delivery/repo/branch/commit tags.
 pub fn result_draft(
     offer_id: &str,
     buyer_pubkey: &str,
@@ -393,21 +402,78 @@ pub fn result_draft(
     job_hash: &str,
     seller_signature: &str,
     content: impl Into<String>,
+    git: Option<GitResultTags<'_>>,
 ) -> EventDraft {
-    EventDraft::new(
-        JOB_RESULT_KIND,
-        vec![
-            TagSpec::new(["e", offer_id, "", "root"]),
-            TagSpec::new(["p", buyer_pubkey]),
-            TagSpec::new(["output", output]),
-            TagSpec::new(["amount", &amount_sats.to_string(), "sat"]),
-            TagSpec::new(["job-hash", job_hash]),
-            TagSpec::new(["sig", "seller", seller_signature]),
-            mobee_tag(),
-            version_tag(),
-        ],
+    let mut tags = vec![
+        TagSpec::new(["e", offer_id, "", "root"]),
+        TagSpec::new(["p", buyer_pubkey]),
+    ];
+    if let Some(git) = git {
+        tags.push(TagSpec::new(["delivery", "git"]));
+        tags.push(TagSpec::new(["output", output]));
+        tags.push(TagSpec::new(["commit", git.commit_sha]));
+        tags.push(TagSpec::new(["repo", git.repo]));
+        tags.push(TagSpec::new(["branch", git.branch]));
+    } else {
+        tags.push(TagSpec::new(["output", output]));
+    }
+    tags.push(TagSpec::new(["amount", &amount_sats.to_string(), "sat"]));
+    tags.push(TagSpec::new(["job-hash", job_hash]));
+    tags.push(TagSpec::new(["sig", "seller", seller_signature]));
+    tags.push(mobee_tag());
+    tags.push(version_tag());
+    EventDraft::new(JOB_RESULT_KIND, tags, content)
+}
+
+/// Thin wrapper: kind-6109 git delivery via [`result_draft`] + [`GitResultTags`].
+pub fn git_result_draft(
+    offer_id: &str,
+    buyer_pubkey: &str,
+    repo: &str,
+    branch: &str,
+    commit_sha: &str,
+    amount_sats: u64,
+    job_hash: &str,
+    seller_signature: &str,
+    content: impl Into<String>,
+) -> EventDraft {
+    result_draft(
+        offer_id,
+        buyer_pubkey,
+        "text/plain",
+        amount_sats,
+        job_hash,
+        seller_signature,
         content,
+        Some(GitResultTags {
+            repo,
+            branch,
+            commit_sha,
+        }),
     )
+}
+
+/// Kind-7000 `status=error` feedback (timeout / push-fail / refuse paths).
+pub fn error_draft(offer_id: &str, buyer_pubkey: &str, seller_pubkey: &str) -> EventDraft {
+    feedback_draft(
+        "error",
+        vec![
+            TagSpec::new(["e", offer_id]),
+            TagSpec::new(["p", buyer_pubkey]),
+            TagSpec::new(["p", seller_pubkey]),
+        ],
+    )
+}
+
+/// Optional git bind on a kind-5109 offer (`delivery=git` + repo + branch).
+pub fn offer_git_target(event: &EventDraft) -> Option<(String, String)> {
+    let delivery = first_tag_value(&event.tags, "delivery")?;
+    if delivery != "git" {
+        return None;
+    }
+    let repo = first_tag_value(&event.tags, "repo")?.to_owned();
+    let branch = first_tag_value(&event.tags, "branch")?.to_owned();
+    Some((repo, branch))
 }
 
 pub fn receipt_draft(
@@ -649,6 +715,7 @@ mod tests {
             "hash",
             "seller-sig",
             "done",
+            None,
         );
         assert_eq!(result.kind, JOB_RESULT_KIND);
         assert_eq!(result.content, "done");

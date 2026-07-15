@@ -572,7 +572,8 @@ fn bind_path(home: &MobeeHome, job_id: &str) -> PathBuf {
     home.root.join(JOBS_DIR).join(format!("{job_id}.json"))
 }
 
-fn job_hash_for_offer(job_id: &str, task: &str, amount_sats: u64) -> String {
+/// Canonical job-hash for offer/result signing (buyer + seller share this).
+pub fn job_hash_for_offer(job_id: &str, task: &str, amount_sats: u64) -> String {
     let mut hasher = Sha256::new();
     hasher.update(job_id.as_bytes());
     hasher.update(b"|");
@@ -880,7 +881,8 @@ fn select_result<'a>(
         })
 }
 
-fn event_to_draft(event: &nostr_sdk::Event) -> EventDraft {
+/// Convert a relay event into an [`EventDraft`] (tag/content only — no secrets).
+pub fn event_to_draft(event: &nostr_sdk::Event) -> EventDraft {
     let tags = event
         .tags
         .iter()

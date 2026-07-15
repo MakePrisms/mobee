@@ -25,6 +25,11 @@ pub mod payment_send;
 pub mod payment_wallet;
 pub mod receipt;
 pub mod runtime_guard;
+pub mod seller;
+#[cfg(feature = "wallet")]
+pub mod seller_daemon;
+#[cfg(feature = "git-delivery")]
+pub mod seller_git;
 #[cfg(feature = "wallet")]
 pub mod wallet;
 
