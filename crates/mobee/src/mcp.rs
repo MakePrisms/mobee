@@ -916,6 +916,77 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn post_job_error_path_never_echoes_secret() {
+        let root = temp_home("post-echo");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = state_at(&root);
+        let secret = home::read_secret_key_hex(&state.home).expect("secret");
+        let response = dispatch(
+            &state,
+            &McpRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(41)),
+                method: "tools/call".into(),
+                params: json!({
+                    "name": "post_job",
+                    "arguments": {
+                        "task": "gate-e",
+                        "output": "text/plain",
+                        "amount_sats": 1
+                    }
+                }),
+            },
+        );
+        let rendered = response.to_string();
+        assert!(!rendered.contains(&secret), "secret leaked on post_job error");
+        assert_eq!(response["result"]["isError"], true);
+        let message = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(
+            message.contains("seller_pubkey") || message.contains("untargeted"),
+            "message={message}"
+        );
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn accept_claim_error_path_never_echoes_secret() {
+        let root = temp_home("accept-echo");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = state_at(&root);
+        let secret = home::read_secret_key_hex(&state.home).expect("secret");
+        let response = dispatch(
+            &state,
+            &McpRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(42)),
+                method: "tools/call".into(),
+                params: json!({
+                    "name": "accept_claim",
+                    "arguments": {
+                        "job_id": "aa".repeat(32),
+                        "claim_id": "bb".repeat(32)
+                    }
+                }),
+            },
+        );
+        let rendered = response.to_string();
+        assert!(!rendered.contains(&secret), "secret leaked on accept_claim error");
+        assert_eq!(response["result"]["isError"], true);
+        let message = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(
+            !message.is_empty(),
+            "expected refuse message, got empty"
+        );
+    }
+
     #[test]
     fn stub_pay_spent_survives_mcp_state_reload() {
         let root = temp_home("spent-reload");

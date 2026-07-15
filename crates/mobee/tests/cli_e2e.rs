@@ -76,6 +76,10 @@ fn mock_run_then_log_replay_round_trips_envelope_payloads() {
                 job_id: JobId("job-1".into()),
                 status: JobExecutionStatus::Running
             },
+            Event::AgentMessage {
+                job_id: JobId("job-1".into()),
+                text: "working".into()
+            },
             Event::JobExecutionChanged {
                 job_id: JobId("job-1".into()),
                 status: JobExecutionStatus::Completed

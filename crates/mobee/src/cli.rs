@@ -590,6 +590,10 @@ mod tests {
                     job_id: JobId("job-1".into()),
                     status: JobExecutionStatus::Running
                 },
+                Event::AgentMessage {
+                    job_id: JobId("job-1".into()),
+                    text: "working".into()
+                },
                 Event::JobExecutionChanged {
                     job_id: JobId("job-1".into()),
                     status: JobExecutionStatus::Completed
