@@ -45,6 +45,18 @@ impl std::fmt::Display for HomeError {
 
 impl std::error::Error for HomeError {}
 
+/// Optional buyer identity metadata (`[profile]` in config.toml).
+///
+/// Absent by default — fresh bootstrap does **not** invent a name. Kind-0 names are
+/// untrusted display metadata only; decision paths must key on hex pubkey alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProfileConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+}
+
 /// Buyer-facing packaged config (`~/.mobee/config.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobeeConfig {
@@ -52,6 +64,9 @@ pub struct MobeeConfig {
     pub mint_url: String,
     pub per_job_budget_sats: u64,
     pub total_budget_sats: u64,
+    /// Optional `[profile] name / about`. Skipped when absent so fresh homes stay unnamed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ProfileConfig>,
 }
 
 impl Default for MobeeConfig {
@@ -61,6 +76,7 @@ impl Default for MobeeConfig {
             mint_url: DEFAULT_MINT_URL.to_owned(),
             per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,
             total_budget_sats: DEFAULT_TOTAL_BUDGET_SATS,
+            profile: None,
         }
     }
 }
@@ -182,6 +198,20 @@ fn write_config(path: &Path, config: &MobeeConfig) -> Result<(), HomeError> {
     let raw = toml::to_string_pretty(config)
         .map_err(|error| HomeError::Config(error.to_string()))?;
     fs::write(path, raw).map_err(|error| HomeError::Io(error.to_string()))
+}
+
+/// Persist `home.config` to `config.toml` (used by `set_profile` and mint migration).
+pub fn save_config(home: &MobeeHome) -> Result<(), HomeError> {
+    write_config(&home.root.join(CONFIG_FILE), &home.config)
+}
+
+/// Reload `config.toml` into `home.config` without touching the key file.
+pub fn reload_config(home: &mut MobeeHome) -> Result<(), HomeError> {
+    home.config = load_config(&home.root.join(CONFIG_FILE))?;
+    if migrate_dead_mint_url(&mut home.config) {
+        write_config(&home.root.join(CONFIG_FILE), &home.config)?;
+    }
+    Ok(())
 }
 
 fn validate_existing_key(path: &Path) -> Result<(), HomeError> {
@@ -373,5 +403,37 @@ mod tests {
         assert_eq!(home.config.mint_url, DEFAULT_MINT_URL);
         let reloaded = load_config(&config_path).expect("reload");
         assert_eq!(reloaded.mint_url, DEFAULT_MINT_URL);
+    }
+
+    #[test]
+    fn bootstrap_does_not_invent_profile() {
+        let root = temp_home("no-profile");
+        let _ = fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        assert!(home.config.profile.is_none());
+        let raw = fs::read_to_string(home.root.join(CONFIG_FILE)).expect("read");
+        assert!(
+            !raw.contains("[profile]"),
+            "fresh bootstrap must not invent [profile]: {raw}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_and_reload_profile_round_trip() {
+        let root = temp_home("profile-rt");
+        let _ = fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        home.config.profile = Some(ProfileConfig {
+            name: Some("anvil-buyer".into()),
+            about: Some("testnut only".into()),
+        });
+        save_config(&home).expect("save");
+        home.config.profile = None;
+        reload_config(&mut home).expect("reload");
+        let profile = home.config.profile.expect("profile present");
+        assert_eq!(profile.name.as_deref(), Some("anvil-buyer"));
+        assert_eq!(profile.about.as_deref(), Some("testnut only"));
+        let _ = fs::remove_dir_all(&root);
     }
 }

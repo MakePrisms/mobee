@@ -122,6 +122,18 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "set_profile",
+            "description": "Set optional buyer identity: write [profile] name/about to ~/.mobee/config.toml and publish/replace the buyer kind-0 metadata event on the configured relay. Called with no args = re-publish from existing config. Never required — absent profile leaves the buyer as hex. Never echoes the secret key. Kind-0 names are untrusted display metadata only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Buyer display name published in kind-0" },
+                    "about": { "type": "string", "description": "Buyer about text published in kind-0" }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "post_job",
             "description": "Publish a real kind-5109 job offer to the configured mobee relay. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. Never echoes secrets.",
             "inputSchema": {
@@ -148,7 +160,7 @@ fn tools() -> Value {
         },
         {
             "name": "get_job",
-            "description": "Read job state from the relay (kind 5109 offer + 7000 claims + 6109 results). Surfaces claim created_at and flags the most-recent LIVE claim. Optional wait_for=claim|result long-poll. Local accept-bind attached if present. Never invents claims/results.",
+            "description": "Read job state from the relay (kind 5109 offer + 7000 claims + 6109 results). Surfaces claim created_at and flags the most-recent LIVE claim. Best-effort kind-0 display_name alongside each pubkey (claims[].display_name, results[].display_name, offer.seller_display_name) — cosmetic only; hex pubkey remains authoritative. Optional wait_for=claim|result long-poll. Local accept-bind attached if present. Never invents claims/results.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -233,6 +245,7 @@ fn call_tool(state: &McpState, params: &Value) -> Result<Value, String> {
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
     match name {
         "setup_wallet" => setup_wallet_fund(&state.home),
+        "set_profile" => set_profile_tool(state, &arguments),
         "post_job" => post_job_tool(state, &arguments),
         "get_job" => get_job_tool(state, &arguments),
         "accept_claim" => accept_claim_tool(state, &arguments),
@@ -276,6 +289,47 @@ fn setup_wallet_fund(home: &MobeeHome) -> Result<Value, String> {
         let _ = home;
         Err("setup_wallet fund path requires the wallet feature".into())
     }
+}
+
+#[cfg(feature = "wallet")]
+fn set_profile_tool(state: &McpState, arguments: &Value) -> Result<Value, String> {
+    use mobee_core::profile::{self, SetProfileRequest};
+
+    let name = arguments
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let about = arguments
+        .get("about")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    // Reload from disk so long-lived MCP sees the latest config.toml.
+    let mut home = home::bootstrap(&state.home.root).map_err(|error| error.to_string())?;
+    let outcome = profile::set_profile(
+        &mut home,
+        SetProfileRequest { name, about },
+    )
+    .map_err(|error| error.to_string())?;
+    let body = json!({
+        "ok": outcome.ok,
+        "pubkey": outcome.pubkey,
+        "name": outcome.name,
+        "about": outcome.about,
+        "event_id": outcome.event_id,
+        "relay_url": outcome.relay_url,
+    });
+    let rendered = body.to_string();
+    if let Ok(secret) = home::read_secret_key_hex(&home) {
+        if rendered.contains(&secret) {
+            return Err("set_profile refused: response would echo secret key".into());
+        }
+    }
+    Ok(tool_ok(body))
+}
+
+#[cfg(not(feature = "wallet"))]
+fn set_profile_tool(_state: &McpState, _arguments: &Value) -> Result<Value, String> {
+    Err("set_profile requires the wallet feature".into())
 }
 
 /// Real pay: BudgetGate → PaymentService::run(&mut PayPathDeliveryVerifier) only.
@@ -731,6 +785,7 @@ mod tests {
             names,
             vec![
                 "setup_wallet",
+                "set_profile",
                 "post_job",
                 "get_job",
                 "accept_claim",
@@ -763,6 +818,49 @@ mod tests {
             result["structuredContent"]["invoice"].is_string()
                 || result["structuredContent"]["already_funded"] == true
         );
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn set_profile_publishes_kind0_writes_config_never_echoes_secret() {
+        let root = temp_home("set-profile");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = state_at(&root);
+        let secret = home::read_secret_key_hex(&state.home).expect("secret");
+        let result = set_profile_tool(
+            &state,
+            &json!({ "name": "anvil-kind0", "about": "testnut only" }),
+        )
+        .expect("set_profile");
+        let rendered = result.to_string();
+        assert!(!rendered.contains(&secret), "secret leaked in set_profile");
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["ok"], true);
+        assert_eq!(result["structuredContent"]["name"], "anvil-kind0");
+        assert_eq!(result["structuredContent"]["about"], "testnut only");
+        let event_id = result["structuredContent"]["event_id"]
+            .as_str()
+            .expect("event_id");
+        assert_eq!(event_id.len(), 64);
+
+        let reloaded = home::bootstrap(&root).expect("reload");
+        let profile = reloaded.config.profile.expect("profile in config");
+        assert_eq!(profile.name.as_deref(), Some("anvil-kind0"));
+        assert_eq!(profile.about.as_deref(), Some("testnut only"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn set_profile_empty_name_refused_never_echoes_secret() {
+        let root = temp_home("set-profile-empty");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = state_at(&root);
+        let secret = home::read_secret_key_hex(&state.home).expect("secret");
+        let err = set_profile_tool(&state, &json!({ "name": "   " })).expect_err("refuse");
+        assert!(err.contains("name"), "got: {err}");
+        assert!(!err.contains(&secret));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -100,12 +100,16 @@ pub struct OfferView {
     pub event_id: String,
     pub created_at: u64,
     pub author_pubkey: String,
+    /// Cosmetic kind-0 `name` for `author_pubkey` (untrusted; never replaces hex).
+    pub author_display_name: Option<String>,
     pub task: String,
     pub output: String,
     pub amount_sats: u64,
     pub deadline_unix: u64,
     pub mint_url: String,
     pub seller_pubkey: Option<String>,
+    /// Cosmetic kind-0 `name` for targeted `seller_pubkey` (untrusted; never replaces hex).
+    pub seller_display_name: Option<String>,
     pub targeted: bool,
     pub repo: Option<String>,
     pub branch: Option<String>,
@@ -116,6 +120,8 @@ pub struct ClaimView {
     pub claim_id: String,
     pub created_at: u64,
     pub seller_pubkey: String,
+    /// Cosmetic kind-0 `name` for this claim's `seller_pubkey` (untrusted).
+    pub display_name: Option<String>,
     pub status: String,
     pub live: bool,
 }
@@ -125,6 +131,8 @@ pub struct ResultView {
     pub result_id: String,
     pub created_at: u64,
     pub seller_pubkey: String,
+    /// Cosmetic kind-0 `name` for this result's `seller_pubkey` (untrusted).
+    pub display_name: Option<String>,
     pub job_hash: Option<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
@@ -609,6 +617,7 @@ async fn fetch_job_view_async(
             event_id: event.id.to_hex(),
             created_at: event.created_at.as_secs(),
             author_pubkey: event.pubkey.to_hex(),
+            author_display_name: None,
             task: parsed
                 .as_ref()
                 .map(|p| p.task.clone())
@@ -624,6 +633,7 @@ async fn fetch_job_view_async(
                 .map(|p| p.mint_url.clone())
                 .unwrap_or_default(),
             seller_pubkey: parsed.as_ref().and_then(|p| p.seller_pubkey.clone()),
+            seller_display_name: None,
             targeted: parsed.as_ref().map(|p| p.is_targeted()).unwrap_or(false),
             repo: first_tag_value(&draft.tags, "repo").map(str::to_owned),
             branch: first_tag_value(&draft.tags, "branch").map(str::to_owned),
@@ -644,6 +654,7 @@ async fn fetch_job_view_async(
             claim_id: event.id.to_hex(),
             created_at: event.created_at.as_secs(),
             seller_pubkey: event.pubkey.to_hex(),
+            display_name: None,
             status,
             live: false,
         });
@@ -670,6 +681,7 @@ async fn fetch_job_view_async(
             result_id: event.id.to_hex(),
             created_at: event.created_at.as_secs(),
             seller_pubkey: event.pubkey.to_hex(),
+            display_name: None,
             job_hash: first_tag_value(&draft.tags, "job-hash").map(str::to_owned),
             repo: delivery.as_ref().map(|d| d.repo().to_owned()),
             branch: delivery.as_ref().map(|d| d.branch().to_owned()),
@@ -683,14 +695,54 @@ async fn fetch_job_view_async(
 
     let accepted = load_accepted_bind(home, job_id)?;
 
-    Ok(JobView {
+    let mut view = JobView {
         job_id: job_id.to_owned(),
         offer,
         claims,
         results,
         live_claim_id,
         accepted,
-    })
+    };
+    attach_display_names(home, &mut view);
+    Ok(view)
+}
+
+/// Cosmetic kind-0 enrichment only — never feeds accept-bind / targeting / pay.
+fn attach_display_names(home: &MobeeHome, view: &mut JobView) {
+    let mut pubkeys: Vec<String> = Vec::new();
+    if let Some(offer) = &view.offer {
+        pubkeys.push(offer.author_pubkey.clone());
+        if let Some(seller) = &offer.seller_pubkey {
+            pubkeys.push(seller.clone());
+        }
+    }
+    for claim in &view.claims {
+        pubkeys.push(claim.seller_pubkey.clone());
+    }
+    for result in &view.results {
+        pubkeys.push(result.seller_pubkey.clone());
+    }
+
+    let names = crate::profile::resolve_display_names(home, pubkeys);
+    let lookup = |hex: &str| -> Option<String> {
+        names
+            .get(&hex.to_ascii_lowercase())
+            .and_then(|value| value.clone())
+    };
+
+    if let Some(offer) = &mut view.offer {
+        offer.author_display_name = lookup(&offer.author_pubkey);
+        offer.seller_display_name = offer
+            .seller_pubkey
+            .as_ref()
+            .and_then(|seller| lookup(seller));
+    }
+    for claim in &mut view.claims {
+        claim.display_name = lookup(&claim.seller_pubkey);
+    }
+    for result in &mut view.results {
+        result.display_name = lookup(&result.seller_pubkey);
+    }
 }
 
 fn select_result<'a>(

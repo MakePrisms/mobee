@@ -30,13 +30,14 @@ below use the same **public** `https://github.com/bitcoin/bips.git` locator.
 
 ## What this tip exposes
 
-Buyer MCP tools on this tip (exactly six):
+Buyer MCP tools on this tip:
 
 | Tool | Role |
 |------|------|
 | `setup_wallet` | Bootstrap `~/.mobee` (config + autogen key + wallet) and fund against the hard-pinned testnut mint |
+| `set_profile` | Optional — write `[profile] name/about` + publish/replace buyer kind-0 (never required) |
 | `post_job` | Publish a real kind-5109 offer to the configured relay (targeted seller p-tag = documented default) |
-| `get_job` | Read offer / claims / results from relay events (not local invent) |
+| `get_job` | Read offer / claims / results from relay events (not local invent); surfaces cosmetic `display_name` when kind-0 is present |
 | `accept_claim` | Publish kind-7000 `accepted` + record local pay-bind for `authorize_pay` |
 | `stub_pay` | Exercise budget caps over a mock pay (no piece-6 `run()`) |
 | `authorize_pay` | Real capped pay. **Documented default = job_id form** (see §4) |
@@ -46,6 +47,7 @@ Defaults written on first bootstrap (`~/.mobee/config.toml`):
 - mint: `https://testnut.cashudevkit.org` (hard-pinned; retarget refused)
 - relay: `wss://mobee-relay.orveth.dev`
 - caps: `per_job_budget_sats = 21`, `total_budget_sats = 100`
+- **no** `[profile]` — fresh homes stay hex until `set_profile`
 
 ---
 
@@ -99,7 +101,7 @@ Initialize once:
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 ```
 
-List tools (optional check — expect exactly `setup_wallet`, `post_job`, `get_job`, `accept_claim`, `stub_pay`, `authorize_pay`):
+List tools (optional check — expect `setup_wallet`, `set_profile`, `post_job`, `get_job`, `accept_claim`, `stub_pay`, `authorize_pay`):
 
 ```json
 {"jsonrpc":"2.0","id":2,"method":"tools/list"}
@@ -120,6 +122,27 @@ Pass criteria (from the tool response body):
 - response text does **not** contain the secret key
 
 `setup_wallet` bootstraps home + runs the testnut fund path (mint quote → auto-pay → mint). There is no separate buyer `fund` tool on this tip.
+
+---
+
+## 2b. Optional named identity — `set_profile`
+
+Optional. Skip and the buyer stays hex everywhere — fine.
+
+```json
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"set_profile","arguments":{
+  "name":"my-buyer",
+  "about":"testnut only"
+}}}
+```
+
+Writes `[profile]` into `~/.mobee/config.toml` and publishes/replaces the buyer kind-0 on the relay. Call with `{}` to re-publish from existing config. `get_job` then surfaces `claims[].display_name` / `results[].display_name` / `offer.seller_display_name` (and optional `offer.author_display_name`) as siblings of the hex pubkey when a kind-0 `name` is present — **cosmetic only**; targeting / accept-bind / D2 / budget stay keyed on hex alone.
+
+Pass criteria:
+
+- `ok: true`, `event_id` is a 64-hex kind-0 event id
+- `name` / `about` echo the public fields only
+- response does **not** contain the secret key
 
 ---
 
@@ -165,6 +188,7 @@ Pass criteria:
 - `source` == `relay`
 - `claims[]` entries carry `created_at`; exactly one may be flagged `live: true`
 - `results[]` include repo/branch/commit_oid from the 6109 (not invented locally)
+- when counterparties have kind-0, `claims[].display_name` / `results[].display_name` / `offer.seller_display_name` may be non-null **alongside** the hex pubkey (never replacing it)
 
 ---
 

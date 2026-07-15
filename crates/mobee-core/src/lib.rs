@@ -3,6 +3,8 @@ pub mod authorize_pay;
 pub mod budget;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 pub mod job_lifecycle;
+#[cfg(all(feature = "wallet", feature = "gateway"))]
+pub mod profile;
 pub mod delivery;
 #[cfg(feature = "git-delivery")]
 pub mod delivery_git;
