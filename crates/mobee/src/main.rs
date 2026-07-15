@@ -1,5 +1,6 @@
 mod cli;
 mod exec;
+mod mcp;
 
 fn main() {
     let code = cli::run(

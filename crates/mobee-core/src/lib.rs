@@ -3,6 +3,7 @@ pub mod engine;
 pub mod event;
 pub mod format;
 pub mod gateway;
+pub mod home;
 pub mod log;
 #[cfg(feature = "wallet")]
 pub mod payment;

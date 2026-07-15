@@ -16,12 +16,14 @@ test-support = []
 [dependencies]
 cashu = { version = "=0.17.2", optional = true }
 cdk = { version = "=0.17.2", default-features = false, features = ["wallet"], optional = true }
+getrandom = "0.3"
 hex = "0.4.3"
 nostr-sdk = { version = "0.44.1", features = ["nip59"], optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11.0"
 tokio = { version = "1.52.0", features = ["rt", "sync"], optional = true }
+toml = "0.8"
 
 [dev-dependencies]
 async-trait = "0.1.89"
