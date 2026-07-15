@@ -1,3 +1,5 @@
+#[cfg(all(feature = "wallet", feature = "gateway"))]
+pub mod authorize_pay;
 pub mod budget;
 pub mod delivery;
 #[cfg(feature = "git-delivery")]

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::delivery::{DeliveryError, DeliveryVerifier, GitDelivery};
+use crate::delivery_git::PayPathDeliveryVerifier;
 use crate::payment_send::PaymentSent;
 use crate::wallet::VerifiedPayment;
 
@@ -537,7 +538,46 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
     }
 
     /// Verifies buyer custody before allowing the first durable payment intent.
-    pub fn run<D: DeliveryVerifier, E: PaymentEffects>(
+    ///
+    /// By construction the pay path accepts only [`PayPathDeliveryVerifier`] — a bare
+    /// or otherwise un-allowlisted `impl DeliveryVerifier` is a type error at the
+    /// `authorize_pay` / MCP call site (compiler refuse). In-crate unit tests that inject
+    /// fake verifiers use [`Self::run_with_verifier`] (`#[cfg(test)]` only — absent from
+    /// release / non-test builds).
+    pub fn run<E: PaymentEffects>(
+        &self,
+        delivery: &GitDelivery,
+        delivery_verifier: &mut PayPathDeliveryVerifier,
+        key: &PaymentKey,
+        terms: &PaymentTerms,
+        authority: &ReceiptAuthority,
+        effects: &mut E,
+    ) -> Result<PaymentState, PaymentError> {
+        self.run_delivery_gated(delivery, delivery_verifier, key, terms, authority, effects)
+    }
+
+    /// Delivery-gated pay entry for in-crate unit tests only (fake / bare verifiers).
+    ///
+    /// Compiler-dropped outside `cfg(test)` — zero production reach (no in-core production
+    /// caller can hand a bare verifier through this escape hatch).
+    #[cfg(test)]
+    pub(crate) fn run_with_verifier<D: DeliveryVerifier, E: PaymentEffects>(
+        &self,
+        delivery: &GitDelivery,
+        delivery_verifier: &mut D,
+        key: &PaymentKey,
+        terms: &PaymentTerms,
+        authority: &ReceiptAuthority,
+        effects: &mut E,
+    ) -> Result<PaymentState, PaymentError> {
+        self.run_delivery_gated(delivery, delivery_verifier, key, terms, authority, effects)
+    }
+
+    /// Shared delivery-verify → tip-bind → [`Self::advance`] impl.
+    ///
+    /// Private: not a production generic entry. Production callers must go through
+    /// [`Self::run`] (`PayPathDeliveryVerifier` only).
+    fn run_delivery_gated<D: DeliveryVerifier, E: PaymentEffects>(
         &self,
         delivery: &GitDelivery,
         delivery_verifier: &mut D,
@@ -1022,7 +1062,7 @@ mod tests {
         let mut effects = FakeEffects::new(shared.clone());
         let mut verifier = RejectDelivery;
 
-        let result = PaymentService::new(&journal).run(
+        let result = PaymentService::new(&journal).run_with_verifier(
             &git_delivery(),
             &mut verifier,
             &git_key(),
@@ -1045,7 +1085,7 @@ mod tests {
         let mut verifier = AcceptDelivery;
 
         let state = PaymentService::new(&journal)
-            .run(
+            .run_with_verifier(
                 &git_delivery(),
                 &mut verifier,
                 &git_key(),
@@ -1073,7 +1113,7 @@ mod tests {
             &terms(),
         );
 
-        let result = PaymentService::new(&journal).run(
+        let result = PaymentService::new(&journal).run_with_verifier(
             &git_delivery(),
             &mut verifier,
             &wrong_key,

@@ -6,6 +6,7 @@
 use std::io::{BufRead, Write};
 use std::sync::Mutex;
 
+use mobee_core::authorize_pay::{self, AuthorizePayRequest};
 use mobee_core::budget::BudgetGate;
 use mobee_core::home::{self, MobeeHome};
 use serde::Deserialize;
@@ -131,6 +132,45 @@ fn tools() -> Value {
                 "required": ["amount_sats"],
                 "additionalProperties": true
             }
+        },
+        {
+            "name": "authorize_pay",
+            "description": "Real testnut pay: BudgetGate → PayPathDeliveryVerifier → PaymentService::run() only (delivery-verify first; stable PaymentKey attempt_id saga). Caps from ~/.mobee config only. Never echoes secrets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string" },
+                    "result_id": { "type": "string" },
+                    "delivery_integrity_hash": {
+                        "type": "string",
+                        "description": "Buyer commitment — full lowercase git oid that must tip-match"
+                    },
+                    "job_hash": {
+                        "type": "string",
+                        "description": "Lowercase SHA-256 job digest (64 hex)"
+                    },
+                    "seller_pubkey": { "type": "string" },
+                    "amount_sats": { "type": "integer", "minimum": 0 },
+                    "repo": {
+                        "type": "string",
+                        "description": "Seller git locator (https / relay-git only; ext::/file/ssh refused)"
+                    },
+                    "branch": { "type": "string" },
+                    "commit_oid": { "type": "string" }
+                },
+                "required": [
+                    "job_id",
+                    "result_id",
+                    "delivery_integrity_hash",
+                    "job_hash",
+                    "seller_pubkey",
+                    "amount_sats",
+                    "repo",
+                    "branch",
+                    "commit_oid"
+                ],
+                "additionalProperties": true
+            }
         }
     ])
 }
@@ -144,6 +184,7 @@ fn call_tool(state: &McpState, params: &Value) -> Result<Value, String> {
     match name {
         "setup_wallet" => setup_wallet_fund(&state.home),
         "stub_pay" => stub_pay(&state.gate, &arguments),
+        "authorize_pay" => authorize_pay_tool(state, &arguments),
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -182,6 +223,56 @@ fn setup_wallet_fund(home: &MobeeHome) -> Result<Value, String> {
         let _ = home;
         Err("setup_wallet fund path requires the wallet feature".into())
     }
+}
+
+/// Real pay: BudgetGate → PaymentService::run(&mut PayPathDeliveryVerifier) only.
+/// Tool args that set per_job/total caps are ignored. Never echoes the secret key.
+fn authorize_pay_tool(state: &McpState, arguments: &Value) -> Result<Value, String> {
+    let require_str = |key: &str| -> Result<String, String> {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("authorize_pay requires {key} (string)"))
+    };
+    let amount_sats = arguments
+        .get("amount_sats")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "authorize_pay requires amount_sats (integer)".to_owned())?;
+
+    let request = AuthorizePayRequest {
+        job_id: require_str("job_id")?,
+        result_id: require_str("result_id")?,
+        delivery_integrity_hash: require_str("delivery_integrity_hash")?,
+        job_hash: require_str("job_hash")?,
+        seller_pubkey: require_str("seller_pubkey")?,
+        amount_sats,
+        repo: require_str("repo")?,
+        branch: require_str("branch")?,
+        commit_oid: require_str("commit_oid")?,
+    };
+
+    let mut gate = state
+        .gate
+        .lock()
+        .map_err(|_| "budget gate lock poisoned".to_owned())?;
+
+    let outcome = authorize_pay::authorize_pay(&state.home, &mut gate, request)
+        .map_err(|error| error.to_string())?;
+
+    let body = json!({
+        "ok": true,
+        "amount_sats": outcome.amount_sats,
+        "attempt_id": outcome.attempt_id,
+        "spent_total_sats": outcome.spent_total_sats,
+        "remaining_sats": outcome.remaining_sats,
+        "per_job_cap_sats": gate.per_job_cap(),
+        "total_cap_sats": gate.total_cap(),
+        "state": outcome.state,
+        "piece6": "run",
+        "verifier": "PayPathDeliveryVerifier",
+    });
+    Ok(tool_ok(body))
 }
 
 /// Gate-wrapped mock pay. Caps from the in-process gate (config-bound at MCP start).
@@ -367,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_setup_wallet_and_stub_pay() {
+    fn tools_list_exposes_setup_wallet_stub_pay_and_authorize_pay() {
         let tools = tools();
         let names: Vec<&str> = tools
             .as_array()
@@ -375,7 +466,7 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect();
-        assert_eq!(names, vec!["setup_wallet", "stub_pay"]);
+        assert_eq!(names, vec!["setup_wallet", "stub_pay", "authorize_pay"]);
     }
 
     #[cfg(feature = "wallet")]
@@ -509,6 +600,49 @@ mod tests {
         let rendered = response.to_string();
         assert!(!rendered.contains(&secret));
         assert_eq!(response["result"]["isError"], true);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn authorize_pay_ext_refused_never_echoes_secret() {
+        let root = temp_home("authorize-ext");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = state_at(&root);
+        let secret = home::read_secret_key_hex(&state.home).expect("secret");
+        let seller = home::public_key_hex(&state.home).expect("pubkey");
+        let response = dispatch(
+            &state,
+            &McpRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(9)),
+                method: "tools/call".into(),
+                params: json!({
+                    "name": "authorize_pay",
+                    "arguments": {
+                        "job_id": "job",
+                        "result_id": "result",
+                        "delivery_integrity_hash": "aa".repeat(20),
+                        "job_hash": "bb".repeat(32),
+                        "seller_pubkey": seller,
+                        "amount_sats": 1,
+                        "repo": "ext::sh -c evil",
+                        "branch": "main",
+                        "commit_oid": "aa".repeat(20),
+                    }
+                }),
+            },
+        );
+        let rendered = response.to_string();
+        assert!(!rendered.contains(&secret), "secret leaked on authorize_pay error");
+        assert_eq!(response["result"]["isError"], true);
+        let message = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(
+            message.contains("ext") || message.contains("refused") || message.contains("transport"),
+            "message={message}"
+        );
     }
 
     #[test]

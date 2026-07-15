@@ -5,9 +5,9 @@
 //! local paths). Redirect following is out of scope here — this gates the locator string
 //! before any fetch.
 //!
-//! Hermetic `GitDeliveryVerifier` tests may still use local path remotes; production
-//! callers MUST wrap via [`AllowlistedDeliveryVerifier`] (or call
-//! [`assert_allowed_repo_locator`] themselves) before fetch.
+//! By construction on the pay path: use [`crate::delivery_git::PayPathDeliveryVerifier`].
+//! Bare `GitDeliveryVerifier` is `pub(crate)` (test-only inside core); peel/`into_inner`
+//! on the allowlist wrapper are crate-private so the allowlist cannot be stripped outside.
 
 use std::fmt;
 
@@ -117,24 +117,29 @@ pub fn is_relay_git_locator(repo: &str) -> bool {
 }
 
 /// Delivery verifier that enforces the transport allowlist before the inner verify/fetch.
-pub struct AllowlistedDeliveryVerifier<V> {
+///
+/// Crate-visible composition helper. Outside core, obtain a fetch-capable verifier only via
+/// [`crate::delivery_git::PayPathDeliveryVerifier`] — peel/`into_inner` stay crate-private.
+pub(crate) struct AllowlistedDeliveryVerifier<V> {
     inner: V,
 }
 
 impl<V> AllowlistedDeliveryVerifier<V> {
-    pub fn new(inner: V) -> Self {
+    pub(crate) fn new(inner: V) -> Self {
         Self { inner }
     }
 
-    pub fn into_inner(self) -> V {
+    #[allow(dead_code)] // kept crate-private so peel/`into_inner` cannot strip allowlist outside core
+    pub(crate) fn into_inner(self) -> V {
         self.inner
     }
 
-    pub fn inner(&self) -> &V {
+    pub(crate) fn inner(&self) -> &V {
         &self.inner
     }
 
-    pub fn inner_mut(&mut self) -> &mut V {
+    #[allow(dead_code)] // kept crate-private so peel/`into_inner` cannot strip allowlist outside core
+    pub(crate) fn inner_mut(&mut self) -> &mut V {
         &mut self.inner
     }
 }

@@ -163,6 +163,16 @@ pub fn read_secret_key_hex(home: &MobeeHome) -> Result<String, HomeError> {
     Ok(secret)
 }
 
+/// Hex-encode the buyer's nostr public key derived from the packaged secret.
+/// Safe to return on MCP surfaces (not secret material).
+#[cfg(feature = "wallet")]
+pub fn public_key_hex(home: &MobeeHome) -> Result<String, HomeError> {
+    let secret = read_secret_key_hex(home)?;
+    let keys = nostr_sdk::Keys::parse(&secret)
+        .map_err(|error| HomeError::Key(format!("key parse for pubkey: {error}")))?;
+    Ok(keys.public_key().to_hex())
+}
+
 fn load_config(path: &Path) -> Result<MobeeConfig, HomeError> {
     let raw = fs::read_to_string(path).map_err(|error| HomeError::Config(error.to_string()))?;
     toml::from_str(&raw).map_err(|error| HomeError::Config(error.to_string()))

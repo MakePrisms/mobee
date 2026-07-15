@@ -11,7 +11,7 @@ default = []
 acp = []
 gateway = ["dep:nostr-sdk"]
 git-delivery = []
-wallet = ["dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "dep:tokio"]
+wallet = ["git-delivery", "gateway", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "dep:tokio"]
 test-support = []
 
 [dependencies]

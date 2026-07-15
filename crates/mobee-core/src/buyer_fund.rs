@@ -106,6 +106,15 @@ async fn open_wallet(home: &MobeeHome) -> Result<Wallet, FundError> {
     .map_err(|error| FundError::Wallet(error.to_string()))
 }
 
+/// Open the packaged testnut wallet (blocking). Used by authorize_pay / MCP.
+pub fn open_testnut_wallet_blocking(home: &MobeeHome) -> Result<Wallet, FundError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| FundError::Wallet(error.to_string()))?;
+    runtime.block_on(open_wallet(home))
+}
+
 /// Read current wallet balance against the hard-pinned testnut mint.
 pub async fn wallet_balance_sats(home: &MobeeHome) -> Result<u64, FundError> {
     let wallet = open_wallet(home).await?;

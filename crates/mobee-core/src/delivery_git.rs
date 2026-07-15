@@ -4,22 +4,27 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use crate::delivery::{CommitOid, DeliveryError, DeliveryVerifier, GitDelivery, VerifiedDelivery};
+use crate::delivery_transport::AllowlistedDeliveryVerifier;
 
 /// Real git-backed verifier that retains fetched objects in a buyer-owned repository.
-pub struct GitDeliveryVerifier {
+///
+/// Crate-private on purpose: bare git verify can fetch `ext::` (RCE). The pay path
+/// must use [`PayPathDeliveryVerifier`] — the only public factory that hands out a
+/// fetch-capable verifier, with the transport allowlist sealed in.
+pub(crate) struct GitDeliveryVerifier {
     repository: PathBuf,
 }
 
 impl GitDeliveryVerifier {
     /// Creates a verifier whose fetched object database lives at `repository`.
-    pub fn new(repository: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new(repository: impl Into<PathBuf>) -> Self {
         Self {
             repository: repository.into(),
         }
     }
 
     /// Returns the local repository that holds verified delivery objects.
-    pub fn repository(&self) -> &Path {
+    pub(crate) fn repository(&self) -> &Path {
         &self.repository
     }
 
@@ -129,6 +134,35 @@ impl DeliveryVerifier for GitDeliveryVerifier {
         let verified = VerifiedDelivery::from_fetched_tip(delivery, fetched_tip)?;
         self.require_local_object(verified.commit_oid())?;
         Ok(verified)
+    }
+}
+
+/// Pay-path delivery verifier: transport allowlist sealed around git verify/fetch.
+///
+/// This is the only public constructor that yields a fetch-capable verifier for
+/// `authorize_pay` / MCP. There is no peel API — the bare git verifier cannot be
+/// reached from outside `mobee-core`.
+pub struct PayPathDeliveryVerifier {
+    inner: AllowlistedDeliveryVerifier<GitDeliveryVerifier>,
+}
+
+impl PayPathDeliveryVerifier {
+    /// Build the allowlisted git verifier used on the authorize_pay path.
+    pub fn new(repository: impl Into<PathBuf>) -> Self {
+        Self {
+            inner: AllowlistedDeliveryVerifier::new(GitDeliveryVerifier::new(repository)),
+        }
+    }
+
+    /// Returns the local repository that holds verified delivery objects.
+    pub fn repository(&self) -> &Path {
+        self.inner.inner().repository()
+    }
+}
+
+impl DeliveryVerifier for PayPathDeliveryVerifier {
+    fn verify(&mut self, delivery: &GitDelivery) -> Result<VerifiedDelivery, DeliveryError> {
+        self.inner.verify(delivery)
     }
 }
 
@@ -307,5 +341,39 @@ mod tests {
             Err(DeliveryError::InvalidBranch)
         );
         assert!(!fixture.custody.exists());
+    }
+
+    #[test]
+    fn pay_path_verifier_refuses_ext_before_fetch() {
+        use crate::delivery_transport::TransportRefuse;
+
+        let fixture = Fixture::new();
+        let delivery = GitDelivery::new(
+            "ext::sh -c evil",
+            "main",
+            fixture.head(),
+        )
+        .expect("delivery shape");
+        let mut verifier = PayPathDeliveryVerifier::new(&fixture.custody);
+        let err = verifier.verify(&delivery).expect_err("refuse ext");
+        assert!(matches!(
+            err,
+            DeliveryError::Transport(TransportRefuse::ForbiddenScheme(_))
+        ));
+        assert!(!fixture.custody.exists());
+    }
+
+    #[test]
+    fn pay_path_verifier_allows_local_path_only_via_bare_inner_in_tests() {
+        // Hermetic tip-match tests still use bare GitDeliveryVerifier (pub(crate)).
+        // Pay path must not be that type — factory always allowlists first.
+        let fixture = Fixture::new();
+        let advertised = fixture.delivery(fixture.head());
+        let mut pay_path = PayPathDeliveryVerifier::new(&fixture.custody);
+        let err = pay_path.verify(&advertised).expect_err("local path refused");
+        assert!(matches!(
+            err,
+            DeliveryError::Transport(crate::delivery_transport::TransportRefuse::LocalPath)
+        ));
     }
 }
