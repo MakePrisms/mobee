@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 
 /// Open-market demo relay (PROCESS.md).
 pub const DEFAULT_RELAY_URL: &str = "wss://mobee-relay.orveth.dev";
-/// Standing testnut mint — no real funds.
-pub const DEFAULT_MINT_URL: &str = "https://testnut.cashu.space";
+/// Standing CDK testnut mint — no real funds. Host re-locked 2026-07-15 after
+/// `testnut.cashu.space` died from turtle; class (TESTNUT) is the load-bearing rule.
+pub const DEFAULT_MINT_URL: &str = "https://testnut.cashudevkit.org";
 /// Conservative per-job spend cap (sats) until config is tuned.
 pub const DEFAULT_PER_JOB_BUDGET_SATS: u64 = 21;
 /// Conservative rolling/session total spend cap (sats).
