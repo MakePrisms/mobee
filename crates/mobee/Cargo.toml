@@ -7,10 +7,11 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-default = []
+default = ["wallet"]
 acp = ["mobee-core/acp"]
+wallet = ["mobee-core/wallet"]
 
 [dependencies]
-mobee-core.workspace = true
+mobee-core = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true

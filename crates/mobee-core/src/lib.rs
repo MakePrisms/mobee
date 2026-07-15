@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod driver;
 pub mod engine;
 pub mod event;
@@ -5,6 +6,8 @@ pub mod format;
 pub mod gateway;
 pub mod home;
 pub mod log;
+#[cfg(feature = "wallet")]
+pub mod buyer_fund;
 #[cfg(feature = "wallet")]
 pub mod payment;
 #[cfg(feature = "wallet")]

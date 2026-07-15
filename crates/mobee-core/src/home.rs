@@ -156,11 +156,43 @@ fn write_config(path: &Path, config: &MobeeConfig) -> Result<(), HomeError> {
 }
 
 fn validate_existing_key(path: &Path) -> Result<(), HomeError> {
+    ensure_key_permissions(path)?;
     let mut file = File::open(path).map_err(|error| HomeError::Key(error.to_string()))?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)
         .map_err(|error| HomeError::Key(error.to_string()))?;
     validate_secret_hex(contents.trim())
+}
+
+/// Existing keys must be `0600`. Too-open modes are re-chmod'd; if that fails, refuse.
+fn ensure_key_permissions(path: &Path) -> Result<(), HomeError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata =
+            fs::metadata(path).map_err(|error| HomeError::Key(error.to_string()))?;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 == 0 {
+            return Ok(());
+        }
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)
+            .map_err(|error| HomeError::Key(format!(
+                "key file permissions too open ({mode:#o}); re-chmod 0600 failed: {error}"
+            )))?;
+        let after = fs::metadata(path)
+            .map_err(|error| HomeError::Key(error.to_string()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if after & 0o077 != 0 {
+            return Err(HomeError::Key(format!(
+                "key file permissions too open ({mode:#o}); refused to leave open (still {after:#o})"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_secret_hex(secret: &str) -> Result<(), HomeError> {
@@ -269,5 +301,31 @@ mod tests {
             None => unsafe { std::env::remove_var("MOBEE_HOME") },
         }
         assert_eq!(resolved, root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_rechmods_too_open_existing_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_home("open-key");
+        let _ = fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let secret = read_secret_key_hex(&home).expect("secret");
+
+        let mut permissions = fs::metadata(&home.key_path)
+            .expect("meta")
+            .permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&home.key_path, permissions).expect("chmod 644");
+
+        let again = bootstrap(&root).expect("re-bootstrap must re-chmod or refuse");
+        let mode = fs::metadata(&again.key_path)
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(read_secret_key_hex(&again).expect("secret again"), secret);
     }
 }
