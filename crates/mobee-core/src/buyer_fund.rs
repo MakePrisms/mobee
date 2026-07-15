@@ -88,7 +88,10 @@ fn sqlite_path(wallet_dir: &Path) -> std::path::PathBuf {
     wallet_dir.join("cdk-wallet.sqlite")
 }
 
-async fn open_wallet(home: &MobeeHome) -> Result<Wallet, FundError> {
+/// Open the packaged testnut wallet (async). Prefer this inside an existing
+/// runtime — [`open_testnut_wallet_blocking`] nests `block_on` and panics if
+/// already in one (seller daemon receive, future async authorize_pay).
+pub async fn open_testnut_wallet_async(home: &MobeeHome) -> Result<Wallet, FundError> {
     require_testnut_mint(home)?;
     let secret = home::read_secret_key_hex(home)?;
     let seed = seed_from_secret_hex(&secret)?;
@@ -106,18 +109,20 @@ async fn open_wallet(home: &MobeeHome) -> Result<Wallet, FundError> {
     .map_err(|error| FundError::Wallet(error.to_string()))
 }
 
-/// Open the packaged testnut wallet (blocking). Used by authorize_pay / MCP.
+/// Thin sync wrapper for non-async callers (authorize_pay / MCP today).
+/// Do **not** call from inside an existing tokio runtime — use
+/// [`open_testnut_wallet_async`] instead.
 pub fn open_testnut_wallet_blocking(home: &MobeeHome) -> Result<Wallet, FundError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| FundError::Wallet(error.to_string()))?;
-    runtime.block_on(open_wallet(home))
+    runtime.block_on(open_testnut_wallet_async(home))
 }
 
 /// Read current wallet balance against the hard-pinned testnut mint.
 pub async fn wallet_balance_sats(home: &MobeeHome) -> Result<u64, FundError> {
-    let wallet = open_wallet(home).await?;
+    let wallet = open_testnut_wallet_async(home).await?;
     let balance = wallet
         .total_balance()
         .await
@@ -131,7 +136,7 @@ pub async fn fund_testnut_wallet(
     amount_sats: u64,
 ) -> Result<FundOutcome, FundError> {
     require_testnut_mint(home)?;
-    let wallet = open_wallet(home).await?;
+    let wallet = open_testnut_wallet_async(home).await?;
     let existing = wallet
         .total_balance()
         .await
