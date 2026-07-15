@@ -155,7 +155,6 @@ impl PaymentTerms {
 pub struct PaymentKey {
     pub job_id: JobId,
     pub result_id: ResultId,
-    #[serde(alias = "content_hash")]
     pub delivery_integrity_hash: DeliveryIntegrityHash,
     pub job_hash: JobHash,
     pub seller_pubkey: NostrPublicKey,
@@ -991,6 +990,29 @@ mod tests {
 
         assert_eq!(sat.attempt_id(), sat.attempt_id());
         assert_ne!(sat.attempt_id(), msat.attempt_id());
+    }
+
+    #[test]
+    fn legacy_content_hash_field_name_refuses_to_deserialize() {
+        let mut value = serde_json::to_value(key()).expect("serialize payment key");
+        let object = value.as_object_mut().expect("payment key object");
+        let hash = object
+            .remove("delivery_integrity_hash")
+            .expect("delivery_integrity_hash present");
+        object.insert("content_hash".into(), hash);
+
+        assert!(serde_json::from_value::<PaymentKey>(value).is_err());
+    }
+
+    #[test]
+    fn payment_key_delivery_integrity_hash_round_trips() {
+        let original = key();
+        let json = serde_json::to_value(&original).expect("serialize payment key");
+        assert!(json.get("delivery_integrity_hash").is_some());
+        assert!(json.get("content_hash").is_none());
+
+        let parsed: PaymentKey = serde_json::from_value(json).expect("deserialize payment key");
+        assert_eq!(parsed, original);
     }
 
     #[test]

@@ -8,7 +8,6 @@ pub struct ReceiptHashInput {
     /// Market/offer job id; this is part of the receipt hash tuple and must not change.
     pub job_id: String,
     /// Integrity identifier for the delivered work (commit oid for git delivery).
-    #[serde(alias = "result_content_hash")]
     pub delivery_integrity_hash: String,
     /// Integer payment amount for the receipt.
     pub price_int: u64,
@@ -102,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_result_content_hash_field_still_deserializes() {
+    fn legacy_result_content_hash_field_name_refuses_to_deserialize() {
         let legacy = serde_json::json!({
             "job_id": "job",
             "result_content_hash": "legacy-hash",
@@ -113,7 +112,18 @@ mod tests {
             "seller_pubkey_hex": "seller"
         });
 
-        let parsed: ReceiptHashInput = serde_json::from_value(legacy).expect("legacy receipt");
-        assert_eq!(parsed.delivery_integrity_hash, "legacy-hash");
+        assert!(serde_json::from_value::<ReceiptHashInput>(legacy).is_err());
+    }
+
+    #[test]
+    fn receipt_delivery_integrity_hash_round_trips() {
+        let original = input();
+        let json = serde_json::to_value(&original).expect("serialize receipt");
+        assert!(json.get("delivery_integrity_hash").is_some());
+        assert!(json.get("result_content_hash").is_none());
+
+        let parsed: ReceiptHashInput =
+            serde_json::from_value(json).expect("deserialize receipt");
+        assert_eq!(parsed, original);
     }
 }
