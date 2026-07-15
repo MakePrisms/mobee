@@ -974,6 +974,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Live MCP smoke via async `tools/call` dispatch (same path as Claude-Code MCP).
+    /// Closes Temper MEDIUM: set_profile was suite-attested on the sync twin only.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn set_profile_async_mcp_dispatch_publishes_kind0_never_echoes_secret() {
+        let root = temp_home("set-profile-async-mcp");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = state_at(&root);
+        let secret = home::read_secret_key_hex(&state.home).expect("secret");
+        let response = dispatch(
+            &state,
+            &McpRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(77)),
+                method: "tools/call".into(),
+                params: json!({
+                    "name": "set_profile",
+                    "arguments": {
+                        "name": "anvil-async-mcp",
+                        "about": "gate9 fast-follow"
+                    }
+                }),
+            },
+        );
+        let rendered = response.to_string();
+        assert!(
+            !rendered.contains(&secret),
+            "secret leaked on async MCP set_profile"
+        );
+        assert_eq!(response["result"]["isError"], false);
+        assert_eq!(response["result"]["structuredContent"]["ok"], true);
+        assert_eq!(
+            response["result"]["structuredContent"]["name"],
+            "anvil-async-mcp"
+        );
+        let event_id = response["result"]["structuredContent"]["event_id"]
+            .as_str()
+            .expect("event_id");
+        assert_eq!(event_id.len(), 64);
+        let reloaded = home::bootstrap(&root).expect("reload");
+        let profile = reloaded.config.profile.expect("profile in config");
+        assert_eq!(profile.name.as_deref(), Some("anvil-async-mcp"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[cfg(feature = "wallet")]
     #[test]
     fn set_profile_empty_name_refused_never_echoes_secret() {

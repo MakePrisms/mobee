@@ -401,4 +401,59 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_metadata_sync_refuses_inside_runtime() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-publish-meta-nested-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let keys = nostr_sdk::Keys::generate();
+        let profile = ProfileConfig {
+            name: Some("nested-guard".into()),
+            about: None,
+        };
+        let err = publish_metadata(&home, &keys, &profile).expect_err("must refuse nested block_on");
+        assert!(
+            err.to_string().contains("nested block_on refused"),
+            "unexpected: {err}"
+        );
+        assert!(
+            err.to_string().contains("publish_metadata"),
+            "op name missing: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_names_sync_refuses_inside_runtime() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-fetch-names-nested-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let mut pubkeys = HashSet::new();
+        pubkeys.insert("aa".repeat(32));
+        let err = fetch_names(&home, &pubkeys).expect_err("must refuse nested block_on");
+        assert!(
+            err.to_string().contains("nested block_on refused"),
+            "unexpected: {err}"
+        );
+        assert!(
+            err.to_string().contains("fetch_names"),
+            "op name missing: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -1095,4 +1095,38 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_draft_sync_refuses_inside_runtime() {
+        let (root, home) = temp_job_home("nested-publish-draft");
+        let keys = nostr_sdk::Keys::generate();
+        let draft = EventDraft::new(5109, Vec::new(), "nested-guard");
+        let err = publish_draft(&home, &keys, &draft).expect_err("must refuse nested block_on");
+        assert!(
+            err.to_string().contains("nested block_on refused"),
+            "unexpected: {err}"
+        );
+        assert!(
+            err.to_string().contains("publish_draft"),
+            "op name missing: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_job_view_sync_refuses_inside_runtime() {
+        let (root, home) = temp_job_home("nested-fetch-job");
+        let keys = nostr_sdk::Keys::generate();
+        let err = fetch_job_view(&home, &keys, &"aa".repeat(32), Duration::from_secs(1))
+            .expect_err("must refuse nested block_on");
+        assert!(
+            err.to_string().contains("nested block_on refused"),
+            "unexpected: {err}"
+        );
+        assert!(
+            err.to_string().contains("fetch_job_view"),
+            "op name missing: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
