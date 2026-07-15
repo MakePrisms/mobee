@@ -125,6 +125,21 @@ pub fn authorize_pay(
         .into());
     }
 
+    // D2 (both job_id and explicit forms): buyer tip-match hash is required and must
+    // equal the seller-advertised commit_oid. Never derive/default the hash from the
+    // claim/result oid — caller must supply it; mismatch refuses.
+    if request.delivery_integrity_hash.trim().is_empty() {
+        return Err(AuthorizePayError::Input(
+            "delivery_integrity_hash is required (buyer tip-match); never auto-filled from claim/result oid".into(),
+        ));
+    }
+    if request.delivery_integrity_hash != request.commit_oid {
+        return Err(AuthorizePayError::Input(format!(
+            "delivery_integrity_hash {} does not match seller-advertised commit_oid {} (buyer tip-match required; refuse mismatch)",
+            request.delivery_integrity_hash, request.commit_oid
+        )));
+    }
+
     let job_id = JobId::new(request.job_id.clone())
         .map_err(|error| AuthorizePayError::Input(error.to_string()))?;
     let result_id = ResultId::new(request.result_id.clone())
@@ -223,6 +238,75 @@ mod tests {
     use super::*;
     use crate::budget::BudgetGate;
     use crate::home;
+
+    #[test]
+    fn authorize_pay_refuses_empty_buyer_hash_without_burn() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-authorize-pay-d2-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let mut gate = BudgetGate::from_home(&home).expect("gate");
+        let request = AuthorizePayRequest {
+            job_id: "job-d2-empty".into(),
+            result_id: "result-d2".into(),
+            delivery_integrity_hash: String::new(),
+            job_hash: "bb".repeat(32),
+            seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
+            amount_sats: 1,
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            // Even if commit_oid is set, empty buyer hash must refuse (no auto-fill).
+            commit_oid: "aa".repeat(20),
+        };
+        let err = authorize_pay(&home, &mut gate, request).expect_err("D2 empty");
+        let message = err.to_string();
+        assert!(
+            message.contains("delivery_integrity_hash is required"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(gate.spent(), 0, "empty-hash refuse must not burn spent");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn authorize_pay_refuses_buyer_hash_mismatch_vs_advertised_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-authorize-pay-d2-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let mut gate = BudgetGate::from_home(&home).expect("gate");
+        let request = AuthorizePayRequest {
+            job_id: "job-d2".into(),
+            result_id: "result-d2".into(),
+            delivery_integrity_hash: "aa".repeat(20),
+            job_hash: "bb".repeat(32),
+            seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
+            amount_sats: 1,
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            commit_oid: "cc".repeat(20),
+        };
+        let err = authorize_pay(&home, &mut gate, request).expect_err("D2 mismatch");
+        let message = err.to_string();
+        assert!(
+            message.contains("does not match seller-advertised commit_oid"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(gate.spent(), 0, "D2 refuse must not burn spent");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn authorize_pay_refuses_ext_locator_via_pay_path_verifier() {

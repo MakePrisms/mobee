@@ -2,23 +2,44 @@
 
 Documented buyer steps only. **Testnut only. No real funds. The key never leaves the box.**
 
-Pinned surface: `dev` tip with composed `authorize_pay` (`BudgetGate` → `PayPathDeliveryVerifier` → `PaymentService::run()`).
+Pinned surface: `dev` tip with buyer MCP job-lifecycle + composed `authorize_pay`
+(`BudgetGate` → `PayPathDeliveryVerifier` → `PaymentService::run()`).
 
-Reality class for this path: **REAL-AND-LIVE (testnut)**. `main` remains **BUILT-BUT-OFF** until back-pull.
+Reality class for this path: **marketplace REAL** (5109 / 7000 / 6109 on the mobee relay) +
+**pay REAL-AND-LIVE (testnut)**. `main` remains **BUILT-BUT-OFF** until back-pull.
+
+---
+
+## 0. Clone + toolchain (step-0)
+
+```bash
+# Public https clone — no auth, no insteadOf / SSH rewrite required.
+git clone https://github.com/bitcoin/bips.git /tmp/mobee-quickstart-bips
+cd /tmp/mobee-quickstart-bips
+
+# Toolchain: this repo's nix develop (or any rustc that builds the workspace).
+# From a mobee checkout:
+cd /path/to/mobee
+nix develop -c bash -lc 'cargo build -p mobee --release'
+```
+
+No `git config insteadOf`, no `GIT_SSH_COMMAND`, no private-repo auth. Tip-match examples
+below use the same **public** `https://github.com/bitcoin/bips.git` locator.
 
 ---
 
 ## What this tip exposes
 
-Buyer MCP tools on this tip (exactly three):
+Buyer MCP tools on this tip (exactly six):
 
 | Tool | Role |
 |------|------|
 | `setup_wallet` | Bootstrap `~/.mobee` (config + autogen key + wallet) and fund against the hard-pinned testnut mint |
+| `post_job` | Publish a real kind-5109 offer to the configured relay (targeted seller p-tag = documented default) |
+| `get_job` | Read offer / claims / results from relay events (not local invent) |
+| `accept_claim` | Publish kind-7000 `accepted` + record local pay-bind for `authorize_pay` |
 | `stub_pay` | Exercise budget caps over a mock pay (no piece-6 `run()`) |
-| `authorize_pay` | Real capped pay: delivery-verify (tip-match) then `run()` |
-
-**Not on this tip:** `post_job`, `get_job`, `accept_claim`. For the acceptance loop those marketplace legs are the **seller stub** (named below) — not buyer MCP commands. Do not invent buyer commands that are not in the table.
+| `authorize_pay` | Real capped pay. **Documented default = job_id form** (see §4) |
 
 Defaults written on first bootstrap (`~/.mobee/config.toml`):
 
@@ -28,7 +49,7 @@ Defaults written on first bootstrap (`~/.mobee/config.toml`):
 
 ---
 
-## 0. Fresh home
+## 0b. Fresh home
 
 Wipe or isolate buyer state before the first tool call:
 
@@ -78,7 +99,7 @@ Initialize once:
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 ```
 
-List tools (optional check — expect exactly `setup_wallet`, `stub_pay`, `authorize_pay`):
+List tools (optional check — expect exactly `setup_wallet`, `post_job`, `get_job`, `accept_claim`, `stub_pay`, `authorize_pay`):
 
 ```json
 {"jsonrpc":"2.0","id":2,"method":"tools/list"}
@@ -102,82 +123,121 @@ Pass criteria (from the tool response body):
 
 ---
 
-## 3. Seller stub — post → claim → deliver
+## 3. Post job — `post_job` (real kind-5109)
 
-**Seller: stub** (not live c2). The stub stands in for marketplace posting / claim / git delivery so the buyer can exercise the composed pay path. Buyer steps never call stub internals except to **read the result packet** the stub prints.
+Targeted seller is the documented default. Obtain a seller hex pubkey (seller daemon, stub keygen, or a known test seller) and post:
 
-Stub recipe (run in a second shell; does not touch buyer `MOBEE_HOME`):
-
-```bash
-# --- seller stub: post_job ---
-JOB_ID="job-acceptance-$(date +%s)"
-JOB_HASH="$(printf '%s' "$JOB_ID" | sha256sum | awk '{print $1}')"
-echo "STUB post_job job_id=$JOB_ID job_hash=$JOB_HASH"
-
-# --- seller stub: claim (ephemeral nostr key; pubkey only on stdout) ---
-STUB_DIR="$(mktemp -d /tmp/mobee-seller-stub-XXXXXX)"
-SELLER_KEY_FILE="$STUB_DIR/key"   # mode 0600; never print / commit / paste
-SELLER_PUB="$(cargo run --release --manifest-path scripts/gen_nostr_keypair/Cargo.toml -- "$SELLER_KEY_FILE")"
-echo "STUB claim seller_pubkey=$SELLER_PUB"
-
-# --- seller stub: deliver (https git tip) ---
-# Tip-match requires an allowlisted https locator (ext:: / file / ssh / local path refused).
-REPO_URL="https://github.com/MakePrisms/mobee.git"
-BRANCH="main"
-COMMIT_OID="$(git ls-remote "$REPO_URL" "refs/heads/$BRANCH" | awk '{print $1}')"
-RESULT_ID="result-acceptance-$(date +%s)"
-echo "STUB deliver repo=$REPO_URL branch=$BRANCH commit_oid=$COMMIT_OID result_id=$RESULT_ID"
+```json
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"post_job","arguments":{
+  "task":"acceptance tip-match pay",
+  "output":"text/plain",
+  "amount_sats":1,
+  "seller_pubkey":"<seller 64-hex pubkey>",
+  "repo":"https://github.com/bitcoin/bips.git",
+  "branch":"master"
+}}}
 ```
 
-Buyer independent commitment (required — do not blind-copy seller advertising without checking):
+Pass criteria:
 
-```bash
-BUYER_TIP="$(git ls-remote "$REPO_URL" "refs/heads/$BRANCH" | awk '{print $1}')"
-test "$BUYER_TIP" = "$COMMIT_OID" && echo "buyer tip-match commitment ok"
-DELIVERY_INTEGRITY_HASH="$BUYER_TIP"
-```
+- `ok: true`, `offer_kind: 5109`, `targeted: true`
+- `job_id` is a 64-hex event id (independent relay read of kind-5109 must see it)
+- response does **not** contain the buyer secret key
 
-Result packet the buyer feeds to `authorize_pay`:
-
-| Field | Source |
-|-------|--------|
-| `job_id` | stub `post_job` |
-| `job_hash` | stub `post_job` (64-hex SHA-256) |
-| `result_id` | stub deliver |
-| `seller_pubkey` | stub claim (64-hex x-only pubkey) |
-| `repo` | stub deliver (`https://…` only) |
-| `branch` | stub deliver |
-| `commit_oid` | stub deliver |
-| `delivery_integrity_hash` | **buyer** `ls-remote` tip (must equal `commit_oid`) |
-| `amount_sats` | buyer choice within caps (e.g. `1`) |
+Open / untargeted offers are allowed with `"untargeted": true` (omit `seller_pubkey`).
 
 ---
 
-## 4. Pay — `authorize_pay` (within caps)
+## 3b. Wait for claim + result — `get_job`
+
+Seller publishes kind-7000 `status=processing` claim and kind-6109 git result (arms-length seller / stub / c2). Buyer polls relay truth:
 
 ```json
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"authorize_pay","arguments":{
-  "job_id":"<job_id>",
-  "result_id":"<result_id>",
-  "delivery_integrity_hash":"<buyer tip oid>",
-  "job_hash":"<64 hex>",
-  "seller_pubkey":"<seller pubkey>",
-  "amount_sats":1,
-  "repo":"https://github.com/MakePrisms/mobee.git",
-  "branch":"main",
-  "commit_oid":"<same tip oid>"
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_job","arguments":{
+  "job_id":"<job_id from post_job>",
+  "wait_for":"result",
+  "timeout_secs":60
 }}}
 ```
+
+Pass criteria:
+
+- `source` == `relay`
+- `claims[]` entries carry `created_at`; exactly one may be flagged `live: true`
+- `results[]` include repo/branch/commit_oid from the 6109 (not invented locally)
+
+---
+
+## 3c. Accept — `accept_claim`
+
+```json
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"accept_claim","arguments":{
+  "job_id":"<job_id>",
+  "claim_id":"<live claim_id from get_job>"
+}}}
+```
+
+Records local pay-bind `{seller_pubkey, result_id, commit_oid, repo, branch, job_hash}` under
+`~/.mobee/jobs/<job_id>.json` and publishes kind-7000 `accepted`. Subsequent
+`authorize_pay` refuses seller/result/commit mismatch against this bind (Gate D).
+
+---
+
+## 3d. Buyer tip-match (independent commitment)
+
+```bash
+REPO_URL="https://github.com/bitcoin/bips.git"
+BRANCH="master"
+BUYER_TIP="$(git ls-remote "$REPO_URL" "refs/heads/$BRANCH" | awk '{print $1}')"
+# Must equal the accepted result's commit_oid from get_job / accept_claim bind.
+DELIVERY_INTEGRITY_HASH="$BUYER_TIP"
+```
+
+Plain https — no `insteadOf`, no SSH.
+
+---
+
+## 4. Pay — `authorize_pay` job_id form (documented default)
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"authorize_pay","arguments":{
+  "job_id":"<job_id>",
+  "amount_sats":1,
+  "delivery_integrity_hash":"<BUYER_TIP from 3d>"
+}}}
+```
+
+MCP binds seller/repo/branch/commit_oid/result_id/job_hash from the **accept_claim** record.
+**D2:** `delivery_integrity_hash` is a **required** buyer arg — never auto-filled from the
+claim (7000) or result (6109) oid. MCP **compares** it to the accepted seller `commit_oid`
+and **refuses on mismatch**. Matching is fine when the buyer independently tip-matched;
+auto-fill from the seller advertisement is the circular-bind failure mode.
 
 Pass criteria:
 
 - tool `ok: true`
 - `piece6` == `run`
 - `verifier` == `PayPathDeliveryVerifier`
-- `state` reaches `receipt_published` or `closed` with a `receipt` / `receipt_id`
-- `amount_sats` matches the request; spent accounting moves
+- `state` reaches `receipt_published` or `closed`
+- spent accounting moves
 
-That receipt object in the response (and the payment journal under `$MOBEE_HOME/payment-journal/`) is the run's receipt evidence.
+### Explicit 9-field form (harness / stub path)
+
+Still accepted. If an accept-bind exists for `job_id`, seller/result/commit must match it.
+
+```json
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"authorize_pay","arguments":{
+  "job_id":"<job_id>",
+  "result_id":"<result_id>",
+  "delivery_integrity_hash":"<buyer tip oid>",
+  "job_hash":"<64 hex>",
+  "seller_pubkey":"<seller pubkey>",
+  "amount_sats":1,
+  "repo":"https://github.com/bitcoin/bips.git",
+  "branch":"master",
+  "commit_oid":"<same tip oid>"
+}}}
+```
 
 ---
 
@@ -188,21 +248,21 @@ That receipt object in the response (and the payment journal under `$MOBEE_HOME/
 Default per-job cap is `21`. Ask for `22`:
 
 ```json
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"stub_pay","arguments":{"amount_sats":22}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"stub_pay","arguments":{"amount_sats":22}}}
 ```
 
 Or the real path (also refused at the gate before mint):
 
 ```json
-{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"authorize_pay","arguments":{
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"authorize_pay","arguments":{
   "job_id":"job-overcap",
   "result_id":"result-overcap",
   "delivery_integrity_hash":"<any 40-hex>",
   "job_hash":"<64 hex>",
   "seller_pubkey":"<seller pubkey>",
   "amount_sats":22,
-  "repo":"https://github.com/MakePrisms/mobee.git",
-  "branch":"main",
+  "repo":"https://github.com/bitcoin/bips.git",
+  "branch":"master",
   "commit_oid":"<any 40-hex>"
 }}}
 ```
@@ -212,7 +272,7 @@ Expect an error response containing a budget refuse (not a successful pay).
 ### 5b. `ext::` locator REFUSED
 
 ```json
-{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"authorize_pay","arguments":{
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"authorize_pay","arguments":{
   "job_id":"job-ext",
   "result_id":"result-ext",
   "delivery_integrity_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -220,7 +280,7 @@ Expect an error response containing a budget refuse (not a successful pay).
   "seller_pubkey":"<seller pubkey>",
   "amount_sats":1,
   "repo":"ext::sh -c evil",
-  "branch":"main",
+  "branch":"master",
   "commit_oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 }}}
 ```
@@ -232,14 +292,17 @@ Expect refuse (transport allowlist / `ext` / forbidden scheme). No successful pa
 ## Acceptance checklist
 
 ```
-fresh home
+step-0: public https clone + toolchain (no insteadOf / SSH)
+→ fresh home
 → documented steps only (this file)
 → setup_wallet with balance_sats > 0
-→ seller stub: post_job → claim → https deliver
-→ buyer tip commitment == advertised commit_oid
-→ authorize_pay within caps → receipt
+→ post_job → real 5109 on relay
+→ get_job → relay claims/results
+→ accept_claim → pay-bind
+→ buyer tip commitment (public https ls-remote)
+→ authorize_pay(job_id) within caps → receipt
 → over-cap REFUSED
 → ext:: REFUSED
 ```
 
-Seller named in evidence: **stub** (not live c2).
+Seller may stay arms-length (stub/c2) for claim + 6109 publish; buyer marketplace legs are MCP-real.

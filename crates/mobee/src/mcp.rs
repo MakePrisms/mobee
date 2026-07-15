@@ -9,6 +9,10 @@ use std::sync::Mutex;
 use mobee_core::authorize_pay::{self, AuthorizePayRequest};
 use mobee_core::budget::BudgetGate;
 use mobee_core::home::{self, MobeeHome};
+#[cfg(feature = "wallet")]
+use mobee_core::job_lifecycle::{
+    self, AcceptClaimRequest, GetJobRequest, PostJobRequest, WaitFor,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -118,6 +122,62 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "post_job",
+            "description": "Publish a real kind-5109 job offer to the configured mobee relay. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. Never echoes secrets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string" },
+                    "output": { "type": "string", "description": "MIME / output type (e.g. text/plain)" },
+                    "amount_sats": { "type": "integer", "minimum": 0 },
+                    "seller_pubkey": {
+                        "type": "string",
+                        "description": "Targeted seller hex pubkey (documented default)"
+                    },
+                    "untargeted": {
+                        "type": "boolean",
+                        "description": "When true, omit p-tag (open offer). Default false."
+                    },
+                    "deadline_unix": { "type": "integer", "minimum": 0 },
+                    "repo": { "type": "string", "description": "Optional https git repo for delivery bind" },
+                    "branch": { "type": "string" }
+                },
+                "required": ["task", "output", "amount_sats"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "get_job",
+            "description": "Read job state from the relay (kind 5109 offer + 7000 claims + 6109 results). Surfaces claim created_at and flags the most-recent LIVE claim. Optional wait_for=claim|result long-poll. Local accept-bind attached if present. Never invents claims/results.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "Offer event id (hex)" },
+                    "wait_for": { "type": "string", "enum": ["claim", "result"] },
+                    "timeout_secs": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["job_id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "accept_claim",
+            "description": "Accept a seller claim: publish kind-7000 status=accepted and record local pay-bind {seller_pubkey, result_id, commit_oid, repo, branch, job_hash} for authorize_pay. Requires a matching git result on the relay. Never echoes secrets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string" },
+                    "claim_id": { "type": "string" },
+                    "result_id": {
+                        "type": "string",
+                        "description": "Optional; defaults to newest git result from the claim seller"
+                    }
+                },
+                "required": ["job_id", "claim_id"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "stub_pay",
             "description": "Exercise the MCP budget gate over a mock pay (allow/deny). Does not call piece-6 run()/advance(). Caps bind from ~/.mobee config only — tool args that set per_job/total are ignored.",
             "inputSchema": {
@@ -135,22 +195,22 @@ fn tools() -> Value {
         },
         {
             "name": "authorize_pay",
-            "description": "Real testnut pay: BudgetGate → PayPathDeliveryVerifier → PaymentService::run() only (delivery-verify first; stable PaymentKey attempt_id saga). Caps from ~/.mobee config only. Never echoes secrets.",
+            "description": "Real testnut pay: BudgetGate → PayPathDeliveryVerifier → PaymentService::run(). Documented default: job_id form (job_id + amount_sats + buyer-supplied delivery_integrity_hash) binds fields from accept_claim — tip-match hash is NEVER auto-filled from the claim oid (D2). Explicit 9-field form kept for harness. If an accept-bind exists, seller/result/commit mismatches are REFUSED. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "job_id": { "type": "string" },
-                    "result_id": { "type": "string" },
+                    "amount_sats": { "type": "integer", "minimum": 0 },
                     "delivery_integrity_hash": {
                         "type": "string",
-                        "description": "Buyer commitment — full lowercase git oid that must tip-match"
+                        "description": "Buyer commitment — full lowercase git oid that must tip-match (required; never auto-filled)"
                     },
+                    "result_id": { "type": "string" },
                     "job_hash": {
                         "type": "string",
-                        "description": "Lowercase SHA-256 job digest (64 hex)"
+                        "description": "Lowercase SHA-256 job digest (64 hex) — explicit form"
                     },
                     "seller_pubkey": { "type": "string" },
-                    "amount_sats": { "type": "integer", "minimum": 0 },
                     "repo": {
                         "type": "string",
                         "description": "Seller git locator (https / relay-git only; ext::/file/ssh refused)"
@@ -158,17 +218,7 @@ fn tools() -> Value {
                     "branch": { "type": "string" },
                     "commit_oid": { "type": "string" }
                 },
-                "required": [
-                    "job_id",
-                    "result_id",
-                    "delivery_integrity_hash",
-                    "job_hash",
-                    "seller_pubkey",
-                    "amount_sats",
-                    "repo",
-                    "branch",
-                    "commit_oid"
-                ],
+                "required": ["job_id", "amount_sats", "delivery_integrity_hash"],
                 "additionalProperties": true
             }
         }
@@ -183,6 +233,9 @@ fn call_tool(state: &McpState, params: &Value) -> Result<Value, String> {
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
     match name {
         "setup_wallet" => setup_wallet_fund(&state.home),
+        "post_job" => post_job_tool(state, &arguments),
+        "get_job" => get_job_tool(state, &arguments),
+        "accept_claim" => accept_claim_tool(state, &arguments),
         "stub_pay" => stub_pay(&state.gate, &arguments),
         "authorize_pay" => authorize_pay_tool(state, &arguments),
         other => Err(format!("unknown tool: {other}")),
@@ -227,6 +280,13 @@ fn setup_wallet_fund(home: &MobeeHome) -> Result<Value, String> {
 
 /// Real pay: BudgetGate → PaymentService::run(&mut PayPathDeliveryVerifier) only.
 /// Tool args that set per_job/total caps are ignored. Never echoes the secret key.
+///
+/// Forms:
+/// - **job_id (documented default):** job_id + amount_sats + delivery_integrity_hash
+///   (buyer tip-match). Other fields filled from accept_claim bind. D2: integrity hash
+///   is never auto-filled from the claim/result oid.
+/// - **explicit:** all nine fields (harness / stub path). If an accept-bind exists for
+///   job_id, seller/result/commit must match (Gate D).
 fn authorize_pay_tool(state: &McpState, arguments: &Value) -> Result<Value, String> {
     let require_str = |key: &str| -> Result<String, String> {
         arguments
@@ -239,17 +299,69 @@ fn authorize_pay_tool(state: &McpState, arguments: &Value) -> Result<Value, Stri
         .get("amount_sats")
         .and_then(Value::as_u64)
         .ok_or_else(|| "authorize_pay requires amount_sats (integer)".to_owned())?;
+    let delivery_integrity_hash = require_str("delivery_integrity_hash")?;
+    let job_id = require_str("job_id")?;
 
-    let request = AuthorizePayRequest {
-        job_id: require_str("job_id")?,
-        result_id: require_str("result_id")?,
-        delivery_integrity_hash: require_str("delivery_integrity_hash")?,
-        job_hash: require_str("job_hash")?,
-        seller_pubkey: require_str("seller_pubkey")?,
-        amount_sats,
-        repo: require_str("repo")?,
-        branch: require_str("branch")?,
-        commit_oid: require_str("commit_oid")?,
+    let explicit = [
+        "result_id",
+        "job_hash",
+        "seller_pubkey",
+        "repo",
+        "branch",
+        "commit_oid",
+    ]
+    .iter()
+    .all(|key| arguments.get(key).and_then(Value::as_str).is_some());
+
+    #[cfg(feature = "wallet")]
+    let request = if explicit {
+        let request = AuthorizePayRequest {
+            job_id: job_id.clone(),
+            result_id: require_str("result_id")?,
+            delivery_integrity_hash,
+            job_hash: require_str("job_hash")?,
+            seller_pubkey: require_str("seller_pubkey")?,
+            amount_sats,
+            repo: require_str("repo")?,
+            branch: require_str("branch")?,
+            commit_oid: require_str("commit_oid")?,
+        };
+        if let Some(bind) = job_lifecycle::load_accepted_bind(&state.home, &job_id)
+            .map_err(|error| error.to_string())?
+        {
+            job_lifecycle::assert_authorize_matches_bind(
+                &bind,
+                &request.seller_pubkey,
+                &request.result_id,
+                &request.commit_oid,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        request
+    } else {
+        let bind = job_lifecycle::load_accepted_bind(&state.home, &job_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "authorize_pay(job_id) requires a prior accept_claim bind for this job (or pass the explicit 9-field form)".to_owned()
+            })?;
+        job_lifecycle::authorize_request_from_bind(&bind, amount_sats, delivery_integrity_hash)
+            .map_err(|error| error.to_string())?
+    };
+
+    #[cfg(not(feature = "wallet"))]
+    let request = {
+        let _ = explicit;
+        AuthorizePayRequest {
+            job_id,
+            result_id: require_str("result_id")?,
+            delivery_integrity_hash,
+            job_hash: require_str("job_hash")?,
+            seller_pubkey: require_str("seller_pubkey")?,
+            amount_sats,
+            repo: require_str("repo")?,
+            branch: require_str("branch")?,
+            commit_oid: require_str("commit_oid")?,
+        }
     };
 
     let mut gate = state
@@ -273,6 +385,155 @@ fn authorize_pay_tool(state: &McpState, arguments: &Value) -> Result<Value, Stri
         "verifier": "PayPathDeliveryVerifier",
     });
     Ok(tool_ok(body))
+}
+
+#[cfg(feature = "wallet")]
+fn post_job_tool(state: &McpState, arguments: &Value) -> Result<Value, String> {
+    let require_str = |key: &str| -> Result<String, String> {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("post_job requires {key} (string)"))
+    };
+    let amount_sats = arguments
+        .get("amount_sats")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "post_job requires amount_sats (integer)".to_owned())?;
+    let untargeted = arguments
+        .get("untargeted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let seller_pubkey = arguments
+        .get("seller_pubkey")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let deadline_unix = arguments.get("deadline_unix").and_then(Value::as_u64);
+    let repo = arguments
+        .get("repo")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let branch = arguments
+        .get("branch")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+
+    let outcome = job_lifecycle::post_job(
+        &state.home,
+        PostJobRequest {
+            task: require_str("task")?,
+            output: require_str("output")?,
+            amount_sats,
+            seller_pubkey,
+            untargeted,
+            deadline_unix,
+            repo,
+            branch,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+
+    let body = json!({
+        "ok": true,
+        "job_id": outcome.job_id,
+        "job_hash": outcome.job_hash,
+        "offer_kind": outcome.offer_kind,
+        "targeted": outcome.targeted,
+        "seller_pubkey": outcome.seller_pubkey,
+        "amount_sats": outcome.amount_sats,
+        "relay_url": outcome.relay_url,
+        "task": outcome.task,
+        "output": outcome.output,
+    });
+    // never-echo: secret key must not appear
+    let rendered = body.to_string();
+    if let Ok(secret) = home::read_secret_key_hex(&state.home) {
+        if rendered.contains(&secret) {
+            return Err("post_job refused: response would echo secret key".into());
+        }
+    }
+    Ok(tool_ok(body))
+}
+
+#[cfg(not(feature = "wallet"))]
+fn post_job_tool(_state: &McpState, _arguments: &Value) -> Result<Value, String> {
+    Err("post_job requires the wallet feature".into())
+}
+
+#[cfg(feature = "wallet")]
+fn get_job_tool(state: &McpState, arguments: &Value) -> Result<Value, String> {
+    let job_id = arguments
+        .get("job_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "get_job requires job_id (string)".to_owned())?
+        .to_owned();
+    let wait_for = match arguments.get("wait_for").and_then(Value::as_str) {
+        Some(raw) => Some(WaitFor::parse(raw).map_err(|error| error.to_string())?),
+        None => None,
+    };
+    let timeout_secs = arguments.get("timeout_secs").and_then(Value::as_u64);
+    let view = job_lifecycle::get_job(
+        &state.home,
+        GetJobRequest {
+            job_id,
+            wait_for,
+            timeout_secs,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let body = serde_json::to_value(&view).map_err(|error| error.to_string())?;
+    let mut body = body;
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("ok".into(), json!(true));
+        obj.insert("source".into(), json!("relay"));
+    }
+    Ok(tool_ok(body))
+}
+
+#[cfg(not(feature = "wallet"))]
+fn get_job_tool(_state: &McpState, _arguments: &Value) -> Result<Value, String> {
+    Err("get_job requires the wallet feature".into())
+}
+
+#[cfg(feature = "wallet")]
+fn accept_claim_tool(state: &McpState, arguments: &Value) -> Result<Value, String> {
+    let require_str = |key: &str| -> Result<String, String> {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("accept_claim requires {key} (string)"))
+    };
+    let result_id = arguments
+        .get("result_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let outcome = job_lifecycle::accept_claim(
+        &state.home,
+        AcceptClaimRequest {
+            job_id: require_str("job_id")?,
+            claim_id: require_str("claim_id")?,
+            result_id,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let body = json!({
+        "ok": true,
+        "accept_event_id": outcome.accept_event_id,
+        "bind": outcome.bind,
+    });
+    let rendered = body.to_string();
+    if let Ok(secret) = home::read_secret_key_hex(&state.home) {
+        if rendered.contains(&secret) {
+            return Err("accept_claim refused: response would echo secret key".into());
+        }
+    }
+    Ok(tool_ok(body))
+}
+
+#[cfg(not(feature = "wallet"))]
+fn accept_claim_tool(_state: &McpState, _arguments: &Value) -> Result<Value, String> {
+    Err("accept_claim requires the wallet feature".into())
 }
 
 /// Gate-wrapped mock pay. Caps from the in-process gate (config-bound at MCP start).
@@ -458,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_setup_wallet_stub_pay_and_authorize_pay() {
+    fn tools_list_exposes_job_lifecycle_and_pay_tools() {
         let tools = tools();
         let names: Vec<&str> = tools
             .as_array()
@@ -466,7 +727,17 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect();
-        assert_eq!(names, vec!["setup_wallet", "stub_pay", "authorize_pay"]);
+        assert_eq!(
+            names,
+            vec![
+                "setup_wallet",
+                "post_job",
+                "get_job",
+                "accept_claim",
+                "stub_pay",
+                "authorize_pay"
+            ]
+        );
     }
 
     #[cfg(feature = "wallet")]
