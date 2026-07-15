@@ -345,11 +345,24 @@ impl SellerDaemon {
         }
 
         let seller_cfg = require_seller_config(&self.home)?.clone();
+        // Gate #10: capture HEAD before agent; deliver only if agent advanced it.
+        let before_oid = seller_git::try_head_oid(&active.workdir, &self.home.root);
         let run_result = run_agent_job(&seller_cfg.agent_command, &active.offer.task, &active.workdir).await;
         if let Err(error) = run_result {
             self.fail_active(&error.to_string()).await?;
             return Err(error);
         }
+        let after_oid = seller_git::try_head_oid(&active.workdir, &self.home.root);
+        let _advanced = match seller_git::require_agent_advanced_head(
+            before_oid.as_deref(),
+            after_oid.as_deref(),
+        ) {
+            Ok(oid) => oid,
+            Err(error) => {
+                self.fail_active(&error.to_string()).await?;
+                return Err(error.into());
+            }
+        };
 
         let branch = format!("mobee/{}", &active.job_id[..8.min(active.job_id.len())]);
         // Ensure we're on a branch named for the job (best-effort).

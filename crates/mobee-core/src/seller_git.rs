@@ -47,6 +47,42 @@ impl From<TransportRefuse> for SellerGitError {
     }
 }
 
+/// Best-effort `HEAD` OID in `workdir`. `None` when the tree has no commits yet.
+///
+/// Used by gate #10 (delivery attribution): deliver only if the agent advanced `HEAD`.
+pub fn try_head_oid(workdir: &Path, seller_home: &Path) -> Option<String> {
+    let rev = scrubbed_git(workdir, seller_home, ["rev-parse", "HEAD"]).ok()?;
+    if !rev.status.success() {
+        return None;
+    }
+    let oid = String::from_utf8_lossy(&rev.stdout).trim().to_owned();
+    if oid.len() < 40 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(oid.to_ascii_lowercase())
+}
+
+/// Gate #10: refuse deliver unless agent advanced `HEAD` (never harness-authored fallback).
+pub fn require_agent_advanced_head(
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Result<String, SellerGitError> {
+    let after = after.ok_or_else(|| {
+        SellerGitError::Io(
+            "delivery refused: agent left no commit (HEAD missing) — no harness fallback".into(),
+        )
+    })?;
+    if let Some(before) = before {
+        if before.eq_ignore_ascii_case(after) {
+            return Err(SellerGitError::Io(
+                "delivery refused: HEAD did not advance after agent run (no harness fallback)"
+                    .into(),
+            ));
+        }
+    }
+    Ok(after.to_owned())
+}
+
 /// Push `branch` from `workdir` to `remote_url` (allowlisted https / relay-git only).
 ///
 /// `seller_home` is the seller's packaged home root: scrubbed git sets `HOME` to this
@@ -282,6 +318,20 @@ mod tests {
     fn allowlist_https_accepted_by_locator_gate() {
         assert_allowed_repo_locator("https://example.invalid/git/owner/repo.git").unwrap();
         assert_allowed_repo_locator("https://example.invalid/repo.git").unwrap();
+    }
+
+    #[test]
+    fn gate10_refuses_unchanged_head_and_missing_after() {
+        let oid = "a".repeat(40);
+        let err = require_agent_advanced_head(Some(&oid), Some(&oid)).expect_err("same head");
+        assert!(err.to_string().contains("did not advance"), "{err}");
+        let err = require_agent_advanced_head(Some(&oid), None).expect_err("missing after");
+        assert!(err.to_string().contains("no commit"), "{err}");
+        let advanced = "b".repeat(40);
+        let ok = require_agent_advanced_head(Some(&oid), Some(&advanced)).expect("advanced");
+        assert_eq!(ok, advanced);
+        let first = require_agent_advanced_head(None, Some(&advanced)).expect("first commit");
+        assert_eq!(first, advanced);
     }
 
     #[test]
