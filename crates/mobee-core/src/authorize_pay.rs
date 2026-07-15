@@ -110,8 +110,9 @@ impl From<PaymentWalletError> for AuthorizePayError {
 /// Authorize spend under [`BudgetGate`], then pay only through
 /// [`PaymentService::run`] with a [`PayPathDeliveryVerifier`].
 ///
-/// Spent-total is persisted **before** `run()` (write-before-effect). `run()` delivery-verifies
-/// first; stable `PaymentKey::attempt_id()` reconciles retries inside the piece-6 saga.
+/// Spent is keyed by stable `PaymentKey::attempt_id()`: first authorize persists
+/// spent **before** `run()` (write-before-mint); a reconciled retry does not
+/// re-count. `run()` delivery-verifies first and reconciles inside the piece-6 saga.
 pub fn authorize_pay(
     home: &MobeeHome,
     gate: &mut BudgetGate,
@@ -191,7 +192,7 @@ pub fn authorize_pay(
     let mut verifier = PayPathDeliveryVerifier::new(custody);
 
     let amount = request.amount_sats;
-    let state = gate.authorize_then(amount, || {
+    let state = gate.authorize_then_attempt(attempt_id.as_str(), amount, || {
         PaymentService::new(&journal).run(
             &delivery,
             &mut verifier,
@@ -250,7 +251,7 @@ mod tests {
             branch: "main".into(),
             commit_oid: "aa".repeat(20),
         };
-        let err = authorize_pay(&home, &mut gate, request).expect_err("ext refused");
+        let err = authorize_pay(&home, &mut gate, request.clone()).expect_err("ext refused");
         let message = err.to_string();
         assert!(
             message.contains("ext") || message.contains("refused") || message.contains("transport"),
@@ -258,6 +259,19 @@ mod tests {
         );
         // Write-before-effect: spent was committed before run() refused.
         assert_eq!(gate.spent(), 1);
+
+        // Reconciled retry of the same PaymentKey attempt_id must not re-count spent.
+        let err2 = authorize_pay(&home, &mut gate, request).expect_err("retry still refuses");
+        let message2 = err2.to_string();
+        assert!(
+            message2.contains("ext")
+                || message2.contains("refused")
+                || message2.contains("transport"),
+            "unexpected retry error: {message2}"
+        );
+        assert_eq!(gate.spent(), 1, "retry must not double-count spent");
+        let reloaded = BudgetGate::from_home(&home).expect("reload");
+        assert_eq!(reloaded.spent(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -597,8 +597,12 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
         self.advance(key, terms, authority, effects)
     }
 
-    /// Advances an already delivery-gated payment inside the core crate.
-    pub(crate) fn advance<E: PaymentEffects>(
+    /// Advances an already delivery-gated payment inside this module only.
+    ///
+    /// Module-private on purpose: other in-core modules cannot skip delivery verify by
+    /// calling `advance` directly. Production callers use [`Self::run`]; same-module
+    /// unit tests may call `advance` or [`Self::run_with_verifier`].
+    fn advance<E: PaymentEffects>(
         &self,
         key: &PaymentKey,
         terms: &PaymentTerms,

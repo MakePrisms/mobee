@@ -565,11 +565,27 @@ mod tests {
 
     use super::*;
     use crate::gateway::ParsedOffer;
+    use crate::delivery::{
+        CommitOid, DeliveryError, DeliveryVerifier, GitDelivery, VerifiedDelivery,
+    };
     use crate::payment::{
         DeliveryIntegrityHash, JobHash, JobId, MemoryPaymentJournal, PaymentKey, PaymentService,
         PaymentState, ReceiptAuthority, ResultId,
     };
     use crate::payment_send::{PaymentSendError, PaymentSent};
+
+    /// Test-only accept verifier so wallet spine tests go through `run_with_verifier`
+    /// (delivery tip-bind) instead of the now module-private `advance`.
+    struct AcceptDelivery;
+
+    impl DeliveryVerifier for AcceptDelivery {
+        fn verify(
+            &mut self,
+            delivery: &GitDelivery,
+        ) -> Result<VerifiedDelivery, DeliveryError> {
+            VerifiedDelivery::from_fetched_tip(delivery, delivery.commit_oid().clone())
+        }
+    }
 
     const MINT: &str = "https://testnut.cashu.space";
     const OTHER_MINT: &str = "https://real-mint.example";
@@ -851,9 +867,18 @@ mod tests {
         )
         .unwrap();
         let journal = MemoryPaymentJournal::default();
+        let delivery = git_delivery_for_key(&key);
+        let mut verifier = AcceptDelivery;
 
         let state = PaymentService::new(&journal)
-            .advance(&key, &fixture.terms, &authority, &mut effects)
+            .run_with_verifier(
+                &delivery,
+                &mut verifier,
+                &key,
+                &fixture.terms,
+                &authority,
+                &mut effects,
+            )
             .unwrap();
 
         assert!(matches!(state, PaymentState::Closed { .. }));
@@ -897,9 +922,18 @@ mod tests {
         )
         .unwrap();
         let journal = MemoryPaymentJournal::default();
+        let delivery = git_delivery_for_key(&key);
+        let mut verifier = AcceptDelivery;
 
         let state = PaymentService::new(&journal)
-            .advance(&key, &fixture.terms, &authority, &mut effects)
+            .run_with_verifier(
+                &delivery,
+                &mut verifier,
+                &key,
+                &fixture.terms,
+                &authority,
+                &mut effects,
+            )
             .unwrap();
 
         assert!(matches!(state, PaymentState::Closed { .. }));
@@ -1069,6 +1103,15 @@ mod tests {
             JobHash::from_hex("22".repeat(32)).unwrap(),
             terms,
         )
+    }
+
+    fn git_delivery_for_key(key: &PaymentKey) -> GitDelivery {
+        GitDelivery::new(
+            "https://example.invalid/repo.git",
+            "mobee/job",
+            CommitOid::parse(key.delivery_integrity_hash.as_str()).unwrap(),
+        )
+        .unwrap()
     }
 
     fn offer(mint_url: &str, seller: &str) -> ParsedOffer {

@@ -6,7 +6,13 @@
 //! Spent-total is durable under `~/.mobee/spent.toml` and is written **before** the
 //! pay effect (write-before-effect). Crash after persist / before effect shrinks
 //! remaining allowance — fail-closed vs restart-resets-allowance.
+//!
+//! When keyed by `attempt_id`, spent is **idempotent**: a reconciled retry of the
+//! same attempt does not re-count (allowance invariant, distinct from piece-6's
+//! journal). The durable write still happens before `run()`'s mint effect on first
+//! authorize of that attempt.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -60,6 +66,9 @@ impl std::error::Error for BudgetRefuse {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SpentFile {
     spent_sats: u64,
+    /// Attempt ids already counted toward spent_sats (idempotent retries).
+    #[serde(default)]
+    attempt_ids: Vec<String>,
 }
 
 /// Allowance gate with durable spent-total under the packaged home.
@@ -68,6 +77,8 @@ pub struct BudgetGate {
     per_job_cap: u64,
     total_cap: u64,
     spent: u64,
+    /// Attempt ids already counted (in-memory + durable when `spent_path` is set).
+    counted_attempts: BTreeSet<String>,
     /// When set, spent is loaded/persisted here (write-before-effect).
     spent_path: Option<PathBuf>,
 }
@@ -79,6 +90,7 @@ impl BudgetGate {
             per_job_cap,
             total_cap,
             spent: 0,
+            counted_attempts: BTreeSet::new(),
             spent_path: None,
         }
     }
@@ -91,11 +103,12 @@ impl BudgetGate {
     /// Caps from home config; spent loaded from `~/.mobee/spent.toml` (created on first write).
     pub fn from_home(home: &MobeeHome) -> Result<Self, BudgetRefuse> {
         let spent_path = home.root.join(SPENT_FILE);
-        let spent = load_spent(&spent_path)?;
+        let loaded = load_spent_file(&spent_path)?;
         Ok(Self {
             per_job_cap: home.config.per_job_budget_sats,
             total_cap: home.config.total_budget_sats,
-            spent,
+            spent: loaded.spent_sats,
+            counted_attempts: loaded.attempt_ids.into_iter().collect(),
             spent_path: Some(spent_path),
         })
     }
@@ -118,6 +131,11 @@ impl BudgetGate {
 
     pub fn spent_path(&self) -> Option<&Path> {
         self.spent_path.as_deref()
+    }
+
+    /// True when this attempt_id was already counted toward spent.
+    pub fn has_counted_attempt(&self, attempt_id: &str) -> bool {
+        self.counted_attempts.contains(attempt_id)
     }
 
     /// Check only — does not mutate. Distinct errors for per-job vs total.
@@ -143,13 +161,17 @@ impl BudgetGate {
     pub fn authorize_and_commit(&mut self, amount: u64) -> Result<(), BudgetRefuse> {
         self.check(amount)?;
         let next = self.spent.saturating_add(amount);
-        self.persist_spent(next)?;
+        self.persist_spent(next, &self.counted_attempts)?;
         self.spent = next;
         Ok(())
     }
 
     /// Authorize, **persist spent**, then run `effect`. Refuse leaves spent untouched
     /// and never calls `effect`. Persist failure never calls `effect`.
+    ///
+    /// Always counts `amount` (no attempt key). Prefer
+    /// [`Self::authorize_then_attempt`] on the real pay path so reconciled retries
+    /// do not double-count spent.
     pub fn authorize_then<T>(
         &mut self,
         amount: u64,
@@ -157,35 +179,70 @@ impl BudgetGate {
     ) -> Result<T, BudgetRefuse> {
         self.check(amount)?;
         let next = self.spent.saturating_add(amount);
-        self.persist_spent(next)?;
+        self.persist_spent(next, &self.counted_attempts)?;
         self.spent = next;
         Ok(effect())
     }
 
-    fn persist_spent(&self, spent: u64) -> Result<(), BudgetRefuse> {
+    /// Authorize keyed by `attempt_id`: first sighting counts `amount` (durable
+    /// write-before-effect); a retry of the same id skips re-count and still runs
+    /// `effect` (piece-6 reconcile / closed return).
+    pub fn authorize_then_attempt<T>(
+        &mut self,
+        attempt_id: &str,
+        amount: u64,
+        effect: impl FnOnce() -> T,
+    ) -> Result<T, BudgetRefuse> {
+        if self.counted_attempts.contains(attempt_id) {
+            // Already counted and persisted — do not re-add; still run effect.
+            return Ok(effect());
+        }
+        self.check(amount)?;
+        let next = self.spent.saturating_add(amount);
+        let mut next_attempts = self.counted_attempts.clone();
+        next_attempts.insert(attempt_id.to_owned());
+        // Durable write-before mint/effect — crash-retry cannot exceed cap.
+        self.persist_spent(next, &next_attempts)?;
+        self.spent = next;
+        self.counted_attempts = next_attempts;
+        Ok(effect())
+    }
+
+    fn persist_spent(&self, spent: u64, attempts: &BTreeSet<String>) -> Result<(), BudgetRefuse> {
         let Some(path) = self.spent_path.as_ref() else {
             return Ok(());
         };
-        write_spent(path, spent)
+        write_spent(
+            path,
+            SpentFile {
+                spent_sats: spent,
+                attempt_ids: attempts.iter().cloned().collect(),
+            },
+        )
     }
+}
+
+fn load_spent_file(path: &Path) -> Result<SpentFile, BudgetRefuse> {
+    if !path.exists() {
+        return Ok(SpentFile {
+            spent_sats: 0,
+            attempt_ids: Vec::new(),
+        });
+    }
+    let raw = fs::read_to_string(path).map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
+    toml::from_str(&raw).map_err(|error| BudgetRefuse::Persist(error.to_string()))
 }
 
 fn load_spent(path: &Path) -> Result<u64, BudgetRefuse> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    let raw = fs::read_to_string(path).map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
-    let parsed: SpentFile =
-        toml::from_str(&raw).map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
-    Ok(parsed.spent_sats)
+    Ok(load_spent_file(path)?.spent_sats)
 }
 
-fn write_spent(path: &Path, spent_sats: u64) -> Result<(), BudgetRefuse> {
+fn write_spent(path: &Path, file: SpentFile) -> Result<(), BudgetRefuse> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
     }
-    let raw = toml::to_string_pretty(&SpentFile { spent_sats })
-        .map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
+    let raw =
+        toml::to_string_pretty(&file).map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
     let tmp = path.with_extension("toml.tmp");
     {
         let mut options = OpenOptions::new();
@@ -385,5 +442,60 @@ mod tests {
         assert!(matches!(err, BudgetRefuse::PerJob { .. }));
         assert_eq!(gate.spent(), 10);
         assert_eq!(load_spent(gate.spent_path().expect("path")).expect("load"), 10);
+    }
+
+    #[test]
+    fn attempt_id_retry_does_not_double_count_spent() {
+        let mut gate = BudgetGate::new(50, 100);
+        let mut fires = 0u32;
+        gate.authorize_then_attempt("att-1", 21, || {
+            fires += 1;
+            "first"
+        })
+        .expect("first");
+        assert_eq!(gate.spent(), 21);
+        assert!(gate.has_counted_attempt("att-1"));
+
+        let out = gate
+            .authorize_then_attempt("att-1", 21, || {
+                fires += 1;
+                "retry"
+            })
+            .expect("retry");
+        assert_eq!(out, "retry");
+        assert_eq!(fires, 2);
+        assert_eq!(gate.spent(), 21, "reconciled retry must not re-count");
+
+        gate.authorize_then_attempt("att-2", 21, || "other")
+            .expect("other attempt");
+        assert_eq!(gate.spent(), 42);
+    }
+
+    #[test]
+    fn attempt_id_write_before_effect_and_survives_reload() {
+        let root = temp_home("attempt-durable");
+        let _ = fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("bootstrap");
+        let mut gate = BudgetGate::from_home(&home).expect("gate");
+        let spent_path = gate.spent_path().expect("path").to_path_buf();
+        let mut effect_fired = false;
+        gate.authorize_then_attempt("att-live", 7, || {
+            let on_disk = load_spent_file(&spent_path).expect("load");
+            assert_eq!(on_disk.spent_sats, 7);
+            assert!(on_disk.attempt_ids.iter().any(|id| id == "att-live"));
+            effect_fired = true;
+            "ok"
+        })
+        .expect("allow");
+        assert!(effect_fired);
+
+        // Crash-retry window: reload then retry same attempt — spent stays 7.
+        let mut reloaded = BudgetGate::from_home(&home).expect("reload");
+        assert_eq!(reloaded.spent(), 7);
+        reloaded
+            .authorize_then_attempt("att-live", 7, || "retry")
+            .expect("retry");
+        assert_eq!(reloaded.spent(), 7);
+        assert_eq!(load_spent(&spent_path).expect("disk"), 7);
     }
 }
