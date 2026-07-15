@@ -357,8 +357,12 @@ impl SellerDaemon {
             .current_dir(&active.workdir)
             .status();
 
-        let commit = match seller_git::push_branch(&active.workdir, &seller_cfg.git_remote, &branch)
-        {
+        let commit = match seller_git::push_branch(
+            &active.workdir,
+            &seller_cfg.git_remote,
+            &branch,
+            &self.home.root,
+        ) {
             Ok(oid) => oid,
             Err(error) => {
                 self.fail_active(&error.to_string()).await?;

@@ -3,10 +3,17 @@
 //! Does NOT modify buyer [`crate::delivery_git::PayPathDeliveryVerifier`]. Seller-local
 //! Command wrapper mirrors the buyer's `GIT_TERMINAL_PROMPT=0` policy and additionally
 //! strips ambient `GIT_SSH*` / `insteadOf` override env that could bypass the allowlist.
+//!
+//! HTTPS auth is seller-owned `.netrc` under the seller home (`HOME` is set **only** for
+//! the scrubbed git child — never for the whole daemon process). Ambient / HOME-scoped
+//! `url.*.insteadOf` is neutralized HOME-independently: empty `GIT_CONFIG_GLOBAL`,
+//! `GIT_CONFIG_NOSYSTEM=1`, and a dedicated empty `XDG_CONFIG_HOME` so neither the
+//! operator XDG config nor a poisoned `$seller/.gitconfig` can rewrite HTTPS→SSH.
 
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
 
 use crate::delivery_transport::{assert_allowed_repo_locator, TransportRefuse};
 
@@ -42,12 +49,17 @@ impl From<TransportRefuse> for SellerGitError {
 
 /// Push `branch` from `workdir` to `remote_url` (allowlisted https / relay-git only).
 ///
+/// `seller_home` is the seller's packaged home root: scrubbed git sets `HOME` to this
+/// path so libcurl can read a seller-owned `.netrc` (mode `0600`) without rewriting
+/// the daemon process environment (nostr/TLS keep ambient HOME).
+///
 /// Returns the pushed commit OID (full hex). Unauthenticated / prompt-needing remotes
 /// fail closed (no hang) via `GIT_TERMINAL_PROMPT=0` + scrubbed ambient SSH/insteadOf.
 pub fn push_branch(
     workdir: &Path,
     remote_url: &str,
     branch: &str,
+    seller_home: &Path,
 ) -> Result<String, SellerGitError> {
     assert_allowed_repo_locator(remote_url)?;
     if branch.trim().is_empty() {
@@ -55,13 +67,13 @@ pub fn push_branch(
     }
 
     // Ensure origin points at the allowlisted remote for this push only.
-    let _ = scrubbed_git(workdir, ["remote", "remove", "origin"]);
+    let _ = scrubbed_git(workdir, seller_home, ["remote", "remove", "origin"]);
     run_ok(
         "remote-add",
-        scrubbed_git(workdir, ["remote", "add", "origin", remote_url])?,
+        scrubbed_git(workdir, seller_home, ["remote", "add", "origin", remote_url])?,
     )?;
 
-    let push = scrubbed_git(workdir, ["push", "-u", "origin", branch])?;
+    let push = scrubbed_git(workdir, seller_home, ["push", "-u", "origin", branch])?;
     if !push.status.success() {
         let stderr = String::from_utf8_lossy(&push.stderr).to_lowercase();
         if stderr.contains("authentication")
@@ -78,7 +90,7 @@ pub fn push_branch(
         return Err(SellerGitError::CommandFailed("push"));
     }
 
-    let rev = scrubbed_git(workdir, ["rev-parse", "HEAD"])?;
+    let rev = scrubbed_git(workdir, seller_home, ["rev-parse", "HEAD"])?;
     run_ok("rev-parse", rev.clone())?;
     let oid = String::from_utf8_lossy(&rev.stdout).trim().to_owned();
     if oid.len() < 40 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -89,7 +101,36 @@ pub fn push_branch(
     Ok(oid)
 }
 
-fn scrubbed_git<I, S>(workdir: &Path, args: I) -> Result<Output, SellerGitError>
+/// Empty global gitconfig — defeats `~/.gitconfig` / `$HOME/.gitconfig` insteadOf.
+fn empty_git_config_global() -> &'static Path {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let path = std::env::temp_dir().join(format!(
+            "mobee-seller-gitconfig-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::write(&path, "");
+        path
+    })
+    .as_path()
+}
+
+/// Empty XDG config root — defeats `$HOME/.config/git/config` (git falls back there
+/// when `XDG_CONFIG_HOME` is unset; removing the env is not enough under `HOME=$seller`).
+fn empty_xdg_config_home() -> &'static Path {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let path = std::env::temp_dir().join(format!(
+            "mobee-seller-xdg-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&path);
+        path
+    })
+    .as_path()
+}
+
+fn scrubbed_git<I, S>(workdir: &Path, seller_home: &Path, args: I) -> Result<Output, SellerGitError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -102,15 +143,21 @@ where
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
-        // Scrub ambient SSH / insteadOf override vectors.
+        // Seller-owned netrc lives at `$HOME/.netrc` — scope HOME to seller home for
+        // this child only (daemon process HOME stays ambient for nostr/TLS).
+        .env("HOME", seller_home)
+        // HOME-independent insteadOf kill: empty global + empty XDG + no system.
+        // Do NOT rely on a "clean" seller HOME — `$seller/.gitconfig` may be poisoned.
+        .env("GIT_CONFIG_GLOBAL", empty_git_config_global())
+        .env("XDG_CONFIG_HOME", empty_xdg_config_home())
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        // Scrub ambient SSH override vectors (HTTPS must stay HTTPS under scrub).
         .env_remove("GIT_SSH")
         .env_remove("GIT_SSH_COMMAND")
         .env_remove("SSH_ASKPASS")
-        .env_remove("GIT_ASKPASS")
-        .env_remove("GIT_CONFIG_GLOBAL")
-        .env_remove("GIT_CONFIG_SYSTEM")
-        .env_remove("GIT_CONFIG_COUNT")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .env_remove("GIT_ASKPASS");
 
     // Clear GIT_CONFIG_KEY_/VALUE_ ambient pairs that could inject url.*.insteadOf.
     for (key, _) in std::env::vars_os() {
@@ -189,38 +236,93 @@ mod tests {
     #[test]
     fn push_refuses_ssh_and_local_paths() {
         let root = temp("refuse");
+        let home = temp("refuse-home");
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("home");
         init_repo(&root);
         assert!(matches!(
-            push_branch(&root, "git@example.invalid:repo.git", "main"),
+            push_branch(&root, "git@example.invalid:repo.git", "main", &home),
             Err(SellerGitError::Transport(_))
         ));
         assert!(matches!(
-            push_branch(&root, "/tmp/local.git", "main"),
+            push_branch(&root, "/tmp/local.git", "main", &home),
             Err(SellerGitError::Transport(_))
         ));
         assert!(matches!(
-            push_branch(&root, "ssh://example.invalid/repo.git", "main"),
+            push_branch(&root, "ssh://example.invalid/repo.git", "main", &home),
             Err(SellerGitError::Transport(_))
         ));
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
     fn push_to_local_https_style_bare_via_file_is_refused() {
         // file:// is not on allowlist — fail closed even for fixtures.
         let root = temp("file-refuse");
+        let home = temp("file-refuse-home");
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("home");
         init_repo(&root);
-        let err = push_branch(&root, &format!("file://{}/remote.git", root.display()), "main")
-            .expect_err("file refused");
+        let err = push_branch(
+            &root,
+            &format!("file://{}/remote.git", root.display()),
+            "main",
+            &home,
+        )
+        .expect_err("file refused");
         assert!(matches!(err, SellerGitError::Transport(_)));
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
     fn allowlist_https_accepted_by_locator_gate() {
         assert_allowed_repo_locator("https://example.invalid/git/owner/repo.git").unwrap();
         assert_allowed_repo_locator("https://example.invalid/repo.git").unwrap();
+    }
+
+    #[test]
+    fn scrub_kills_global_xdg_and_home_insteadof() {
+        // Prove HOME-independent neutralization: poison seller HOME gitconfig with
+        // insteadOf; scrubbed_git must not surface it (empty GIT_CONFIG_GLOBAL +
+        // GIT_CONFIG_NOSYSTEM + empty XDG_CONFIG_HOME — never trust $seller/.gitconfig).
+        let root = temp("scrub-cfg");
+        let home = temp("scrub-cfg-home");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("home");
+        init_repo(&root);
+        fs::write(
+            home.join(".gitconfig"),
+            "[url \"git@poison.invalid:\"]\n\tinsteadOf = https://github.com/\n",
+        )
+        .expect("poison home gitconfig");
+        // Also drop a poisoned XDG tree under seller HOME (the path git would use if
+        // XDG_CONFIG_HOME were unset and HOME=$seller). Scrub pins empty XDG instead.
+        fs::create_dir_all(home.join(".config/git")).expect("xdg under home");
+        fs::write(
+            home.join(".config/git/config"),
+            "[url \"git@xdg-poison.invalid:\"]\n\tinsteadOf = https://github.com/\n",
+        )
+        .expect("poison home xdg gitconfig");
+
+        let listed = scrubbed_git(&root, &home, ["config", "--list", "--show-origin"])
+            .expect("scrubbed config --list");
+        assert!(listed.status.success(), "config --list failed");
+        let text = String::from_utf8_lossy(&listed.stdout).to_lowercase();
+        assert!(
+            !text.contains("insteadof"),
+            "scrub leaked insteadOf into config list:\n{text}"
+        );
+        assert!(
+            !text.contains("poison.invalid"),
+            "scrub leaked poisoned host into config list:\n{text}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
     }
 }
