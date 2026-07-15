@@ -287,6 +287,16 @@ Expect an error response containing a budget refuse (not a successful pay).
 
 Expect refuse (transport allowlist / `ext` / forbidden scheme). No successful pay.
 
+### 5c. Wrong buyer hash REFUSED (D2, zero burn)
+
+With a valid accept-bind for `<job_id>` (§3c), call the job_id form with a hash ≠ accepted `commit_oid`:
+
+```json
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"authorize_pay","arguments":{"job_id":"<job_id>","amount_sats":1,"delivery_integrity_hash":"<40-hex ≠ accepted commit_oid>"}}}
+```
+
+Expect: refuse (buyer tip-match mismatch) AND `spent_total_sats` UNCHANGED from before the probe (zero burn — refuses in `authorize_request_from_bind` before budget is touched).
+
 ---
 
 ## Acceptance checklist
@@ -303,6 +313,7 @@ step-0: public https clone + toolchain (no insteadOf / SSH)
 → authorize_pay(job_id) within caps → receipt
 → over-cap REFUSED
 → ext:: REFUSED
+→ wrong-hash REFUSED (D2, zero burn)
 ```
 
 Seller may stay arms-length (stub/c2) for claim + 6109 publish; buyer marketplace legs are MCP-real.
