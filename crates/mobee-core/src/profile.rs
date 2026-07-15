@@ -65,9 +65,23 @@ impl From<HomeError> for ProfileError {
 
 /// Write optional name/about into `[profile]`, then publish/replace buyer kind-0.
 ///
-/// No-args call re-publishes from existing config (may be empty — buyer stays hex).
-/// Never echoes the secret key.
+/// Sync entry for CLI/tests. Nested call from an async context fails fast —
+/// use [`set_profile_async`]. Never echoes the secret key.
 pub fn set_profile(
+    home: &mut MobeeHome,
+    request: SetProfileRequest,
+) -> Result<SetProfileOutcome, ProfileError> {
+    crate::runtime_guard::refuse_nested_block_on("set_profile")
+        .map_err(ProfileError::Relay)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| ProfileError::Relay(error.to_string()))?;
+    runtime.block_on(set_profile_async(home, request))
+}
+
+/// Async `set_profile` for callers already on a Tokio runtime (MCP dispatch).
+pub async fn set_profile_async(
     home: &mut MobeeHome,
     request: SetProfileRequest,
 ) -> Result<SetProfileOutcome, ProfileError> {
@@ -95,7 +109,7 @@ pub fn set_profile(
 
     let profile = home.config.profile.clone().unwrap_or_default();
     let keys = buyer_keys(home)?;
-    let event_id = publish_metadata(home, &keys, &profile)?;
+    let event_id = publish_metadata_async(home, &keys, &profile).await?;
 
     Ok(SetProfileOutcome {
         ok: true,
@@ -156,11 +170,14 @@ fn buyer_keys(home: &MobeeHome) -> Result<nostr_sdk::Keys, ProfileError> {
         .map_err(|error| ProfileError::Home(HomeError::Key(format!("buyer key parse: {error}"))))
 }
 
+#[allow(dead_code)] // guarded sync twin for non-async callers; MCP uses `_async`
 fn publish_metadata(
     home: &MobeeHome,
     keys: &nostr_sdk::Keys,
     profile: &ProfileConfig,
 ) -> Result<String, ProfileError> {
+    crate::runtime_guard::refuse_nested_block_on("publish_metadata")
+        .map_err(ProfileError::Relay)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -218,6 +235,8 @@ fn fetch_names(
 ) -> Result<HashMap<String, Option<String>>, ProfileError> {
     // Sync entry only — must not be called from inside an existing Tokio runtime
     // (nested block_on panics). Async callers use [`fetch_names_async`].
+    crate::runtime_guard::refuse_nested_block_on("fetch_names")
+        .map_err(ProfileError::Relay)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -353,6 +372,33 @@ mod tests {
         let profile = home.config.profile.expect("present");
         assert_eq!(profile.name.as_deref(), Some("buyer-x"));
         assert_eq!(profile.about.as_deref(), Some("about-x"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_profile_sync_refuses_inside_runtime() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-profile-nested-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("home");
+        let err = set_profile(
+            &mut home,
+            SetProfileRequest {
+                name: Some("nested-guard".into()),
+                about: None,
+            },
+        )
+        .expect_err("must refuse nested block_on");
+        assert!(
+            err.to_string().contains("nested block_on refused"),
+            "unexpected: {err}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -27,6 +27,9 @@ const RUNTIME_ERROR: i32 = 2;
 /// Hard cap per `tools/call`. Confirmed under Claude-Code MCP client default (~60s)
 /// with margin (Scribe ★1). Cap-hit → graceful tool-error; server stays up.
 const TOOL_DEADLINE_SECS: u64 = 15;
+/// `setup_wallet` mint-fund is slower than relay reads; keep under ~60s client timeout
+/// with margin, but allow enough wall time for testnut quote→pay→mint.
+const SETUP_WALLET_DEADLINE_SECS: u64 = 45;
 
 #[derive(Debug, Deserialize)]
 struct McpRequest {
@@ -138,8 +141,18 @@ async fn dispatch_async(state: &McpState, request: &McpRequest) -> Value {
         "ping" => ok(id, json!({})),
         "tools/list" => ok(id, json!({ "tools": tools() })),
         "tools/call" => {
+            let tool_name = request
+                .params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let deadline_secs = if tool_name == "setup_wallet" {
+                SETUP_WALLET_DEADLINE_SECS
+            } else {
+                TOOL_DEADLINE_SECS
+            };
             match tokio::time::timeout(
-                Duration::from_secs(TOOL_DEADLINE_SECS),
+                Duration::from_secs(deadline_secs),
                 call_tool_async(state, &request.params),
             )
             .await
@@ -149,7 +162,7 @@ async fn dispatch_async(state: &McpState, request: &McpRequest) -> Value {
                 Err(_) => tool_error(
                     id,
                     format!(
-                        "tool deadline exceeded ({TOOL_DEADLINE_SECS}s); server still alive — retry or narrow the call"
+                        "tool deadline exceeded ({deadline_secs}s); server still alive — retry or narrow the call"
                     ),
                 ),
             }
@@ -292,9 +305,18 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
         .ok_or_else(|| "tools/call missing name".to_owned())?;
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
     match name {
-        "setup_wallet" => setup_wallet_fund(&state.home),
-        "set_profile" => set_profile_tool(state, &arguments),
-        "post_job" => post_job_tool(state, &arguments),
+        "setup_wallet" => setup_wallet_fund_async(&state.home).await,
+        "set_profile" => set_profile_tool_async(state, &arguments).await,
+        "post_job" => {
+            #[cfg(feature = "wallet")]
+            {
+                post_job_tool_async(state, &arguments).await
+            }
+            #[cfg(not(feature = "wallet"))]
+            {
+                post_job_tool(state, &arguments)
+            }
+        }
         "get_job" => {
             #[cfg(feature = "wallet")]
             {
@@ -321,13 +343,26 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
     }
 }
 
+/// Sync helper for unit tests (outermost runtime only — never call from MCP async path).
+#[cfg(test)]
 fn setup_wallet_fund(home: &MobeeHome) -> Result<Value, String> {
+    mobee_core::runtime_guard::refuse_nested_block_on("setup_wallet_fund")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(setup_wallet_fund_async(home))
+}
+
+async fn setup_wallet_fund_async(home: &MobeeHome) -> Result<Value, String> {
     // Re-bootstrap so a long-lived MCP process still converges if files were removed.
     let home = home::bootstrap(&home.root).map_err(|error| error.to_string())?;
     #[cfg(feature = "wallet")]
     {
         use mobee_core::buyer_fund::{self, DEFAULT_FUND_AMOUNT_SATS};
-        let outcome = buyer_fund::fund_testnut_wallet_blocking(&home, DEFAULT_FUND_AMOUNT_SATS)
+        // Await async fund — never fund_testnut_wallet_blocking (nested block_on panic).
+        let outcome = buyer_fund::fund_testnut_wallet(&home, DEFAULT_FUND_AMOUNT_SATS)
+            .await
             .map_err(|error| error.to_string())?;
         let body = json!({
             "home": home.root.display().to_string(),
@@ -357,8 +392,18 @@ fn setup_wallet_fund(home: &MobeeHome) -> Result<Value, String> {
     }
 }
 
-#[cfg(feature = "wallet")]
+#[cfg(all(test, feature = "wallet"))]
 fn set_profile_tool(state: &McpState, arguments: &Value) -> Result<Value, String> {
+    mobee_core::runtime_guard::refuse_nested_block_on("set_profile_tool")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(set_profile_tool_async(state, arguments))
+}
+
+#[cfg(feature = "wallet")]
+async fn set_profile_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
     use mobee_core::profile::{self, SetProfileRequest};
 
     let name = arguments
@@ -371,10 +416,11 @@ fn set_profile_tool(state: &McpState, arguments: &Value) -> Result<Value, String
         .map(str::to_owned);
     // Reload from disk so long-lived MCP sees the latest config.toml.
     let mut home = home::bootstrap(&state.home.root).map_err(|error| error.to_string())?;
-    let outcome = profile::set_profile(
+    let outcome = profile::set_profile_async(
         &mut home,
         SetProfileRequest { name, about },
     )
+    .await
     .map_err(|error| error.to_string())?;
     let body = json!({
         "ok": outcome.ok,
@@ -391,6 +437,11 @@ fn set_profile_tool(state: &McpState, arguments: &Value) -> Result<Value, String
         }
     }
     Ok(tool_ok(body))
+}
+
+#[cfg(not(feature = "wallet"))]
+async fn set_profile_tool_async(_state: &McpState, _arguments: &Value) -> Result<Value, String> {
+    Err("set_profile requires the wallet feature".into())
 }
 
 #[cfg(not(feature = "wallet"))]
@@ -509,7 +560,7 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
 }
 
 #[cfg(feature = "wallet")]
-fn post_job_tool(state: &McpState, arguments: &Value) -> Result<Value, String> {
+async fn post_job_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
     let require_str = |key: &str| -> Result<String, String> {
         arguments
             .get(key)
@@ -539,7 +590,7 @@ fn post_job_tool(state: &McpState, arguments: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .map(str::to_owned);
 
-    let outcome = job_lifecycle::post_job(
+    let outcome = job_lifecycle::post_job_async(
         &state.home,
         PostJobRequest {
             task: require_str("task")?,
@@ -552,6 +603,7 @@ fn post_job_tool(state: &McpState, arguments: &Value) -> Result<Value, String> {
             branch,
         },
     )
+    .await
     .map_err(|error| error.to_string())?;
 
     let body = json!({

@@ -211,7 +211,23 @@ impl From<HomeError> for JobLifecycleError {
 }
 
 /// Publish a kind-5109 offer to the configured relay. Returns the offer event id as `job_id`.
+/// Sync entry for CLI/tests — nested call fails fast; MCP uses [`post_job_async`].
 pub fn post_job(home: &MobeeHome, request: PostJobRequest) -> Result<PostJobOutcome, JobLifecycleError> {
+    crate::runtime_guard::refuse_nested_block_on("post_job")
+        .map_err(JobLifecycleError::Relay)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| JobLifecycleError::Relay(error.to_string()))?;
+    runtime.block_on(post_job_async(home, request))
+}
+
+/// Async `post_job` for callers already on a Tokio runtime (MCP dispatch).
+/// Avoids nested `block_on` when publishing the offer over the relay.
+pub async fn post_job_async(
+    home: &MobeeHome,
+    request: PostJobRequest,
+) -> Result<PostJobOutcome, JobLifecycleError> {
     if request.task.trim().is_empty() {
         return Err(JobLifecycleError::Input("task must be non-empty".into()));
     }
@@ -272,7 +288,7 @@ pub fn post_job(home: &MobeeHome, request: PostJobRequest) -> Result<PostJobOutc
     }
 
     let keys = buyer_keys(home)?;
-    let event_id = publish_draft(home, &keys, &draft)?;
+    let event_id = publish_draft_async(home, &keys, &draft).await?;
     let job_hash = job_hash_for_offer(&event_id, &request.task, request.amount_sats);
 
     Ok(PostJobOutcome {
@@ -289,7 +305,10 @@ pub fn post_job(home: &MobeeHome, request: PostJobRequest) -> Result<PostJobOutc
 }
 
 /// Read offer / claims / results from the relay. Local accept-bind is attached if present.
+/// Sync entry for CLI/tests — nested call fails fast; MCP uses [`get_job_async`].
 pub fn get_job(home: &MobeeHome, request: GetJobRequest) -> Result<JobView, JobLifecycleError> {
+    crate::runtime_guard::refuse_nested_block_on("get_job")
+        .map_err(JobLifecycleError::Relay)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -351,10 +370,13 @@ pub async fn get_job_async(
 }
 
 /// Accept a live claim: publish kind-7000 `accepted` and persist the pay-bind (Gate D).
+/// Sync entry for CLI/tests — nested call fails fast; MCP uses [`accept_claim_async`].
 pub fn accept_claim(
     home: &MobeeHome,
     request: AcceptClaimRequest,
 ) -> Result<AcceptClaimOutcome, JobLifecycleError> {
+    crate::runtime_guard::refuse_nested_block_on("accept_claim")
+        .map_err(JobLifecycleError::Relay)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -566,11 +588,14 @@ fn buyer_keys(home: &MobeeHome) -> Result<nostr_sdk::Keys, JobLifecycleError> {
         .map_err(|error| JobLifecycleError::Home(HomeError::Key(format!("buyer key parse: {error}"))))
 }
 
+#[allow(dead_code)] // guarded sync twin for non-async callers; MCP uses `_async`
 fn publish_draft(
     home: &MobeeHome,
     keys: &nostr_sdk::Keys,
     draft: &EventDraft,
 ) -> Result<String, JobLifecycleError> {
+    crate::runtime_guard::refuse_nested_block_on("publish_draft")
+        .map_err(JobLifecycleError::Relay)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -618,12 +643,15 @@ async fn publish_draft_async(
     Ok(output.val.to_hex())
 }
 
+#[allow(dead_code)] // guarded sync twin for non-async callers; MCP uses `_async`
 fn fetch_job_view(
     home: &MobeeHome,
     keys: &nostr_sdk::Keys,
     job_id: &str,
     timeout: Duration,
 ) -> Result<JobView, JobLifecycleError> {
+    crate::runtime_guard::refuse_nested_block_on("fetch_job_view")
+        .map_err(JobLifecycleError::Relay)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -989,6 +1017,82 @@ mod tests {
         )
         .expect_err("seller required");
         assert!(err.to_string().contains("seller_pubkey"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn temp_job_home(label: &str) -> (std::path::PathBuf, crate::home::MobeeHome) {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-jobs-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        (root, home)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_job_sync_refuses_inside_runtime() {
+        let (root, home) = temp_job_home("nested-post");
+        let err = post_job(
+            &home,
+            PostJobRequest {
+                task: "t".into(),
+                output: "text/plain".into(),
+                amount_sats: 1,
+                seller_pubkey: Some("aa".repeat(32)),
+                untargeted: false,
+                deadline_unix: Some(1_800_000_000),
+                repo: None,
+                branch: None,
+            },
+        )
+        .expect_err("must refuse nested block_on");
+        assert!(
+            err.to_string().contains("nested block_on refused"),
+            "unexpected: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_job_sync_refuses_inside_runtime() {
+        let (root, home) = temp_job_home("nested-get");
+        let err = get_job(
+            &home,
+            GetJobRequest {
+                job_id: "aa".repeat(32),
+                wait_for: None,
+                timeout_secs: None,
+            },
+        )
+        .expect_err("must refuse nested block_on");
+        assert!(
+            err.to_string().contains("nested block_on refused"),
+            "unexpected: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn accept_claim_sync_refuses_inside_runtime() {
+        let (root, home) = temp_job_home("nested-accept");
+        let err = accept_claim(
+            &home,
+            AcceptClaimRequest {
+                job_id: "aa".repeat(32),
+                claim_id: "bb".repeat(32),
+                result_id: None,
+            },
+        )
+        .expect_err("must refuse nested block_on");
+        assert!(
+            err.to_string().contains("nested block_on refused"),
+            "unexpected: {err}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

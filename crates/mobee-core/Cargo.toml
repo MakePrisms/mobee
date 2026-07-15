@@ -11,7 +11,7 @@ default = []
 acp = []
 gateway = ["dep:nostr-sdk"]
 git-delivery = []
-wallet = ["git-delivery", "gateway", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "dep:tokio"]
+wallet = ["git-delivery", "gateway", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "tokio/sync", "tokio/time"]
 test-support = []
 
 [dependencies]
@@ -24,12 +24,12 @@ nostr-sdk = { version = "0.44.1", features = ["nip59"], optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11.0"
-tokio = { version = "1.52.0", features = ["rt", "sync", "time", "macros"], optional = true }
+tokio = { version = "1.52.0", default-features = false, features = ["rt", "macros"] }
 toml = "0.8"
 
 [dev-dependencies]
 async-trait = "0.1.89"
 cdk-sqlite = "=0.17.2"
-tokio = { version = "1.52.0", features = ["macros", "rt", "time"] }
+tokio = { version = "1.52.0", features = ["macros", "rt", "rt-multi-thread", "time"] }
 url = "2.5.8"
 uuid = "1.23.5"

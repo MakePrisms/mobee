@@ -24,6 +24,7 @@ pub mod payment_send;
 #[cfg(feature = "wallet")]
 pub mod payment_wallet;
 pub mod receipt;
+pub mod runtime_guard;
 #[cfg(feature = "wallet")]
 pub mod wallet;
 

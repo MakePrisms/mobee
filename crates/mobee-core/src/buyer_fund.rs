@@ -89,8 +89,8 @@ fn sqlite_path(wallet_dir: &Path) -> std::path::PathBuf {
 }
 
 /// Open the packaged testnut wallet (async). Prefer this inside an existing
-/// runtime — [`open_testnut_wallet_blocking`] nests `block_on` and panics if
-/// already in one (seller daemon receive, future async authorize_pay).
+/// runtime — [`open_testnut_wallet_blocking`] fails fast if a Tokio runtime is
+/// already current (no nested `block_on` panic).
 pub async fn open_testnut_wallet_async(home: &MobeeHome) -> Result<Wallet, FundError> {
     require_testnut_mint(home)?;
     let secret = home::read_secret_key_hex(home)?;
@@ -109,10 +109,12 @@ pub async fn open_testnut_wallet_async(home: &MobeeHome) -> Result<Wallet, FundE
     .map_err(|error| FundError::Wallet(error.to_string()))
 }
 
-/// Thin sync wrapper for non-async callers (authorize_pay / MCP today).
+/// Thin sync wrapper for non-async callers (CLI / tests).
 /// Do **not** call from inside an existing tokio runtime — use
-/// [`open_testnut_wallet_async`] instead.
+/// [`open_testnut_wallet_async`] instead. Nested call fails fast (no panic).
 pub fn open_testnut_wallet_blocking(home: &MobeeHome) -> Result<Wallet, FundError> {
+    crate::runtime_guard::refuse_nested_block_on("open_testnut_wallet_blocking")
+        .map_err(FundError::Wallet)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -208,11 +210,14 @@ pub async fn fund_testnut_wallet(
     })
 }
 
-/// Blocking wrapper for MCP / CLI (current-thread runtime).
+/// Blocking wrapper for CLI / tests (current-thread runtime).
+/// Nested call from an async context fails fast — use [`fund_testnut_wallet`].
 pub fn fund_testnut_wallet_blocking(
     home: &MobeeHome,
     amount_sats: u64,
 ) -> Result<FundOutcome, FundError> {
+    crate::runtime_guard::refuse_nested_block_on("fund_testnut_wallet_blocking")
+        .map_err(FundError::Wallet)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -254,6 +259,35 @@ mod tests {
         let err = fund_testnut_wallet_blocking(&home, 1).expect_err("pin");
         assert!(matches!(err, FundError::MintPinned { .. }));
         assert!(err.to_string().contains(DEFAULT_MINT_URL));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_fund_refuses_inside_runtime() {
+        let root = temp_home("nested-refuse");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let err = fund_testnut_wallet_blocking(&home, DEFAULT_FUND_AMOUNT_SATS)
+            .expect_err("must refuse nested block_on");
+        let message = err.to_string();
+        assert!(
+            message.contains("nested block_on refused"),
+            "unexpected: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_open_refuses_inside_runtime() {
+        let root = temp_home("nested-open-refuse");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let err = open_testnut_wallet_blocking(&home).expect_err("must refuse nested block_on");
+        let message = err.to_string();
+        assert!(
+            message.contains("nested block_on refused"),
+            "unexpected: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

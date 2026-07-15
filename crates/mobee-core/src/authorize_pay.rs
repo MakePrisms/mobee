@@ -118,6 +118,8 @@ pub fn authorize_pay(
     gate: &mut BudgetGate,
     request: AuthorizePayRequest,
 ) -> Result<AuthorizePayOutcome, AuthorizePayError> {
+    crate::runtime_guard::refuse_nested_block_on("authorize_pay")
+        .map_err(AuthorizePayError::Effects)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -254,6 +256,40 @@ mod tests {
     use super::*;
     use crate::budget::BudgetGate;
     use crate::home;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authorize_pay_sync_refuses_inside_runtime() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-authorize-pay-nested-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let mut gate = BudgetGate::from_home(&home).expect("gate");
+        let request = AuthorizePayRequest {
+            job_id: "job-nested".into(),
+            result_id: "result-nested".into(),
+            delivery_integrity_hash: "aa".repeat(20),
+            job_hash: "bb".repeat(32),
+            seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
+            amount_sats: 1,
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            commit_oid: "aa".repeat(20),
+        };
+        let err = authorize_pay(&home, &mut gate, request).expect_err("must refuse nested block_on");
+        let message = err.to_string();
+        assert!(
+            message.contains("nested block_on refused"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(gate.spent(), 0, "nested refuse must not burn spent");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn authorize_pay_refuses_empty_buyer_hash_without_burn() {
