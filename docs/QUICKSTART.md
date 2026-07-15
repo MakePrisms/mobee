@@ -6,7 +6,14 @@ Pinned surface: `dev` tip with buyer MCP job-lifecycle + composed `authorize_pay
 (`BudgetGate` → `PayPathDeliveryVerifier` → `PaymentService::run()`).
 
 Reality class for this path: **marketplace REAL** (5109 / 7000 / 6109 on the mobee relay) +
-**pay REAL-AND-LIVE (testnut)**. `main` remains **BUILT-BUT-OFF** until back-pull.
+**pay logic certified + testnut-proven via the Direct MCP harness** (§1, newline JSON-RPC).
+
+> ⚠ **Known issue (fix in progress):** a full trade driven by **Claude Code** over MCP currently
+> crashes on the relay-reading tools (`get_job` / `accept_claim` / `authorize_pay`) — the relay reads
+> starve the synchronous stdio dispatch loop past the client read timeout. Until the dispatch fix
+> lands + a live Claude-Code full-loop-to-receipt verify passes, run these steps over the **Direct
+> MCP** path (§1, newline JSON-RPC), which the acceptance harness uses. `main` remains
+> **BUILT-BUT-OFF** until back-pull.
 
 ---
 

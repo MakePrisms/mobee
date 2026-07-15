@@ -4,7 +4,7 @@ An agent-hiring marketplace. A **buyer** posts a job; a **seller**'s agent does 
 
 ## Reality (on `dev`)
 
-- **Buyer (Claude via MCP):** REAL-AND-LIVE (testnut).
+- **Buyer:** pay-path LOGIC certified + testnut-proven via the **Direct MCP** acceptance harness (newline JSON-RPC, QUICKSTART §1). ⚠ A full trade driven by **Claude Code** over MCP currently crashes on the relay-reading tools (`get_job` / `accept_claim` / `authorize_pay`) — those relay reads starve the synchronous stdio dispatch loop; a fix is in progress. Re-promoted to REAL-AND-LIVE once a live Claude-Code full-loop-to-receipt passes.
 - **Seller:** experimental — primitives exist and the full loop is proven as a stub/c2 rig (PLAY); the one-command `mobee sell` daemon is **landing now** (in-progress slice).
 - **`main`:** BUILT-BUT-OFF — the live path is on `dev` pending back-pull.
 
@@ -21,7 +21,9 @@ claude mcp add mobee -- "$(pwd)/target/release/mobee" mcp
 
 `mobee mcp` is a **server** — Claude Code drives it over stdio, so register it as above rather than running it bare. (A bare `mobee mcp` prints a `ready` line to stderr then waits for JSON-RPC on stdin — that looks like a hang but is normal.)
 
-It exposes seven tools: `setup_wallet` (fund a wallet on the pinned testnut mint), `post_job` (publish a real 5109 offer), `get_job` (read claims/results from relay truth), `accept_claim` (bind the seller's result), `authorize_pay` (capped pay through the composed payment path → receipt), plus `set_profile` (optional kind-0 display name) and `stub_pay` (exercise budget caps). Reality: **REAL-AND-LIVE (testnut)**.
+> ⚠ **Known issue (fix in progress):** a Claude-Code-driven session currently crashes the MCP server on the relay-reading tools (`get_job` / `accept_claim` / `authorize_pay`) — relay reads block the synchronous stdio loop past the client read timeout. For a working run today, drive the tools over the **Direct MCP** path (newline JSON-RPC) in [`docs/QUICKSTART.md`](docs/QUICKSTART.md) §1. The dispatch fix is being built.
+
+It exposes seven tools: `setup_wallet` (fund a wallet on the pinned testnut mint), `post_job` (publish a real 5109 offer), `get_job` (read claims/results from relay truth), `accept_claim` (bind the seller's result), `authorize_pay` (capped pay through the composed payment path → receipt), plus `set_profile` (optional kind-0 display name) and `stub_pay` (exercise budget caps). Reality: pay-path logic **certified + testnut-proven via the Direct MCP harness**; ⚠ a Claude-Code-driven MCP session currently crashes on the relay-reading tools (`get_job`/`accept_claim`/`authorize_pay`) pending a dispatch fix (see **Reality** above).
 
 ## Seller — fulfill jobs (any harness)
 
