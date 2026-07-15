@@ -14,6 +14,8 @@ pub const DEFAULT_RELAY_URL: &str = "wss://mobee-relay.orveth.dev";
 /// Standing CDK testnut mint — no real funds. Host re-locked 2026-07-15 after
 /// `testnut.cashu.space` died from turtle; class (TESTNUT) is the load-bearing rule.
 pub const DEFAULT_MINT_URL: &str = "https://testnut.cashudevkit.org";
+/// Dead testnut host — bootstrap migrates config.toml away from this.
+pub const DEAD_TESTNUT_MINT_HOST: &str = "testnut.cashu.space";
 /// Conservative per-job spend cap (sats) until config is tuned.
 pub const DEFAULT_PER_JOB_BUDGET_SATS: u64 = 21;
 /// Conservative rolling/session total spend cap (sats).
@@ -90,7 +92,8 @@ pub fn default_home_dir() -> Result<PathBuf, HomeError> {
 
 /// Ensure `root` exists with config, key (`0600`), and `wallet/` dir.
 ///
-/// Idempotent: existing config/key are left in place. Never returns the secret key.
+/// Idempotent: existing config/key are left in place except dead-mint migration
+/// (`testnut.cashu.space` → [`DEFAULT_MINT_URL`]). Never returns the secret key.
 pub fn bootstrap(root: impl AsRef<Path>) -> Result<MobeeHome, HomeError> {
     let root = root.as_ref().to_path_buf();
     fs::create_dir_all(&root).map_err(|error| HomeError::Io(error.to_string()))?;
@@ -100,7 +103,11 @@ pub fn bootstrap(root: impl AsRef<Path>) -> Result<MobeeHome, HomeError> {
     let wallet_dir = root.join(WALLET_DIR);
 
     let config = if config_path.exists() {
-        load_config(&config_path)?
+        let mut config = load_config(&config_path)?;
+        if migrate_dead_mint_url(&mut config) {
+            write_config(&config_path, &config)?;
+        }
+        config
     } else {
         let config = MobeeConfig::default();
         write_config(&config_path, &config)?;
@@ -124,6 +131,17 @@ pub fn bootstrap(root: impl AsRef<Path>) -> Result<MobeeHome, HomeError> {
         wallet_dir,
         key_created,
     })
+}
+
+/// Rewrite dead `.cashu.space` testnut hosts to [`DEFAULT_MINT_URL`]. Returns true when changed.
+pub fn migrate_dead_mint_url(config: &mut MobeeConfig) -> bool {
+    let lower = config.mint_url.to_ascii_lowercase();
+    if lower.contains(DEAD_TESTNUT_MINT_HOST) {
+        config.mint_url = DEFAULT_MINT_URL.to_owned();
+        true
+    } else {
+        false
+    }
 }
 
 /// Hex-encode the secp256k1 x-only/public view is deferred; this returns the *public* key
@@ -328,5 +346,22 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(read_secret_key_hex(&again).expect("secret again"), secret);
+    }
+
+    #[test]
+    fn bootstrap_migrates_dead_cashu_space_mint() {
+        let root = temp_home("dead-mint");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        let config_path = root.join(CONFIG_FILE);
+        let stale = MobeeConfig {
+            mint_url: format!("https://{DEAD_TESTNUT_MINT_HOST}"),
+            ..MobeeConfig::default()
+        };
+        write_config(&config_path, &stale).expect("write stale");
+        let home = bootstrap(&root).expect("bootstrap migrates");
+        assert_eq!(home.config.mint_url, DEFAULT_MINT_URL);
+        let reloaded = load_config(&config_path).expect("reload");
+        assert_eq!(reloaded.mint_url, DEFAULT_MINT_URL);
     }
 }

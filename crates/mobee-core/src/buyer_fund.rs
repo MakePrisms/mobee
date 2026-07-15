@@ -41,7 +41,9 @@ impl std::fmt::Display for FundError {
             Self::Home(error) => write!(formatter, "{error}"),
             Self::MintPinned { configured } => write!(
                 formatter,
-                "fund path hard-pinned to {DEFAULT_MINT_URL}; configured mint_url is {configured}"
+                "fund path hard-pinned to {DEFAULT_MINT_URL}; configured mint_url is {configured}. \
+                 If this is a dead testnut host (e.g. testnut.cashu.space), update ~/.mobee/config.toml \
+                 mint_url to {DEFAULT_MINT_URL} (or delete config.toml and re-run setup_wallet / bootstrap)"
             ),
             Self::Wallet(message) => write!(formatter, "wallet fund error: {message}"),
         }

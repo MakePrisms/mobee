@@ -116,6 +116,7 @@ pub enum DeliveryError {
     InvalidCommitOid,
     MissingRepo,
     InvalidBranch,
+    Transport(crate::delivery_transport::TransportRefuse),
     GitUnavailable,
     GitCommandFailed(&'static str),
     MissingFetchedTip,
@@ -134,6 +135,7 @@ impl fmt::Display for DeliveryError {
             }
             Self::MissingRepo => formatter.write_str("delivery repository is missing"),
             Self::InvalidBranch => formatter.write_str("delivery branch is invalid"),
+            Self::Transport(refuse) => write!(formatter, "{refuse}"),
             Self::GitUnavailable => formatter.write_str("git executable is unavailable"),
             Self::GitCommandFailed(operation) => write!(formatter, "git {operation} failed"),
             Self::MissingFetchedTip => {
@@ -153,6 +155,12 @@ impl fmt::Display for DeliveryError {
 }
 
 impl std::error::Error for DeliveryError {}
+
+impl From<crate::delivery_transport::TransportRefuse> for DeliveryError {
+    fn from(value: crate::delivery_transport::TransportRefuse) -> Self {
+        Self::Transport(value)
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -2,6 +2,7 @@ pub mod budget;
 pub mod delivery;
 #[cfg(feature = "git-delivery")]
 pub mod delivery_git;
+pub mod delivery_transport;
 pub mod driver;
 pub mod engine;
 pub mod event;

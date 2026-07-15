@@ -77,7 +77,7 @@ pub fn run(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 fn bootstrap_state() -> Result<McpState, String> {
     let root = home::default_home_dir().map_err(|error| error.to_string())?;
     let home = home::bootstrap(root).map_err(|error| error.to_string())?;
-    let gate = Mutex::new(BudgetGate::from_config(&home.config));
+    let gate = Mutex::new(BudgetGate::from_home(&home).map_err(|error| error.to_string())?);
     Ok(McpState { home, gate })
 }
 
@@ -328,7 +328,7 @@ mod tests {
 
     fn state_at(root: &std::path::Path) -> McpState {
         let home = home::bootstrap(root).expect("bootstrap");
-        let gate = Mutex::new(BudgetGate::from_config(&home.config));
+        let gate = Mutex::new(BudgetGate::from_home(&home).expect("gate"));
         McpState { home, gate }
     }
 
@@ -509,5 +509,22 @@ mod tests {
         let rendered = response.to_string();
         assert!(!rendered.contains(&secret));
         assert_eq!(response["result"]["isError"], true);
+    }
+
+    #[test]
+    fn stub_pay_spent_survives_mcp_state_reload() {
+        let root = temp_home("spent-reload");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = state_at(&root);
+        stub_pay(&state.gate, &json!({ "amount_sats": 7 })).expect("pay");
+        assert_eq!(state.gate.lock().expect("lock").spent(), 7);
+
+        // Simulate MCP process restart: new gate from same home.
+        let reloaded = state_at(&root);
+        assert_eq!(reloaded.gate.lock().expect("lock").spent(), 7);
+        assert_eq!(
+            reloaded.gate.lock().expect("lock").remaining(),
+            reloaded.home.config.total_budget_sats - 7
+        );
     }
 }
