@@ -19,6 +19,8 @@ pub mod log;
 #[cfg(feature = "wallet")]
 pub mod buyer_fund;
 #[cfg(feature = "wallet")]
+pub mod wallet_ops;
+#[cfg(feature = "wallet")]
 pub mod payment;
 pub mod payment_send;
 #[cfg(feature = "wallet")]

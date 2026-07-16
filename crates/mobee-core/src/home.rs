@@ -164,6 +164,10 @@ pub struct MobeeConfig {
     pub mint_url: String,
     pub per_job_budget_sats: u64,
     pub total_budget_sats: u64,
+    /// Opt-in additional mints (`mobee wallet mints add`). Default mint stays
+    /// [`DEFAULT_MINT_URL`] / `mint_url`; never invents spendable credit by itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_mints: Vec<String>,
     /// Optional `[profile] name / about`. Skipped when absent so fresh homes stay unnamed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfileConfig>,
@@ -179,6 +183,7 @@ impl Default for MobeeConfig {
             mint_url: DEFAULT_MINT_URL.to_owned(),
             per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,
             total_budget_sats: DEFAULT_TOTAL_BUDGET_SATS,
+            extra_mints: Vec::new(),
             profile: None,
             seller: None,
         }

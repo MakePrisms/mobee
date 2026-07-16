@@ -3,6 +3,7 @@ mod cli;
 mod exec;
 mod mcp;
 mod sell;
+mod wallet_cli;
 
 fn main() {
     let code = cli::run(

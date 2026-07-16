@@ -146,7 +146,10 @@ async fn dispatch_async(state: &McpState, request: &McpRequest) -> Value {
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let deadline_secs = if tool_name == "setup_wallet" {
+            let deadline_secs = if matches!(
+                tool_name,
+                "setup_wallet" | "wallet_mint" | "wallet_invoice" | "wallet_melt"
+            ) {
                 SETUP_WALLET_DEADLINE_SECS
             } else {
                 TOOL_DEADLINE_SECS
@@ -303,6 +306,92 @@ fn tools() -> Value {
                 "properties": {},
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "wallet_balance",
+            "description": "Show ecash balance per configured mint (default testnut + opt-in extra_mints). Never echoes the secret key.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "wallet_mint",
+            "description": "Flexible/repeatable mint-fund via bolt11 (mint quote → pay → mint) for ANY amount. Unlike setup_wallet, this has no already_funded hard-block. Optional mint must already be configured. Never echoes secrets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "amount_sats": { "type": "integer", "minimum": 1 },
+                    "mint": { "type": "string", "description": "Optional mint URL (must be configured)" }
+                },
+                "required": ["amount_sats"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "wallet_send",
+            "description": "Create an unlocked cashu token (ecash out). Returns the token string. Never echoes the wallet secret key.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "amount_sats": { "type": "integer", "minimum": 1 },
+                    "mint": { "type": "string" }
+                },
+                "required": ["amount_sats"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "wallet_receive",
+            "description": "Redeem a cashu token (ecash in). Token mint must already be configured. Response never echoes the raw token or secret key.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "token": { "type": "string" }
+                },
+                "required": ["token"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "wallet_melt",
+            "description": "Pay a lightning invoice from ecash (fail-closed on insufficient funds / unpaid). Never echoes secrets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "bolt11": { "type": "string" },
+                    "mint": { "type": "string" }
+                },
+                "required": ["bolt11"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "wallet_invoice",
+            "description": "Create a bolt11 invoice and mint once paid (testnut auto-pays). Flexible amount. Never echoes secrets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "amount_sats": { "type": "integer", "minimum": 1 },
+                    "mint": { "type": "string" }
+                },
+                "required": ["amount_sats"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "wallet_mints",
+            "description": "Manage configured mints: action=list|add|remove. Default testnut stays pinned; add is opt-in. Never invents spendable credit.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "add", "remove"] },
+                    "mint": { "type": "string", "description": "Required for add/remove" }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -359,6 +448,82 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
                 Err("reconcile_wallet requires the wallet feature".into())
             }
         }
+        "wallet_balance" => {
+            #[cfg(feature = "wallet")]
+            {
+                wallet_balance_tool_async(state).await
+            }
+            #[cfg(not(feature = "wallet"))]
+            {
+                Err("wallet_balance requires the wallet feature".into())
+            }
+        }
+        "wallet_mint" => {
+            #[cfg(feature = "wallet")]
+            {
+                wallet_mint_tool_async(state, &arguments).await
+            }
+            #[cfg(not(feature = "wallet"))]
+            {
+                let _ = arguments;
+                Err("wallet_mint requires the wallet feature".into())
+            }
+        }
+        "wallet_send" => {
+            #[cfg(feature = "wallet")]
+            {
+                wallet_send_tool_async(state, &arguments).await
+            }
+            #[cfg(not(feature = "wallet"))]
+            {
+                let _ = arguments;
+                Err("wallet_send requires the wallet feature".into())
+            }
+        }
+        "wallet_receive" => {
+            #[cfg(feature = "wallet")]
+            {
+                wallet_receive_tool_async(state, &arguments).await
+            }
+            #[cfg(not(feature = "wallet"))]
+            {
+                let _ = arguments;
+                Err("wallet_receive requires the wallet feature".into())
+            }
+        }
+        "wallet_melt" => {
+            #[cfg(feature = "wallet")]
+            {
+                wallet_melt_tool_async(state, &arguments).await
+            }
+            #[cfg(not(feature = "wallet"))]
+            {
+                let _ = arguments;
+                Err("wallet_melt requires the wallet feature".into())
+            }
+        }
+        "wallet_invoice" => {
+            #[cfg(feature = "wallet")]
+            {
+                wallet_invoice_tool_async(state, &arguments).await
+            }
+            #[cfg(not(feature = "wallet"))]
+            {
+                let _ = arguments;
+                Err("wallet_invoice requires the wallet feature".into())
+            }
+        }
+        "wallet_mints" => {
+            #[cfg(feature = "wallet")]
+            {
+                wallet_mints_tool_async(state, &arguments).await
+            }
+            #[cfg(not(feature = "wallet"))]
+            {
+                let _ = arguments;
+                Err("wallet_mints requires the wallet feature".into())
+            }
+        }
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -372,6 +537,173 @@ fn setup_wallet_fund(home: &MobeeHome) -> Result<Value, String> {
         .build()
         .map_err(|error| error.to_string())?;
     runtime.block_on(setup_wallet_fund_async(home))
+}
+
+#[cfg(feature = "wallet")]
+async fn wallet_balance_tool_async(state: &McpState) -> Result<Value, String> {
+    use mobee_core::wallet_ops;
+    let home = home::bootstrap(&state.home.root).map_err(|error| error.to_string())?;
+    let rows = wallet_ops::balances_async(&home)
+        .await
+        .map_err(|error| error.to_string())?;
+    let total_sats = rows.iter().fold(0u64, |acc, row| acc.saturating_add(row.balance_sats));
+    let mints: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "mint_url": row.mint_url,
+                "balance_sats": row.balance_sats,
+                "role": if row.is_default { "default" } else { "extra" },
+            })
+        })
+        .collect();
+    Ok(tool_ok(json!({
+        "mints": mints,
+        "total_sats": total_sats,
+    })))
+}
+
+#[cfg(feature = "wallet")]
+async fn wallet_mint_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
+    use mobee_core::wallet_ops;
+    let amount = arguments
+        .get("amount_sats")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "wallet_mint requires amount_sats".to_owned())?;
+    let mint = arguments.get("mint").and_then(Value::as_str);
+    let home = home::bootstrap(&state.home.root).map_err(|error| error.to_string())?;
+    let outcome = wallet_ops::mint_async(&home, amount, mint)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(tool_ok(json!({
+        "mint_url": outcome.mint_url,
+        "funded_sats": outcome.funded_sats,
+        "balance_sats": outcome.balance_sats,
+        // invoice present for debugging payment path; not a secret key
+        "invoice_present": !outcome.invoice.is_empty(),
+    })))
+}
+
+#[cfg(feature = "wallet")]
+async fn wallet_send_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
+    use mobee_core::wallet_ops;
+    let amount = arguments
+        .get("amount_sats")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "wallet_send requires amount_sats".to_owned())?;
+    let mint = arguments.get("mint").and_then(Value::as_str);
+    let home = home::bootstrap(&state.home.root).map_err(|error| error.to_string())?;
+    let outcome = wallet_ops::send_async(&home, amount, mint)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(tool_ok(json!({
+        "mint_url": outcome.mint_url,
+        "sent_sats": outcome.sent_sats,
+        "balance_sats": outcome.balance_sats,
+        "token": outcome.token,
+    })))
+}
+
+#[cfg(feature = "wallet")]
+async fn wallet_receive_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
+    use mobee_core::wallet_ops;
+    let token = arguments
+        .get("token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "wallet_receive requires token".to_owned())?;
+    let home = home::bootstrap(&state.home.root).map_err(|error| error.to_string())?;
+    let outcome = wallet_ops::receive_async(&home, token)
+        .await
+        .map_err(|error| error.to_string())?;
+    // Never echo the raw token back.
+    Ok(tool_ok(json!({
+        "mint_url": outcome.mint_url,
+        "received_sats": outcome.received_sats,
+        "balance_sats": outcome.balance_sats,
+    })))
+}
+
+#[cfg(feature = "wallet")]
+async fn wallet_melt_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
+    use mobee_core::wallet_ops;
+    let bolt11 = arguments
+        .get("bolt11")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "wallet_melt requires bolt11".to_owned())?;
+    let mint = arguments.get("mint").and_then(Value::as_str);
+    let home = home::bootstrap(&state.home.root).map_err(|error| error.to_string())?;
+    let outcome = wallet_ops::melt_async(&home, bolt11, mint)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(tool_ok(json!({
+        "mint_url": outcome.mint_url,
+        "paid_sats": outcome.paid_sats,
+        "fee_sats": outcome.fee_sats,
+        "balance_sats": outcome.balance_sats,
+    })))
+}
+
+#[cfg(feature = "wallet")]
+async fn wallet_invoice_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
+    use mobee_core::wallet_ops;
+    let amount = arguments
+        .get("amount_sats")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "wallet_invoice requires amount_sats".to_owned())?;
+    let mint = arguments.get("mint").and_then(Value::as_str);
+    let home = home::bootstrap(&state.home.root).map_err(|error| error.to_string())?;
+    let outcome = wallet_ops::invoice_async(&home, amount, mint)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(tool_ok(json!({
+        "mint_url": outcome.mint_url,
+        "amount_sats": outcome.amount_sats,
+        "funded_sats": outcome.funded_sats,
+        "balance_sats": outcome.balance_sats,
+        "invoice": outcome.invoice,
+    })))
+}
+
+#[cfg(feature = "wallet")]
+async fn wallet_mints_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
+    use mobee_core::wallet_ops;
+    let action = arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "wallet_mints requires action".to_owned())?;
+    let mut home = home::bootstrap(&state.home.root).map_err(|error| error.to_string())?;
+    match action {
+        "list" => {
+            let rows = wallet_ops::list_mints(&home).map_err(|error| error.to_string())?;
+            let mints: Vec<Value> = rows
+                .into_iter()
+                .map(|row| {
+                    json!({
+                        "mint_url": row.mint_url,
+                        "role": if row.is_default { "default" } else { "extra" },
+                    })
+                })
+                .collect();
+            Ok(tool_ok(json!({ "mints": mints })))
+        }
+        "add" => {
+            let mint = arguments
+                .get("mint")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "wallet_mints add requires mint".to_owned())?;
+            let normalized = wallet_ops::add_mint(&mut home, mint).map_err(|error| error.to_string())?;
+            Ok(tool_ok(json!({ "added": normalized })))
+        }
+        "remove" => {
+            let mint = arguments
+                .get("mint")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "wallet_mints remove requires mint".to_owned())?;
+            wallet_ops::remove_mint(&mut home, mint).map_err(|error| error.to_string())?;
+            Ok(tool_ok(json!({ "removed": mint })))
+        }
+        other => Err(format!("unknown wallet_mints action: {other}")),
+    }
 }
 
 async fn setup_wallet_fund_async(home: &MobeeHome) -> Result<Value, String> {
@@ -959,7 +1291,14 @@ mod tests {
                 "accept_claim",
                 "stub_pay",
                 "authorize_pay",
-                "reconcile_wallet"
+                "reconcile_wallet",
+                "wallet_balance",
+                "wallet_mint",
+                "wallet_send",
+                "wallet_receive",
+                "wallet_melt",
+                "wallet_invoice",
+                "wallet_mints",
             ]
         );
     }
