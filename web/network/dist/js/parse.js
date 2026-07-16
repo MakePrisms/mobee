@@ -96,8 +96,16 @@ function isSafePictureUrl(url) {
 }
 
 /**
- * Extract usage adjunct fields using the locked vocabulary.
- * Missing fields stay null — never invent totals by summing siblings.
+ * Extract the piece-9 Item-2 usage adjunct.
+ *
+ * SPEC WINS: the seller emits exec-metadata as TAGS on the kind-6109 result (its content is a
+ * non-JSON string like "delivery commit <oid>", so contentJson is null). We read tags first,
+ * per the PIECE-9 schema, and fall back to the legacy JSON vocabulary only for fields that
+ * never had a tag form (measured_cost_tokens / paid_price_tokens). `harness` is mapped to the
+ * spec enum {codex, claude, cursor, other} (e.g. claude-agent-acp → claude).
+ *
+ * degrades-never-blanks: a missing field is `null` (renders a dash) — NEVER a fabricated
+ * value, and totals are never invented by summing siblings.
  * @param {unknown} contentJson
  * @param {string[][]} tags
  */
@@ -115,26 +123,43 @@ export function extractUsageAdjunct(contentJson, tags = []) {
       asObject(root.usage_measure) ||
       null;
 
-    const total_tokens = measure
+    const legacyTotal = measure
       ? asNumberOrNull(measure.total_tokens)
       : asNumberOrNull(adjunct.total_tokens);
+    const cost = costFromTags(tags);
 
     return {
-      total_tokens,
+      // tags (PIECE-9) win; legacy JSON is a fallback for total only.
+      total_tokens: tokensTagValue(tags, "total") ?? legacyTotal,
+      input_tokens: tokensTagValue(tags, "input"),
+      output_tokens: tokensTagValue(tags, "output"),
+      reasoning_tokens: tokensTagValue(tags, "reasoning"),
+      cache_read_tokens: tokensTagValue(tags, "cache_read"),
+      cache_write_tokens: tokensTagValue(tags, "cache_write"),
+      model: firstTagValue(tags, "model"),
+      cost_usd: cost.usd,
+      cost_basis: cost.basis,
+      // Legacy-only (never emitted as tags) — stay null on tagged results → dash.
       measured_cost_tokens: asNumberOrNull(
         adjunct.measured_cost_tokens ?? root.measured_cost_tokens,
       ),
       paid_price_tokens: asNumberOrNull(
         adjunct.paid_price_tokens ?? root.paid_price_tokens,
       ),
-      usage_transport: asEnumString(
-        adjunct.usage_transport ?? root.usage_transport,
-        ["acp-native", "side-channel"],
-      ),
-      harness_family: asEnumString(
-        adjunct.harness_family ?? root.harness_family,
-        ["codex", "claude", "cursor", "other"],
-      ),
+      usage_transport:
+        firstTagValue(tags, "usage_transport") ??
+        asEnumString(adjunct.usage_transport ?? root.usage_transport, [
+          "acp-native",
+          "side-channel",
+        ]),
+      harness_family:
+        harnessFamilyFromId(firstTagValue(tags, "harness")) ??
+        asEnumString(adjunct.harness_family ?? root.harness_family, [
+          "codex",
+          "claude",
+          "cursor",
+          "other",
+        ]),
       paid_price_sats: amountSatsFromTags(tags),
     };
   } catch {
@@ -142,9 +167,49 @@ export function extractUsageAdjunct(contentJson, tags = []) {
   }
 }
 
+/** Value of a `["tokens","<n>","<qualifier>"]` tag (total/input/output/reasoning/cache_*). */
+function tokensTagValue(tags, qualifier) {
+  for (const tag of tags) {
+    if (tag[0] === "tokens" && tag[2] === qualifier && tag[1] != null) {
+      const n = Number(tag[1]);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
+/** Reported USD cost from `["cost","<n>","usd","<basis>"]`; absent → both null. */
+function costFromTags(tags) {
+  for (const tag of tags) {
+    if (tag[0] === "cost" && tag[2] === "usd" && tag[1] != null) {
+      const n = Number(tag[1]);
+      if (Number.isFinite(n)) return { usd: n, basis: tag[3] || null };
+    }
+  }
+  return { usd: null, basis: null };
+}
+
+/** Map a seller `harness` id to the spec enum. Present-but-unrecognized → "other"; absent → null. */
+function harnessFamilyFromId(id) {
+  if (!id) return null;
+  const s = String(id).toLowerCase();
+  if (s.includes("claude")) return "claude";
+  if (s.includes("cursor")) return "cursor";
+  if (s.includes("codex")) return "codex";
+  return "other";
+}
+
 function emptyUsage() {
   return {
     total_tokens: null,
+    input_tokens: null,
+    output_tokens: null,
+    reasoning_tokens: null,
+    cache_read_tokens: null,
+    cache_write_tokens: null,
+    model: null,
+    cost_usd: null,
+    cost_basis: null,
     measured_cost_tokens: null,
     paid_price_tokens: null,
     usage_transport: null,
@@ -177,6 +242,9 @@ function parseResult(base) {
   return {
     offerId: firstETag(base.tags, "root") || firstETag(base.tags, null),
     amount_sats: amountSatsFromTags(base.tags),
+    // PIECE-9: the seller's kind-6109 result is the AUTHORITATIVE usage source (the receipt
+    // echo is a convenience copy). Read it from the result-event TAGS.
+    usage: extractUsageAdjunct(base.contentJson, base.tags),
   };
 }
 

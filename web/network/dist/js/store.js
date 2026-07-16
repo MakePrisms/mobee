@@ -173,6 +173,27 @@ export function createStore() {
         });
       }
     }
+    // piece-9: the seller's kind-6109 RESULT is the AUTHORITATIVE usage source (the kind-3400
+    // receipt echo is a convenience copy, and no 3400s are published on dev yet). A settled
+    // trade therefore fills the dashboard from its result. Skip offers that already carry a
+    // receipt row (echo stands in there) to avoid double counting; an UNTAGGED result
+    // contributes only dashes (absent-stays-absent — legacy trades are never backfilled).
+    for (const [offerId, list] of resultsByOffer) {
+      if (receiptsByOffer.has(offerId)) continue;
+      for (const ev of list) {
+        const u = ev.result?.usage || emptyUsage();
+        rows.push({
+          id: ev.id,
+          created_at: ev.created_at,
+          paid_price_sats: u.paid_price_sats ?? ev.result?.amount_sats ?? null,
+          paid_price_tokens: u.paid_price_tokens,
+          measured_cost_tokens: u.measured_cost_tokens,
+          total_tokens: u.total_tokens,
+          usage_transport: u.usage_transport,
+          harness_family: u.harness_family,
+        });
+      }
+    }
     rows.sort((a, b) => b.created_at - a.created_at);
 
     /** @type {Map<string, {n:number, withCost:number, sumCost:number, sumPaidTok:number, sumPaidSat:number}>} */

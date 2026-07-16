@@ -1,6 +1,6 @@
 use crate::driver::{
     Artifact, ContentBlock, Driver, DriverError, PermissionOutcome, PermissionRequest, PromptTurn,
-    SessionConfig, SessionUpdate, StopReason,
+    SessionConfig, SessionUpdate, StopReason, UsageMetadata,
 };
 use crate::event::{ArtifactId, Envelope, Event, JobExecutionStatus, JobId};
 use crate::log::{EventLog, LogError};
@@ -20,6 +20,9 @@ pub enum RunEvent<'a> {
 pub struct RunOutcome {
     pub terminal: JobExecutionStatus,
     pub artifacts: Vec<Artifact>,
+    /// piece-9 Item-2: usage the driver surfaced for this run (seller-claimed). `None` when the
+    /// harness exposed nothing — carried optionally so absent-stays-absent survives the seam.
+    pub usage: Option<UsageMetadata>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,10 +148,13 @@ pub async fn run_job<D: Driver>(
             artifact_id: ArtifactId(artifact.uri_or_path.clone()),
         })?;
     }
+    // piece-9 Item-2: lift whatever usage the driver captured (absent-stays-absent → None).
+    let usage = driver.usage();
     driver.shutdown().await?;
     Ok(RunOutcome {
         terminal,
         artifacts,
+        usage,
     })
 }
 
@@ -200,6 +206,7 @@ mod tests {
 
     use crate::driver::{
         Artifact, ContentBlock, MockDriver, ScriptedSession, SessionUpdate, StopReason,
+        UsageMetadata, UsageTransport,
     };
     use crate::engine::{EngineError, RunEvent, RunOutcome, RunParams, run_job};
     use crate::event::{ArtifactId, Event, JobExecutionStatus, JobId, RuntimeId};
@@ -240,6 +247,7 @@ mod tests {
                     mime: Some("text/plain".into()),
                     bytes: None,
                 }],
+                usage: None,
             }
         );
         assert_eq!(
@@ -265,6 +273,38 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn run_job_threads_driver_usage_into_outcome() {
+        // piece-9 Item-2: usage the driver surfaced must ride out on RunOutcome (the seam the
+        // seller reads). A driver that exposes nothing keeps `usage: None` (absent-stays-absent).
+        let usage = UsageMetadata {
+            model: Some("claude-opus-4-8".into()),
+            input_tokens: Some(100),
+            output_tokens: Some(40),
+            transport: Some(UsageTransport::AcpNative),
+            ..UsageMetadata::default()
+        };
+        let script = ScriptedSession {
+            session_id: "session-1".into(),
+            updates: vec![SessionUpdate::TurnEnded(StopReason::Completed)],
+            artifacts: Vec::new(),
+        };
+        let mut driver =
+            MockDriver::new(RuntimeId("mock".into()), vec![script]).with_usage(usage.clone());
+        let mut log = EventLog::open(test_path("usage-threads")).expect("open log");
+
+        let outcome = block_on(run_job(
+            &mut driver,
+            &mut log,
+            &JobId("job-1".into()),
+            RunParams::mock_defaults(),
+            &mut |_| {},
+        ))
+        .expect("run job");
+
+        assert_eq!(outcome.usage, Some(usage));
     }
 
     #[test]

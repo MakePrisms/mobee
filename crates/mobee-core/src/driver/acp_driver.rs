@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::driver::acp::{PROTOCOL_VERSION, UpdateStream};
+use crate::driver::acp::{PROTOCOL_VERSION, UpdateStream, parse_acp_usage};
 use crate::driver::{
     Artifact, Caps, ContentBlock, Driver, DriverError, Initialize, PermissionOutcome,
     PermissionRequest, PromptTurn, Readiness, RuntimeId, SessionConfig, SessionId, SessionUpdate,
-    StopReason,
+    StopReason, UsageMetadata,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +40,9 @@ pub struct AcpDriver {
     updates: Option<mpsc::Receiver<SessionUpdate>>,
     update_tx: Option<mpsc::Sender<SessionUpdate>>,
     next_request_id: AtomicU64,
+    /// piece-9 Item-2: ACP-native usage captured from the most recent `session/prompt`
+    /// result. `None` when the harness surfaced nothing (absent-stays-absent).
+    last_usage: Option<UsageMetadata>,
 }
 
 impl AcpDriver {
@@ -58,6 +61,7 @@ impl AcpDriver {
             updates: None,
             update_tx: None,
             next_request_id: AtomicU64::new(1),
+            last_usage: None,
         }
     }
 
@@ -228,6 +232,9 @@ impl Driver for AcpDriver {
     ) -> Result<UpdateStream, DriverError> {
         let id = self.send_request("session/prompt", prompt_params(session_id, turn))?;
         let result = self.wait_response(id)?;
+        // piece-9 Item-2: capture ACP-native usage off the prompt result before we reduce it
+        // to a stop reason. Absent-stays-absent — `None` when the harness surfaced nothing.
+        self.last_usage = parse_acp_usage(&result);
         if let Some(update_tx) = &self.update_tx {
             let _ = update_tx.send(SessionUpdate::TurnEnded(stop_reason_from_params(&result)));
         }
@@ -258,6 +265,10 @@ impl Driver for AcpDriver {
             let _ = self.wait_response(id);
         }
         Ok(())
+    }
+
+    fn usage(&self) -> Option<UsageMetadata> {
+        self.last_usage.clone()
     }
 
     async fn shutdown(&mut self) -> Result<(), DriverError> {

@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::buyer_fund::{self, FundError};
+use crate::driver::UsageMetadata;
 use crate::gateway::{
     self, claim_draft, error_draft, git_result_draft, parse_offer, EventDraft, ParsedOffer,
     TagSpec, JOB_OFFER_KIND,
@@ -561,12 +562,16 @@ impl SellerDaemon {
         let run_result =
             run_agent_job(&seller_cfg.agent_command, &active.offer.task, &active.workdir, &identity)
                 .await;
-        // Wall-time is the one usage field we can measure without ACP-usage plumbing.
+        // Wall-time is always measurable; token/model/cost ride out on `usage` only when the
+        // ACP driver actually surfaced them (absent-stays-absent → `None`).
         let wall_time_ms = run_started.elapsed().as_millis() as u64;
-        if let Err(error) = run_result {
-            self.fail_active(&error.to_string()).await?;
-            return Err(error);
-        }
+        let usage = match run_result {
+            Ok(usage) => usage,
+            Err(error) => {
+                self.fail_active(&error.to_string()).await?;
+                return Err(error);
+            }
+        };
         let after_oid = seller_git::try_head_oid(&active.workdir, &self.home.root);
         let _advanced = match seller_git::require_agent_authored_delivery(
             &active.workdir,
@@ -628,8 +633,10 @@ impl SellerDaemon {
         };
         let seller_sig = sign_receipt_hash(&self.keys, &preimage.digest_hex())?;
         // Piece-9 Item 2: harness-generic PUBLIC seller-claimed usage block (opportunistic;
-        // absent fields stay absent — token/model/cost await ACP-usage plumbing).
-        let exec_metadata = seller_exec_metadata(&seller_cfg.agent_command, wall_time_ms);
+        // absent fields stay absent). `usage` carries the ACP-native token/model/cost the driver
+        // surfaced this run — `None` when the harness exposed nothing.
+        let exec_metadata =
+            seller_exec_metadata(&seller_cfg.agent_command, wall_time_ms, usage.as_ref());
         let draft = git_result_draft(
             &active.job_id,
             &active.buyer_pubkey,
@@ -681,22 +688,77 @@ fn mint_url(raw: &str) -> Result<cashu::MintUrl, DaemonError> {
 /// Build the piece-9 Item-2 seller-claimed PUBLIC usage block for a kind-6109 result.
 ///
 /// Per gudnuf's Q2 ruling this block is PUBLIC and harness-generic. It is **opportunistic**:
-/// emit only fields the seller can source. `harness` + `usage_transport` are derived from
-/// the configured agent command (USAGE-MATRIX checkpoint-b), `wall_time` is measured, and
-/// `metadata_trust=seller-claimed` is required whenever any field is present (anchor rule).
+/// emit only fields the seller can source. `harness` is derived from the configured agent
+/// command (USAGE-MATRIX checkpoint-b), `wall_time` is measured, and `metadata_trust=
+/// seller-claimed` is required whenever any field is present (anchor rule).
 ///
-/// Token / model / cost are **OMITTED (absent-stays-absent, never zero-filled)** until ACP
-/// usage capture is plumbed through the driver — the ACP-wire usage probe is a named piece-9
-/// deferred; the seller run surface exposes no token counts today.
-fn seller_exec_metadata(agent_command: &[String], wall_time_ms: u64) -> Vec<TagSpec> {
-    let (harness, transport) = harness_and_transport(agent_command);
+/// `usage_transport` reflects **reality**: when the ACP driver actually captured usage this
+/// run it is that surface (`acp-native`); otherwise the harness's declared axis.
+///
+/// Token / model / cost tags are appended **only where the driver surfaced them**
+/// (absent-stays-absent, never zero-filled — a fabricated `0` is worse than a rendered dash).
+/// `total` = `input + output + reasoning` (locked rule); cache siblings are evidence and are
+/// NEVER summed into `total`. When `usage` is `None` the block is exactly the pre-plumbing
+/// four tags — legacy/no-capture trades stay honestly dashed.
+fn seller_exec_metadata(
+    agent_command: &[String],
+    wall_time_ms: u64,
+    usage: Option<&UsageMetadata>,
+) -> Vec<TagSpec> {
+    let (harness, static_transport) = harness_and_transport(agent_command);
+    let transport = usage
+        .and_then(|u| u.transport)
+        .map(|t| t.as_str())
+        .unwrap_or(static_transport);
     let wall = wall_time_ms.to_string();
-    vec![
+
+    let mut tags = vec![
         TagSpec::new(["harness", harness.as_str()]),
         TagSpec::new(["usage_transport", transport]),
         TagSpec::new(["metadata_trust", "seller-claimed"]),
         TagSpec::new(["wall_time", wall.as_str(), "ms"]),
-    ]
+    ];
+
+    if let Some(u) = usage {
+        if let Some(model) = &u.model {
+            tags.push(TagSpec::new(["model", model.as_str()]));
+        }
+        // Own the string renders so the borrows outlive each `TagSpec::new` call.
+        let total = u.total_tokens().map(|n| n.to_string());
+        let input = u.input_tokens.map(|n| n.to_string());
+        let output = u.output_tokens.map(|n| n.to_string());
+        let reasoning = u.reasoning_tokens.map(|n| n.to_string());
+        let cache_read = u.cache_read_tokens.map(|n| n.to_string());
+        let cache_write = u.cache_write_tokens.map(|n| n.to_string());
+        if let Some(v) = &total {
+            tags.push(TagSpec::new(["tokens", v.as_str(), "total"]));
+        }
+        if let Some(v) = &input {
+            tags.push(TagSpec::new(["tokens", v.as_str(), "input"]));
+        }
+        if let Some(v) = &output {
+            tags.push(TagSpec::new(["tokens", v.as_str(), "output"]));
+        }
+        if let Some(v) = &reasoning {
+            tags.push(TagSpec::new(["tokens", v.as_str(), "reasoning"]));
+        }
+        if let Some(v) = &cache_read {
+            tags.push(TagSpec::new(["tokens", v.as_str(), "cache_read"]));
+        }
+        if let Some(v) = &cache_write {
+            tags.push(TagSpec::new(["tokens", v.as_str(), "cache_write"]));
+        }
+        if let Some(cost) = &u.cost {
+            tags.push(TagSpec::new([
+                "cost",
+                cost.amount.as_str(),
+                "usd",
+                cost.basis.as_str(),
+            ]));
+        }
+    }
+
+    tags
 }
 
 /// Best-effort harness id + usage transport (USAGE-MATRIX checkpoint-b) from the configured
@@ -769,7 +831,7 @@ async fn run_agent_job(
     task: &str,
     workdir: &Path,
     identity: &seller_git::DeliveryAgentIdentity,
-) -> Result<(), DaemonError> {
+) -> Result<Option<UsageMetadata>, DaemonError> {
     use std::time::Duration;
 
     use crate::driver::{AcpDriver, AgentCommand, ContentBlock, PromptTurn, SessionConfig};
@@ -810,7 +872,7 @@ async fn run_agent_job(
     .await
     .map_err(|error| DaemonError::Agent(error.to_string()))?;
     match outcome.terminal {
-        crate::event::JobExecutionStatus::Completed => Ok(()),
+        crate::event::JobExecutionStatus::Completed => Ok(outcome.usage),
         other => Err(DaemonError::Agent(format!("agent terminal {other:?}"))),
     }
 }
@@ -821,7 +883,7 @@ async fn run_agent_job(
     _task: &str,
     _workdir: &Path,
     _identity: &seller_git::DeliveryAgentIdentity,
-) -> Result<(), DaemonError> {
+) -> Result<Option<UsageMetadata>, DaemonError> {
     Err(DaemonError::AcpRequired)
 }
 
@@ -1136,24 +1198,84 @@ mod tests {
         };
 
         // claude ⇒ side-channel; codex ⇒ acp-native; unknown ⇒ basename + side-channel.
-        let claude = seller_exec_metadata(&["claude".into(), "--print".into()], 1234);
+        // `None` usage: the pre-capture block — token/model/cost stay absent.
+        let claude = seller_exec_metadata(&["claude".into(), "--print".into()], 1234, None);
         assert_eq!(value(&claude, "harness").as_deref(), Some("claude-agent-acp"));
         assert_eq!(value(&claude, "usage_transport").as_deref(), Some("side-channel"));
         // Anchor rule: metadata_trust present whenever any field is present.
         assert_eq!(value(&claude, "metadata_trust").as_deref(), Some("seller-claimed"));
         assert_eq!(value(&claude, "wall_time").as_deref(), Some("1234"));
-        // Absent-stays-absent: no zero-filled token/model/cost fields (not yet sourced).
+        // Absent-stays-absent: no zero-filled token/model/cost fields (not sourced this run).
         assert!(value(&claude, "tokens").is_none());
         assert!(value(&claude, "model").is_none());
         assert!(value(&claude, "cost").is_none());
 
-        let codex = seller_exec_metadata(&["/nix/store/x/bin/codex-acp".into()], 5);
+        let codex = seller_exec_metadata(&["/nix/store/x/bin/codex-acp".into()], 5, None);
         assert_eq!(value(&codex, "harness").as_deref(), Some("codex-acp-ng"));
         assert_eq!(value(&codex, "usage_transport").as_deref(), Some("acp-native"));
 
-        let unknown = seller_exec_metadata(&["/opt/tools/mytool".into()], 5);
+        let unknown = seller_exec_metadata(&["/opt/tools/mytool".into()], 5, None);
         assert_eq!(value(&unknown, "harness").as_deref(), Some("mytool"));
         assert_eq!(value(&unknown, "usage_transport").as_deref(), Some("side-channel"));
+    }
+
+    #[test]
+    fn seller_exec_metadata_emits_captured_usage_into_result_tags() {
+        use crate::driver::{UsageCost, UsageMetadata, UsageTransport};
+
+        // A tag qualified by cell index 1 (value) + cell 2 (qualifier), e.g. ["tokens","140","total"].
+        let qualified = |tags: &[TagSpec], name: &str, qualifier: &str| -> Option<String> {
+            tags.iter()
+                .find(|tag| tag.first() == Some(name) && tag.0.get(2).map(String::as_str) == Some(qualifier))
+                .and_then(|tag| tag.value().map(str::to_owned))
+        };
+        let value = |tags: &[TagSpec], name: &str| -> Option<String> {
+            tags.iter()
+                .find(|tag| tag.first() == Some(name))
+                .and_then(|tag| tag.value().map(str::to_owned))
+        };
+
+        let usage = UsageMetadata {
+            model: Some("claude-opus-4-8".into()),
+            input_tokens: Some(100),
+            output_tokens: Some(40),
+            reasoning_tokens: None,
+            cache_read_tokens: Some(4096),
+            cache_write_tokens: Some(512),
+            cost: Some(UsageCost {
+                amount: "0.0123".into(),
+                basis: "harness-reported-usd".into(),
+            }),
+            transport: Some(UsageTransport::AcpNative),
+        };
+        // claude command would statically declare side-channel; a REAL acp-native capture wins.
+        let tags = seller_exec_metadata(&["claude".into()], 4321, Some(&usage));
+
+        assert_eq!(value(&tags, "usage_transport").as_deref(), Some("acp-native"));
+        assert_eq!(value(&tags, "model").as_deref(), Some("claude-opus-4-8"));
+        // total = input + output (reasoning absent = unknown, not zero); cache NOT folded in.
+        assert_eq!(qualified(&tags, "tokens", "total").as_deref(), Some("140"));
+        assert_eq!(qualified(&tags, "tokens", "input").as_deref(), Some("100"));
+        assert_eq!(qualified(&tags, "tokens", "output").as_deref(), Some("40"));
+        assert_eq!(qualified(&tags, "tokens", "reasoning"), None);
+        assert_eq!(qualified(&tags, "tokens", "cache_read").as_deref(), Some("4096"));
+        assert_eq!(qualified(&tags, "tokens", "cache_write").as_deref(), Some("512"));
+        // cost tag: ["cost","<amount>","usd","<basis>"].
+        let cost = tags
+            .iter()
+            .find(|t| t.first() == Some("cost"))
+            .expect("cost tag");
+        assert_eq!(cost.0, vec!["cost", "0.0123", "usd", "harness-reported-usd"]);
+
+        // Partial capture (output only) → NO total tag (a partial never masquerades as complete).
+        let partial = UsageMetadata {
+            output_tokens: Some(40),
+            transport: Some(UsageTransport::AcpNative),
+            ..UsageMetadata::default()
+        };
+        let partial_tags = seller_exec_metadata(&["claude".into()], 1, Some(&partial));
+        assert_eq!(qualified(&partial_tags, "tokens", "total"), None);
+        assert_eq!(qualified(&partial_tags, "tokens", "output").as_deref(), Some("40"));
     }
 
     fn sample_offer(amount: u64, seller: &str) -> ParsedOffer {

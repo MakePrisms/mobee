@@ -289,4 +289,107 @@ assert.equal(v12.tail().length, 2, "profiles stay out of live tail");
 assert.equal(v12.funnel().profiles, 1);
 assert.equal(v12.tail()[1].profile?.name, "ok-name");
 
+// ——— piece-9 Item-2: usage adjunct reads from result TAGS (SPEC WINS) ———
+
+// (1) OLD / untagged 6109 result (content is a non-JSON delivery string) → every usage field
+// dashes. Absent-stays-absent applies to legacy rows too: NO fabricated zeros/backfill.
+const untaggedResult = ok({
+  id: "e1".padEnd(64, "0"),
+  pubkey: "f1".padEnd(64, "0"),
+  kind: 6109,
+  created_at: 500,
+  tags: [
+    ["e", offerId, "", "root"],
+    ["amount", "21", "sat"],
+    ["t", "mobee"],
+    ["v", "1"],
+  ],
+  content: "delivery commit abcdef0123",
+});
+{
+  const u = untaggedResult.result.usage;
+  assert.equal(u.total_tokens, null);
+  assert.equal(u.input_tokens, null);
+  assert.equal(u.output_tokens, null);
+  assert.equal(u.reasoning_tokens, null);
+  assert.equal(u.model, null);
+  assert.equal(u.cost_usd, null);
+  assert.equal(u.cost_basis, null);
+  assert.equal(u.usage_transport, null);
+  assert.equal(u.harness_family, null);
+  // the amount tag is still read (it is not usage-adjunct data)
+  assert.equal(u.paid_price_sats, 21);
+}
+
+// (2) NEW tagged 6109 result → fills per the PIECE-9 schema; harness mapped to the spec enum.
+const taggedResult = ok({
+  id: "e2".padEnd(64, "0"),
+  pubkey: "f2".padEnd(64, "0"),
+  kind: 6109,
+  created_at: 510,
+  tags: [
+    ["e", offerId, "", "root"],
+    ["amount", "21", "sat"],
+    ["harness", "claude-agent-acp"],
+    ["usage_transport", "acp-native"],
+    ["metadata_trust", "seller-claimed"],
+    ["model", "claude-opus-4-8"],
+    ["tokens", "140", "total"],
+    ["tokens", "100", "input"],
+    ["tokens", "40", "output"],
+    ["tokens", "4096", "cache_read"],
+    ["cost", "0.0123", "usd", "harness-reported-usd"],
+    ["wall_time", "4321", "ms"],
+    ["t", "mobee"],
+    ["v", "1"],
+  ],
+  content: "delivery commit abcdef0123",
+});
+{
+  const u = taggedResult.result.usage;
+  assert.equal(u.total_tokens, 140);
+  assert.equal(u.input_tokens, 100);
+  assert.equal(u.output_tokens, 40);
+  assert.equal(u.cache_read_tokens, 4096);
+  assert.equal(u.reasoning_tokens, null); // absent = unknown, NOT zero
+  assert.equal(u.model, "claude-opus-4-8");
+  assert.equal(u.cost_usd, 0.0123);
+  assert.equal(u.cost_basis, "harness-reported-usd");
+  assert.equal(u.usage_transport, "acp-native");
+  assert.equal(u.harness_family, "claude"); // claude-agent-acp → claude
+  assert.equal(u.paid_price_sats, 21);
+  // cache siblings must NOT be folded into total by the reader
+  assert.notEqual(u.total_tokens, 100 + 40 + 4096);
+}
+
+// harness_family mapping across the spec enum; unknown → "other"; absent → null.
+assert.equal(
+  extractUsageAdjunct(null, [["harness", "cursor-agent"]]).harness_family,
+  "cursor",
+);
+assert.equal(
+  extractUsageAdjunct(null, [["harness", "codex-acp-ng"]]).harness_family,
+  "codex",
+);
+assert.equal(
+  extractUsageAdjunct(null, [["harness", "some-tool"]]).harness_family,
+  "other",
+);
+assert.equal(extractUsageAdjunct(null, []).harness_family, null);
+
+// Dashboard END-TO-END: a tagged result fills its economics row; an untagged one dashes.
+const eco2 = createStore();
+eco2.ingest(taggedResult);
+eco2.ingest(untaggedResult);
+const e2rows = eco2.economics().rows;
+const tRow = e2rows.find((r) => r.id === taggedResult.id);
+const uRow = e2rows.find((r) => r.id === untaggedResult.id);
+assert.ok(tRow, "tagged 6109 result fills an economics row");
+assert.equal(tRow.total_tokens, 140);
+assert.equal(tRow.harness_family, "claude");
+assert.equal(tRow.usage_transport, "acp-native");
+assert.ok(uRow, "untagged 6109 result still rows out");
+assert.equal(uRow.total_tokens, null, "untagged usage stays dashed — never fabricated");
+assert.equal(uRow.harness_family, null);
+
 console.log("ok — parse/store suite passed");
