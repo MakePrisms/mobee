@@ -318,7 +318,7 @@ fn tools() -> Value {
         },
         {
             "name": "wallet_mint",
-            "description": "Flexible/repeatable mint-fund via bolt11 (mint quote → pay → mint) for ANY amount. Unlike setup_wallet, this has no already_funded hard-block. Optional mint must already be configured. Never echoes secrets.",
+            "description": "Flexible/repeatable mint-fund via bolt11 for ANY amount. Returns bolt11 before wait; testnut FakeWallet auto-pays (status=funded). Other configured mints return status=needs_payment + invoice (caller pays, then complete). No already_funded hard-block. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -369,7 +369,7 @@ fn tools() -> Value {
         },
         {
             "name": "wallet_invoice",
-            "description": "Create a bolt11 invoice and mint once paid (testnut auto-pays). Flexible amount. Never echoes secrets.",
+            "description": "Create a bolt11 mint quote (invoice returned before wait). Testnut auto-pays → status=funded; extras → status=needs_payment + invoice. Flexible amount. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -565,23 +565,36 @@ async fn wallet_balance_tool_async(state: &McpState) -> Result<Value, String> {
 
 #[cfg(feature = "wallet")]
 async fn wallet_mint_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
-    use mobee_core::wallet_ops;
+    use mobee_core::wallet_ops::{self, MintFlow};
     let amount = arguments
         .get("amount_sats")
         .and_then(Value::as_u64)
         .ok_or_else(|| "wallet_mint requires amount_sats".to_owned())?;
     let mint = arguments.get("mint").and_then(Value::as_str);
     let home = home::bootstrap(&state.home.root).map_err(|error| error.to_string())?;
-    let outcome = wallet_ops::mint_async(&home, amount, mint)
+    let flow = wallet_ops::mint_async(&home, amount, mint)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(tool_ok(json!({
-        "mint_url": outcome.mint_url,
-        "funded_sats": outcome.funded_sats,
-        "balance_sats": outcome.balance_sats,
-        // invoice present for debugging payment path; not a secret key
-        "invoice_present": !outcome.invoice.is_empty(),
-    })))
+    match flow {
+        MintFlow::Funded(outcome) => Ok(tool_ok(json!({
+            "status": "funded",
+            "mint_url": outcome.mint_url,
+            "funded_sats": outcome.funded_sats,
+            "balance_sats": outcome.balance_sats,
+            "quote_id": outcome.quote_id,
+            "invoice": outcome.invoice,
+            "invoice_present": true,
+        }))),
+        MintFlow::NeedsPayment(quote) => Ok(tool_ok(json!({
+            "status": "needs_payment",
+            "mint_url": quote.mint_url,
+            "amount_sats": quote.amount_sats,
+            "quote_id": quote.quote_id,
+            // bolt11 before poll — caller pays, then complete_mint
+            "invoice": quote.invoice,
+            "invoice_present": true,
+        }))),
+    }
 }
 
 #[cfg(feature = "wallet")]
@@ -645,23 +658,34 @@ async fn wallet_melt_tool_async(state: &McpState, arguments: &Value) -> Result<V
 
 #[cfg(feature = "wallet")]
 async fn wallet_invoice_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
-    use mobee_core::wallet_ops;
+    use mobee_core::wallet_ops::{self, MintFlow};
     let amount = arguments
         .get("amount_sats")
         .and_then(Value::as_u64)
         .ok_or_else(|| "wallet_invoice requires amount_sats".to_owned())?;
     let mint = arguments.get("mint").and_then(Value::as_str);
     let home = home::bootstrap(&state.home.root).map_err(|error| error.to_string())?;
-    let outcome = wallet_ops::invoice_async(&home, amount, mint)
+    let flow = wallet_ops::invoice_async(&home, amount, mint)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(tool_ok(json!({
-        "mint_url": outcome.mint_url,
-        "amount_sats": outcome.amount_sats,
-        "funded_sats": outcome.funded_sats,
-        "balance_sats": outcome.balance_sats,
-        "invoice": outcome.invoice,
-    })))
+    match flow {
+        MintFlow::Funded(outcome) => Ok(tool_ok(json!({
+            "status": "funded",
+            "mint_url": outcome.mint_url,
+            "amount_sats": amount,
+            "funded_sats": outcome.funded_sats,
+            "balance_sats": outcome.balance_sats,
+            "quote_id": outcome.quote_id,
+            "invoice": outcome.invoice,
+        }))),
+        MintFlow::NeedsPayment(quote) => Ok(tool_ok(json!({
+            "status": "needs_payment",
+            "mint_url": quote.mint_url,
+            "amount_sats": quote.amount_sats,
+            "quote_id": quote.quote_id,
+            "invoice": quote.invoice,
+        }))),
+    }
 }
 
 #[cfg(feature = "wallet")]

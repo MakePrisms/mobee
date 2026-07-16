@@ -167,14 +167,25 @@ fn cmd_balance(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
             return RUNTIME_ERROR;
         }
     };
+    let filter = match opts.mint.as_deref() {
+        Some(raw) => match wallet_ops::normalize_mint_url(raw) {
+            Ok(url) => Some(url),
+            Err(error) => {
+                let _ = writeln!(err, "{error}");
+                return RUNTIME_ERROR;
+            }
+        },
+        None => None,
+    };
     let mut total = 0u64;
+    let mut matched = 0u64;
     for row in &rows {
-        if let Some(filter) = opts.mint.as_deref() {
-            if row.mint_url != filter.trim().trim_end_matches('/') {
-                // also accept normalized compare via configured list only
+        if let Some(filter) = filter.as_deref() {
+            if row.mint_url != filter {
                 continue;
             }
         }
+        matched = matched.saturating_add(1);
         total = total.saturating_add(row.balance_sats);
         let marker = if row.is_default { "default" } else { "extra" };
         let _ = writeln!(
@@ -182,6 +193,14 @@ fn cmd_balance(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
             "mint={} role={} balance_sats={}",
             row.mint_url, marker, row.balance_sats
         );
+    }
+    if filter.is_some() && matched == 0 {
+        let _ = writeln!(
+            err,
+            "no balance row for mint={} (configured mints only; check `mobee wallet mints list`)",
+            filter.as_deref().unwrap_or("")
+        );
+        return RUNTIME_ERROR;
     }
     let _ = writeln!(out, "total_sats={total}");
     SUCCESS
@@ -215,12 +234,22 @@ fn cmd_mint(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         Err(code) => return code,
     };
     match wallet_ops::mint_blocking(&home, amount, opts.mint.as_deref()) {
-        Ok(outcome) => {
+        Ok(wallet_ops::MintFlow::Funded(outcome)) => {
             let _ = writeln!(
                 out,
-                "minted_sats={} balance_sats={} mint={}",
-                outcome.funded_sats, outcome.balance_sats, outcome.mint_url
+                "minted_sats={} balance_sats={} mint={} quote_id={}",
+                outcome.funded_sats, outcome.balance_sats, outcome.mint_url, outcome.quote_id
             );
+            SUCCESS
+        }
+        Ok(wallet_ops::MintFlow::NeedsPayment(quote)) => {
+            // Bolt11 before any poll — payer must fund, then complete_mint.
+            let _ = writeln!(
+                err,
+                "status=needs_payment amount_sats={} mint={} quote_id={} (testnut auto-pays; extras require external pay + complete)",
+                quote.amount_sats, quote.mint_url, quote.quote_id
+            );
+            let _ = writeln!(out, "{}", quote.invoice);
             SUCCESS
         }
         Err(error) => {
@@ -377,13 +406,22 @@ fn cmd_invoice(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
         Err(code) => return code,
     };
     match wallet_ops::invoice_blocking(&home, amount, opts.mint.as_deref()) {
-        Ok(outcome) => {
+        Ok(wallet_ops::MintFlow::Funded(outcome)) => {
             let _ = writeln!(
                 err,
-                "funded_sats={} balance_sats={} mint={}",
-                outcome.funded_sats, outcome.balance_sats, outcome.mint_url
+                "status=funded funded_sats={} balance_sats={} mint={} quote_id={}",
+                outcome.funded_sats, outcome.balance_sats, outcome.mint_url, outcome.quote_id
             );
             let _ = writeln!(out, "{}", outcome.invoice);
+            SUCCESS
+        }
+        Ok(wallet_ops::MintFlow::NeedsPayment(quote)) => {
+            let _ = writeln!(
+                err,
+                "status=needs_payment amount_sats={} mint={} quote_id={}",
+                quote.amount_sats, quote.mint_url, quote.quote_id
+            );
+            let _ = writeln!(out, "{}", quote.invoice);
             SUCCESS
         }
         Err(error) => {

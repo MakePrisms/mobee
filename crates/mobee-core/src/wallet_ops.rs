@@ -3,6 +3,10 @@
 //! Additive surface over the packaged CDK wallet at `home/.mobee/wallet`.
 //! Does **not** replace the toy [`crate::buyer_fund::fund_testnut_wallet`] path
 //! (`setup_wallet` keeps hardcoded 21 + `already_funded`).
+//!
+//! **Funding assumption:** only the pinned testnut host ([`DEFAULT_MINT_URL`])
+//! FakeWallet-auto-pays mint quotes. For other configured mints, [`begin_mint_async`]
+//! returns the bolt11 and callers must pay it, then [`complete_mint_async`].
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -63,8 +67,26 @@ pub struct MintBalance {
 pub struct MintOutcome {
     pub mint_url: String,
     pub invoice: String,
+    pub quote_id: String,
     pub funded_sats: u64,
     pub balance_sats: u64,
+}
+
+/// Bolt11 mint quote ready for payment (invoice is available before any wait).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintQuote {
+    pub mint_url: String,
+    pub invoice: String,
+    pub quote_id: String,
+    pub amount_sats: u64,
+}
+
+/// Result of a mint attempt: auto-paid fund, or invoice awaiting external pay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MintFlow {
+    Funded(MintOutcome),
+    /// Non-autopay mint: bolt11 surfaced; pay then [`complete_mint_async`].
+    NeedsPayment(MintQuote),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,20 +112,12 @@ pub struct MeltOutcome {
     pub balance_sats: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvoiceOutcome {
-    pub mint_url: String,
-    pub invoice: String,
-    pub amount_sats: u64,
-    pub funded_sats: u64,
-    pub balance_sats: u64,
-}
-
 fn sqlite_path(wallet_dir: &Path) -> std::path::PathBuf {
     wallet_dir.join("cdk-wallet.sqlite")
 }
 
-fn normalize_mint_url(raw: &str) -> Result<String, WalletOpsError> {
+/// Normalize a mint URL (trim, strip trailing `/`, parse as [`MintUrl`]).
+pub fn normalize_mint_url(raw: &str) -> Result<String, WalletOpsError> {
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Err(WalletOpsError::Wallet("mint URL is empty".into()));
@@ -111,6 +125,13 @@ fn normalize_mint_url(raw: &str) -> Result<String, WalletOpsError> {
     let parsed = MintUrl::from_str(trimmed)
         .map_err(|error| WalletOpsError::Wallet(format!("invalid mint URL: {error}")))?;
     Ok(parsed.to_string())
+}
+
+fn is_autopay_mint(mint_url: &str) -> bool {
+    normalize_mint_url(mint_url)
+        .ok()
+        .as_deref()
+        == Some(DEFAULT_MINT_URL)
 }
 
 /// Configured mints: default `mint_url` first, then opt-in `extra_mints` (deduped).
@@ -168,7 +189,11 @@ pub async fn open_wallet_async(
     .map_err(|error| WalletOpsError::Wallet(error.to_string()))
 }
 
-async fn poll_and_mint(wallet: &Wallet, quote_id: &str) -> Result<u64, WalletOpsError> {
+async fn poll_and_mint(
+    wallet: &Wallet,
+    quote_id: &str,
+    expected_sats: u64,
+) -> Result<u64, WalletOpsError> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {
         let status = wallet
@@ -200,6 +225,12 @@ async fn poll_and_mint(wallet: &Wallet, quote_id: &str) -> Result<u64, WalletOps
             "mint completed but funded amount is 0 (refusing phantom credit)".into(),
         ));
     }
+    // Exact mint proofs == requested (no invented fee delta / under-over fund).
+    if funded != expected_sats {
+        return Err(WalletOpsError::Wallet(format!(
+            "mint funded amount {funded} != requested {expected_sats} (refusing under/over fund)"
+        )));
+    }
     Ok(funded)
 }
 
@@ -223,12 +254,12 @@ pub async fn balances_async(home: &MobeeHome) -> Result<Vec<MintBalance>, Wallet
     Ok(rows)
 }
 
-/// Flexible/repeatable mint-fund (no `already_funded` hard-block).
-pub async fn mint_async(
+/// Create a mint quote and return the bolt11 **before** any poll/wait.
+pub async fn begin_mint_async(
     home: &MobeeHome,
     amount_sats: u64,
     mint_override: Option<&str>,
-) -> Result<MintOutcome, WalletOpsError> {
+) -> Result<MintQuote, WalletOpsError> {
     if amount_sats == 0 {
         return Err(WalletOpsError::Wallet("amount must be > 0".into()));
     }
@@ -240,8 +271,27 @@ pub async fn mint_async(
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     let invoice = quote.request.clone();
-    let quote_id = quote.id.clone();
-    let funded = poll_and_mint(&wallet, &quote_id).await?;
+    if invoice.is_empty() {
+        return Err(WalletOpsError::Wallet(
+            "mint quote returned empty bolt11 (refusing silent fund path)".into(),
+        ));
+    }
+    Ok(MintQuote {
+        mint_url,
+        invoice,
+        quote_id: quote.id,
+        amount_sats,
+    })
+}
+
+/// Poll + mint a previously created quote. Refuses when proof total ≠ requested.
+pub async fn complete_mint_async(
+    home: &MobeeHome,
+    quote: &MintQuote,
+) -> Result<MintOutcome, WalletOpsError> {
+    let mint_url = mint_is_allowed(home, &quote.mint_url)?;
+    let wallet = open_wallet_async(home, &mint_url).await?;
+    let funded = poll_and_mint(&wallet, &quote.quote_id, quote.amount_sats).await?;
     let balance = wallet
         .total_balance()
         .await
@@ -249,26 +299,39 @@ pub async fn mint_async(
         .to_u64();
     Ok(MintOutcome {
         mint_url,
-        invoice,
+        invoice: quote.invoice.clone(),
+        quote_id: quote.quote_id.clone(),
         funded_sats: funded,
         balance_sats: balance,
     })
 }
 
-/// Create a bolt11 invoice and mint once paid (testnut FakeWallet auto-pays).
+/// Flexible/repeatable mint-fund (no `already_funded` hard-block).
+///
+/// Testnut ([`DEFAULT_MINT_URL`]) FakeWallet-auto-pays: begin → complete.
+/// Other configured mints return [`MintFlow::NeedsPayment`] with bolt11 already
+/// surfaced (caller pays, then [`complete_mint_async`]).
+pub async fn mint_async(
+    home: &MobeeHome,
+    amount_sats: u64,
+    mint_override: Option<&str>,
+) -> Result<MintFlow, WalletOpsError> {
+    let quote = begin_mint_async(home, amount_sats, mint_override).await?;
+    if is_autopay_mint(&quote.mint_url) {
+        Ok(MintFlow::Funded(complete_mint_async(home, &quote).await?))
+    } else {
+        Ok(MintFlow::NeedsPayment(quote))
+    }
+}
+
+/// Create a bolt11 invoice; on testnut, mint once FakeWallet auto-pays.
+/// Non-autopay mints return [`MintFlow::NeedsPayment`] (invoice before any wait).
 pub async fn invoice_async(
     home: &MobeeHome,
     amount_sats: u64,
     mint_override: Option<&str>,
-) -> Result<InvoiceOutcome, WalletOpsError> {
-    let minted = mint_async(home, amount_sats, mint_override).await?;
-    Ok(InvoiceOutcome {
-        mint_url: minted.mint_url,
-        invoice: minted.invoice,
-        amount_sats,
-        funded_sats: minted.funded_sats,
-        balance_sats: minted.balance_sats,
-    })
+) -> Result<MintFlow, WalletOpsError> {
+    mint_async(home, amount_sats, mint_override).await
 }
 
 /// Create/print an unlocked cashu token (ecash out).
@@ -368,6 +431,7 @@ pub async fn receive_async(
 }
 
 /// Pay a lightning invoice from ecash (fail-closed on insufficient / unpaid).
+/// Post-confirm: refuses if balance did not drop (same movement guard as send).
 pub async fn melt_async(
     home: &MobeeHome,
     bolt11: &str,
@@ -384,14 +448,14 @@ pub async fn melt_async(
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     let need = quote.amount.to_u64().saturating_add(quote.fee_reserve.to_u64());
-    let balance = wallet
+    let before = wallet
         .total_balance()
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?
         .to_u64();
-    if balance < need {
+    if before < need {
         return Err(WalletOpsError::Wallet(format!(
-            "insufficient funds for melt: balance={balance} need={need} (amount+fee_reserve)"
+            "insufficient funds for melt: balance={before} need={need} (amount+fee_reserve)"
         )));
     }
     let prepared = wallet
@@ -409,6 +473,11 @@ pub async fn melt_async(
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?
         .to_u64();
+    if balance_sats >= before {
+        return Err(WalletOpsError::Wallet(format!(
+            "melt did not drop balance: before={before} after={balance_sats} (refusing unproven melt)"
+        )));
+    }
     Ok(MeltOutcome {
         mint_url,
         paid_sats,
@@ -487,13 +556,26 @@ pub fn mint_blocking(
     home: &MobeeHome,
     amount_sats: u64,
     mint_override: Option<&str>,
-) -> Result<MintOutcome, WalletOpsError> {
+) -> Result<MintFlow, WalletOpsError> {
     crate::runtime_guard::refuse_nested_block_on("mint_blocking").map_err(WalletOpsError::Wallet)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     runtime.block_on(mint_async(home, amount_sats, mint_override))
+}
+
+pub fn complete_mint_blocking(
+    home: &MobeeHome,
+    quote: &MintQuote,
+) -> Result<MintOutcome, WalletOpsError> {
+    crate::runtime_guard::refuse_nested_block_on("complete_mint_blocking")
+        .map_err(WalletOpsError::Wallet)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    runtime.block_on(complete_mint_async(home, quote))
 }
 
 pub fn send_blocking(
@@ -539,7 +621,7 @@ pub fn invoice_blocking(
     home: &MobeeHome,
     amount_sats: u64,
     mint_override: Option<&str>,
-) -> Result<InvoiceOutcome, WalletOpsError> {
+) -> Result<MintFlow, WalletOpsError> {
     crate::runtime_guard::refuse_nested_block_on("invoice_blocking")
         .map_err(WalletOpsError::Wallet)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -605,5 +687,14 @@ mod tests {
         let err = mint_blocking(&home, 1, Some("https://evil.example")).expect_err("deny");
         assert!(matches!(err, WalletOpsError::MintNotAllowed { .. }));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn normalize_mint_url_trims_and_strips_trailing_slash() {
+        let normalized =
+            normalize_mint_url(" https://testnut.cashudevkit.org/ ").expect("normalize");
+        assert_eq!(normalized, DEFAULT_MINT_URL);
+        let err = normalize_mint_url("   ").expect_err("empty");
+        assert!(matches!(err, WalletOpsError::Wallet(_)));
     }
 }
