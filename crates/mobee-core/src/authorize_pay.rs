@@ -203,6 +203,11 @@ pub async fn authorize_pay_async(
     };
 
     let wallet = buyer_fund::open_testnut_wallet_async(home).await?;
+    // Dust guard (live keyset N=1 floor, fail-closed). lock_or_reconcile re-checks
+    // against CDK input-count send_fee after prepare_send.
+    crate::payment_wallet::require_fee_safe_amount(&wallet, terms.amount)
+        .await
+        .map_err(AuthorizePayError::Wallet)?;
     let payment_send = NostrPaymentSend::new(home.config.relay_url.clone(), keys);
     let mut effects = CdkPaymentEffects::spawn(
         wallet,
@@ -375,14 +380,15 @@ mod tests {
         // Fund path not needed: budget check runs first, then run() refuses ext before fetch.
         // Pre-seed spent path via from_home; caps from config.
         let mut gate = BudgetGate::from_home(&home).expect("gate");
-        // Tiny amount within default caps.
+        // Fee-safe tiny amount (testnut fee=1 → need ≥2) within default caps.
+        // Dust guard runs before delivery verify; amount=1 would false-pass this test.
         let request = AuthorizePayRequest {
             job_id: "job-ext".into(),
             result_id: "result-ext".into(),
             delivery_integrity_hash: "aa".repeat(20),
             job_hash: "bb".repeat(32),
             seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
-            amount_sats: 1,
+            amount_sats: 2,
             repo: "ext::sh -c evil".into(),
             branch: "main".into(),
             commit_oid: "aa".repeat(20),
@@ -394,7 +400,7 @@ mod tests {
             "unexpected error: {message}"
         );
         // Write-before-effect: spent was committed before run() refused.
-        assert_eq!(gate.spent(), 1);
+        assert_eq!(gate.spent(), 2);
 
         // Reconciled retry of the same PaymentKey attempt_id must not re-count spent.
         let err2 = authorize_pay(&home, &mut gate, request).expect_err("retry still refuses");
@@ -405,9 +411,9 @@ mod tests {
                 || message2.contains("transport"),
             "unexpected retry error: {message2}"
         );
-        assert_eq!(gate.spent(), 1, "retry must not double-count spent");
+        assert_eq!(gate.spent(), 2, "retry must not double-count spent");
         let reloaded = BudgetGate::from_home(&home).expect("reload");
-        assert_eq!(reloaded.spent(), 1);
+        assert_eq!(reloaded.spent(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

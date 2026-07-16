@@ -8,11 +8,12 @@ use std::thread;
 
 use cashu::{
     Amount, CurrencyUnit, MintUrl, PublicKey as CashuPublicKey, SecretKey, SpendingConditions,
-    Token,
+    State, Token,
 };
 use cdk::wallet::{
     HttpClient, KeysetFilter, MintConnector, ReceiveOptions, SendOptions, Wallet,
 };
+use cdk::wallet::types::{SendSagaState, TransactionDirection, WalletSagaState};
 use nostr_sdk::PublicKey as NostrPublicKey;
 
 use crate::gateway::ParsedOffer;
@@ -24,6 +25,15 @@ use crate::payment_send::{PaymentPayload, PaymentSend, PaymentSent};
 use crate::wallet::{TradeLock, VerifiedPayment, verify_trade_p2pk_with_connector};
 
 const ATTEMPT_METADATA: &str = "mobee_attempt_id";
+
+/// Outcome of retiring incomplete send sagas that are safe to clean up.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RetireReport {
+    /// `Send(ProofsReserved)` sagas cancelled after mint Unspent proof.
+    pub retired: usize,
+    /// Mapped `Send(TokenCreated)` pending claims left alone (not a wedge).
+    pub mapped_token_created: usize,
+}
 
 #[derive(Debug)]
 /// Failure in a wallet-backed payment operation.
@@ -145,8 +155,12 @@ impl<'a> CdkBuyerMint<'a> {
         require_wallet_matches(self.wallet, terms)?;
         self.recover_unmapped_sagas().await?;
         if let Some(token) = self.reconcile(attempt_id, terms).await? {
+            require_realized_locked_token(&token, terms)?;
             return Ok(LockedPayment::new(token));
         }
+        // N=1 floor from live keyset (fail-closed). Input-count re-check happens
+        // after prepare_send against CDK's send_fee / get_proofs_fee.
+        require_fee_safe_amount(self.wallet, terms.amount).await?;
         let mut options = SendOptions {
             conditions: Some(SpendingConditions::new_p2pk(terms.seller_p2pk_lock, None)),
             ..SendOptions::default()
@@ -159,8 +173,70 @@ impl<'a> CdkBuyerMint<'a> {
             .prepare_send(terms.amount, options)
             .await
             .map_err(wallet_error)?;
-        let token = prepared.confirm(None).await.map_err(wallet_error)?;
+        // Redeem fee = CDK input-count fee on the proofs the seller will present.
+        // prepared.send_fee() is that same fee API the send path uses.
+        let send_fee = prepared.send_fee();
+        if terms.amount <= send_fee {
+            prepared.cancel().await.map_err(wallet_error)?;
+            return Err(PaymentWalletError::Policy(format!(
+                "dust vs mint input fee after prepare: amount={} fee={send_fee}; need amount >= fee+1",
+                terms.amount
+            )));
+        }
+        let token = match prepared.confirm(None).await {
+            Ok(token) => token,
+            Err(error) => {
+                // Definitive confirm failure should leave no residual ProofsReserved
+                // (CDK compensates). Any leftover is handled on the next recover.
+                return Err(wallet_error(error));
+            }
+        };
+        if let Err(error) = require_realized_locked_token(&token, terms) {
+            // Confirm already minted TokenCreated — revoke that branch (not
+            // ProofsReserved retire). Pure cleanup; no receipt / Closed.
+            if let Err(revoke_error) = self.revoke_attempt_token_created(attempt_id).await {
+                return Err(PaymentWalletError::Reconcile(format!(
+                    "{error}; revoke after zero/mismatch realized token also failed: {revoke_error}"
+                )));
+            }
+            return Err(error);
+        }
         Ok(LockedPayment::new(token))
+    }
+
+    async fn revoke_attempt_token_created(
+        &self,
+        attempt_id: &AttemptId,
+    ) -> Result<(), PaymentWalletError> {
+        let matches = self
+            .wallet
+            .list_transactions(Some(TransactionDirection::Outgoing))
+            .await
+            .map_err(wallet_error)?
+            .into_iter()
+            .filter(|transaction| {
+                transaction
+                    .metadata
+                    .get(ATTEMPT_METADATA)
+                    .map(String::as_str)
+                    == Some(attempt_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        let Some(transaction) = matches.first() else {
+            return Err(PaymentWalletError::Reconcile(
+                "zero/mismatch realized token has no outgoing transaction to revoke".into(),
+            ));
+        };
+        let Some(saga_id) = transaction.saga_id else {
+            return Err(PaymentWalletError::Reconcile(
+                "zero/mismatch realized token transaction has no saga id".into(),
+            ));
+        };
+        self.wallet
+            .revoke_send(saga_id)
+            .await
+            .map_err(wallet_error)?;
+        Ok(())
     }
 
     async fn reconcile(
@@ -168,8 +244,6 @@ impl<'a> CdkBuyerMint<'a> {
         attempt_id: &AttemptId,
         terms: &PaymentTerms,
     ) -> Result<Option<Token>, PaymentWalletError> {
-        use cdk::wallet::types::TransactionDirection;
-
         let matches = self
             .wallet
             .list_transactions(Some(TransactionDirection::Outgoing))
@@ -223,29 +297,281 @@ impl<'a> CdkBuyerMint<'a> {
             transaction.memo.clone(),
             transaction.unit.clone(),
         );
-        if token.value().map_err(wallet_error)? != terms.amount {
-            return Err(PaymentWalletError::Reconcile(
-                "persisted payment proofs do not match the confirmed amount".into(),
-            ));
-        }
+        require_realized_locked_token(&token, terms).map_err(|error| {
+            PaymentWalletError::Reconcile(format!(
+                "persisted payment proofs fail realized-output gate: {error}"
+            ))
+        })?;
         Ok(Some(token))
     }
 
     async fn recover_unmapped_sagas(&self) -> Result<(), PaymentWalletError> {
-        if self
+        retire_eligible_incomplete_sagas(self.wallet).await?;
+        let incomplete = self
             .wallet
             .localstore
             .get_incomplete_sagas()
             .await
             .map_err(wallet_error)?
-            .is_empty()
-        {
+            .into_iter()
+            .filter(|saga| saga.mint_url == self.wallet.mint_url && saga.unit == self.wallet.unit)
+            .collect::<Vec<_>>();
+        if incomplete.is_empty() {
             return Ok(());
         }
-        Err(PaymentWalletError::Reconcile(
-            "wallet has an incomplete operation with no matching confirmed attempt".into(),
-        ))
+        for saga in &incomplete {
+            match &saga.state {
+                WalletSagaState::Send(SendSagaState::TokenCreated)
+                    if saga_has_confirmed_outgoing_tx(self.wallet, saga).await? =>
+                {
+                    // Mapped pending claim — not a wedge; must not block a new attempt.
+                    continue;
+                }
+                WalletSagaState::Send(SendSagaState::ProofsReserved) => {
+                    return Err(PaymentWalletError::Reconcile(
+                        "wallet has an incomplete ProofsReserved operation that could not be retired safely".into(),
+                    ));
+                }
+                WalletSagaState::Send(SendSagaState::TokenCreated) => {
+                    return Err(PaymentWalletError::Reconcile(
+                        "wallet has an incomplete TokenCreated operation with no matching confirmed attempt".into(),
+                    ));
+                }
+                WalletSagaState::Send(SendSagaState::RollingBack) => {
+                    return Err(PaymentWalletError::Reconcile(
+                        "wallet has an in-flight RollingBack send; refuse rather than retire".into(),
+                    ));
+                }
+                other => {
+                    return Err(PaymentWalletError::Reconcile(format!(
+                        "wallet has an incomplete non-eligible saga ({}); refuse rather than retire",
+                        other.state_str()
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
+}
+
+/// Live active-keyset redeem fee for `proof_count` inputs (`ceil(Σ ppk / 1000)`).
+///
+/// Fail-closed: fee-query errors propagate — never default the fee.
+pub async fn mint_input_fee_for_count(
+    wallet: &Wallet,
+    proof_count: u64,
+) -> Result<Amount, PaymentWalletError> {
+    let keyset = wallet
+        .fetch_active_keyset()
+        .await
+        .map_err(|error| PaymentWalletError::Wallet(format!("fee query failed: {error}")))?;
+    wallet
+        .get_keyset_count_fee(&keyset.id, proof_count)
+        .await
+        .map_err(|error| PaymentWalletError::Wallet(format!("fee query failed: {error}")))
+}
+
+/// Refuse amounts that cannot yield a redeemable locked token after mint input fees.
+///
+/// Uses the N=1 floor from the live keyset (`ceil(ppk/1000)`). Callers that know
+/// the real input set must also gate on CDK `get_proofs_fee` / `send_fee`.
+pub async fn require_fee_safe_amount(
+    wallet: &Wallet,
+    amount: Amount,
+) -> Result<Amount, PaymentWalletError> {
+    let fee = mint_input_fee_for_count(wallet, 1).await?;
+    require_amount_covers_fee(amount, fee)?;
+    Ok(fee)
+}
+
+/// `amount < fee + 1` (equivalently `amount <= fee`) is economic dust.
+pub fn require_amount_covers_fee(
+    amount: Amount,
+    fee: Amount,
+) -> Result<(), PaymentWalletError> {
+    if amount <= fee {
+        return Err(PaymentWalletError::Policy(format!(
+            "dust vs mint fee: amount={amount} fee={fee}; need amount >= fee+1"
+        )));
+    }
+    Ok(())
+}
+
+/// Gate on the **realized** locked token after prepare_send/confirm — never input face.
+fn require_realized_locked_token(
+    token: &Token,
+    terms: &PaymentTerms,
+) -> Result<(), PaymentWalletError> {
+    let mint = token.mint_url().map_err(wallet_error)?;
+    let realized = token.value().map_err(wallet_error)?;
+    if realized == Amount::ZERO {
+        return Err(PaymentWalletError::Policy(
+            "realized locked token value is zero after confirm (no materialized outputs)".into(),
+        ));
+    }
+    if realized != terms.amount || mint != terms.mint || token.unit().as_ref() != Some(&terms.unit)
+    {
+        return Err(PaymentWalletError::Policy(format!(
+            "realized locked token does not match terms: realized={realized} expected={}",
+            terms.amount
+        )));
+    }
+    Ok(())
+}
+
+/// Retire only enumerated-safe incomplete ops: `Send(ProofsReserved)` with no
+/// confirmed attempt, all reserved `y` NUT-07 Unspent, and cancel succeeding.
+///
+/// Pure cleanup — no receipt, no balance credit. Idempotent (second call is a
+/// no-op). Mixed Spent|Pending / check-state fail / cancel fail ⇒ refuse whole
+/// retire (wedged-safer-than-double-spend).
+pub async fn retire_eligible_incomplete_sagas(
+    wallet: &Wallet,
+) -> Result<RetireReport, PaymentWalletError> {
+    let incomplete = wallet
+        .localstore
+        .get_incomplete_sagas()
+        .await
+        .map_err(wallet_error)?
+        .into_iter()
+        .filter(|saga| saga.mint_url == wallet.mint_url && saga.unit == wallet.unit)
+        .collect::<Vec<_>>();
+
+    let mut report = RetireReport::default();
+    if incomplete.is_empty() {
+        return Ok(report);
+    }
+
+    for saga in incomplete {
+        match &saga.state {
+            WalletSagaState::Send(SendSagaState::ProofsReserved) => {
+                if saga_has_confirmed_outgoing_tx(wallet, &saga).await? {
+                    return Err(PaymentWalletError::Reconcile(
+                        "ProofsReserved saga unexpectedly has a confirmed outgoing tx; refuse retire".into(),
+                    ));
+                }
+                retire_one_proofs_reserved(wallet, &saga).await?;
+                report.retired += 1;
+            }
+            WalletSagaState::Send(SendSagaState::TokenCreated)
+                if saga_has_confirmed_outgoing_tx(wallet, &saga).await? =>
+            {
+                report.mapped_token_created += 1;
+            }
+            // TokenCreated without confirmed tx, RollingBack, other kinds: leave
+            // in place for recover_unmapped_sagas to refuse. Do not retire here.
+            _ => {}
+        }
+    }
+    Ok(report)
+}
+
+async fn saga_has_confirmed_outgoing_tx(
+    wallet: &Wallet,
+    saga: &cdk::wallet::types::WalletSaga,
+) -> Result<bool, PaymentWalletError> {
+    let txs = wallet
+        .list_transactions(Some(TransactionDirection::Outgoing))
+        .await
+        .map_err(wallet_error)?;
+    Ok(txs.iter().any(|tx| tx.saga_id == Some(saga.id)))
+}
+
+async fn retire_one_proofs_reserved(
+    wallet: &Wallet,
+    saga: &cdk::wallet::types::WalletSaga,
+) -> Result<(), PaymentWalletError> {
+    let reserved = wallet
+        .localstore
+        .get_reserved_proofs(&saga.id)
+        .await
+        .map_err(wallet_error)?;
+
+    if !reserved.is_empty() {
+        let proofs = reserved
+            .iter()
+            .map(|info| info.proof.clone())
+            .collect::<Vec<_>>();
+        // NUT-07 via mint — do not use local-only state. Any Spent|Pending ⇒
+        // refuse whole retire (all-or-nothing).
+        let states = wallet.check_proofs_spent(proofs).await.map_err(|error| {
+            PaymentWalletError::Reconcile(format!(
+                "check-state failed (fail-closed, no retire): {error}"
+            ))
+        })?;
+        if states
+            .iter()
+            .any(|proof_state| proof_state.state != State::Unspent)
+        {
+            return Err(PaymentWalletError::Reconcile(
+                "retire refused: reserved proof mint state is Spent or Pending (all-or-nothing)"
+                    .into(),
+            ));
+        }
+    }
+
+    // Match CDK compensate_send: PendingSpent → Reserved locally, then revert
+    // Reserved/Pending → Unspent and clear used_by_operation, then delete saga.
+    // TOCTOU: any failure here aborts with error — never report retire success.
+    let reserved = wallet
+        .localstore
+        .get_reserved_proofs(&saga.id)
+        .await
+        .map_err(wallet_error)?;
+    let mut pending_spent: Vec<_> = reserved
+        .iter()
+        .filter(|proof| proof.state == State::PendingSpent)
+        .cloned()
+        .collect();
+    for proof in pending_spent.iter_mut() {
+        proof.state = State::Reserved;
+    }
+    if !pending_spent.is_empty() {
+        wallet
+            .localstore
+            .update_proofs(pending_spent, vec![])
+            .await
+            .map_err(|error| {
+                PaymentWalletError::Reconcile(format!(
+                    "retire cancel failed (leave wedged-safer-than-double-spend): {error}"
+                ))
+            })?;
+    }
+
+    let reserved = wallet
+        .localstore
+        .get_reserved_proofs(&saga.id)
+        .await
+        .map_err(wallet_error)?;
+    let mut to_unspent: Vec<_> = reserved
+        .into_iter()
+        .filter(|proof| proof.state == State::Reserved || proof.state == State::Pending)
+        .collect();
+    for proof in to_unspent.iter_mut() {
+        proof.state = State::Unspent;
+        proof.used_by_operation = None;
+    }
+    if !to_unspent.is_empty() {
+        wallet
+            .localstore
+            .update_proofs(to_unspent, vec![])
+            .await
+            .map_err(|error| {
+                PaymentWalletError::Reconcile(format!(
+                    "retire cancel failed (leave wedged-safer-than-double-spend): {error}"
+                ))
+            })?;
+    }
+    wallet
+        .localstore
+        .delete_saga(&saga.id)
+        .await
+        .map_err(|error| {
+            PaymentWalletError::Reconcile(format!(
+                "retire cancel failed deleting saga (leave wedged-safer-than-double-spend): {error}"
+            ))
+        })?;
+    Ok(())
 }
 
 struct CdkPaymentVerifier<'a, C: ?Sized> {
@@ -736,7 +1062,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unbound_incomplete_saga_refuses_instead_of_guessing_or_reminting() {
+    async fn unbound_incomplete_proofs_reserved_without_proofs_is_retired() {
         let fixture = wallet_fixture().await;
         let key = payment_key(&fixture.terms);
         let saga = WalletSaga::new(
@@ -758,27 +1084,247 @@ mod tests {
         );
         fixture.wallet.localstore.add_saga(saga).await.unwrap();
 
-        let result = CdkBuyerMint::new(&fixture.wallet)
-            .lock_or_reconcile(&key.attempt_id(), &fixture.terms)
-            .await;
+        let report = retire_eligible_incomplete_sagas(&fixture.wallet)
+            .await
+            .unwrap();
+        assert_eq!(report.retired, 1);
 
-        assert!(matches!(
-            result,
-            Err(PaymentWalletError::Reconcile(message))
-                if message.contains("incomplete operation with no matching confirmed attempt")
-        ));
+        // Second retire is a no-op (compensate-once / idempotent).
+        let report2 = retire_eligible_incomplete_sagas(&fixture.wallet)
+            .await
+            .unwrap();
+        assert_eq!(report2.retired, 0);
         assert!(
             fixture
                 .wallet
-                .list_transactions(Some(TransactionDirection::Outgoing))
+                .localstore
+                .get_incomplete_sagas()
                 .await
                 .unwrap()
                 .is_empty()
         );
+
+        // Orphan retired; no confirmed attempt and no funds → prepare will fail,
+        // but recover must not hard-block with the old wedge message.
+        let result = CdkBuyerMint::new(&fixture.wallet)
+            .lock_or_reconcile(&key.attempt_id(), &fixture.terms)
+            .await;
+        match &result {
+            Err(PaymentWalletError::Reconcile(message))
+                if message.contains("incomplete operation with no matching confirmed attempt") =>
+            {
+                panic!("unexpected wedge residual: {message}");
+            }
+            _ => {}
+        }
     }
 
     #[tokio::test]
-    async fn confirmed_attempt_with_an_unrelated_incomplete_saga_refuses() {
+    async fn proofs_reserved_with_spent_mint_state_refuses_retire() {
+        let seller = secret_key(1).public_key();
+        let proof = p2pk_proof(7, seller);
+        let proof_y = proof.y().unwrap();
+        let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        // Insert as Unspent; reserve_proofs requires Unspent → marks Reserved.
+        let proof_info = ProofInfo::new(
+            proof.clone(),
+            mint(MINT),
+            State::Unspent,
+            CurrencyUnit::Sat,
+        )
+        .unwrap();
+        let saga_id = uuid::Uuid::now_v7();
+        store.update_proofs(vec![proof_info], vec![]).await.unwrap();
+        store
+            .reserve_proofs(vec![proof_y], &saga_id)
+            .await
+            .unwrap();
+        let saga = WalletSaga::new(
+            saga_id,
+            cdk::wallet::types::WalletSagaState::Send(
+                cdk::wallet::types::SendSagaState::ProofsReserved,
+            ),
+            Amount::from(7),
+            mint(MINT),
+            CurrencyUnit::Sat,
+            cdk::wallet::types::OperationData::Send(cdk::wallet::types::SendOperationData {
+                amount: Amount::from(7),
+                memo: None,
+                counter_start: None,
+                counter_end: None,
+                token: None,
+                proofs: None,
+            }),
+        );
+        store.add_saga(saga).await.unwrap();
+        let connector = Arc::new(BaseHttpClient::with_transport(
+            mint(MINT),
+            CheckStateTransport::new(cashu::CheckStateResponse {
+                states: vec![ProofState::from((proof_y, State::Spent))],
+            }),
+            None,
+        ));
+        let wallet = WalletBuilder::new()
+            .mint_url(mint(MINT))
+            .unit(CurrencyUnit::Sat)
+            .localstore(store)
+            .seed([9; 64])
+            .shared_client(connector)
+            .build()
+            .unwrap();
+
+        let err = retire_eligible_incomplete_sagas(&wallet)
+            .await
+            .expect_err("spent must refuse");
+        match &err {
+            PaymentWalletError::Reconcile(message) if message.contains("Spent or Pending") => {}
+            other => panic!("expected Spent/Pending refuse, got: {other}"),
+        }
+        assert_eq!(
+            wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "saga must remain when retire refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn proofs_reserved_all_unspent_retires_and_returns_spendable() {
+        let seller = secret_key(1).public_key();
+        let proof = p2pk_proof(7, seller);
+        let proof_y = proof.y().unwrap();
+        let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        // Insert as Unspent; reserve_proofs requires Unspent → marks Reserved.
+        let proof_info = ProofInfo::new(
+            proof.clone(),
+            mint(MINT),
+            State::Unspent,
+            CurrencyUnit::Sat,
+        )
+        .unwrap();
+        let saga_id = uuid::Uuid::now_v7();
+        store.update_proofs(vec![proof_info], vec![]).await.unwrap();
+        store
+            .reserve_proofs(vec![proof_y], &saga_id)
+            .await
+            .unwrap();
+        let saga = WalletSaga::new(
+            saga_id,
+            cdk::wallet::types::WalletSagaState::Send(
+                cdk::wallet::types::SendSagaState::ProofsReserved,
+            ),
+            Amount::from(7),
+            mint(MINT),
+            CurrencyUnit::Sat,
+            cdk::wallet::types::OperationData::Send(cdk::wallet::types::SendOperationData {
+                amount: Amount::from(7),
+                memo: None,
+                counter_start: None,
+                counter_end: None,
+                token: None,
+                proofs: None,
+            }),
+        );
+        store.add_saga(saga).await.unwrap();
+        let connector = Arc::new(BaseHttpClient::with_transport(
+            mint(MINT),
+            CheckStateTransport::new(cashu::CheckStateResponse {
+                states: vec![ProofState::from((proof_y, State::Unspent))],
+            }),
+            None,
+        ));
+        let wallet = WalletBuilder::new()
+            .mint_url(mint(MINT))
+            .unit(CurrencyUnit::Sat)
+            .localstore(store)
+            .seed([10; 64])
+            .shared_client(connector)
+            .build()
+            .unwrap();
+
+        let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+        assert_eq!(report.retired, 1);
+        assert!(
+            wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let unspent = wallet
+            .localstore
+            .get_proofs(None, None, Some(vec![State::Unspent]), None)
+            .await
+            .unwrap();
+        assert_eq!(unspent.len(), 1);
+        assert_eq!(unspent[0].used_by_operation, None);
+
+        let report2 = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+        assert_eq!(report2.retired, 0);
+    }
+
+    #[tokio::test]
+    async fn token_created_without_confirmed_tx_is_not_retired() {
+        let fixture = wallet_fixture().await;
+        let saga = WalletSaga::new(
+            uuid::Uuid::now_v7(),
+            cdk::wallet::types::WalletSagaState::Send(
+                cdk::wallet::types::SendSagaState::TokenCreated,
+            ),
+            fixture.terms.amount,
+            fixture.terms.mint.clone(),
+            fixture.terms.unit.clone(),
+            cdk::wallet::types::OperationData::Send(cdk::wallet::types::SendOperationData {
+                amount: fixture.terms.amount,
+                memo: None,
+                counter_start: None,
+                counter_end: None,
+                token: Some("cashuBplaceholder".into()),
+                proofs: None,
+            }),
+        );
+        fixture.wallet.localstore.add_saga(saga).await.unwrap();
+
+        let report = retire_eligible_incomplete_sagas(&fixture.wallet)
+            .await
+            .unwrap();
+        assert_eq!(report.retired, 0);
+        assert_eq!(
+            fixture
+                .wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let key = payment_key(&fixture.terms);
+        let result = CdkBuyerMint::new(&fixture.wallet)
+            .lock_or_reconcile(&key.attempt_id(), &fixture.terms)
+            .await;
+        match &result {
+            Err(PaymentWalletError::Reconcile(message)) if message.contains("TokenCreated") => {}
+            Err(other) => panic!("expected TokenCreated refuse, got: {other}"),
+            Ok(_) => panic!("expected TokenCreated refuse, got Ok"),
+        }
+    }
+
+    #[test]
+    fn amount_covers_fee_refuses_dust_and_accepts_fee_plus_one() {
+        require_amount_covers_fee(Amount::from(1), Amount::from(1)).unwrap_err();
+        require_amount_covers_fee(Amount::from(0), Amount::from(1)).unwrap_err();
+        require_amount_covers_fee(Amount::from(2), Amount::from(1)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirmed_attempt_with_an_unrelated_incomplete_saga_retires_orphan_then_reconciles() {
         let fixture = wallet_fixture().await;
         let key = payment_key(&fixture.terms);
         let attempt_id = key.attempt_id();
@@ -802,11 +1348,20 @@ mod tests {
         );
         fixture.wallet.localstore.add_saga(saga).await.unwrap();
 
-        let result = CdkBuyerMint::new(&fixture.wallet)
+        let locked = CdkBuyerMint::new(&fixture.wallet)
             .lock_or_reconcile(&attempt_id, &fixture.terms)
-            .await;
-
-        assert!(matches!(result, Err(PaymentWalletError::Reconcile(_))));
+            .await
+            .unwrap();
+        assert_eq!(locked.token(), &fixture.token);
+        assert!(
+            fixture
+                .wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -746,6 +746,13 @@ fn require_locked_matches_terms(
     let mint = token
         .mint_url()
         .map_err(|error| PaymentError::Refused(format!("invalid locked token: {error}")))?;
+    // Defense-in-depth: realized value must be non-zero and match terms before
+    // any Sent / publish_receipt / Closed (buyer lock_or_reconcile is the primary gate).
+    if amount == cashu::Amount::ZERO {
+        return Err(PaymentError::Refused(
+            "locked token realized value is zero".into(),
+        ));
+    }
     if amount != terms.amount || mint != terms.mint || token.unit().as_ref() != Some(&terms.unit) {
         return Err(PaymentError::Refused(
             "locked token does not match typed payment terms".into(),

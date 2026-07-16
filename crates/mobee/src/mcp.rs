@@ -294,6 +294,15 @@ fn tools() -> Value {
                 "required": ["job_id", "amount_sats", "delivery_integrity_hash"],
                 "additionalProperties": true
             }
+        },
+        {
+            "name": "reconcile_wallet",
+            "description": "Retire incomplete CDK Send(ProofsReserved) ops that have no confirmed attempt and whose reserved proofs are all NUT-07 Unspent at the mint. Pure cleanup (no receipt / no balance credit). TokenCreated / RollingBack / Spent|Pending / check-state fail are refused (wedged-safer-than-double-spend). Idempotent. Never echoes secrets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -339,6 +348,17 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
         }
         "stub_pay" => stub_pay(&state.gate, &arguments),
         "authorize_pay" => authorize_pay_tool_async(state, &arguments).await,
+        "reconcile_wallet" => {
+            #[cfg(feature = "wallet")]
+            {
+                reconcile_wallet_tool_async(state).await
+            }
+            #[cfg(not(feature = "wallet"))]
+            {
+                let _ = arguments;
+                Err("reconcile_wallet requires the wallet feature".into())
+            }
+        }
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -556,6 +576,30 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
         "piece6": "run",
         "verifier": "PayPathDeliveryVerifier",
     });
+    Ok(tool_ok(body))
+}
+
+#[cfg(feature = "wallet")]
+async fn reconcile_wallet_tool_async(state: &McpState) -> Result<Value, String> {
+    use mobee_core::buyer_fund;
+    use mobee_core::payment_wallet;
+
+    let wallet = buyer_fund::open_testnut_wallet_async(&state.home)
+        .await
+        .map_err(|error| error.to_string())?;
+    let report = payment_wallet::retire_eligible_incomplete_sagas(&wallet)
+        .await
+        .map_err(|error| error.to_string())?;
+    let body = json!({
+        "ok": true,
+        "retired": report.retired,
+        "mapped_token_created": report.mapped_token_created,
+    });
+    let rendered = body.to_string();
+    let secret = home::read_secret_key_hex(&state.home).unwrap_or_default();
+    if !secret.is_empty() && rendered.contains(&secret) {
+        return Err("reconcile_wallet refused: response would echo secret key".into());
+    }
     Ok(tool_ok(body))
 }
 
@@ -914,7 +958,8 @@ mod tests {
                 "get_job",
                 "accept_claim",
                 "stub_pay",
-                "authorize_pay"
+                "authorize_pay",
+                "reconcile_wallet"
             ]
         );
     }
@@ -1162,7 +1207,7 @@ mod tests {
                         "delivery_integrity_hash": "aa".repeat(20),
                         "job_hash": "bb".repeat(32),
                         "seller_pubkey": seller,
-                        "amount_sats": 1,
+                        "amount_sats": 2,
                         "repo": "ext::sh -c evil",
                         "branch": "main",
                         "commit_oid": "aa".repeat(20),

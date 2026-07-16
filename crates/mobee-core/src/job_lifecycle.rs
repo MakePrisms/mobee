@@ -22,6 +22,8 @@ use crate::gateway::{
     JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RESULT_KIND,
 };
 use crate::home::{self, HomeError, MobeeHome};
+#[cfg(feature = "wallet")]
+use crate::{buyer_fund, payment_wallet};
 
 const JOBS_DIR: &str = "jobs";
 /// Per-relay-fetch budget. Kept well under [`WAIT_FOR_CAP_SECS`] / MCP tool deadline.
@@ -252,6 +254,17 @@ pub async fn post_job_async(
             ));
         }
         _ => {}
+    }
+
+    // Dust guard: live keyset N=1 floor, fail-closed (no hardcoded fee=1).
+    #[cfg(feature = "wallet")]
+    {
+        let wallet = buyer_fund::open_testnut_wallet_async(home)
+            .await
+            .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
+        payment_wallet::require_fee_safe_amount(&wallet, cashu::Amount::from(request.amount_sats))
+            .await
+            .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
     }
 
     let deadline_unix = request.deadline_unix.unwrap_or_else(|| {
