@@ -128,6 +128,31 @@ Test: `job_lifecycle::tests::processing_claim_past_deadline_is_expired_not_live`
   (`"expired"`) — no new buyer-view schema.
 - Frozen money-core (`payment_wallet.rs`, `authorize_pay.rs`, `payment.rs`) is **byte-unchanged**.
 
+## Known limitations + forward-compat (v1)
+
+- **Revenue-forfeiture across a crash/eviction (money-SAFE — not a safety bug).** The
+  delivered-but-unpaid binding lives only in the in-memory `awaiting_payment` Vec (it is **not**
+  journaled). A crash in the deliver→pay window, or eviction past the cap (16 delivered-unpaid),
+  means a later payment for that job is buffered/ignored and never redeemed; on restart the job
+  (Claim, no Receipt, no Release) is RELEASEd. This forfeits **revenue, never safety** — the money
+  was never received, no receipt is released, no double-pay. It is ~pre-existing (base also lost
+  `active` on restart and buffered the payment into the void); piece-11 improves on base by
+  surfacing a kind-7000 to the buyer. Fixing it (journal the delivered-unpaid binding so a payment
+  survives a restart) is a named follow-up, **not** core money-safety.
+- **Release vocabulary stays OPEN (forward-compat).** `RELEASED` reuses kind-7000 `status=error`
+  — the seller's only honest exit today (there is no claim-retract event, and claim-then-renege
+  *for gain* is forbidden by the business-manager design). A future fast-claim / decline path
+  **extends this same claim-release vocabulary** rather than inventing a conflicting one; the state
+  machine is intentionally left open here, not specced shut.
+- **`RESUME` deferred** (see § behavior 2): v1 RELEASEs every orphan. Ground truth — today's
+  working resolution is release + buyer re-post; a safe resume (re-fetch + re-verify the offer,
+  re-run) is future work.
+- **`awaiting_payment` `.expect(result_id)` (seller_daemon.rs) is a panic-on-invariant** — low
+  severity. It holds structurally today (only `mark_delivered` pushes, on the Ok path after
+  `result_id` is set; failures go through `fail_active`, which never pushes). A future refactor
+  that pushed a no-result job should return an error, not panic — a named hardening, not a live
+  defect.
+
 ## Files
 
 - `crates/mobee-core/src/seller.rs` — journal (`Claim` fields, `Release`, `append_claim`,
