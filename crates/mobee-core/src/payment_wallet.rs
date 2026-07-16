@@ -10,7 +10,9 @@ use cashu::{
     Amount, CurrencyUnit, MintUrl, PublicKey as CashuPublicKey, SecretKey, SpendingConditions,
     Token,
 };
-use cdk::wallet::{HttpClient, MintConnector, ReceiveOptions, SendOptions, Wallet};
+use cdk::wallet::{
+    HttpClient, KeysetFilter, MintConnector, ReceiveOptions, SendOptions, Wallet,
+};
 use nostr_sdk::PublicKey as NostrPublicKey;
 
 use crate::gateway::ParsedOffer;
@@ -30,6 +32,15 @@ pub enum PaymentWalletError {
     Wallet(String),
     Reconcile(String),
     Verify(String),
+    /// Predicted mint fee did not match the post-swap net credit.
+    ///
+    /// Wallet credit from the swap is left intact; callers must not journal or
+    /// publish a receipt for this attempt.
+    FeeMismatch {
+        face: Amount,
+        received: Amount,
+        predicted_fee: Amount,
+    },
 }
 
 impl std::fmt::Display for PaymentWalletError {
@@ -41,6 +52,14 @@ impl std::fmt::Display for PaymentWalletError {
                 write!(formatter, "wallet reconciliation refused: {message}")
             }
             Self::Verify(message) => write!(formatter, "payment verification failed: {message}"),
+            Self::FeeMismatch {
+                face,
+                received,
+                predicted_fee,
+            } => write!(
+                formatter,
+                "fee mismatch after swap: face={face} received={received} predicted_fee={predicted_fee} (wallet credit intact; do not journal)"
+            ),
         }
     }
 }
@@ -497,10 +516,10 @@ impl<'a> CdkSellerReceive<'a> {
     {
         require_wallet_matches(self.wallet, terms)?;
         let token_mint = token.mint_url().map_err(wallet_error)?;
-        let token_amount = token.value().map_err(wallet_error)?;
+        let face = token.value().map_err(wallet_error)?;
         if token_mint != terms.mint
             || token.unit().as_ref() != Some(&terms.unit)
-            || token_amount != terms.amount
+            || face != terms.amount
         {
             return Err(PaymentWalletError::Policy(
                 "received token does not match payment terms".into(),
@@ -513,25 +532,57 @@ impl<'a> CdkSellerReceive<'a> {
                 "seller receive key does not match payment terms".into(),
             ));
         }
+
+        // Fee must be predicted pre-swap: CDK receive returns net after fees.
+        let keysets = self
+            .wallet
+            .get_mint_keysets(KeysetFilter::All)
+            .await
+            .map_err(wallet_error)?;
+        let proofs = token.proofs(&keysets).map_err(wallet_error)?;
+        let fee = self
+            .wallet
+            .get_proofs_fee(&proofs)
+            .await
+            .map_err(wallet_error)?
+            .total;
+        if face <= fee {
+            return Err(PaymentWalletError::Policy(format!(
+                "token uneconomical vs mint fee: face={face} fee={fee}"
+            )));
+        }
+
         let options = ReceiveOptions {
             p2pk_signing_keys: vec![self.seller_key.clone()],
             ..ReceiveOptions::default()
         };
         let received = receive(options).await?;
-        require_received_amount(received, terms)
+        require_received_amount_after_fee(received, face, fee)
     }
 }
 
-fn require_received_amount(
+fn require_received_amount_after_fee(
     received: Amount,
-    terms: &PaymentTerms,
+    face: Amount,
+    fee: Amount,
 ) -> Result<Amount, PaymentWalletError> {
-    if received != terms.amount {
-        return Err(PaymentWalletError::Policy(
-            "received amount does not match payment terms".into(),
-        ));
+    // Journal/daemon invariants expect face (== offer.amount), not wallet net.
+    if received
+        .checked_add(fee)
+        .is_some_and(|total| total == face)
+    {
+        return Ok(face);
     }
-    Ok(received)
+    if received > Amount::ZERO {
+        return Err(PaymentWalletError::FeeMismatch {
+            face,
+            received,
+            predicted_fee: fee,
+        });
+    }
+    Err(PaymentWalletError::Policy(
+        "received amount does not match payment terms".into(),
+    ))
 }
 
 fn require_wallet_matches(wallet: &Wallet, terms: &PaymentTerms) -> Result<(), PaymentWalletError> {
@@ -813,17 +864,124 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seller_receive_rejects_when_wallet_returns_a_mismatched_amount() {
-        let fixture = wallet_fixture().await;
-        let adapter = CdkSellerReceive::new(&fixture.wallet, secret_key(1));
+    async fn seller_receive_rejects_dust_as_uneconomical_before_swap() {
+        let seller_key = secret_key(1);
+        let keyset = test_keyset_with_fee(1_000); // 1 proof → fee = 1
+        let proof = p2pk_proof_for_keyset(1, seller_key.public_key(), keyset.id);
+        let proof_y = proof.y().unwrap();
+        let token = Token::new(mint(MINT), vec![proof], None, CurrencyUnit::Sat);
+        let transport = InflatedSwapTransport::new(proof_y, Amount::from(1));
+        let swap_calls = transport.swap_calls.clone();
+        let wallet = seller_wallet(transport, keyset).await;
+        let terms = PaymentTerms::new(
+            mint(MINT),
+            Amount::from(1),
+            CurrencyUnit::Sat,
+            nostr_key_for_p2pk(seller_key.public_key()),
+            seller_key.public_key(),
+        );
+
+        let result = CdkSellerReceive::new(&wallet, seller_key)
+            .receive(&token, &terms)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(PaymentWalletError::Policy(message))
+                if message.contains("uneconomical vs mint fee")
+        ));
+        assert_eq!(swap_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn seller_receive_returns_face_when_net_plus_fee_matches() {
+        let seller_key = secret_key(1);
+        let keyset = test_keyset_with_fee(1_000); // 1 proof → fee = 1
+        let proof = p2pk_proof_for_keyset(2, seller_key.public_key(), keyset.id);
+        let token = Token::new(mint(MINT), vec![proof], None, CurrencyUnit::Sat);
+        let wallet = seller_wallet(InflatedSwapTransport::default(), keyset).await;
+        let terms = PaymentTerms::new(
+            mint(MINT),
+            Amount::from(2),
+            CurrencyUnit::Sat,
+            nostr_key_for_p2pk(seller_key.public_key()),
+            seller_key.public_key(),
+        );
+        let adapter = CdkSellerReceive::new(&wallet, seller_key);
+
+        // CDK receive returns net after fees (face 2 − fee 1 = 1).
+        let amount = adapter
+            .receive_with(&token, &terms, |_| async { Ok(Amount::from(1)) })
+            .await
+            .unwrap();
+
+        assert_eq!(amount, Amount::from(2));
+    }
+
+    #[tokio::test]
+    async fn seller_receive_surfaces_fee_mismatch_without_treating_as_underpay() {
+        let seller_key = secret_key(1);
+        let keyset = test_keyset_with_fee(1_000); // 1 proof → fee = 1
+        let proof = p2pk_proof_for_keyset(2, seller_key.public_key(), keyset.id);
+        let token = Token::new(mint(MINT), vec![proof], None, CurrencyUnit::Sat);
+        let wallet = seller_wallet(InflatedSwapTransport::default(), keyset).await;
+        let terms = PaymentTerms::new(
+            mint(MINT),
+            Amount::from(2),
+            CurrencyUnit::Sat,
+            nostr_key_for_p2pk(seller_key.public_key()),
+            seller_key.public_key(),
+        );
+        let adapter = CdkSellerReceive::new(&wallet, seller_key);
 
         let result = adapter
-            .receive_with(&fixture.token, &fixture.terms, |_| async {
+            .receive_with(&token, &terms, |_| async { Ok(Amount::from(2)) })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(PaymentWalletError::FeeMismatch {
+                face,
+                received,
+                predicted_fee,
+            }) if face == Amount::from(2)
+                && received == Amount::from(2)
+                && predicted_fee == Amount::from(1)
+        ));
+    }
+
+    #[tokio::test]
+    async fn seller_receive_rejects_when_wallet_returns_a_mismatched_amount() {
+        let seller_key = secret_key(1);
+        let keyset = test_keyset(); // fee = 0
+        let proof = p2pk_proof_for_keyset(7, seller_key.public_key(), keyset.id);
+        let token = Token::new(mint(MINT), vec![proof], None, CurrencyUnit::Sat);
+        let wallet = seller_wallet(InflatedSwapTransport::default(), keyset).await;
+        let terms = PaymentTerms::new(
+            mint(MINT),
+            Amount::from(7),
+            CurrencyUnit::Sat,
+            nostr_key_for_p2pk(seller_key.public_key()),
+            seller_key.public_key(),
+        );
+        let adapter = CdkSellerReceive::new(&wallet, seller_key);
+
+        let result = adapter
+            .receive_with(&token, &terms, |_| async {
                 Ok(Amount::from(1))
             })
             .await;
 
-        assert!(matches!(result, Err(PaymentWalletError::Policy(_))));
+        assert!(matches!(
+            result,
+            Err(PaymentWalletError::FeeMismatch {
+                face,
+                received,
+                predicted_fee,
+            }) if face == Amount::from(7)
+                && received == Amount::from(1)
+                && predicted_fee == Amount::ZERO
+        ));
     }
 
     #[test]
@@ -1029,6 +1187,10 @@ mod tests {
     }
 
     fn test_keyset() -> KeySet {
+        test_keyset_with_fee(0)
+    }
+
+    fn test_keyset_with_fee(input_fee_ppk: u64) -> KeySet {
         let keys = [1_u64, 2, 4, 8]
             .into_iter()
             .map(|amount| {
@@ -1044,7 +1206,7 @@ mod tests {
             unit: CurrencyUnit::Sat,
             active: Some(true),
             keys,
-            input_fee_ppk: 0,
+            input_fee_ppk,
             final_expiry: None,
         }
     }
