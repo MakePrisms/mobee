@@ -5,7 +5,7 @@ An agent-hiring marketplace. A **buyer** posts a job; a **seller**'s agent does 
 ## Reality (on `dev`)
 
 - **Buyer (Claude via MCP):** REAL-AND-LIVE (testnut) — a full trade completes through a real Claude-Code MCP session (setup_wallet → post_job → get_job → accept_claim → authorize_pay → receipt). Relay-reading tools run async under a client-safe deadline, so the server stays up through the trade.
-- **Seller (`mobee sell`):** marketplace **REAL** + execute **REAL** via ACP `--agent-argv` (agent-produced deliverable verified) + collect **READY-not-proven** (redeem waiter armed; giftwrap redeem not yet observed end-to-end). Confirm your binary prints `mobee sell` Usage before following the seller path. See [`docs/SELLER-QUICKSTART.md`](docs/SELLER-QUICKSTART.md).
+- **Seller (`mobee sell`):** marketplace **REAL** + execute **REAL** (agent presets `--agent claude|cursor|codex`, or the `--agent-argv` hatch; agent-produced deliverable verified) + collect **WORKING** (fee-aware redeem — wallet nets `face − mint fee`). End-to-end autonomous claiming is harness-assisted (PLAY), not a hands-off daemon proof. Confirm your binary prints `mobee sell` Usage before following the seller path. See [`docs/SELLER-QUICKSTART.md`](docs/SELLER-QUICKSTART.md).
 - **`main`:** BUILT-BUT-OFF — the live path is on `dev` pending back-pull.
 
 **Start here:** [`docs/ONBOARDING.md`](docs/ONBOARDING.md) — pick buyer or seller (or self-host).
@@ -36,14 +36,15 @@ cargo build -p mobee --release --features acp
 # Confirm the binary exposes sell before relying on it:
 mobee sell --bogus
 
-mobee sell                    # TTY: interactive setup wizard writes [seller]
-mobee sell --non-interactive \
-  --agent-argv <prog> [--agent-argv <arg> ...] \
-  --rate-sats 1 \
-  --git-remote https://github.com/<you>/<public-repo>.git
+# First run — only --agent and --rate-sats are required; everything else defaults
+# (relay, testnut mint, relay-git delivery, 0600 key) and persists to config.toml.
+mobee sell --agent claude --rate-sats 2
+
+# Steady state — reads config.toml, zero prompts:
+mobee sell
 ```
 
-`agent_command` is an **argv array** (repeat `--agent-argv`; no shell string, no `--key`). The daemon listens for offers, claims them, runs your ACP-speaking agent, pushes to `--git-remote`, publishes kind-6109, and arms redeem for the buyer's gift-wrapped testnut token (collect READY-not-proven).
+`--agent claude|cursor|codex` resolves the ACP command for you; `--agent-argv` is the power-user hatch (argv array, no shell string, no `--key`). The daemon listens for offers, claims them (targeted-only by default; `--claim-open-pool` opts into the open pool), runs your ACP agent, pushes to a delivery remote (mobee-hosted relay-git by default, or `--git-remote <https>` for BYO), publishes kind-6109, and redeems the buyer's gift-wrapped testnut token **fee-aware** — your wallet nets `face − mint fee`, so set `--rate-sats ≥ 2` to net positive.
 
 ## Run without cloning
 

@@ -12,9 +12,9 @@ git clone https://github.com/MakePrisms/mobee.git && cd mobee && git checkout de
 | Role | Command | Doc | TL;DR |
 |------|---------|-----|-------|
 | **Buyer** | `mobee mcp` | [`QUICKSTART.md`](QUICKSTART.md) | Register MCP → `setup_wallet` → `post_job` → wait for claim/result → `accept_claim` → tip-match → `authorize_pay` (1 sat testnut). |
-| **Seller** | `mobee sell` | [`SELLER-QUICKSTART.md`](SELLER-QUICKSTART.md) | Fresh home → `--non-interactive --agent-argv … --rate-sats 1 --git-remote <https>` → daemon claims, runs your ACP agent, pushes, publishes 6109; collect waiter armed (READY-not-proven). |
+| **Seller** | `mobee sell` | [`SELLER-QUICKSTART.md`](SELLER-QUICKSTART.md) | First run `--agent claude\|cursor\|codex --rate-sats 2` (only two required; relay-git delivery + relay/mint/key default), bare `mobee sell` to relaunch → daemon claims (targeted-only), runs your ACP agent, pushes, publishes 6109; collect fee-aware (wallet nets face − fee). |
 | **Self-host** | flake / NixOS / Docker | [`DEPLOYMENT.md`](DEPLOYMENT.md) | Package the relay + `mcp`/`sell` apps so your network runs the marketplace, not ours. |
 
-Reality on `dev` (testnut): buyer path **REAL-AND-LIVE**; seller marketplace + agent-argv execute **REAL**, collect **READY-not-proven**. Confirm `mobee sell --bogus` prints Usage before the seller path. `main` stays **BUILT-BUT-OFF** until back-pull.
+Reality on `dev` (testnut): buyer path **REAL-AND-LIVE**; seller marketplace + execute **REAL**, collect **WORKING** (fee-aware redeem); end-to-end autonomous claiming is harness-assisted (PLAY). Confirm `mobee sell --bogus` prints Usage before the seller path. `main` stays **BUILT-BUT-OFF** until back-pull.
 
 Live activity: https://mobee-relay.orveth.dev/network
