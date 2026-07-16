@@ -364,14 +364,21 @@ fn deterministic_created_at(digest: &[u8; 32]) -> u64 {
 /// Publish the signed kind-3400 to the relay and return the accepted relay set.
 ///
 /// Runs on a fresh OS thread with its own current-thread runtime: publishing is async and
-/// the caller may already hold a Tokio runtime (a nested `block_on` would panic). Empty
-/// `relay_success` ⇒ [`ReceiptAuthority::verify`] fails closed and recovery republishes.
+/// the caller may already hold a Tokio runtime (a nested `block_on` would panic).
+///
+/// mobee-relay requires NIP-42 AUTH for ALL writes, so this path completes + WAITS FOR the
+/// auth handshake before `send_event_to` (mirroring the seller's `wait_for_nip42_auth`); the
+/// payment WRAP path already authenticates, only this receipt path did not. On auth
+/// timeout/failure the send is NOT reached and an empty `relay_success` is returned (never a
+/// forced success) ⇒ [`ReceiptAuthority::verify`] fails closed, the payment reducer holds at
+/// `Sent`, and the deterministic-id receipt republishes idempotently on recovery.
 fn publish_receipt_event(
     relay_url: &str,
     keys: &Keys,
     event: &nostr_sdk::Event,
 ) -> Result<Vec<String>, EffectError> {
-    use nostr_sdk::prelude::Client;
+    use nostr_sdk::prelude::{Client, RelayUrl};
+    use std::time::Duration;
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -381,22 +388,86 @@ fn publish_receipt_event(
                     .map_err(|error| EffectError::new(format!("receipt runtime: {error}")))?;
                 runtime.block_on(async {
                     let client = Client::new(keys.clone());
+                    // Enable the auto-AUTH responder explicitly (default true; set to mirror
+                    // the seller and guard against option drift) so the client answers the
+                    // relay's NIP-42 challenge — otherwise the write is rejected auth-required.
+                    client.automatic_authentication(true);
                     client.add_relay(relay_url).await.map_err(|error| {
                         EffectError::new(format!("receipt add relay: {error}"))
                     })?;
+                    // Subscribe to the relay's notification stream BEFORE connect —
+                    // `Authenticated` is emitted once and is not re-emitted (relay quirk; see
+                    // the reference `seller_daemon::wait_for_nip42_auth`).
+                    let parsed_relay = RelayUrl::parse(relay_url).map_err(|error| {
+                        EffectError::new(format!("receipt parse relay url: {error}"))
+                    })?;
+                    let relay = client
+                        .relays()
+                        .await
+                        .get(&parsed_relay)
+                        .cloned()
+                        .ok_or_else(|| {
+                            EffectError::new("receipt relay missing after add_relay")
+                        })?;
+                    let mut relay_notifications = relay.notifications();
                     client.connect().await;
-                    let output = client.send_event_to([relay_url], event).await;
-                    client.disconnect().await;
-                    let output = output
-                        .map_err(|error| EffectError::new(format!("receipt send: {error}")))?;
-                    Ok::<Vec<String>, EffectError>(
-                        output.success.iter().map(|url| url.to_string()).collect(),
+                    client.wait_for_connection(Duration::from_secs(20)).await;
+                    // Auth gate: the receipt write MUST NOT be sent until the relay confirms
+                    // NIP-42 AUTH. On timeout/failure we fail CLOSED with an empty relay set
+                    // (send not reached, never a forced success) — the designed-safe
+                    // direction (no double-pay; payment holds at `Sent` and retries).
+                    let relay_success = if wait_for_nip42_auth(
+                        &mut relay_notifications,
+                        Duration::from_secs(20),
                     )
+                    .await
+                    {
+                        let output = client.send_event_to([relay_url], event).await;
+                        client.disconnect().await;
+                        let output = output
+                            .map_err(|error| EffectError::new(format!("receipt send: {error}")))?;
+                        output.success.iter().map(|url| url.to_string()).collect()
+                    } else {
+                        client.disconnect().await;
+                        Vec::new()
+                    };
+                    Ok::<Vec<String>, EffectError>(relay_success)
                 })
             })
             .join()
             .map_err(|_| EffectError::new("receipt publisher thread panicked"))?
     })
+}
+
+// interim: dedup with seller_daemon::wait_for_nip42_auth (follow-up: unify after builder-2
+// lands). Inlined here to keep this money-core auth fix confined to authorize_pay.rs while a
+// concurrent worker owns seller_daemon.rs.
+//
+/// Drain the relay's notification stream until NIP-42 AUTH resolves. Returns `true` ONLY on
+/// [`RelayNotification::Authenticated`]; every other terminal (`AuthenticationFailed` /
+/// `Shutdown` / channel closed / lagged / timeout) returns `false`, so the caller fails
+/// CLOSED and never reaches the send. The caller MUST obtain `notifications` BEFORE `connect`
+/// — `Authenticated` is not re-emitted.
+async fn wait_for_nip42_auth(
+    notifications: &mut tokio::sync::broadcast::Receiver<nostr_sdk::pool::RelayNotification>,
+    timeout: std::time::Duration,
+) -> bool {
+    use nostr_sdk::pool::RelayNotification;
+
+    tokio::time::timeout(timeout, async {
+        loop {
+            match notifications.recv().await {
+                Ok(RelayNotification::Authenticated) => return true,
+                Ok(RelayNotification::AuthenticationFailed) | Ok(RelayNotification::Shutdown) => {
+                    return false;
+                }
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -562,5 +633,65 @@ mod tests {
         let reloaded = BudgetGate::from_home(&home).expect("reload");
         assert_eq!(reloaded.spent(), 2);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- NIP-42 receipt auth-wait gate (the receipt-auth fix) --------------------------
+    // Smallest testable seam of the fix: the decision that gates the receipt
+    // `send_event_to` on a confirmed relay AUTH. The full live publish is real relay I/O
+    // (proven by the coordinator's live re-run); the auth-ordering / fail-closed decision
+    // is pure and is asserted here (red-on-revert: defeating the gate turns the
+    // fail-closed cases green→red).
+    use nostr_sdk::pool::RelayNotification;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nip42_auth_wait_true_only_on_authenticated() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<RelayNotification>(8);
+        tx.send(RelayNotification::Authenticated).expect("send");
+        assert!(
+            wait_for_nip42_auth(&mut rx, Duration::from_secs(20)).await,
+            "Authenticated must gate the send open"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nip42_auth_wait_fails_closed_on_timeout() {
+        // Sender kept alive, no Authenticated ever arrives ⇒ the bounded wait elapses ⇒ the
+        // send is NOT reached (empty relay_success upstream ⇒ verify holds at `Sent`).
+        let (_tx, mut rx) = tokio::sync::broadcast::channel::<RelayNotification>(8);
+        assert!(
+            !wait_for_nip42_auth(&mut rx, Duration::from_millis(50)).await,
+            "auth timeout must fail closed (never a forced success)"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nip42_auth_wait_fails_closed_on_authentication_failed() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<RelayNotification>(8);
+        tx.send(RelayNotification::AuthenticationFailed).expect("send");
+        assert!(
+            !wait_for_nip42_auth(&mut rx, Duration::from_secs(20)).await,
+            "AuthenticationFailed must fail closed"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nip42_auth_wait_fails_closed_on_shutdown() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<RelayNotification>(8);
+        tx.send(RelayNotification::Shutdown).expect("send");
+        assert!(
+            !wait_for_nip42_auth(&mut rx, Duration::from_secs(20)).await,
+            "relay Shutdown before auth must fail closed"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nip42_auth_wait_fails_closed_on_channel_closed() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<RelayNotification>(8);
+        drop(tx);
+        assert!(
+            !wait_for_nip42_auth(&mut rx, Duration::from_secs(20)).await,
+            "notification channel closed before auth must fail closed"
+        );
     }
 }
