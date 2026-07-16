@@ -507,9 +507,22 @@ async fn nut07_check_state_non_mutating(
     Ok(response.states)
 }
 
+/// Require a complete NUT-07 answer: response `Y` set == requested ys, and every
+/// reported state Unspent. Empty / partial / wrong-y responses must refuse —
+/// treating them as all-Unspent would false-retire possibly mint-Spent proofs
+/// into local spendable (phantom credit).
 fn refuse_if_not_all_unspent(
+    requested_ys: &[CashuPublicKey],
     states: &[cashu::ProofState],
 ) -> Result<(), PaymentWalletError> {
+    let requested: HashSet<_> = requested_ys.iter().copied().collect();
+    let reported: HashSet<_> = states.iter().map(|proof_state| proof_state.y).collect();
+    if requested.is_empty() || requested != reported {
+        return Err(PaymentWalletError::Reconcile(
+            "retire refused: NUT-07 response Y set incomplete or mismatched (empty/partial/wrong-y; per-saga fail-closed)"
+                .into(),
+        ));
+    }
     if states
         .iter()
         .any(|proof_state| proof_state.state != State::Unspent)
@@ -544,8 +557,8 @@ async fn retire_one_proofs_reserved(
 
     let ys = reserved.iter().map(|info| info.y).collect::<Vec<_>>();
     // Never use check_proofs_spent — it deletes mint-Spent ys from localstore.
-    let states = nut07_check_state_non_mutating(wallet, ys).await?;
-    refuse_if_not_all_unspent(&states)?;
+    let states = nut07_check_state_non_mutating(wallet, ys.clone()).await?;
+    refuse_if_not_all_unspent(&ys, &states)?;
 
     // Pre-mutate TOCTOU: re-fetch ProofsReserved ∧ no confirmed tx ∧ Unspent
     // immediately before local Unspent+delete (concurrent authorize_pay confirm).
@@ -586,8 +599,8 @@ async fn retire_one_proofs_reserved(
     }
 
     let ys = reserved.iter().map(|info| info.y).collect::<Vec<_>>();
-    let states = nut07_check_state_non_mutating(wallet, ys).await?;
-    refuse_if_not_all_unspent(&states)?;
+    let states = nut07_check_state_non_mutating(wallet, ys.clone()).await?;
+    refuse_if_not_all_unspent(&ys, &states)?;
 
     // Match CDK compensate_send: PendingSpent → Reserved locally, then revert
     // Reserved/Pending → Unspent and clear used_by_operation, then delete saga.
@@ -1477,6 +1490,217 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// Shared setup: one ProofsReserved saga with a reserved proof; mint returns `states`.
+    async fn reserved_saga_with_nut07_states(
+        seed: u8,
+        states: Vec<ProofState>,
+    ) -> (Wallet, uuid::Uuid, CashuPublicKey) {
+        let seller = secret_key(1).public_key();
+        let proof = p2pk_proof(7, seller);
+        let proof_y = proof.y().unwrap();
+        let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        let proof_info = ProofInfo::new(
+            proof.clone(),
+            mint(MINT),
+            State::Unspent,
+            CurrencyUnit::Sat,
+        )
+        .unwrap();
+        let saga_id = uuid::Uuid::now_v7();
+        store.update_proofs(vec![proof_info], vec![]).await.unwrap();
+        store
+            .reserve_proofs(vec![proof_y], &saga_id)
+            .await
+            .unwrap();
+        let saga = WalletSaga::new(
+            saga_id,
+            cdk::wallet::types::WalletSagaState::Send(
+                cdk::wallet::types::SendSagaState::ProofsReserved,
+            ),
+            Amount::from(7),
+            mint(MINT),
+            CurrencyUnit::Sat,
+            cdk::wallet::types::OperationData::Send(cdk::wallet::types::SendOperationData {
+                amount: Amount::from(7),
+                memo: None,
+                counter_start: None,
+                counter_end: None,
+                token: None,
+                proofs: Some(vec![proof]),
+            }),
+        );
+        store.add_saga(saga).await.unwrap();
+        let connector = Arc::new(BaseHttpClient::with_transport(
+            mint(MINT),
+            CheckStateTransport::new(cashu::CheckStateResponse { states }),
+            None,
+        ));
+        let wallet = WalletBuilder::new()
+            .mint_url(mint(MINT))
+            .unit(CurrencyUnit::Sat)
+            .localstore(store)
+            .seed([seed; 64])
+            .shared_client(connector)
+            .build()
+            .unwrap();
+        (wallet, saga_id, proof_y)
+    }
+
+    async fn assert_nut07_incomplete_refuses(wallet: &Wallet, saga_id: uuid::Uuid, proof_y: CashuPublicKey) {
+        let err = retire_eligible_incomplete_sagas(wallet)
+            .await
+            .expect_err("incomplete NUT-07 must refuse");
+        match &err {
+            PaymentWalletError::Reconcile(message)
+                if message.contains("Y set incomplete") || message.contains("mismatched") => {}
+            other => panic!("expected Y-set incomplete refuse, got: {other}"),
+        }
+        assert_eq!(
+            wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "saga must remain"
+        );
+        assert_eq!(
+            wallet
+                .localstore
+                .get_reserved_proofs(&saga_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "reserved must remain"
+        );
+        let unspent = wallet
+            .localstore
+            .get_proofs(None, None, Some(vec![State::Unspent]), None)
+            .await
+            .unwrap();
+        assert!(
+            unspent.iter().all(|info| info.y != proof_y),
+            "incomplete NUT-07 must not phantom-credit as Unspent"
+        );
+    }
+
+    #[tokio::test]
+    async fn nut07_empty_states_refuses_retire() {
+        // Temper HIGH: states=[] previously passed refuse_if_not_all_unspent.
+        let (wallet, saga_id, proof_y) = reserved_saga_with_nut07_states(20, vec![]).await;
+        assert_nut07_incomplete_refuses(&wallet, saga_id, proof_y).await;
+    }
+
+    #[tokio::test]
+    async fn nut07_wrong_y_states_refuses_retire() {
+        let wrong_y = p2pk_proof(3, secret_key(2).public_key()).y().unwrap();
+        let (wallet, saga_id, proof_y) = reserved_saga_with_nut07_states(
+            21,
+            vec![ProofState::from((wrong_y, State::Unspent))],
+        )
+        .await;
+        assert_nut07_incomplete_refuses(&wallet, saga_id, proof_y).await;
+    }
+
+    #[tokio::test]
+    async fn nut07_partial_states_refuses_retire() {
+        // Two reserved ys; mint returns only one → refuse.
+        let seller = secret_key(1).public_key();
+        let proof_a = p2pk_proof(4, seller);
+        let proof_b = p2pk_proof(3, seller);
+        let y_a = proof_a.y().unwrap();
+        let y_b = proof_b.y().unwrap();
+        let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        let info_a = ProofInfo::new(proof_a.clone(), mint(MINT), State::Unspent, CurrencyUnit::Sat)
+            .unwrap();
+        let info_b = ProofInfo::new(proof_b.clone(), mint(MINT), State::Unspent, CurrencyUnit::Sat)
+            .unwrap();
+        let saga_id = uuid::Uuid::now_v7();
+        store
+            .update_proofs(vec![info_a, info_b], vec![])
+            .await
+            .unwrap();
+        store
+            .reserve_proofs(vec![y_a, y_b], &saga_id)
+            .await
+            .unwrap();
+        let saga = WalletSaga::new(
+            saga_id,
+            cdk::wallet::types::WalletSagaState::Send(
+                cdk::wallet::types::SendSagaState::ProofsReserved,
+            ),
+            Amount::from(7),
+            mint(MINT),
+            CurrencyUnit::Sat,
+            cdk::wallet::types::OperationData::Send(cdk::wallet::types::SendOperationData {
+                amount: Amount::from(7),
+                memo: None,
+                counter_start: None,
+                counter_end: None,
+                token: None,
+                proofs: Some(vec![proof_a, proof_b]),
+            }),
+        );
+        store.add_saga(saga).await.unwrap();
+        let connector = Arc::new(BaseHttpClient::with_transport(
+            mint(MINT),
+            CheckStateTransport::new(cashu::CheckStateResponse {
+                // Partial: only y_a, missing y_b.
+                states: vec![ProofState::from((y_a, State::Unspent))],
+            }),
+            None,
+        ));
+        let wallet = WalletBuilder::new()
+            .mint_url(mint(MINT))
+            .unit(CurrencyUnit::Sat)
+            .localstore(store)
+            .seed([22; 64])
+            .shared_client(connector)
+            .build()
+            .unwrap();
+
+        let err = retire_eligible_incomplete_sagas(&wallet)
+            .await
+            .expect_err("partial NUT-07 must refuse");
+        match &err {
+            PaymentWalletError::Reconcile(message)
+                if message.contains("Y set incomplete") || message.contains("mismatched") => {}
+            other => panic!("expected Y-set incomplete refuse, got: {other}"),
+        }
+        assert_eq!(
+            wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            wallet
+                .localstore
+                .get_reserved_proofs(&saga_id)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "both reserved proofs must remain"
+        );
+        let unspent = wallet
+            .localstore
+            .get_proofs(None, None, Some(vec![State::Unspent]), None)
+            .await
+            .unwrap();
+        assert!(
+            unspent
+                .iter()
+                .all(|info| info.y != y_a && info.y != y_b),
+            "partial NUT-07 must not phantom-credit reserved proofs"
         );
     }
 
