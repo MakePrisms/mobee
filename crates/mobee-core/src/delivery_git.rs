@@ -72,6 +72,12 @@ impl GitDeliveryVerifier {
     }
 
     fn fetch(&self, delivery: &GitDelivery) -> Result<CommitOid, DeliveryError> {
+        // Stage the untrusted seller branch in an isolated, OID-keyed local ref
+        // namespace — deliberately NOT refs/heads/* or refs/remotes/*, so a delivery
+        // cannot masquerade as a real branch or remote-tracking ref, and each delivery
+        // is uniquely keyed by its claimed commit OID (no cross-delivery collision).
+        // Internal verify-staging only, not a config knob: the buyer then resolves
+        // `<fetched_ref>^{commit}` and tip-matches the expected OID before paying.
         let fetched_ref = format!("refs/mobee/deliveries/{}", delivery.commit_oid().as_str());
         let refspec = format!("+refs/heads/{}:{fetched_ref}", delivery.branch());
         let output = git_output([
