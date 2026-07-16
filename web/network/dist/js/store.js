@@ -164,6 +164,8 @@ export function createStore() {
         rows.push({
           id: ev.id,
           created_at: ev.created_at,
+          // A kind-3400 co-signed receipt backs this row → the trade is PAID.
+          source: "paid",
           paid_price_sats: u.paid_price_sats ?? ev.receipt?.amount_sats ?? null,
           paid_price_tokens: u.paid_price_tokens,
           measured_cost_tokens: u.measured_cost_tokens,
@@ -185,6 +187,9 @@ export function createStore() {
         rows.push({
           id: ev.id,
           created_at: ev.created_at,
+          // Only a kind-6109 result backs this row (no receipt yet) → DELIVERED, not paid.
+          // The label MUST stay distinct so "delivered" never reads as "paid".
+          source: "delivered",
           paid_price_sats: u.paid_price_sats ?? ev.result?.amount_sats ?? null,
           paid_price_tokens: u.paid_price_tokens,
           measured_cost_tokens: u.measured_cost_tokens,

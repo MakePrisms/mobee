@@ -392,4 +392,64 @@ assert.ok(uRow, "untagged 6109 result still rows out");
 assert.equal(uRow.total_tokens, null, "untagged usage stays dashed — never fabricated");
 assert.equal(uRow.harness_family, null);
 
+// ——— row SOURCE: "delivered" (6109-only) must never read as "paid" (3400-backed) ———
+
+// result-only rows are DELIVERED, not paid.
+assert.equal(tRow.source, "delivered", "6109-result-only row is delivered, not paid");
+assert.equal(uRow.source, "delivered");
+
+// a kind-3400 receipt-backed row is PAID.
+const paidStore = createStore();
+const paidOffer = "b1".padEnd(64, "0");
+const paidReceipt = ok({
+  id: "b2".padEnd(64, "0"),
+  pubkey: "b3".padEnd(64, "0"),
+  kind: 3400,
+  created_at: 600,
+  tags: [
+    ["amount", "9", "sat"],
+    ["e", paidOffer, "", "root"],
+    ["e", "b9".padEnd(64, "0"), "", "reply"],
+    ["mint", "https://testnut.cashu.space"],
+  ],
+  content: "",
+});
+paidStore.ingest(paidReceipt);
+const paidRow = paidStore.economics().rows.find((r) => r.id === paidReceipt.id);
+assert.ok(paidRow, "receipt produces an economics row");
+assert.equal(paidRow.source, "paid", "kind-3400 receipt-backed row is paid");
+
+// dedup: a job with BOTH a result and a receipt → the receipt wins → PAID (no duplicate row).
+const bothStore = createStore();
+bothStore.ingest(
+  ok({
+    id: "c1".padEnd(64, "0"),
+    pubkey: "c2".padEnd(64, "0"),
+    kind: 6109,
+    created_at: 700,
+    tags: [
+      ["e", paidOffer, "", "root"],
+      ["amount", "9", "sat"],
+      ["harness", "claude-agent-acp"],
+      ["usage_transport", "acp-native"],
+      ["tokens", "5", "total"],
+      ["tokens", "3", "input"],
+      ["tokens", "2", "output"],
+    ],
+    content: "delivery commit c0ffee",
+  }),
+);
+bothStore.ingest(paidReceipt); // same offer (paidOffer) → receipt wins
+const bothRows = bothStore.economics().rows.filter((r) => r.source);
+assert.equal(
+  bothRows.filter((r) => r.source === "delivered").length,
+  0,
+  "result echo is suppressed once a receipt exists for the offer",
+);
+assert.equal(
+  bothRows.filter((r) => r.source === "paid").length,
+  1,
+  "the settled job shows exactly one paid row",
+);
+
 console.log("ok — parse/store suite passed");

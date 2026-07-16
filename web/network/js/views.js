@@ -111,6 +111,7 @@ function renderEconomics(eco) {
   const detailRows = eco.rows.slice(0, 40).map((r) =>
     el("tr", {}, [
       td(shortId(r.id)),
+      td(r.source || "—"),
       td(r.harness_family || "—"),
       td(r.usage_transport || "—"),
       td(fmtNum(r.total_tokens)),
@@ -137,12 +138,13 @@ function renderEconomics(eco) {
         el("tbody", {}, groupRows.length ? groupRows : [emptyRow(6)]),
       ]),
     ]),
-    el("h3", {}, [text("recent receipts")]),
+    el("h3", {}, [text("recent settlements")]),
     el("div", { class: "table-wrap" }, [
       el("table", {}, [
         el("thead", {}, [
           el("tr", {}, [
             th("id"),
+            th("source"),
             th("harness_family"),
             th("usage_transport"),
             th("total_tokens"),
@@ -151,7 +153,7 @@ function renderEconomics(eco) {
             th("paid sats"),
           ]),
         ]),
-        el("tbody", {}, detailRows.length ? detailRows : [emptyRow(7)]),
+        el("tbody", {}, detailRows.length ? detailRows : [emptyRow(8)]),
       ]),
     ]),
   ]);
