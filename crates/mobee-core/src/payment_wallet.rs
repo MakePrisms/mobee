@@ -7,8 +7,8 @@ use std::sync::mpsc;
 use std::thread;
 
 use cashu::{
-    Amount, CurrencyUnit, MintUrl, PublicKey as CashuPublicKey, SecretKey, SpendingConditions,
-    State, Token,
+    Amount, CheckStateRequest, CurrencyUnit, MintUrl, PublicKey as CashuPublicKey, SecretKey,
+    SpendingConditions, State, Token,
 };
 use cdk::wallet::{
     HttpClient, KeysetFilter, MintConnector, ReceiveOptions, SendOptions, Wallet,
@@ -420,11 +420,24 @@ fn require_realized_locked_token(
 }
 
 /// Retire only enumerated-safe incomplete ops: `Send(ProofsReserved)` with no
-/// confirmed attempt, all reserved `y` NUT-07 Unspent, and cancel succeeding.
+/// confirmed attempt, non-empty reserved set, all reserved `y` NUT-07 Unspent,
+/// and cancel succeeding.
 ///
 /// Pure cleanup — no receipt, no balance credit. Idempotent (second call is a
-/// no-op). Mixed Spent|Pending / check-state fail / cancel fail ⇒ refuse whole
-/// retire (wedged-safer-than-double-spend).
+/// no-op when nothing eligible remains). Per-saga fail-closed: Spent|Pending /
+/// empty-reserved / check-state fail / cancel fail ⇒ refuse that saga's retire
+/// (wedged-safer-than-double-spend). Not atomic across sagas — earlier sagas in
+/// the same call may already have retired before a later refuse aborts the loop.
+///
+/// NUT-07 uses non-mutating `post_check_state` — never CDK `check_proofs_spent`,
+/// which deletes mint-Spent `y`s from localstore and would make a second retire
+/// see empty-reserved and falsely auto-retire.
+///
+/// **Migration edge (fail-closed):** empty-reserved is ALWAYS refused. Wallets
+/// that previously ran destructive `check_proofs_spent` can hold empty sagas
+/// that were Spent-then-deleted, indistinguishable from never-bound orphans —
+/// auto-retiring either class would reopen the double-spend hole. Orphans stay
+/// wedged-safer; operators can document/manual-clear.
 pub async fn retire_eligible_incomplete_sagas(
     wallet: &Wallet,
 ) -> Result<RetireReport, PaymentWalletError> {
@@ -477,6 +490,38 @@ async fn saga_has_confirmed_outgoing_tx(
     Ok(txs.iter().any(|tx| tx.saga_id == Some(saga.id)))
 }
 
+/// NUT-07 via mint connector only — does not mutate localstore.
+async fn nut07_check_state_non_mutating(
+    wallet: &Wallet,
+    ys: Vec<CashuPublicKey>,
+) -> Result<Vec<cashu::ProofState>, PaymentWalletError> {
+    let response = wallet
+        .mint_connector()
+        .post_check_state(CheckStateRequest { ys })
+        .await
+        .map_err(|error| {
+            PaymentWalletError::Reconcile(format!(
+                "check-state failed (fail-closed, no retire): {error}"
+            ))
+        })?;
+    Ok(response.states)
+}
+
+fn refuse_if_not_all_unspent(
+    states: &[cashu::ProofState],
+) -> Result<(), PaymentWalletError> {
+    if states
+        .iter()
+        .any(|proof_state| proof_state.state != State::Unspent)
+    {
+        return Err(PaymentWalletError::Reconcile(
+            "retire refused: reserved proof mint state is Spent or Pending (per-saga fail-closed)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn retire_one_proofs_reserved(
     wallet: &Wallet,
     saga: &cdk::wallet::types::WalletSaga,
@@ -487,37 +532,66 @@ async fn retire_one_proofs_reserved(
         .await
         .map_err(wallet_error)?;
 
-    if !reserved.is_empty() {
-        let proofs = reserved
-            .iter()
-            .map(|info| info.proof.clone())
-            .collect::<Vec<_>>();
-        // NUT-07 via mint — do not use local-only state. Any Spent|Pending ⇒
-        // refuse whole retire (all-or-nothing).
-        let states = wallet.check_proofs_spent(proofs).await.map_err(|error| {
-            PaymentWalletError::Reconcile(format!(
-                "check-state failed (fail-closed, no retire): {error}"
-            ))
-        })?;
-        if states
-            .iter()
-            .any(|proof_state| proof_state.state != State::Unspent)
-        {
-            return Err(PaymentWalletError::Reconcile(
-                "retire refused: reserved proof mint state is Spent or Pending (all-or-nothing)"
-                    .into(),
-            ));
-        }
+    // Migration edge fail-closed: empty-reserved ALWAYS refused. Spent-then-
+    // deleted under old check_proofs_spent is indistinguishable from a never-
+    // bound orphan — auto-retire of either reopens the double-spend hole.
+    if reserved.is_empty() {
+        return Err(PaymentWalletError::Reconcile(
+            "retire refused: empty reserved set (migration-safe fail-closed; Spent-deleted and orphan are indistinguishable; leave wedged-safer-than-double-spend)"
+                .into(),
+        ));
     }
 
-    // Match CDK compensate_send: PendingSpent → Reserved locally, then revert
-    // Reserved/Pending → Unspent and clear used_by_operation, then delete saga.
-    // TOCTOU: any failure here aborts with error — never report retire success.
+    let ys = reserved.iter().map(|info| info.y).collect::<Vec<_>>();
+    // Never use check_proofs_spent — it deletes mint-Spent ys from localstore.
+    let states = nut07_check_state_non_mutating(wallet, ys).await?;
+    refuse_if_not_all_unspent(&states)?;
+
+    // Pre-mutate TOCTOU: re-fetch ProofsReserved ∧ no confirmed tx ∧ Unspent
+    // immediately before local Unspent+delete (concurrent authorize_pay confirm).
+    let fresh = wallet
+        .localstore
+        .get_saga(&saga.id)
+        .await
+        .map_err(wallet_error)?
+        .ok_or_else(|| {
+            PaymentWalletError::Reconcile(
+                "retire refused: saga disappeared before mutate (leave wedged-safer)".into(),
+            )
+        })?;
+    if !matches!(
+        fresh.state,
+        WalletSagaState::Send(SendSagaState::ProofsReserved)
+    ) {
+        return Err(PaymentWalletError::Reconcile(
+            "retire refused: saga no longer ProofsReserved before mutate (TOCTOU)".into(),
+        ));
+    }
+    if saga_has_confirmed_outgoing_tx(wallet, &fresh).await? {
+        return Err(PaymentWalletError::Reconcile(
+            "retire refused: confirmed outgoing tx appeared before mutate (TOCTOU)".into(),
+        ));
+    }
+
     let reserved = wallet
         .localstore
         .get_reserved_proofs(&saga.id)
         .await
         .map_err(wallet_error)?;
+    if reserved.is_empty() {
+        return Err(PaymentWalletError::Reconcile(
+            "retire refused: reserved emptied before mutate (TOCTOU / migration-safe fail-closed)"
+                .into(),
+        ));
+    }
+
+    let ys = reserved.iter().map(|info| info.y).collect::<Vec<_>>();
+    let states = nut07_check_state_non_mutating(wallet, ys).await?;
+    refuse_if_not_all_unspent(&states)?;
+
+    // Match CDK compensate_send: PendingSpent → Reserved locally, then revert
+    // Reserved/Pending → Unspent and clear used_by_operation, then delete saga.
+    // TOCTOU: any failure here aborts with error — never report retire success.
     let mut pending_spent: Vec<_> = reserved
         .iter()
         .filter(|proof| proof.state == State::PendingSpent)
@@ -1062,7 +1136,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unbound_incomplete_proofs_reserved_without_proofs_is_retired() {
+    async fn empty_reserved_proofs_reserved_refuses_retire_migration_safe() {
+        // Migration edge: empty reserved is ALWAYS refused — Spent-then-deleted
+        // under old check_proofs_spent is indistinguishable from never-bound orphan.
         let fixture = wallet_fixture().await;
         let key = payment_key(&fixture.terms);
         let saga = WalletSaga::new(
@@ -1084,38 +1160,43 @@ mod tests {
         );
         fixture.wallet.localstore.add_saga(saga).await.unwrap();
 
-        let report = retire_eligible_incomplete_sagas(&fixture.wallet)
+        let err = retire_eligible_incomplete_sagas(&fixture.wallet)
             .await
-            .unwrap();
-        assert_eq!(report.retired, 1);
-
-        // Second retire is a no-op (compensate-once / idempotent).
-        let report2 = retire_eligible_incomplete_sagas(&fixture.wallet)
-            .await
-            .unwrap();
-        assert_eq!(report2.retired, 0);
-        assert!(
+            .expect_err("empty-reserved must refuse (migration-safe fail-closed)");
+        match &err {
+            PaymentWalletError::Reconcile(message)
+                if message.contains("empty reserved") && message.contains("fail-closed") => {}
+            other => panic!("expected empty-reserved refuse, got: {other}"),
+        }
+        assert_eq!(
             fixture
                 .wallet
                 .localstore
                 .get_incomplete_sagas()
                 .await
                 .unwrap()
-                .is_empty()
+                .len(),
+            1,
+            "empty-reserved saga must remain"
         );
+        let err2 = retire_eligible_incomplete_sagas(&fixture.wallet)
+            .await
+            .expect_err("empty-reserved refuse must be sticky");
+        match &err2 {
+            PaymentWalletError::Reconcile(message) if message.contains("empty reserved") => {}
+            other => panic!("expected sticky empty-reserved refuse, got: {other}"),
+        }
 
-        // Orphan retired; no confirmed attempt and no funds → prepare will fail,
-        // but recover must not hard-block with the old wedge message.
+        // recover path still sees the incomplete saga (wedged-safer, no auto-clear).
         let result = CdkBuyerMint::new(&fixture.wallet)
             .lock_or_reconcile(&key.attempt_id(), &fixture.terms)
             .await;
         match &result {
             Err(PaymentWalletError::Reconcile(message))
-                if message.contains("incomplete operation with no matching confirmed attempt") =>
-            {
-                panic!("unexpected wedge residual: {message}");
-            }
-            _ => {}
+                if message.contains("empty reserved")
+                    || message.contains("incomplete operation") => {}
+            Err(other) => panic!("expected wedged refuse, got: {other}"),
+            Ok(_) => panic!("expected wedged refuse, got Ok"),
         }
     }
 
@@ -1153,7 +1234,7 @@ mod tests {
                 counter_start: None,
                 counter_end: None,
                 token: None,
-                proofs: None,
+                proofs: Some(vec![proof.clone()]),
             }),
         );
         store.add_saga(saga).await.unwrap();
@@ -1189,6 +1270,213 @@ mod tests {
                 .len(),
             1,
             "saga must remain when retire refused"
+        );
+        // Non-mutating NUT-07: reserved proofs must still be present after Spent refuse.
+        assert_eq!(
+            wallet
+                .localstore
+                .get_reserved_proofs(&saga_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "check_proofs_spent must not be used (would delete Spent ys)"
+        );
+
+        // Stickiness RED triad: 2nd Err ∧ saga len==1 ∧ no phantom Unspent credit.
+        let err2 = retire_eligible_incomplete_sagas(&wallet)
+            .await
+            .expect_err("spent refuse must be sticky on second retire");
+        match &err2 {
+            PaymentWalletError::Reconcile(message) if message.contains("Spent or Pending") => {}
+            other => panic!("expected sticky Spent/Pending refuse, got: {other}"),
+        }
+        assert_eq!(
+            wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "saga must remain after second spent refuse"
+        );
+        let unspent = wallet
+            .localstore
+            .get_proofs(None, None, Some(vec![State::Unspent]), None)
+            .await
+            .unwrap();
+        assert!(
+            unspent.iter().all(|info| info.y != proof_y),
+            "Spent refuse must not phantom-credit proof as Unspent/spendable"
+        );
+        assert_eq!(
+            wallet
+                .localstore
+                .get_reserved_proofs(&saga_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "Spent proof must remain reserved (not returned to spendable)"
+        );
+    }
+
+    #[tokio::test]
+    async fn proofs_reserved_with_pending_mint_state_refuses_retire_sticky() {
+        let seller = secret_key(1).public_key();
+        let proof = p2pk_proof(7, seller);
+        let proof_y = proof.y().unwrap();
+        let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        let proof_info = ProofInfo::new(
+            proof.clone(),
+            mint(MINT),
+            State::Unspent,
+            CurrencyUnit::Sat,
+        )
+        .unwrap();
+        let saga_id = uuid::Uuid::now_v7();
+        store.update_proofs(vec![proof_info], vec![]).await.unwrap();
+        store
+            .reserve_proofs(vec![proof_y], &saga_id)
+            .await
+            .unwrap();
+        let saga = WalletSaga::new(
+            saga_id,
+            cdk::wallet::types::WalletSagaState::Send(
+                cdk::wallet::types::SendSagaState::ProofsReserved,
+            ),
+            Amount::from(7),
+            mint(MINT),
+            CurrencyUnit::Sat,
+            cdk::wallet::types::OperationData::Send(cdk::wallet::types::SendOperationData {
+                amount: Amount::from(7),
+                memo: None,
+                counter_start: None,
+                counter_end: None,
+                token: None,
+                proofs: Some(vec![proof.clone()]),
+            }),
+        );
+        store.add_saga(saga).await.unwrap();
+        let connector = Arc::new(BaseHttpClient::with_transport(
+            mint(MINT),
+            CheckStateTransport::new(cashu::CheckStateResponse {
+                states: vec![ProofState::from((proof_y, State::Pending))],
+            }),
+            None,
+        ));
+        let wallet = WalletBuilder::new()
+            .mint_url(mint(MINT))
+            .unit(CurrencyUnit::Sat)
+            .localstore(store)
+            .seed([11; 64])
+            .shared_client(connector)
+            .build()
+            .unwrap();
+
+        let err = retire_eligible_incomplete_sagas(&wallet)
+            .await
+            .expect_err("pending must refuse");
+        match &err {
+            PaymentWalletError::Reconcile(message) if message.contains("Spent or Pending") => {}
+            other => panic!("expected Spent/Pending refuse, got: {other}"),
+        }
+        let err2 = retire_eligible_incomplete_sagas(&wallet)
+            .await
+            .expect_err("pending refuse must be sticky");
+        match &err2 {
+            PaymentWalletError::Reconcile(message) if message.contains("Spent or Pending") => {}
+            other => panic!("expected sticky Pending refuse, got: {other}"),
+        }
+        assert_eq!(
+            wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let unspent = wallet
+            .localstore
+            .get_proofs(None, None, Some(vec![State::Unspent]), None)
+            .await
+            .unwrap();
+        assert!(
+            unspent.iter().all(|info| info.y != proof_y),
+            "Pending refuse must not phantom-credit proof as Unspent/spendable"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_reserved_with_bound_proofs_refuses_retire() {
+        // Spent-then-deleted localstore gap (old check_proofs_spent): reserved
+        // empty even with bound op proofs ⇒ refuse, never auto-retire.
+        let seller = secret_key(1).public_key();
+        let proof = p2pk_proof(7, seller);
+        let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        let saga_id = uuid::Uuid::now_v7();
+        let saga = WalletSaga::new(
+            saga_id,
+            cdk::wallet::types::WalletSagaState::Send(
+                cdk::wallet::types::SendSagaState::ProofsReserved,
+            ),
+            Amount::from(7),
+            mint(MINT),
+            CurrencyUnit::Sat,
+            cdk::wallet::types::OperationData::Send(cdk::wallet::types::SendOperationData {
+                amount: Amount::from(7),
+                memo: None,
+                counter_start: None,
+                counter_end: None,
+                token: None,
+                proofs: Some(vec![proof]),
+            }),
+        );
+        store.add_saga(saga).await.unwrap();
+        let connector = Arc::new(BaseHttpClient::with_transport(
+            mint(MINT),
+            CheckStateTransport::new(cashu::CheckStateResponse { states: vec![] }),
+            None,
+        ));
+        let wallet = WalletBuilder::new()
+            .mint_url(mint(MINT))
+            .unit(CurrencyUnit::Sat)
+            .localstore(store)
+            .seed([12; 64])
+            .shared_client(connector)
+            .build()
+            .unwrap();
+
+        let err = retire_eligible_incomplete_sagas(&wallet)
+            .await
+            .expect_err("empty-reserved must refuse");
+        match &err {
+            PaymentWalletError::Reconcile(message) if message.contains("empty reserved") => {}
+            other => panic!("expected empty-reserved refuse, got: {other}"),
+        }
+        assert_eq!(
+            wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "saga must remain when empty reserved"
+        );
+        let _ = retire_eligible_incomplete_sagas(&wallet)
+            .await
+            .expect_err("empty-reserved refuse must be sticky");
+        assert_eq!(
+            wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -1324,7 +1612,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirmed_attempt_with_an_unrelated_incomplete_saga_retires_orphan_then_reconciles() {
+    async fn confirmed_attempt_with_empty_reserved_orphan_refuses_reconcile() {
+        // Empty-reserved orphan blocks even when a confirmed attempt exists —
+        // migration-safe fail-closed (Spent-deleted vs orphan indistinguishable).
         let fixture = wallet_fixture().await;
         let key = payment_key(&fixture.terms);
         let attempt_id = key.attempt_id();
@@ -1348,19 +1638,24 @@ mod tests {
         );
         fixture.wallet.localstore.add_saga(saga).await.unwrap();
 
-        let locked = CdkBuyerMint::new(&fixture.wallet)
+        let result = CdkBuyerMint::new(&fixture.wallet)
             .lock_or_reconcile(&attempt_id, &fixture.terms)
-            .await
-            .unwrap();
-        assert_eq!(locked.token(), &fixture.token);
-        assert!(
+            .await;
+        match &result {
+            Err(PaymentWalletError::Reconcile(message)) if message.contains("empty reserved") => {}
+            Err(other) => panic!("expected empty-reserved refuse, got: {other}"),
+            Ok(_) => panic!("expected empty-reserved refuse, got Ok"),
+        }
+        assert_eq!(
             fixture
                 .wallet
                 .localstore
                 .get_incomplete_sagas()
                 .await
                 .unwrap()
-                .is_empty()
+                .len(),
+            1,
+            "empty orphan must remain (not auto-retired)"
         );
     }
 

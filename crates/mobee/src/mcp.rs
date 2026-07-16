@@ -297,7 +297,7 @@ fn tools() -> Value {
         },
         {
             "name": "reconcile_wallet",
-            "description": "Retire incomplete CDK Send(ProofsReserved) ops that have no confirmed attempt and whose reserved proofs are all NUT-07 Unspent at the mint. Pure cleanup (no receipt / no balance credit). TokenCreated / RollingBack / Spent|Pending / check-state fail are refused (wedged-safer-than-double-spend). Idempotent. Never echoes secrets.",
+            "description": "Retire incomplete CDK Send(ProofsReserved) ops that have no confirmed attempt, a non-empty reserved set, and whose reserved proofs are all NUT-07 Unspent (non-mutating post_check_state). Pure cleanup (no receipt / no balance credit). Per-saga fail-closed: empty-reserved (migration-safe — Spent-deleted vs orphan indistinguishable), TokenCreated / RollingBack / Spent|Pending / check-state fail are refused (wedged-safer-than-double-spend). Idempotent. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
