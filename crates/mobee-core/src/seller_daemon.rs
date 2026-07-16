@@ -28,13 +28,20 @@ use crate::job_lifecycle::{event_to_draft, job_hash_for_offer};
 use crate::payment_send::ReceivedPayment;
 use crate::payment_wallet::{CdkSellerReceive, PaymentPolicy, PaymentWalletError};
 use crate::seller::{
-    cashu_secret_from_nostr_hex, job_deadline_unix, rate_gate_allows, require_seller_config,
-    sign_receipt_hash, unwrap_own_payment_gift_wrap, SellerError, SellerJournal,
+    cashu_secret_from_nostr_hex, job_deadline_unix, plan_orphaned_claims, rate_gate_allows,
+    require_seller_config, sign_receipt_hash, unwrap_own_payment_gift_wrap, ClaimLiveness,
+    OrphanClaim, SellerError, SellerJournal,
 };
 use crate::seller_git::{self, SellerGitError};
 
-/// In-flight single-flight lock for v1 (one job at a time per process).
+/// In-flight single-flight lock for v1 (one job in the PROCESSING phase per process).
+/// Held from claim through delivery (kind-6109), then released — a delivered-but-unpaid
+/// job awaiting payment does NOT hold this lock (piece-11 #15 fix).
 static FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Upper bound on delivered-but-unpaid jobs tracked concurrently (bounded memory).
+/// Reaching it back-pressures new claims with a logged skip reason (never a silent drop).
+const AWAITING_PAYMENT_CAP: usize = 16;
 
 #[derive(Debug)]
 pub enum DaemonError {
@@ -111,6 +118,74 @@ pub struct ActiveJob {
     pub workdir: PathBuf,
 }
 
+/// What [`SellerDaemon::classify_offer`] decided to do with an offer event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OfferDisposition {
+    /// Admitted — claim the offer (single-flight reservation happens next).
+    Claim(ClaimIntent),
+    /// Not claimed — carries a named, loggable reason (never a silent drop).
+    Skip(OfferSkip),
+}
+
+/// Everything needed to publish a claim + journal it, resolved without relay I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimIntent {
+    pub job_id: String,
+    pub buyer_pubkey: String,
+    pub offer: ParsedOffer,
+    pub deadline_unix: u64,
+}
+
+/// Enumerated reasons an offer is not claimed. Every variant maps to a logged reason —
+/// there is no silent-drop path (piece-11 #15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OfferSkip {
+    /// Event is not a kind-5109 offer.
+    NotAnOffer { kind: u16 },
+    /// Offer tags did not parse.
+    Unparseable,
+    /// Offer mint is not the fail-closed testnut mint.
+    NonTestnutMint { mint_url: String },
+    /// Rate-gate refused (not targeted to us / below rate / untargeted without opt-in).
+    RateGate { reason: String },
+    /// Journal already has a claim/receipt/release for this job (dedup).
+    AlreadyProcessed,
+    /// A job is already in the PROCESSING phase (single-flight). NOT triggered by
+    /// delivered-but-unpaid jobs — those await payment without holding the slot.
+    ProcessingBusy { job_id: String },
+    /// Too many delivered-but-unpaid jobs pending payment (bounded-memory back-pressure).
+    AwaitingPaymentFull { capacity: usize },
+}
+
+impl OfferSkip {
+    /// Human-readable skip reason for logging (never empty).
+    pub fn reason(&self) -> String {
+        match self {
+            Self::NotAnOffer { kind } => format!("not a kind-{JOB_OFFER_KIND} offer (kind {kind})"),
+            Self::Unparseable => "offer tags did not parse".to_string(),
+            Self::NonTestnutMint { mint_url } => format!("non-testnut mint {mint_url}"),
+            Self::RateGate { reason } => format!("rate-gate: {reason}"),
+            Self::AlreadyProcessed => "already claimed/receipted/released (journal dedup)".to_string(),
+            Self::ProcessingBusy { job_id } => {
+                format!("single-flight busy: job {job_id} is in the processing phase")
+            }
+            Self::AwaitingPaymentFull { capacity } => {
+                format!("awaiting-payment backlog full (cap {capacity}); back-pressuring new claims")
+            }
+        }
+    }
+}
+
+/// Reason string journaled + surfaced when a claim is released during restart-reconcile.
+fn reconcile_reason(liveness: ClaimLiveness) -> &'static str {
+    match liveness {
+        ClaimLiveness::Expired => "claim expired before daemon restart (deadline passed, unpaid)",
+        ClaimLiveness::Live => {
+            "daemon restarted mid-execution; live claim released (v1 does not resume in-memory job state)"
+        }
+    }
+}
+
 /// Buffered early payment (received before/while result published).
 struct BufferedPay {
     event_id: String,
@@ -125,7 +200,11 @@ pub struct SellerDaemon {
     journal: SellerJournal,
     /// Early / unmatched 1059 payments awaiting reconcile (ids only logged).
     pay_buffer: VecDeque<BufferedPay>,
+    /// The PROCESSING-phase job (holds single-flight). `None` when idle or only awaiting pay.
     active: Option<ActiveJob>,
+    /// DELIVERED-but-unpaid jobs (kind-6109 published, payment not yet redeemed). These do
+    /// NOT hold single-flight, so new offers can still be claimed while payment is pending.
+    awaiting_payment: Vec<ActiveJob>,
 }
 
 impl SellerDaemon {
@@ -149,6 +228,7 @@ impl SellerDaemon {
             journal,
             pay_buffer: VecDeque::new(),
             active: None,
+            awaiting_payment: Vec::new(),
         })
     }
 
@@ -176,28 +256,95 @@ impl SellerDaemon {
     }
 
     /// Handle one kind-5109 offer event. Returns Ok(Some(active)) when claimed.
+    ///
+    /// Skips are NEVER silent — every non-claim path is logged with its reason
+    /// ([`OfferSkip::reason`]). A delivered-but-unpaid job does not block here (its
+    /// binding lives in `awaiting_payment`, not the single-flight slot).
     pub async fn on_offer_event(
         &mut self,
         event: &nostr_sdk::Event,
     ) -> Result<Option<&ActiveJob>, DaemonError> {
-        if Self::in_flight() || self.active.is_some() {
-            return Ok(None); // single-flight: ignore while busy
-        }
-        if event.kind.as_u16() != JOB_OFFER_KIND {
+        let now = now_unix();
+        let intent = match self.classify_offer(event, now)? {
+            OfferDisposition::Skip(skip) => {
+                eprintln!("seller skip offer {}: {}", event.id.to_hex(), skip.reason());
+                return Ok(None);
+            }
+            OfferDisposition::Claim(intent) => intent,
+        };
+
+        // Atomic reservation of the PROCESSING single-flight slot.
+        if !Self::try_begin_flight() {
+            eprintln!(
+                "seller skip offer {}: single-flight busy (a job is already in the processing phase)",
+                event.id.to_hex()
+            );
             return Ok(None);
+        }
+
+        let claim = claim_draft(&intent.job_id, &intent.buyer_pubkey, &self.seller_pubkey);
+        let claim_id = match publish_draft(&self.home, &self.keys, &claim).await {
+            Ok(id) => id,
+            Err(error) => {
+                Self::end_flight();
+                return Err(error);
+            }
+        };
+        // Journal the CLAIMED transition WITH the deadline/claim_id/buyer so a restart can
+        // reconcile this claim without the relay (piece-11 restart-reconcile).
+        if let Err(error) = self.journal.append_claim(
+            &intent.job_id,
+            &claim_id,
+            &intent.buyer_pubkey,
+            intent.deadline_unix,
+        ) {
+            Self::end_flight();
+            return Err(error.into());
+        }
+
+        let workdir = job_workdir(&self.home, &intent.job_id);
+        if let Err(error) = std::fs::create_dir_all(&workdir) {
+            Self::end_flight();
+            return Err(DaemonError::Seller(SellerError::Io(error.to_string())));
+        }
+
+        self.active = Some(ActiveJob {
+            job_id: intent.job_id,
+            buyer_pubkey: intent.buyer_pubkey,
+            offer: intent.offer,
+            claim_id,
+            result_id: None,
+            deadline_unix: intent.deadline_unix,
+            workdir,
+        });
+        Ok(self.active.as_ref())
+    }
+
+    /// Decide, WITHOUT any relay I/O, whether an offer event should be claimed.
+    ///
+    /// `now` is injected so the deadline is a pure function of inputs. Single-flight is
+    /// enforced ONLY for the PROCESSING slot (`self.active`): a delivered-but-unpaid job
+    /// in `awaiting_payment` does not block (piece-11 #15 silent-drop fix).
+    fn classify_offer(
+        &self,
+        event: &nostr_sdk::Event,
+        now: u64,
+    ) -> Result<OfferDisposition, DaemonError> {
+        if event.kind.as_u16() != JOB_OFFER_KIND {
+            return Ok(OfferDisposition::Skip(OfferSkip::NotAnOffer {
+                kind: event.kind.as_u16(),
+            }));
         }
         let draft = event_to_draft(event);
         let offer = match parse_offer(&draft) {
             Ok(offer) => offer,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(OfferDisposition::Skip(OfferSkip::Unparseable)),
         };
         // Offer mint fail-closed to testnut (soft-skip so the daemon stays up).
         if offer.mint_url != DEFAULT_MINT_URL {
-            eprintln!(
-                "seller skip offer {}: non-testnut mint",
-                event.id.to_hex()
-            );
-            return Ok(None);
+            return Ok(OfferDisposition::Skip(OfferSkip::NonTestnutMint {
+                mint_url: offer.mint_url.clone(),
+            }));
         }
         let seller_cfg = require_seller_config(&self.home)?;
         if let Err(error) = rate_gate_allows(
@@ -206,50 +353,94 @@ impl SellerDaemon {
             seller_cfg.rate_sats,
             seller_cfg.claim_open_pool,
         ) {
-            // Soft skip (not our rate / not targeted) — not a hard daemon error.
-            let _ = error;
-            return Ok(None);
+            return Ok(OfferDisposition::Skip(OfferSkip::RateGate {
+                reason: error.to_string(),
+            }));
         }
         let job_id = event.id.to_hex();
         if self.journal.has_claim(&job_id)? {
-            return Ok(None);
+            return Ok(OfferDisposition::Skip(OfferSkip::AlreadyProcessed));
         }
-        if !Self::try_begin_flight() {
-            return Ok(None);
+        // Single-flight is for PROCESSING only. Delivered-but-unpaid jobs live in
+        // `awaiting_payment` and MUST NOT block a new claim.
+        if let Some(active) = &self.active {
+            return Ok(OfferDisposition::Skip(OfferSkip::ProcessingBusy {
+                job_id: active.job_id.clone(),
+            }));
         }
-
-        let buyer_pubkey = event.pubkey.to_hex();
-        let claim = claim_draft(&job_id, &buyer_pubkey, &self.seller_pubkey);
-        let claim_id = match publish_draft(&self.home, &self.keys, &claim).await {
-            Ok(id) => id,
-            Err(error) => {
-                Self::end_flight();
-                return Err(error);
-            }
-        };
-        if let Err(error) = self.journal.append_claim(&job_id) {
-            Self::end_flight();
-            return Err(error.into());
+        if self.awaiting_payment.len() >= AWAITING_PAYMENT_CAP {
+            return Ok(OfferDisposition::Skip(OfferSkip::AwaitingPaymentFull {
+                capacity: AWAITING_PAYMENT_CAP,
+            }));
         }
-
-        let now = now_unix();
-        let deadline = job_deadline_unix(&offer, seller_cfg, now);
-        let workdir = job_workdir(&self.home, &job_id);
-        if let Err(error) = std::fs::create_dir_all(&workdir) {
-            Self::end_flight();
-            return Err(DaemonError::Seller(SellerError::Io(error.to_string())));
-        }
-
-        self.active = Some(ActiveJob {
+        let deadline_unix = job_deadline_unix(&offer, seller_cfg, now);
+        Ok(OfferDisposition::Claim(ClaimIntent {
             job_id,
-            buyer_pubkey,
+            buyer_pubkey: event.pubkey.to_hex(),
             offer,
-            claim_id,
-            result_id: None,
-            deadline_unix: deadline,
-            workdir,
-        });
-        Ok(self.active.as_ref())
+            deadline_unix,
+        }))
+    }
+
+    /// DELIVERED transition: move the PROCESSING job to `awaiting_payment` and free the
+    /// single-flight slot so new offers can be claimed while payment is pending (#15).
+    /// The payment binding is preserved (job_id + result_id) for [`try_apply_payment`].
+    fn mark_delivered(&mut self) {
+        if let Some(job) = self.active.take() {
+            // `result_id` was set by `execute_active_job` on the successful publish path.
+            self.awaiting_payment.push(job);
+            while self.awaiting_payment.len() > AWAITING_PAYMENT_CAP {
+                let dropped = self.awaiting_payment.remove(0);
+                eprintln!(
+                    "seller drop awaiting-payment job_id={} (backlog cap {AWAITING_PAYMENT_CAP})",
+                    dropped.job_id
+                );
+            }
+        }
+        Self::end_flight();
+    }
+
+    /// Pure restart-reconcile plan: orphaned in-flight claims (journaled, no receipt, no
+    /// release) classified Expired/Live by the injected `now`. No relay, no wall-clock.
+    pub fn reconcile_plan(&self, now: u64) -> Result<Vec<OrphanClaim>, DaemonError> {
+        Ok(plan_orphaned_claims(&self.journal.entries()?, now))
+    }
+
+    /// Durable restart-reconcile (NO relay): journal a terminal RELEASE for every orphaned
+    /// in-flight claim so it can never read live again and is never re-claimed. Idempotent.
+    /// Returns the plan that was acted on.
+    pub fn reconcile_journal(&mut self, now: u64) -> Result<Vec<OrphanClaim>, DaemonError> {
+        let plan = self.reconcile_plan(now)?;
+        for orphan in &plan {
+            self.journal
+                .append_release(&orphan.job_id, reconcile_reason(orphan.liveness))?;
+        }
+        Ok(plan)
+    }
+
+    /// Full startup reconcile: durable journal release (above) + best-effort kind-7000
+    /// error to surface the dead claim to the buyer. Publish failure is logged, not fatal —
+    /// the journal release is the durable guarantee; the buyer view also derives expiry.
+    pub async fn reconcile_on_startup(
+        &mut self,
+        now: u64,
+    ) -> Result<Vec<OrphanClaim>, DaemonError> {
+        let plan = self.reconcile_journal(now)?;
+        for orphan in &plan {
+            let reason = reconcile_reason(orphan.liveness);
+            let draft = error_draft(&orphan.job_id, &orphan.buyer_pubkey, &self.seller_pubkey);
+            match publish_draft(&self.home, &self.keys, &draft).await {
+                Ok(id) => eprintln!(
+                    "seller reconcile: released orphaned claim job_id={} liveness={:?} kind7000={id} reason={reason}",
+                    orphan.job_id, orphan.liveness
+                ),
+                Err(error) => eprintln!(
+                    "seller reconcile: released orphaned claim job_id={} liveness={:?} (kind-7000 publish deferred: {error}) reason={reason}",
+                    orphan.job_id, orphan.liveness
+                ),
+            }
+        }
+        Ok(plan)
     }
 
     /// Buffer or attempt apply of one kind-1059 gift wrap (ONE decode site).
@@ -278,25 +469,31 @@ impl SellerDaemon {
 
     async fn try_apply_payment(
         &mut self,
-        _event_id: &str,
         received: ReceivedPayment,
     ) -> Result<Option<ReceiptOutcome>, DaemonError> {
-        let Some(active) = self.active.as_ref() else {
-            // No active job yet — caller should buffer.
+        // Bind to the delivered-but-unpaid job this payment declares (exact job + result).
+        // Never scans `active` — the processing slot is not a payment target.
+        let Some(idx) = self.awaiting_payment.iter().position(|job| {
+            job.job_id == received.payload.job_id
+                && job.result_id.as_deref() == Some(received.payload.result_id.as_str())
+        }) else {
+            // No delivered job binds this payment yet — caller should buffer.
             return Ok(None);
         };
-        let Some(result_id) = active.result_id.as_deref() else {
-            return Ok(None);
-        };
-        let local_job = active.job_id.clone();
-        let local_result = result_id.to_owned();
-        let expected_amount = active.offer.amount;
-        let mint = active.offer.mint_url.clone();
-        let offer = active.offer.clone();
+        let job = self.awaiting_payment[idx].clone();
+        let local_job = job.job_id.clone();
+        let local_result = job
+            .result_id
+            .clone()
+            .expect("awaiting-payment job always carries a result_id");
+        let expected_amount = job.offer.amount;
+        let mint = job.offer.mint_url.clone();
+        let offer = job.offer.clone();
 
         let payload_job = received.payload.job_id.clone();
         let payload_result = received.payload.result_id.clone();
-        // B2: bind BEFORE journal — wrong-job refuse (no misattribution).
+        // B2: bind BEFORE journal — wrong-job refuse (no misattribution). Matched by
+        // construction above; kept as a defensive guard.
         if payload_job != local_job || payload_result != local_result {
             return Err(DaemonError::Policy(format!(
                 "payment bind refused: payload job/result ({payload_job}/{payload_result}) != local ({local_job}/{local_result})"
@@ -332,8 +529,8 @@ impl SellerDaemon {
             result_id: local_result,
             amount_received,
         };
-        self.active = None;
-        Self::end_flight();
+        // PAID: drop the delivered binding. Single-flight was already freed at delivery.
+        self.awaiting_payment.remove(idx);
         Ok(Some(outcome))
     }
 
@@ -593,58 +790,38 @@ async fn try_apply_or_buffer(
     event_id: String,
     received: ReceivedPayment,
 ) -> Result<ApplyResult, DaemonError> {
-    let has_result = daemon
-        .active
-        .as_ref()
-        .and_then(|job| job.result_id.as_ref())
-        .is_some();
-    if !has_result {
+    // Does a delivered-but-unpaid job bind this payment (exact job + result)?
+    let binds = daemon.awaiting_payment.iter().any(|job| {
+        job.job_id == received.payload.job_id
+            && job.result_id.as_deref() == Some(received.payload.result_id.as_str())
+    });
+    if !binds {
+        // No delivered job matches yet — buffer it (early pay for a still-processing job, or
+        // the wrap arrived before its delivery was recorded). Misattribution is impossible:
+        // `try_apply_payment` only receives against an exact job+result match.
         daemon.buffer_payment(event_id, received);
         return Ok(ApplyResult::Buffered);
     }
-    // Bind check first without consuming into receive on wrong-job:
-    if let Some(active) = daemon.active.as_ref() {
-        let local_job = &active.job_id;
-        let local_result = active.result_id.as_deref().unwrap_or("");
-        if received.payload.job_id != *local_job || received.payload.result_id != local_result {
-            return Err(DaemonError::Policy(format!(
-                "payment bind refused: payload job/result ({}/{}) != local ({local_job}/{local_result})",
-                received.payload.job_id, received.payload.result_id
-            )));
-        }
-    }
-    match daemon.try_apply_payment(&event_id, received).await? {
+    match daemon.try_apply_payment(received).await? {
         Some(outcome) => Ok(ApplyResult::Applied(outcome)),
         None => Ok(ApplyResult::Buffered),
     }
 }
 
-/// Reconcile buffered payments after 6109 publish (B2 early-pay).
+/// Reconcile buffered payments after 6109 publish (B2 early-pay). Applies every buffered
+/// wrap that now binds a delivered job; leaves the rest buffered. Returns the last receipt.
 pub async fn reconcile_after_result(
     daemon: &mut SellerDaemon,
 ) -> Result<Option<ReceiptOutcome>, DaemonError> {
+    // Drain into a snapshot; unmatched wraps are re-buffered into the (now empty) pay_buffer.
     let mut pending = std::mem::take(&mut daemon.pay_buffer);
-    let mut leftover = VecDeque::new();
     let mut done = None;
     while let Some(BufferedPay { event_id, received }) = pending.pop_front() {
-        if done.is_some() {
-            leftover.push_back(BufferedPay { event_id, received });
-            continue;
-        }
-        match try_apply_or_buffer(daemon, event_id.clone(), received).await? {
+        match try_apply_or_buffer(daemon, event_id, received).await? {
             ApplyResult::Applied(outcome) => done = Some(outcome),
-            ApplyResult::Buffered => {
-                // re-buffered inside try_apply_or_buffer when no result — should not happen
-                // after result publish; if bind not ready, leave in leftover via buffer.
-                let _ = event_id;
-            }
+            ApplyResult::Buffered => {}
         }
     }
-    // Drain anything re-buffered during loop.
-    while let Some(item) = daemon.pay_buffer.pop_front() {
-        leftover.push_back(item);
-    }
-    daemon.pay_buffer = leftover;
     Ok(done)
 }
 
@@ -735,6 +912,20 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
     client.wait_for_connection(Duration::from_secs(20)).await;
     wait_for_nip42_auth(&mut relay_notifications, Duration::from_secs(20)).await?;
 
+    // Restart-reconcile: release any orphaned in-flight claims from a prior run BEFORE
+    // serving new offers, so a claim left live by a crash never reads "processing" forever
+    // (evidence job 0867a213). Durable via journal; kind-7000 surface is best-effort.
+    match daemon.reconcile_on_startup(now_unix()).await {
+        Ok(plan) if !plan.is_empty() => {
+            eprintln!(
+                "seller reconcile: released {} orphaned claim(s) on startup",
+                plan.len()
+            );
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("seller reconcile failed on startup (continuing): {error}"),
+    }
+
     let offer_filter = Filter::new()
         .kind(Kind::Custom(JOB_OFFER_KIND))
         .pubkey(daemon.keys.public_key());
@@ -782,6 +973,9 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
                             match daemon.execute_active_job().await {
                                 Ok(result_id) => {
                                     eprintln!("seller published 6109 result_id={result_id}");
+                                    // DELIVERED: free the single-flight slot so new offers can
+                                    // be claimed while this job awaits payment (#15).
+                                    daemon.mark_delivered();
                                     match reconcile_after_result(&mut daemon).await {
                                         Ok(Some(receipt)) => eprintln!(
                                             "seller receipt (reconcile) job_id={} amount_received={}",
@@ -865,6 +1059,168 @@ mod tests {
         SellerDaemon::end_flight();
         assert!(SellerDaemon::try_begin_flight());
         SellerDaemon::end_flight();
+    }
+
+    fn sample_offer(amount: u64, seller: &str) -> ParsedOffer {
+        ParsedOffer {
+            task: "task".into(),
+            output: "text/plain".into(),
+            amount,
+            unit: "sat".into(),
+            deadline_unix: 2_000_000_000,
+            mint_url: DEFAULT_MINT_URL.into(),
+            seller_pubkey: Some(seller.to_owned()),
+        }
+    }
+
+    fn active_job(
+        job_id: &str,
+        seller: &str,
+        result_id: Option<&str>,
+        deadline: u64,
+        root: &Path,
+    ) -> ActiveJob {
+        ActiveJob {
+            job_id: job_id.into(),
+            buyer_pubkey: "bb".repeat(32),
+            offer: sample_offer(5, seller),
+            claim_id: format!("claim-{job_id}"),
+            result_id: result_id.map(str::to_owned),
+            deadline_unix: deadline,
+            workdir: root.join(job_id),
+        }
+    }
+
+    fn test_daemon(label: &str) -> (PathBuf, SellerDaemon) {
+        let root = temp(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("bootstrap");
+        home.config.mint_url = DEFAULT_MINT_URL.into();
+        home.config.seller = Some(SellerConfig {
+            agent_command: vec!["echo".into()],
+            rate_sats: 1,
+            git_remote: "https://example.invalid/repo.git".into(),
+            job_timeout_secs: None,
+            agent: None,
+            claim_open_pool: false,
+        });
+        home::save_config(&home).expect("save");
+        let keys = nostr_sdk::Keys::generate();
+        let seller_pubkey = keys.public_key().to_hex();
+        let journal = SellerJournal::open(&home).expect("journal");
+        let daemon = SellerDaemon {
+            home,
+            keys,
+            seller_pubkey,
+            journal,
+            pay_buffer: VecDeque::new(),
+            active: None,
+            awaiting_payment: Vec::new(),
+        };
+        (root, daemon)
+    }
+
+    fn offer_event(
+        buyer: &nostr_sdk::Keys,
+        seller_pubkey: &str,
+        amount: u64,
+        deadline: u64,
+    ) -> nostr_sdk::Event {
+        let offer = crate::gateway::OfferDraft::new(
+            "do a task",
+            "text/plain",
+            amount,
+            deadline,
+            DEFAULT_MINT_URL,
+            seller_pubkey,
+        );
+        let draft = offer.to_event_draft();
+        let builder = gateway::nostr::event_builder(&draft).expect("event builder");
+        builder.sign_with_keys(buyer).expect("sign offer")
+    }
+
+    // Behavior 1 (#15): a delivered-but-unpaid job MUST NOT block claiming a new offer;
+    // only a PROCESSING job holds single-flight, and any skip is a NAMED reason.
+    #[test]
+    fn delivered_unpaid_does_not_block_new_offer_but_processing_does() {
+        let (root, mut daemon) = test_daemon("admit");
+        let seller_pk = daemon.seller_pubkey().to_owned();
+        let buyer = nostr_sdk::Keys::generate();
+        let now = 1_000_000u64;
+
+        // Idle slot ⇒ offer is admitted (Claim).
+        let ev1 = offer_event(&buyer, &seller_pk, 5, now + 3600);
+        match daemon.classify_offer(&ev1, now).expect("classify idle") {
+            OfferDisposition::Claim(intent) => assert_eq!(intent.job_id, ev1.id.to_hex()),
+            other => panic!("idle daemon must admit an offer, got {other:?}"),
+        }
+
+        // A DELIVERED-but-unpaid job awaiting payment ⇒ STILL admits a new offer (the fix).
+        daemon.awaiting_payment.push(active_job(
+            "delivered-prev",
+            &seller_pk,
+            Some("result-prev"),
+            now + 3600,
+            &root,
+        ));
+        assert!(daemon.active.is_none(), "delivered job must not hold the slot");
+        let ev2 = offer_event(&buyer, &seller_pk, 5, now + 3600);
+        match daemon.classify_offer(&ev2, now).expect("classify while awaiting-pay") {
+            OfferDisposition::Claim(_) => {}
+            other => panic!("delivered-but-unpaid must NOT block a new claim, got {other:?}"),
+        }
+
+        // A PROCESSING job (holds the slot) ⇒ skip, but with an explicit, non-empty reason.
+        daemon.active = Some(active_job("processing-now", &seller_pk, None, now + 3600, &root));
+        let ev3 = offer_event(&buyer, &seller_pk, 5, now + 3600);
+        match daemon.classify_offer(&ev3, now).expect("classify while processing") {
+            OfferDisposition::Skip(skip) => {
+                assert!(matches!(skip, OfferSkip::ProcessingBusy { .. }), "got {skip:?}");
+                let reason = skip.reason();
+                assert!(!reason.is_empty(), "skip reason must never be empty (never silent)");
+                assert!(
+                    reason.contains("processing"),
+                    "reason must name the processing single-flight: {reason}"
+                );
+            }
+            other => panic!("processing job must block with a reason, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Behavior 2: restart-reconcile over a REAL orphaned-claim fixture (journaled in-flight
+    // claim + past deadline). The orphan is released (durable, no relay) and never re-fired.
+    #[test]
+    fn reconcile_journal_releases_real_orphaned_claim_and_is_idempotent() {
+        let (root, mut daemon) = test_daemon("reconcile");
+        let buyer = "cc".repeat(32);
+
+        // A real journaled in-flight claim with a PAST deadline, no receipt, no release —
+        // exactly the orphaned live claim a crashed daemon leaves behind (job 0867a213).
+        daemon
+            .journal
+            .append_claim("orphan-job", "orphan-claim", &buyer, 1_000_000_000)
+            .expect("journal orphaned claim");
+
+        // Before reconcile, it reads as an in-flight orphan (would show "processing").
+        let pre = daemon.reconcile_plan(2_000_000_000).expect("plan");
+        assert_eq!(pre.len(), 1, "one orphaned claim in flight: {pre:?}");
+        assert_eq!(pre[0].job_id, "orphan-job");
+        assert_eq!(pre[0].buyer_pubkey, buyer);
+        assert_eq!(pre[0].liveness, ClaimLiveness::Expired, "past deadline ⇒ EXPIRED");
+
+        // Reconcile releases it durably (journal RELEASE) with no relay.
+        let released = daemon.reconcile_journal(2_000_000_000).expect("reconcile");
+        assert_eq!(released.len(), 1);
+        assert!(
+            daemon.journal.has_release("orphan-job").expect("has_release"),
+            "orphan must be journaled as released — never left silently live"
+        );
+
+        // Idempotent: a second restart finds nothing to release.
+        let again = daemon.reconcile_journal(2_000_000_000).expect("reconcile again");
+        assert!(again.is_empty(), "released orphan is terminal: {again:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(not(feature = "acp"))]

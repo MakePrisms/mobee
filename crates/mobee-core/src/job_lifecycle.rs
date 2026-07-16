@@ -32,6 +32,9 @@ const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 5;
 /// cap-hit returns PENDING for re-poll instead of starving the client read-timeout (~60s).
 const WAIT_FOR_CAP_SECS: u64 = 10;
 const DEFAULT_DEADLINE_SECS: u64 = 3_600;
+/// Derived claim status surfaced when a `processing` claim is past its offer deadline.
+/// Never a relay status value — it is computed by [`derive_claim_liveness`] from `now`.
+pub const CLAIM_STATUS_EXPIRED: &str = "expired";
 
 /// Inputs for posting a kind-5109 offer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -341,7 +344,8 @@ pub async fn get_job_async(
     let fetch_timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
 
     let Some(wait_for) = request.wait_for else {
-        let mut view = fetch_job_view_async(home, &keys, &request.job_id, fetch_timeout).await?;
+        let mut view =
+            fetch_job_view_async(home, &keys, &request.job_id, fetch_timeout, now_unix()).await?;
         view.pending = false;
         return Ok(view);
     };
@@ -356,7 +360,8 @@ pub async fn get_job_async(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             let mut view =
-                fetch_job_view_async(home, &keys, &request.job_id, fetch_timeout).await?;
+                fetch_job_view_async(home, &keys, &request.job_id, fetch_timeout, now_unix())
+                    .await?;
             let ready = match wait_for {
                 WaitFor::Claim => view.live_claim_id.is_some(),
                 WaitFor::Result => !view.results.is_empty(),
@@ -365,7 +370,8 @@ pub async fn get_job_async(
             return Ok(view);
         }
         let this_fetch = fetch_timeout.min(remaining);
-        let mut view = fetch_job_view_async(home, &keys, &request.job_id, this_fetch).await?;
+        let mut view =
+            fetch_job_view_async(home, &keys, &request.job_id, this_fetch, now_unix()).await?;
         let ready = match wait_for {
             WaitFor::Claim => view.live_claim_id.is_some(),
             WaitFor::Result => !view.results.is_empty(),
@@ -404,7 +410,9 @@ pub async fn accept_claim_async(
 ) -> Result<AcceptClaimOutcome, JobLifecycleError> {
     let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
     let keys = buyer_keys(home)?;
-    let view = fetch_job_view_async(home, &keys, &request.job_id, timeout).await?;
+    // Injected `now` derives expiry: an expired claim surfaces as non-processing and is
+    // refused below (cannot accept a claim past its deadline).
+    let view = fetch_job_view_async(home, &keys, &request.job_id, timeout, now_unix()).await?;
     let offer = view
         .offer
         .as_ref()
@@ -670,7 +678,48 @@ fn fetch_job_view(
         .enable_all()
         .build()
         .map_err(|error| JobLifecycleError::Relay(error.to_string()))?;
-    runtime.block_on(fetch_job_view_async(home, keys, job_id, timeout))
+    runtime.block_on(fetch_job_view_async(home, keys, job_id, timeout, now_unix()))
+}
+
+/// Current unix time (seconds). Wall-clock lives ONLY at call sites; the derivation
+/// ([`derive_claim_liveness`]) takes `now` as input so the pure path stays testable.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Derive claim liveness from status + offer deadline + the injected `now`.
+///
+/// A `processing` claim whose offer deadline has passed (`now > deadline`) is EXPIRED:
+/// its status is surfaced as [`CLAIM_STATUS_EXPIRED`], it is marked `live = false`, and it
+/// is excluded from `live_claim_id`. Expiry is DERIVED — never stored, never read from the
+/// wall clock inside this function (tests pass a fixed `now`). `claims` must be pre-sorted
+/// newest-first; the newest still-`processing` claim becomes the live one.
+///
+/// `offer_deadline_unix == None` (offer not yet on the relay) means expiry cannot be derived,
+/// so status-based liveness is preserved unchanged.
+fn derive_claim_liveness(
+    claims: &mut [ClaimView],
+    offer_deadline_unix: Option<u64>,
+    now: u64,
+) -> Option<String> {
+    if let Some(deadline) = offer_deadline_unix {
+        for claim in claims.iter_mut() {
+            if claim.status == "processing" && now > deadline {
+                claim.status = CLAIM_STATUS_EXPIRED.to_string();
+            }
+        }
+    }
+    let live_claim_id = claims
+        .iter()
+        .find(|claim| claim.status == "processing")
+        .map(|claim| claim.claim_id.clone());
+    for claim in claims.iter_mut() {
+        claim.live = live_claim_id.as_deref() == Some(claim.claim_id.as_str());
+    }
+    live_claim_id
 }
 
 async fn fetch_job_view_async(
@@ -678,6 +727,7 @@ async fn fetch_job_view_async(
     keys: &nostr_sdk::Keys,
     job_id: &str,
     timeout: Duration,
+    now: u64,
 ) -> Result<JobView, JobLifecycleError> {
     use nostr_sdk::prelude::{Client, EventId, Filter, Kind};
 
@@ -764,15 +814,10 @@ async fn fetch_job_view_async(
         });
     }
     claims.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    let live_claim_id = claims
-        .iter()
-        .find(|claim| claim.status == "processing")
-        .map(|claim| claim.claim_id.clone());
-    if let Some(live_id) = &live_claim_id {
-        for claim in &mut claims {
-            claim.live = &claim.claim_id == live_id;
-        }
-    }
+    // Liveness is DERIVED from `now` vs the offer deadline — a processing claim past its
+    // deadline is EXPIRED and must not read live (piece-11 behavior 3; job 0867a213).
+    let offer_deadline_unix = offer.as_ref().map(|o| o.deadline_unix);
+    let live_claim_id = derive_claim_liveness(&mut claims, offer_deadline_unix, now);
 
     let mut results = Vec::new();
     for event in result_events {
@@ -1003,6 +1048,79 @@ mod tests {
         let err = assert_authorize_matches_bind(&bind, &bad_seller, &bind.result_id, &bind.commit_oid)
             .expect_err("mismatch");
         assert!(err.to_string().contains("seller"));
+    }
+
+    fn claim_view(claim_id: &str, created_at: u64, status: &str) -> ClaimView {
+        ClaimView {
+            claim_id: claim_id.to_owned(),
+            created_at,
+            seller_pubkey: "dd".repeat(32),
+            display_name: None,
+            status: status.to_owned(),
+            live: false,
+        }
+    }
+
+    // Behavior 3: a processing claim past its offer deadline surfaces as EXPIRED and is not
+    // live. REAL claim/deadline path — a fixed `now` (injected), no relay, no wall-clock.
+    #[test]
+    fn processing_claim_past_deadline_is_expired_not_live() {
+        let deadline = 1_700_000_000u64;
+        let mut claims = vec![claim_view("orphan-claim", 100, "processing")];
+        // now well past the deadline (the 0867a213 shape: still "processing" 25 min later).
+        let live = derive_claim_liveness(&mut claims, Some(deadline), deadline + 1_500);
+        assert_eq!(live, None, "an expired claim must never be the live claim");
+        assert_eq!(
+            claims[0].status, CLAIM_STATUS_EXPIRED,
+            "past-deadline processing claim must surface as EXPIRED"
+        );
+        assert!(!claims[0].live, "expired claim must not read live/processing");
+    }
+
+    #[test]
+    fn processing_claim_before_deadline_is_live_newest_wins() {
+        let deadline = 1_700_000_000u64;
+        let mut claims = vec![
+            claim_view("newest", 200, "processing"),
+            claim_view("older", 100, "processing"),
+        ];
+        let live = derive_claim_liveness(&mut claims, Some(deadline), deadline - 10);
+        assert_eq!(live.as_deref(), Some("newest"), "newest processing claim is live");
+        assert!(claims[0].live && !claims[1].live);
+        assert_eq!(claims[0].status, "processing", "not expired before the deadline");
+    }
+
+    // The SAME fixture flips live→expired purely by advancing the injected `now` — proves
+    // expiry is derived from `now`, never stored (and that `now` is load-bearing input).
+    #[test]
+    fn liveness_flips_with_injected_now_only() {
+        let deadline = 1_700_000_000u64;
+        let make = || vec![claim_view("c1", 100, "processing")];
+
+        let mut before = make();
+        let live_before = derive_claim_liveness(&mut before, Some(deadline), deadline - 1);
+        assert_eq!(live_before.as_deref(), Some("c1"));
+        assert!(before[0].live && before[0].status == "processing");
+
+        let mut after = make();
+        let live_after = derive_claim_liveness(&mut after, Some(deadline), deadline + 1);
+        assert_eq!(live_after, None);
+        assert!(!after[0].live && after[0].status == CLAIM_STATUS_EXPIRED);
+    }
+
+    // No offer deadline known ⇒ expiry cannot be derived; status-based liveness preserved.
+    // An `error` claim is never live regardless.
+    #[test]
+    fn no_deadline_preserves_status_and_error_never_live() {
+        let mut claims = vec![
+            claim_view("proc", 200, "processing"),
+            claim_view("err", 100, "error"),
+        ];
+        let live = derive_claim_liveness(&mut claims, None, 9_999_999_999);
+        assert_eq!(live.as_deref(), Some("proc"));
+        assert!(claims[0].live, "processing claim stays live when no deadline is known");
+        assert!(!claims[1].live, "error claim is never live");
+        assert_eq!(claims[0].status, "processing");
     }
 
     #[test]

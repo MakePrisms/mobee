@@ -124,6 +124,18 @@ pub enum JournalEntry {
     Claim {
         job_id: String,
         ts: u64,
+        /// Derived-expiry anchor: deadline this claim was journaled against.
+        /// `#[serde(default)]` = back-compat; pre-piece-11 claim lines default to 0
+        /// (treated as already-expired by [`plan_orphaned_claims`], the safe default —
+        /// an old orphan is released, never left live).
+        #[serde(default)]
+        deadline_unix: u64,
+        /// kind-7000 claim event id (so restart-reconcile can reference the dead claim).
+        #[serde(default)]
+        claim_id: String,
+        /// Buyer pubkey (p-tag target for a reconcile kind-7000 release). Back-compat empty.
+        #[serde(default)]
+        buyer_pubkey: String,
     },
     Receipt {
         job_id: String,
@@ -134,6 +146,80 @@ pub enum JournalEntry {
         swap_ok: bool,
         ts: u64,
     },
+    /// Terminal release of an orphaned/undeliverable claim (restart-reconcile).
+    /// Makes reconcile idempotent: a released job is terminal, never re-released.
+    Release {
+        job_id: String,
+        reason: String,
+        ts: u64,
+    },
+}
+
+/// Whether an orphaned claim is past its deadline at reconcile time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimLiveness {
+    /// `now > deadline_unix` — dead claim, buyer may re-post.
+    Expired,
+    /// `now <= deadline_unix` — deadline not yet reached.
+    Live,
+}
+
+/// An in-flight claim discovered at daemon startup (journaled Claim, no matching
+/// Receipt and no matching Release). Carries everything reconcile needs to publish a
+/// kind-7000 release WITHOUT touching the relay or re-parsing the offer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanClaim {
+    pub job_id: String,
+    pub claim_id: String,
+    pub buyer_pubkey: String,
+    pub deadline_unix: u64,
+    pub liveness: ClaimLiveness,
+}
+
+/// Pure restart-reconcile plan over journal entries.
+///
+/// Returns every journaled `Claim` that has neither a `Receipt` (paid → CLOSED) nor a
+/// `Release` (already terminal) for its `job_id`, classified `Expired`/`Live` by the
+/// **injected** `now`. No wall-clock, no relay — expiry is DERIVED, never stored.
+pub fn plan_orphaned_claims(entries: &[JournalEntry], now: u64) -> Vec<OrphanClaim> {
+    let mut terminal: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for entry in entries {
+        match entry {
+            JournalEntry::Receipt { job_id, .. } | JournalEntry::Release { job_id, .. } => {
+                terminal.insert(job_id.as_str());
+            }
+            JournalEntry::Claim { .. } => {}
+        }
+    }
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for entry in entries {
+        if let JournalEntry::Claim {
+            job_id,
+            deadline_unix,
+            claim_id,
+            buyer_pubkey,
+            ..
+        } = entry
+        {
+            if terminal.contains(job_id.as_str()) || !seen.insert(job_id.as_str()) {
+                continue;
+            }
+            let liveness = if now > *deadline_unix {
+                ClaimLiveness::Expired
+            } else {
+                ClaimLiveness::Live
+            };
+            out.push(OrphanClaim {
+                job_id: job_id.clone(),
+                claim_id: claim_id.clone(),
+                buyer_pubkey: buyer_pubkey.clone(),
+                deadline_unix: *deadline_unix,
+                liveness,
+            });
+        }
+    }
+    out
 }
 
 /// Append-only seller journal — claim dedup + pay-once receipt evidence.
@@ -177,6 +263,7 @@ impl SellerJournal {
         Ok(self.entries()?.into_iter().any(|entry| match entry {
             JournalEntry::Claim { job_id: id, .. } => id == job_id,
             JournalEntry::Receipt { job_id: id, .. } => id == job_id,
+            JournalEntry::Release { job_id: id, .. } => id == job_id,
         }))
     }
 
@@ -187,7 +274,22 @@ impl SellerJournal {
         )))
     }
 
-    pub fn append_claim(&self, job_id: &str) -> Result<(), SellerError> {
+    pub fn has_release(&self, job_id: &str) -> Result<bool, SellerError> {
+        Ok(self.entries()?.into_iter().any(|entry| matches!(
+            entry,
+            JournalEntry::Release { job_id: id, .. } if id == job_id
+        )))
+    }
+
+    /// Journal a CLAIMED transition. `claim_id`/`buyer_pubkey`/`deadline_unix` are the
+    /// anchors restart-reconcile needs to release an orphan without the relay.
+    pub fn append_claim(
+        &self,
+        job_id: &str,
+        claim_id: &str,
+        buyer_pubkey: &str,
+        deadline_unix: u64,
+    ) -> Result<(), SellerError> {
         if self.has_claim(job_id)? {
             return Err(SellerError::Journal(format!(
                 "job {job_id} already claimed (dedup)"
@@ -195,6 +297,22 @@ impl SellerJournal {
         }
         self.append(JournalEntry::Claim {
             job_id: job_id.to_owned(),
+            ts: now_unix(),
+            deadline_unix,
+            claim_id: claim_id.to_owned(),
+            buyer_pubkey: buyer_pubkey.to_owned(),
+        })
+    }
+
+    /// Journal a terminal RELEASE marker (restart-reconcile). Idempotent — a second
+    /// release for the same `job_id` is a no-op so repeated restarts do not re-fire.
+    pub fn append_release(&self, job_id: &str, reason: &str) -> Result<(), SellerError> {
+        if self.has_release(job_id)? {
+            return Ok(());
+        }
+        self.append(JournalEntry::Release {
+            job_id: job_id.to_owned(),
+            reason: reason.to_owned(),
             ts: now_unix(),
         })
     }
@@ -436,8 +554,14 @@ git_remote = "https://example.invalid/repo.git"
         home::save_config(&home).expect("save");
 
         let journal = SellerJournal::open(&home).expect("journal");
-        journal.append_claim("job-a").expect("claim");
-        assert!(journal.append_claim("job-a").is_err());
+        journal
+            .append_claim("job-a", "claim-a", "buyer-a", 2_000_000_000)
+            .expect("claim");
+        assert!(
+            journal
+                .append_claim("job-a", "claim-a", "buyer-a", 2_000_000_000)
+                .is_err()
+        );
 
         let refused = journal.append_receipt(
             "job-a",
@@ -497,7 +621,9 @@ git_remote = "https://example.invalid/repo.git"
         let _ = fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("bootstrap");
         let journal = SellerJournal::open(&home).expect("journal");
-        journal.append_claim("job-b").expect("claim");
+        journal
+            .append_claim("job-b", "claim-b", "buyer-b", 2_000_000_000)
+            .expect("claim");
         // offer.amount=21, rate would have been 1 — journal expects offer.amount
         let err = journal
             .append_receipt(
@@ -513,6 +639,101 @@ git_remote = "https://example.invalid/repo.git"
             )
             .expect_err("amount_received must == offer.amount");
         assert!(err.to_string().contains("offer.amount"));
+    }
+
+    #[test]
+    fn plan_orphaned_claims_from_real_journal_marks_past_deadline_expired() {
+        // REAL orphaned-claim fixture: a journaled in-flight claim + a PAST deadline,
+        // written to a real journal file (no relay). Piece-11 restart-reconcile core.
+        let root = temp_home("reconcile-plan");
+        let _ = fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("bootstrap");
+        let journal = SellerJournal::open(&home).expect("journal");
+
+        // Orphaned claim: deadline in the deep past, no receipt, no release.
+        let past_deadline = 1_000_000_000u64; // 2001-09-09
+        journal
+            .append_claim("job-orphan", "claim-orphan", "buyer-orphan", past_deadline)
+            .expect("append orphan claim");
+        // A paid job (Claim + Receipt) must NOT show up as an orphan.
+        journal
+            .append_claim("job-paid", "claim-paid", "buyer-paid", past_deadline)
+            .expect("append paid claim");
+        journal
+            .append_receipt(
+                "job-paid",
+                "result-paid",
+                "job-paid",
+                "result-paid",
+                7,
+                7,
+                "https://testnut.cashudevkit.org",
+                "buyer-paid",
+                true,
+            )
+            .expect("receipt");
+
+        let now = 2_000_000_000u64; // well past the deadline
+        let plan = plan_orphaned_claims(&journal.entries().expect("entries"), now);
+        assert_eq!(plan.len(), 1, "only the unpaid orphan is in-flight: {plan:?}");
+        let orphan = &plan[0];
+        assert_eq!(orphan.job_id, "job-orphan");
+        assert_eq!(orphan.claim_id, "claim-orphan");
+        assert_eq!(orphan.buyer_pubkey, "buyer-orphan");
+        assert_eq!(
+            orphan.liveness,
+            ClaimLiveness::Expired,
+            "now > deadline_unix ⇒ EXPIRED (derived, never stored)"
+        );
+
+        // Release makes it terminal — reconcile is idempotent across restarts.
+        journal
+            .append_release("job-orphan", "deadline exceeded before restart")
+            .expect("release");
+        let plan2 = plan_orphaned_claims(&journal.entries().expect("entries"), now);
+        assert!(plan2.is_empty(), "released orphan is terminal: {plan2:?}");
+        // Second release is a no-op (idempotent).
+        journal.append_release("job-orphan", "again").expect("idempotent release");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_orphaned_claims_live_before_deadline_and_backcompat_old_line() {
+        let root = temp_home("reconcile-live");
+        let _ = fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("bootstrap");
+        let journal = SellerJournal::open(&home).expect("journal");
+
+        // Within-deadline orphan ⇒ Live (a fixed `now` before the deadline).
+        journal
+            .append_claim("job-live", "claim-live", "buyer-live", 2_000_000_000)
+            .expect("claim");
+        let plan = plan_orphaned_claims(&journal.entries().expect("entries"), 1_500_000_000);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].liveness, ClaimLiveness::Live);
+
+        // Back-compat: a pre-piece-11 claim line has no deadline_unix field. It must parse
+        // (serde default = 0) and classify Expired for any now>0 (safe: old orphan released).
+        let raw_old = r#"{"kind":"claim","job_id":"job-old","ts":1}"#;
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(journal.path())
+                .expect("open");
+            writeln!(file, "{raw_old}").expect("write old line");
+        }
+        let entries = journal.entries().expect("entries parse old line");
+        let plan = plan_orphaned_claims(&entries, 1_500_000_000);
+        let old = plan
+            .iter()
+            .find(|c| c.job_id == "job-old")
+            .expect("old claim planned");
+        assert_eq!(old.deadline_unix, 0, "missing field defaults to 0");
+        assert_eq!(old.liveness, ClaimLiveness::Expired);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(feature = "wallet")]
