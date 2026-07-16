@@ -393,7 +393,8 @@ pub struct GitResultTags<'a> {
     pub commit_sha: &'a str,
 }
 
-/// Kind-6109 result draft. Pass `Some(git)` to attach delivery/repo/branch/commit tags.
+/// Kind-6109 result draft. Pass `Some(git)` to attach delivery/repo/branch/commit tags;
+/// `exec_metadata` appends the piece-9 Item-2 seller-claimed usage block (may be empty).
 pub fn result_draft(
     offer_id: &str,
     buyer_pubkey: &str,
@@ -403,6 +404,7 @@ pub fn result_draft(
     seller_signature: &str,
     content: impl Into<String>,
     git: Option<GitResultTags<'_>>,
+    exec_metadata: &[TagSpec],
 ) -> EventDraft {
     let mut tags = vec![
         TagSpec::new(["e", offer_id, "", "root"]),
@@ -420,12 +422,15 @@ pub fn result_draft(
     tags.push(TagSpec::new(["amount", &amount_sats.to_string(), "sat"]));
     tags.push(TagSpec::new(["job-hash", job_hash]));
     tags.push(TagSpec::new(["sig", "seller", seller_signature]));
+    // Item-2 exec-metadata (seller-claimed, unsigned — sig/seller does NOT cover it).
+    tags.extend(exec_metadata.iter().cloned());
     tags.push(mobee_tag());
     tags.push(version_tag());
     EventDraft::new(JOB_RESULT_KIND, tags, content)
 }
 
 /// Thin wrapper: kind-6109 git delivery via [`result_draft`] + [`GitResultTags`].
+/// `exec_metadata` is the optional seller-claimed usage block (may be empty).
 pub fn git_result_draft(
     offer_id: &str,
     buyer_pubkey: &str,
@@ -436,6 +441,7 @@ pub fn git_result_draft(
     job_hash: &str,
     seller_signature: &str,
     content: impl Into<String>,
+    exec_metadata: &[TagSpec],
 ) -> EventDraft {
     result_draft(
         offer_id,
@@ -450,6 +456,7 @@ pub fn git_result_draft(
             branch,
             commit_sha,
         }),
+        exec_metadata,
     )
 }
 
@@ -476,6 +483,21 @@ pub fn offer_git_target(event: &EventDraft) -> Option<(String, String)> {
     Some((repo, branch))
 }
 
+/// Delivery binding (piece-9 D4) echoed into a kind-3400 receipt. Both fields are in the
+/// co-signed preimage, so the settled receipt attests which git object was paid for and
+/// its kind (commit vs tree) is not forgeable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiptDelivery<'a> {
+    /// Full lowercase git oid of the delivered object.
+    pub integrity_hash: &'a str,
+    /// `fork` | `patch`.
+    pub kind: &'a str,
+}
+
+/// Buyer-authored kind-3400 receipt draft. Fixed tag order + a pinned `created_at` at the
+/// event-build site give a deterministic event id (idempotent republish). `delivery` adds
+/// the D4 binding tags; `exec_metadata` appends the buyer's filtered echo (may be empty —
+/// seller-claimed, NOT covered by the co-signatures).
 pub fn receipt_draft(
     offer_id: &str,
     result_id: &str,
@@ -486,24 +508,31 @@ pub fn receipt_draft(
     job_hash: &str,
     seller_signature: &str,
     buyer_signature: &str,
+    delivery: Option<ReceiptDelivery<'_>>,
+    exec_metadata: &[TagSpec],
 ) -> EventDraft {
-    EventDraft::new(
-        JOB_RECEIPT_KIND,
-        vec![
-            TagSpec::new(["job-hash", job_hash]),
-            TagSpec::new(["amount", &amount_sats.to_string(), "sat"]),
-            TagSpec::new(["e", offer_id, "", "root"]),
-            TagSpec::new(["e", result_id, "", "reply"]),
-            TagSpec::new(["p", buyer_pubkey]),
-            TagSpec::new(["p", seller_pubkey]),
-            TagSpec::new(["mint", mint_url]),
-            TagSpec::new(["sig", "seller", seller_signature]),
-            TagSpec::new(["sig", "buyer", buyer_signature]),
-            mobee_tag(),
-            version_tag(),
-        ],
-        "",
-    )
+    let mut tags = vec![
+        TagSpec::new(["job-hash", job_hash]),
+        TagSpec::new(["amount", &amount_sats.to_string(), "sat"]),
+        TagSpec::new(["e", offer_id, "", "root"]),
+        TagSpec::new(["e", result_id, "", "reply"]),
+        TagSpec::new(["p", buyer_pubkey]),
+        TagSpec::new(["p", seller_pubkey]),
+        TagSpec::new(["mint", mint_url]),
+        TagSpec::new(["sig", "seller", seller_signature]),
+        TagSpec::new(["sig", "buyer", buyer_signature]),
+    ];
+    if let Some(delivery) = delivery {
+        tags.push(TagSpec::new([
+            "delivery_integrity_hash",
+            delivery.integrity_hash,
+        ]));
+        tags.push(TagSpec::new(["delivery_kind", delivery.kind]));
+    }
+    tags.extend(exec_metadata.iter().cloned());
+    tags.push(mobee_tag());
+    tags.push(version_tag());
+    EventDraft::new(JOB_RECEIPT_KIND, tags, "")
 }
 
 fn feedback_draft(status: &str, mut tags: Vec<TagSpec>) -> EventDraft {
@@ -716,6 +745,7 @@ mod tests {
             "seller-sig",
             "done",
             None,
+            &[],
         );
         assert_eq!(result.kind, JOB_RESULT_KIND);
         assert_eq!(result.content, "done");
@@ -733,6 +763,8 @@ mod tests {
             "hash",
             "seller-sig",
             "buyer-sig",
+            None,
+            &[],
         );
         assert_eq!(receipt.kind, JOB_RECEIPT_KIND);
         assert!(has_tag_value(&receipt.tags, "mint", TESTNUT_MINT_URL));
@@ -748,6 +780,84 @@ mod tests {
         );
         assert!(has_tag_value_at(&receipt.tags, "sig", 1, "seller"));
         assert!(has_tag_value_at(&receipt.tags, "sig", 1, "buyer"));
+        // No delivery binding requested ⇒ absent (legacy-shaped receipt).
+        assert!(first_tag(&receipt.tags, "delivery_integrity_hash").is_none());
+    }
+
+    #[test]
+    fn receipt_draft_binds_delivery_and_echoes_exec_metadata() {
+        let exec = vec![
+            TagSpec::new(["harness", "claude-agent-acp"]),
+            TagSpec::new(["usage_transport", "side-channel"]),
+            TagSpec::new(["metadata_trust", "seller-claimed"]),
+            TagSpec::new(["wall_time", "1234", "ms"]),
+        ];
+        let receipt = receipt_draft(
+            "offer",
+            "result",
+            BUYER,
+            SELLER,
+            TESTNUT_MINT_URL,
+            7,
+            "hash",
+            "seller-sig",
+            "buyer-sig",
+            Some(ReceiptDelivery {
+                integrity_hash: &"a".repeat(40),
+                kind: "fork",
+            }),
+            &exec,
+        );
+        // D4 delivery binding present and typed.
+        assert!(has_tag_value(
+            &receipt.tags,
+            "delivery_integrity_hash",
+            &"a".repeat(40)
+        ));
+        assert!(has_tag_value(&receipt.tags, "delivery_kind", "fork"));
+        // Filtered echo carried through, with its required provenance marker.
+        assert!(has_tag_value(&receipt.tags, "harness", "claude-agent-acp"));
+        assert!(has_tag_value(&receipt.tags, "metadata_trust", "seller-claimed"));
+        // t/v markers stay last.
+        assert_eq!(receipt.tags[receipt.tags.len() - 2], mobee_tag());
+        assert_eq!(receipt.tags[receipt.tags.len() - 1], version_tag());
+    }
+
+    #[test]
+    fn result_draft_carries_seller_claimed_exec_metadata_after_sig() {
+        let exec = vec![
+            TagSpec::new(["harness", "codex-acp-ng"]),
+            TagSpec::new(["usage_transport", "acp-native"]),
+            TagSpec::new(["metadata_trust", "seller-claimed"]),
+            TagSpec::new(["tokens", "3172", "total"]),
+        ];
+        let result = git_result_draft(
+            "offer",
+            BUYER,
+            "https://example.invalid/repo.git",
+            "mobee/job",
+            &"a".repeat(40),
+            7,
+            "hash",
+            "seller-sig",
+            "commit",
+            &exec,
+        );
+        assert!(has_tag_value(&result.tags, "harness", "codex-acp-ng"));
+        assert!(has_tag_value(&result.tags, "usage_transport", "acp-native"));
+        assert!(has_tag_value(&result.tags, "metadata_trust", "seller-claimed"));
+        // exec-metadata sits after the seller signature, before the protocol markers.
+        let sig_at = result
+            .tags
+            .iter()
+            .position(|tag| tag.first() == Some("sig"))
+            .unwrap();
+        let harness_at = result
+            .tags
+            .iter()
+            .position(|tag| tag.first() == Some("harness"))
+            .unwrap();
+        assert!(harness_at > sig_at);
     }
 
     #[test]

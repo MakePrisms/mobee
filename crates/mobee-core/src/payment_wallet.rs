@@ -2085,18 +2085,11 @@ mod tests {
         let send_count = Arc::new(AtomicUsize::new(0));
         let sender = CountingSend(send_count.clone());
         let authority = authority();
-        let receipt_authority = authority.clone();
         let mut effects = CdkPaymentEffects::spawn_with_connector(
             fixture.wallet.clone(),
             connector,
             sender,
-            move |_: &PaymentKey, _: &PaymentSent| {
-                Ok(ReceiptEvidence {
-                    receipt_id: "receipt".into(),
-                    author: receipt_authority.buyer,
-                    valid_signers: vec![receipt_authority.buyer, receipt_authority.seller],
-                })
-            },
+            move |key: &PaymentKey, _: &PaymentSent| Ok(cosigned_receipt(key)),
         )
         .unwrap();
         let journal = MemoryPaymentJournal::default();
@@ -2140,18 +2133,11 @@ mod tests {
             None,
         );
         let authority = authority();
-        let receipt_authority = authority.clone();
         let mut effects = CdkPaymentEffects::spawn_with_connector(
             fixture.wallet.clone(),
             connector,
             NostrRecipientSend,
-            move |_: &PaymentKey, _: &PaymentSent| {
-                Ok(ReceiptEvidence {
-                    receipt_id: "receipt".into(),
-                    author: receipt_authority.buyer,
-                    valid_signers: vec![receipt_authority.buyer, receipt_authority.seller],
-                })
-            },
+            move |key: &PaymentKey, _: &PaymentSent| Ok(cosigned_receipt(key)),
         )
         .unwrap();
         let journal = MemoryPaymentJournal::default();
@@ -2364,9 +2350,45 @@ mod tests {
     }
 
     fn authority() -> ReceiptAuthority {
+        // External anchors are nostr identities; the receipt co-signatures verify against
+        // these (never the receipt's own p-tags).
         ReceiptAuthority {
-            buyer: secret_key(2).public_key(),
-            seller: secret_key(1).public_key(),
+            buyer: receipt_buyer_keys().public_key(),
+            seller: receipt_seller_keys().public_key(),
+        }
+    }
+
+    fn receipt_buyer_keys() -> nostr_sdk::Keys {
+        nostr_sdk::Keys::parse(&"21".repeat(32)).unwrap()
+    }
+
+    fn receipt_seller_keys() -> nostr_sdk::Keys {
+        nostr_sdk::Keys::parse(&"11".repeat(32)).unwrap()
+    }
+
+    /// A real co-signed kind-3400 receipt over the trade preimage (both schnorr sigs by
+    /// the anchored buyer/seller nostr keys) — what a real buyer publishes.
+    fn cosigned_receipt(key: &PaymentKey) -> ReceiptEvidence {
+        let preimage = crate::receipt::ReceiptPreimage {
+            job_hash: key.job_hash.as_str().to_owned(),
+            offer_id: key.job_id.as_str().to_owned(),
+            amount: key.amount.to_u64(),
+            unit: key.unit.to_string(),
+            mint: key.mint.to_string(),
+            buyer_pubkey: receipt_buyer_keys().public_key().to_hex(),
+            seller_pubkey: receipt_seller_keys().public_key().to_hex(),
+            delivery_integrity_hash: key.delivery_integrity_hash.as_str().to_owned(),
+            delivery_kind: "fork".to_owned(),
+            exec_metadata_commitment: crate::receipt::EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
+        };
+        let message = nostr_sdk::secp256k1::Message::from_digest(preimage.digest_bytes());
+        ReceiptEvidence {
+            receipt_id: "aa".repeat(32),
+            author: receipt_buyer_keys().public_key(),
+            seller_signature: receipt_seller_keys().sign_schnorr(&message).to_string(),
+            buyer_signature: receipt_buyer_keys().sign_schnorr(&message).to_string(),
+            preimage,
+            relay_success: vec!["memory://relay".into()],
         }
     }
 

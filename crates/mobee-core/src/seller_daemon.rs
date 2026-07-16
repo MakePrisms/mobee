@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use crate::buyer_fund::{self, FundError};
 use crate::gateway::{
     self, claim_draft, error_draft, git_result_draft, parse_offer, EventDraft, ParsedOffer,
-    JOB_OFFER_KIND,
+    TagSpec, JOB_OFFER_KIND,
 };
 use crate::home::{self, HomeError, MobeeHome, DEFAULT_MINT_URL};
 use crate::job_lifecycle::{event_to_draft, job_hash_for_offer};
@@ -557,9 +557,12 @@ impl SellerDaemon {
             self.fail_active(&error.to_string()).await?;
             return Err(error.into());
         }
+        let run_started = std::time::Instant::now();
         let run_result =
             run_agent_job(&seller_cfg.agent_command, &active.offer.task, &active.workdir, &identity)
                 .await;
+        // Wall-time is the one usage field we can measure without ACP-usage plumbing.
+        let wall_time_ms = run_started.elapsed().as_millis() as u64;
         if let Err(error) = run_result {
             self.fail_active(&error.to_string()).await?;
             return Err(error);
@@ -607,7 +610,26 @@ impl SellerDaemon {
         drop(push_auth);
 
         let job_hash = job_hash_for_offer(&active.job_id, &active.offer.task, active.offer.amount);
-        let seller_sig = sign_receipt_hash(&self.keys, &job_hash)?;
+        // Piece-9 Item 1: the seller signs the RECEIPT PREIMAGE (binds the trade + the
+        // delivered git object, D4) — not the bare job-hash. The buyer reconstructs this
+        // exact preimage and co-signs it. `exec_metadata_commitment` is the empty marker:
+        // exec-metadata is NOT covered by the co-signature (Item 2, seller-claimed).
+        let preimage = crate::receipt::ReceiptPreimage {
+            job_hash: job_hash.clone(),
+            offer_id: active.job_id.clone(),
+            amount: active.offer.amount,
+            unit: "sat".to_owned(),
+            mint: active.offer.mint_url.clone(),
+            buyer_pubkey: active.buyer_pubkey.clone(),
+            seller_pubkey: self.seller_pubkey.clone(),
+            delivery_integrity_hash: commit.clone(),
+            delivery_kind: crate::receipt::DeliveryKind::Fork.as_str().to_owned(),
+            exec_metadata_commitment: crate::receipt::EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
+        };
+        let seller_sig = sign_receipt_hash(&self.keys, &preimage.digest_hex())?;
+        // Piece-9 Item 2: harness-generic PUBLIC seller-claimed usage block (opportunistic;
+        // absent fields stay absent — token/model/cost await ACP-usage plumbing).
+        let exec_metadata = seller_exec_metadata(&seller_cfg.agent_command, wall_time_ms);
         let draft = git_result_draft(
             &active.job_id,
             &active.buyer_pubkey,
@@ -618,6 +640,7 @@ impl SellerDaemon {
             &job_hash,
             &seller_sig,
             format!("delivery commit {commit}"),
+            &exec_metadata,
         );
         let result_id = match publish_draft(&self.home, &self.keys, &draft).await {
             Ok(id) => id,
@@ -653,6 +676,49 @@ fn mint_url(raw: &str) -> Result<cashu::MintUrl, DaemonError> {
     use std::str::FromStr;
     cashu::MintUrl::from_str(raw)
         .map_err(|error| DaemonError::Policy(format!("invalid mint url: {error}")))
+}
+
+/// Build the piece-9 Item-2 seller-claimed PUBLIC usage block for a kind-6109 result.
+///
+/// Per gudnuf's Q2 ruling this block is PUBLIC and harness-generic. It is **opportunistic**:
+/// emit only fields the seller can source. `harness` + `usage_transport` are derived from
+/// the configured agent command (USAGE-MATRIX checkpoint-b), `wall_time` is measured, and
+/// `metadata_trust=seller-claimed` is required whenever any field is present (anchor rule).
+///
+/// Token / model / cost are **OMITTED (absent-stays-absent, never zero-filled)** until ACP
+/// usage capture is plumbed through the driver — the ACP-wire usage probe is a named piece-9
+/// deferred; the seller run surface exposes no token counts today.
+fn seller_exec_metadata(agent_command: &[String], wall_time_ms: u64) -> Vec<TagSpec> {
+    let (harness, transport) = harness_and_transport(agent_command);
+    let wall = wall_time_ms.to_string();
+    vec![
+        TagSpec::new(["harness", harness.as_str()]),
+        TagSpec::new(["usage_transport", transport]),
+        TagSpec::new(["metadata_trust", "seller-claimed"]),
+        TagSpec::new(["wall_time", wall.as_str(), "ms"]),
+    ]
+}
+
+/// Best-effort harness id + usage transport (USAGE-MATRIX checkpoint-b) from the configured
+/// agent command. Unknown harness ⇒ the command basename + the conservative `side-channel`.
+fn harness_and_transport(agent_command: &[String]) -> (String, &'static str) {
+    let program = agent_command.first().map(String::as_str).unwrap_or("");
+    let lower = program.to_ascii_lowercase();
+    if lower.contains("codex") {
+        ("codex-acp-ng".to_owned(), "acp-native")
+    } else if lower.contains("cursor") {
+        ("cursor-agent".to_owned(), "side-channel")
+    } else if lower.contains("claude") {
+        ("claude-agent-acp".to_owned(), "side-channel")
+    } else {
+        let basename = program.rsplit('/').next().unwrap_or(program);
+        let harness = if basename.is_empty() {
+            "unknown".to_owned()
+        } else {
+            basename.to_owned()
+        };
+        (harness, "side-channel")
+    }
 }
 
 fn job_workdir(home: &MobeeHome, job_id: &str) -> PathBuf {
@@ -1059,6 +1125,35 @@ mod tests {
         SellerDaemon::end_flight();
         assert!(SellerDaemon::try_begin_flight());
         SellerDaemon::end_flight();
+    }
+
+    #[test]
+    fn seller_exec_metadata_is_harness_generic_public_and_absent_stays_absent() {
+        let value = |tags: &[TagSpec], name: &str| -> Option<String> {
+            tags.iter()
+                .find(|tag| tag.first() == Some(name))
+                .and_then(|tag| tag.value().map(str::to_owned))
+        };
+
+        // claude ⇒ side-channel; codex ⇒ acp-native; unknown ⇒ basename + side-channel.
+        let claude = seller_exec_metadata(&["claude".into(), "--print".into()], 1234);
+        assert_eq!(value(&claude, "harness").as_deref(), Some("claude-agent-acp"));
+        assert_eq!(value(&claude, "usage_transport").as_deref(), Some("side-channel"));
+        // Anchor rule: metadata_trust present whenever any field is present.
+        assert_eq!(value(&claude, "metadata_trust").as_deref(), Some("seller-claimed"));
+        assert_eq!(value(&claude, "wall_time").as_deref(), Some("1234"));
+        // Absent-stays-absent: no zero-filled token/model/cost fields (not yet sourced).
+        assert!(value(&claude, "tokens").is_none());
+        assert!(value(&claude, "model").is_none());
+        assert!(value(&claude, "cost").is_none());
+
+        let codex = seller_exec_metadata(&["/nix/store/x/bin/codex-acp".into()], 5);
+        assert_eq!(value(&codex, "harness").as_deref(), Some("codex-acp-ng"));
+        assert_eq!(value(&codex, "usage_transport").as_deref(), Some("acp-native"));
+
+        let unknown = seller_exec_metadata(&["/opt/tools/mytool".into()], 5);
+        assert_eq!(value(&unknown, "harness").as_deref(), Some("mytool"));
+        assert_eq!(value(&unknown, "usage_transport").as_deref(), Some("side-channel"));
     }
 
     fn sample_offer(amount: u64, seller: &str) -> ParsedOffer {

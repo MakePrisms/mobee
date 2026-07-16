@@ -24,7 +24,22 @@ requirement.** Design piece — no product code lands here.
 > a server version gate + the workspace spend cap is exhausted; unlock = gudnuf cap-raise + CLI bump;
 > re-run on mobee-orch's ping).
 
+> **v4 — Q2 ruling folded (7/16, gudnuf; supersedes D2's cost-private default):** the public
+> exec-metadata block is **harness-generic and PUBLIC**, an **open/opportunistic** schema —
+> each harness fills what it exposes; **absent fields stay ABSENT (never zero-filled)**. **Cost
+> is PUBLIC where the harness reports it** (claude-agent-acp exposes `usage` + `total_cost_usd`
+> → now a public tag), carrying harness id, model, `usage_transport`, `total_tokens` (+
+> input/output/reasoning components), cache siblings, `wall_time` (ms), and cost — plus whatever
+> else the harness exposes. `metadata_trust = seller-claimed` stays. This walks forward on the D2
+> reversible default (publishing cost is additive, and D2 explicitly left it a pending gudnuf
+> ruling — now ruled public). The margin-exposure trade-off (§ Privacy) is **accepted** as the
+> cost of a transparent usage market. Item 2 below is written to this ruling.
+
 Verified against `origin/dev` `168c8bc`: `payment.rs`, `authorize_pay.rs`, `gateway.rs`.
+Build (piece-9 code, `scribe/piece9-code-receipt-usage` off `e2196db`): the public block is
+**opportunistic** — the seller emits `harness` + `usage_transport` + `metadata_trust` +
+`wall_time`; `tokens`/`model`/`cost` stay **absent** until ACP-usage capture is plumbed through
+the driver (named deferred — the seller run surface exposes no token counts today).
 
 ---
 
@@ -187,7 +202,7 @@ All **OPTIONAL** (absent ≠ invalid). Flat positional tags (codebase idiom `["a
 | tokens (total) | `["tokens", "<n>", "total"]` | `= input+output+reasoning` (see invariant) |
 | tokens (components) | `["tokens", "<n>", "input"\|"output"\|"reasoning"]` | `input` = **non-cached**; `reasoning` MAY be absent |
 | tokens (cache) | `["tokens", "<n>", "cache_read"\|"cache_write"]` | **siblings — never folded into `total`** |
-| cost | `["cost", "<n>", "usd", "<basis>"]` | **speced but NOT emitted on public events by default (D2)** — see § cost |
+| cost | `["cost", "<n>", "usd", "<basis>"]` | **PUBLIC where the harness reports it (Q2)** — opportunistic, absent-stays-absent — see § cost |
 | wall_time | `["wall_time", "<n>", "ms"]` | unit **locked to milliseconds** |
 
 **Anchor rule (parse-gate, not validity-gate).** If any **known** exec-metadata tag is present,
@@ -205,33 +220,30 @@ When `reasoning` is **absent** it is **unknown, not zero** — skip the equality
 **Never zero-fake an absent field** (a real `0` ≠ unavailable: cursor `reasoning` = absent, codex
 `reasoning` = `0`). **`input` = non-cached input** — do not fold `cache_*` into `input`/`total`.
 
-### cost — private by default (D2 ruling)
+### cost — PUBLIC where the harness reports it (Q2 ruling — supersedes D2)
 
-- **Default (reversible, hearth-ruled): public events carry TOKENS-ONLY; `cost` is NOT emitted
-  publicly.** The seller/buyer record cost in their **private journal**; the public kind-6109 /
-  kind-3400 events omit it. The `cost` tag is **speced but unpopulated** on public events so a future
-  decision to publish is purely additive (schema-compatible), never a retraction — published events
-  cannot be unpublished, so the default walks forward.
-- **Open gudnuf ruling (flagged):** whether to publish cost at all. If yes, it becomes a populate
-  follow-on under the schema below; until then cost stays private.
-- **When (and only when) cost is emitted:** `unit` is locked to lowercase **`usd`**; `basis ∈
-  { harness-reported-usd, harness-reported-notional }`. `total_cost_usd` is **auth-dependent** —
-  API-key billing = *incurred* cost (`harness-reported-usd`); a Max/subscription seat = *notional
-  list-price* (`harness-reported-notional`). Never a token count under `cost` (a UI would render `3172`
-  as "$3172").
-- **Privacy is why (below):** cost + amount on one public event exposes the seller's per-job margin.
-  The private-by-default rule is the mitigation; it also sidesteps the USAGE-MATRIX "cost not real"
-  re-lock — cost stays private until gudnuf rules, so no public schema commits to a cost figure yet.
+- **Ruling (gudnuf, 7/16): cost is PUBLIC**, emitted **where the harness reports it** and left
+  **absent otherwise** (opportunistic; never zero-filled). claude-agent-acp exposes
+  `total_cost_usd` → a public `cost` tag; a harness that bills server-side (cursor) omits it. This
+  supersedes D2's tokens-only-public default and walks forward on D2's reversible design (publishing
+  cost is additive; D2 explicitly left public-cost a pending gudnuf ruling).
+- **Shape:** `unit` is locked to lowercase **`usd`**; `basis ∈ { harness-reported-usd,
+  harness-reported-notional }`. `total_cost_usd` is **auth-dependent** — API-key billing = *incurred*
+  cost (`harness-reported-usd`); a Max/subscription seat = *notional list-price*
+  (`harness-reported-notional`). Never a token count under `cost` (a UI would render `3172` as
+  "$3172").
+- **Trade-off accepted (§ Privacy):** publishing cost is the deliberate cost of a transparent usage
+  market. A seller that treats cost as sensitive MAY still omit it (all exec-metadata is optional).
 
-### Privacy (the private-by-default rule, adopted)
+### Privacy (margin-exposure trade-off — accepted per Q2)
 
-Publishing `cost` + `amount` on the same public **seller-authored** result would let any observer
-compute the seller's **per-job margin**, and across jobs reconstruct its **pricing/cost structure and
-volume**; and it pairs a **dark** gift-wrap payment with a public "$0.80" record — partially undoing
-gift-wrap darkness. **Adopted (D2):** cost is **private-journal-only by default** (above); public
-exec-metadata is **tokens-only**. `remaining` stays excluded. `model`/`harness`/`wall_time` remain
-optional public tags — a seller that treats its tooling as sensitive MAY omit them (all exec-metadata is
-optional); note they can tie a seller's nostr identity to its harness/persona.
+Publishing `cost` + `amount` on the same public **seller-authored** result lets any observer compute
+the seller's **per-job margin**, and across jobs reconstruct its **pricing/cost structure and
+volume**; and it pairs a **dark** gift-wrap payment with a public cost record — partially undoing
+gift-wrap darkness. **Q2 accepts this trade-off** for a transparent usage market: cost is public
+where reported. `remaining` stays excluded (seller-local). `model`/`harness`/`wall_time`/`cost`
+remain **optional** — a seller that treats its tooling or cost as sensitive MAY omit any of them
+(absent-stays-absent); note public tags can tie a seller's nostr identity to its harness/persona.
 
 ### Harness reality (USAGE-MATRIX checkpoint-b + this piece's probe)
 
@@ -246,7 +258,7 @@ optional); note they can tie a seller's nostr identity to its harness/persona.
   --output-format json`: `model` = **key** of `modelUsage` (no top-level model string in `json`;
   present in `stream-json` `system/init` / `assistant.message.model`); `usage.input_tokens`
   (**non-cached**), `usage.output_tokens`, `cache_read`/`cache_creation_input_tokens`, `total_cost_usd`
-  (real USD, auth-dependent — **recorded to the private journal, not public, per D2**), `duration_ms`.
+  (real USD, auth-dependent — **published as a public `cost` tag per Q2** when reported), `duration_ms`.
   **`usage_transport` for claude = `side-channel`** (provisional): usage captured off the print sibling;
   the claude-agent-acp ACP-wire native-vs-dark label awaits the probe USAGE-MATRIX named — but the
   fleet's primary harness now has a **defined** value to emit.
@@ -278,14 +290,19 @@ impossible" claims.
 
 **Operator rulings folded (7/16, hearth; gudnuf-overridable):**
 1. **Publisher = BUYER** (D1) — closed as spec conformance (locked piece-6); no re-lock needed.
-2. **Cost = private-by-default** (D2, reversible) — tokens-only public, cost in the private journal,
-   `total_cost_usd` speced-but-unpopulated; public-cost is a pending gudnuf ruling (walk-forward).
+2. **Cost = PUBLIC where the harness reports it** (Q2, 7/16 — supersedes D2's reversible
+   private-by-default). Harness-generic, opportunistic, absent-stays-absent; `total_cost_usd`
+   published as a public `cost` tag when reported. Walked forward on D2's design as intended.
 3. **Receipt attests the delivered object** (D4, from piece-10) — `delivery_integrity_hash` +
    `delivery_kind` added to the kind-3400 schema **and** the signed preimage.
 
 **Named deferred (not built):** independent measurement/attestation of exec-metadata (it is seller
 self-report); encrypted-delivery rail for detailed metadata (DP-1); the claude-agent-acp ACP-wire
-transport probe; the public-cost gudnuf ruling.
+transport probe; **ACP-usage capture through the driver** (the seller run surface exposes no token
+counts today, so the built block emits `harness`/`usage_transport`/`metadata_trust`/`wall_time` and
+leaves `tokens`/`model`/`cost` absent — Q2 makes them public *when reported*); folding exec-metadata
+into the co-signed preimage (today `exec_metadata_commitment` = empty marker, Item 1). Public-cost is
+**ruled** (Q2 — public where reported), no longer deferred.
 
 ## Acceptance (spec bar)
 
@@ -296,19 +313,23 @@ transport probe; the public-cost gudnuf ruling.
   object** (D4).
 - Back-compat: legacy discriminated by **state+kind/version** (not missing-id); missing
   `delivery_integrity_hash`/exec-metadata = legacy, not a failure; no reject/re-pay of legacy.
-- Usage aligned to locked checkpoint-a; `usage_transport` + `metadata_trust` required; **cost
-  private-by-default** (D2); privacy rule adopted.
+- Usage aligned to locked checkpoint-a; `usage_transport` + `metadata_trust` required; **cost PUBLIC
+  where the harness reports it** (Q2 — supersedes D2's private default); opportunistic + absent-stays-
+  absent; margin-exposure trade-off accepted.
 - Both probe legs included (claude rich; cursor static + cost-absent).
 - Operator rulings D1/D2/D4 folded; codex deep PARKED (version gate + spend cap; re-run on ping).
 
 ## Fence / reality class
 
-**SPEC-DRAFT (design).** No code lands here. The build (follow-up): wire the real `publish_receipt`
-(deterministic-id kind-3400 via `receipt_draft`, real signature verification over the defined preimage
-incl. the delivery-binding tags, `receipt_id` = the 3400 id, empty-relay fail-closed) into the
-**existing** live `ReceiptPublished` effect; extend `result_draft` with an optional exec-metadata tag
-set; filtered echo into `receipt_draft`; record cost to the private journal only. Reality: today's
-`ReceiptPublished` is **BUILT-BUT-STUBBED**; this makes it real.
+**SPEC-DRAFT (design).** The build lands on branch `scribe/piece9-code-receipt-usage` (off
+`e2196db`): the real `publish_receipt` (deterministic-id kind-3400 via `receipt_draft`, real schnorr
+verification over the defined preimage incl. the delivery-binding tags, `receipt_id` = the 3400 id,
+empty-relay fail-closed) wired into the **existing** live `ReceiptPublished` effect; `result_draft`
+extended with the optional PUBLIC exec-metadata tag set (Q2); `receipt_draft` extended with the
+delivery-binding tags + an optional filtered echo. Cost is PUBLIC where the harness reports it (Q2);
+the built seller block is opportunistic (emits harness/usage_transport/metadata_trust/wall_time;
+tokens/model/cost absent pending ACP-usage capture). Reality: today's `ReceiptPublished` was
+**BUILT-BUT-STUBBED**; this makes it real.
 
 ## Reference
 

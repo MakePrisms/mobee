@@ -4,8 +4,11 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use cashu::{Amount, CurrencyUnit, MintUrl, PublicKey, Token};
+use nostr_sdk::secp256k1::schnorr::Signature as SchnorrSignature;
+use nostr_sdk::secp256k1::{Message, Secp256k1};
 use nostr_sdk::PublicKey as NostrPublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,9 +16,15 @@ use sha2::{Digest, Sha256};
 use crate::delivery::{DeliveryError, DeliveryVerifier, GitDelivery};
 use crate::delivery_git::PayPathDeliveryVerifier;
 use crate::payment_send::PaymentSent;
+use crate::receipt::ReceiptPreimage;
 use crate::wallet::VerifiedPayment;
 
 const ATTEMPT_DOMAIN: &[u8] = b"mobee/v1/payment-attempt";
+
+/// Nostr event kind of a piece-9 co-signed settlement receipt. Stamped on
+/// [`ReceiptRecord`] so a consumer discriminates a real receipt from a legacy
+/// (kind-1059-aliased) record with a LOCAL check — never "missing id".
+const RECEIPT_EVENT_KIND: u16 = 3400;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -194,7 +203,15 @@ impl PaymentKey {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Durable metadata for a published receipt.
 pub struct ReceiptRecord {
+    /// The published kind-3400 receipt event id (piece-9). For legacy records this is the
+    /// kind-1059 payment-envelope id (see `receipt_kind`).
     pub receipt_id: String,
+    /// Nostr event kind of the settlement receipt. `3400` = piece-9 co-signed receipt
+    /// event; `0` (serde default on pre-piece-9 journals) = legacy record whose
+    /// `receipt_id` aliases the kind-1059 envelope. LOCAL legacy discriminator — no relay
+    /// fetch, and `Sent`-with-no-receipt stays new-and-incomplete (not legacy).
+    #[serde(default)]
+    pub receipt_kind: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,31 +464,79 @@ impl PaymentJournalGuard for FsPaymentJournalGuard {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/// Receipt authorship and cryptographically validated signer evidence.
+/// A published kind-3400 receipt plus the co-signature material [`ReceiptAuthority`]
+/// verifies. Signatures are real schnorr over [`ReceiptPreimage::digest_bytes`] — not a
+/// caller-asserted signer list.
 pub struct ReceiptEvidence {
+    /// The published kind-3400 event id (deterministic ⇒ idempotent republish).
     pub receipt_id: String,
-    pub author: PublicKey,
-    pub valid_signers: Vec<PublicKey>,
+    /// The receipt event author — MUST equal the externally-anchored buyer (offer author).
+    pub author: NostrPublicKey,
+    /// The co-signed preimage; `verify` recomputes its digest (never trusts a caller digest).
+    pub preimage: ReceiptPreimage,
+    /// Seller schnorr signature (hex) over the preimage digest.
+    pub seller_signature: String,
+    /// Buyer (counter-)schnorr signature (hex) over the same preimage digest.
+    pub buyer_signature: String,
+    /// Relays that accepted the receipt publish. EMPTY ⇒ fail closed before evidence.
+    pub relay_success: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/// Required buyer author and dual receipt signers.
+/// The **externally-anchored** receipt identities: buyer == the offer's author, seller ==
+/// the accepted-claim seller. NEVER derived from the receipt's own `p`-tags (a
+/// self-anchored check is circular — an attacker could name itself and lift the seller's
+/// public signature). These are nostr identities; the co-signatures verify against them.
 pub struct ReceiptAuthority {
-    pub buyer: PublicKey,
-    pub seller: PublicKey,
+    pub buyer: NostrPublicKey,
+    pub seller: NostrPublicKey,
 }
 
 impl ReceiptAuthority {
     fn verify(&self, evidence: ReceiptEvidence) -> Result<ReceiptRecord, PaymentError> {
-        let buyer_signed = evidence.valid_signers.contains(&self.buyer);
-        let seller_signed = evidence.valid_signers.contains(&self.seller);
-        if evidence.author != self.buyer || !buyer_signed || !seller_signed {
+        // Money-path publish rule: empty relay_success ⇒ fail closed BEFORE returning
+        // evidence (mirrors `send_payment`'s empty-relay gate). Recovery retries only the
+        // idempotent receipt publish.
+        if evidence.relay_success.is_empty() {
+            return Err(PaymentError::NoRelayAccepted);
+        }
+        // Author must be the externally-anchored buyer (offer author).
+        if evidence.author != self.buyer {
             return Err(PaymentError::ForgedReceipt);
         }
+        // The signed preimage's embedded identities must equal the external anchors, so the
+        // co-signature commits to the anchored parties — not the receipt's self-declared
+        // `p`-tags.
+        if evidence.preimage.buyer_pubkey != self.buyer.to_hex()
+            || evidence.preimage.seller_pubkey != self.seller.to_hex()
+        {
+            return Err(PaymentError::ForgedReceipt);
+        }
+        // Real schnorr verification of BOTH co-signatures over the preimage digest, each
+        // against its EXTERNAL anchor.
+        let message = Message::from_digest(evidence.preimage.digest_bytes());
+        verify_schnorr_hex(&evidence.seller_signature, &message, &self.seller)?;
+        verify_schnorr_hex(&evidence.buyer_signature, &message, &self.buyer)?;
         Ok(ReceiptRecord {
             receipt_id: evidence.receipt_id,
+            receipt_kind: RECEIPT_EVENT_KIND,
         })
     }
+}
+
+/// Verify one schnorr signature (hex) over `message` against a nostr x-only anchor.
+/// Any parse or verification failure is a [`PaymentError::ForgedReceipt`] (fail closed).
+fn verify_schnorr_hex(
+    signature_hex: &str,
+    message: &Message,
+    anchor: &NostrPublicKey,
+) -> Result<(), PaymentError> {
+    let signature =
+        SchnorrSignature::from_str(signature_hex).map_err(|_| PaymentError::ForgedReceipt)?;
+    let anchor = anchor.xonly().map_err(|_| PaymentError::ForgedReceipt)?;
+    Secp256k1::verification_only()
+        .verify_schnorr(&signature, message, &anchor)
+        .map_err(|_| PaymentError::ForgedReceipt)
 }
 
 /// Ephemeral wallet lock result; never persisted by the trade journal.
@@ -1355,6 +1420,7 @@ mod tests {
                 attempt_id,
                 receipt: ReceiptRecord {
                     receipt_id: "receipt".into(),
+                    receipt_kind: RECEIPT_EVENT_KIND,
                 },
             },
         ];
@@ -1398,6 +1464,93 @@ mod tests {
             journal.records().last().map(|record| &record.value),
             Some(PaymentState::Sent { .. })
         ));
+    }
+
+    #[test]
+    fn receipt_authority_accepts_real_cosigned_receipt_and_stamps_kind() {
+        let record = authority()
+            .verify(valid_evidence(&key()))
+            .expect("valid co-signed receipt verifies");
+        assert_eq!(record.receipt_kind, RECEIPT_EVENT_KIND);
+        assert_eq!(record.receipt_id, valid_evidence(&key()).receipt_id);
+    }
+
+    #[test]
+    fn receipt_authority_rejects_forged_seller_signature() {
+        let mut evidence = valid_evidence(&key());
+        // A real schnorr signature, but by an attacker key — not the anchored seller.
+        evidence.seller_signature = sign_hex(&attacker_keys(), evidence.preimage.digest_bytes());
+        assert!(matches!(
+            authority().verify(evidence),
+            Err(PaymentError::ForgedReceipt)
+        ));
+    }
+
+    #[test]
+    fn receipt_authority_rejects_wrong_external_anchor() {
+        // Verify against an authority whose seller anchor is NOT who signed. The
+        // receipt's own preimage/p-tags cannot rescue it — anchors are external.
+        let wrong_anchor = ReceiptAuthority {
+            buyer: buyer_keys().public_key(),
+            seller: attacker_keys().public_key(),
+        };
+        assert!(matches!(
+            wrong_anchor.verify(valid_evidence(&key())),
+            Err(PaymentError::ForgedReceipt)
+        ));
+    }
+
+    #[test]
+    fn receipt_authority_fails_closed_on_empty_relay_before_returning_evidence() {
+        // Empty relay_success ⇒ Err even though both co-signatures are valid.
+        let mut evidence = valid_evidence(&key());
+        evidence.relay_success.clear();
+        assert!(matches!(
+            authority().verify(evidence),
+            Err(PaymentError::NoRelayAccepted)
+        ));
+    }
+
+    #[test]
+    fn receipt_authority_rejects_tampered_delivery_binding() {
+        // Flip the signed delivery oid AFTER signing — the co-signature no longer matches
+        // the digest (D4: the delivered object is really bound, not decorative).
+        let mut evidence = valid_evidence(&key());
+        evidence.preimage.delivery_integrity_hash = "ab".repeat(20);
+        assert!(matches!(
+            authority().verify(evidence),
+            Err(PaymentError::ForgedReceipt)
+        ));
+    }
+
+    #[test]
+    fn receipt_backcompat_empty_exec_metadata_commitment_still_verifies() {
+        // A receipt with no echoed exec-metadata (empty-marker commitment) is valid —
+        // the exec-metadata tags are optional; their absence is never a verify failure.
+        let evidence = valid_evidence(&key());
+        assert_eq!(
+            evidence.preimage.exec_metadata_commitment,
+            crate::receipt::EXEC_METADATA_COMMITMENT_EMPTY
+        );
+        assert!(authority().verify(evidence).is_ok());
+    }
+
+    #[test]
+    fn receipt_record_legacy_journal_without_kind_defaults_to_legacy() {
+        // A pre-piece-9 journal record has no `receipt_kind` field. It must still
+        // deserialize (serde default 0 = legacy, kind-1059-aliased id) — never rejected.
+        let legacy: ReceiptRecord =
+            serde_json::from_str(r#"{"receipt_id":"1059envelopeid"}"#).expect("legacy parse");
+        assert_eq!(legacy.receipt_kind, 0);
+        assert_eq!(legacy.receipt_id, "1059envelopeid");
+
+        // A new record round-trips with the 3400 stamp.
+        let new = ReceiptRecord {
+            receipt_id: "3400id".into(),
+            receipt_kind: RECEIPT_EVENT_KIND,
+        };
+        let json = serde_json::to_string(&new).unwrap();
+        assert_eq!(serde_json::from_str::<ReceiptRecord>(&json).unwrap(), new);
     }
 
     #[test]
@@ -1498,6 +1651,7 @@ mod tests {
         empty_send: bool,
         fail_receipt: bool,
         forged_receipt: bool,
+        empty_receipt_relay: bool,
         ordering_journal: Option<MemoryPaymentJournal>,
         replay_sync_journal: Option<MemoryPaymentJournal>,
     }
@@ -1537,6 +1691,7 @@ mod tests {
                 empty_send: false,
                 fail_receipt: false,
                 forged_receipt: false,
+                empty_receipt_relay: false,
                 ordering_journal: None,
                 replay_sync_journal: None,
             }
@@ -1623,7 +1778,7 @@ mod tests {
 
         fn publish_receipt(
             &mut self,
-            _key: &PaymentKey,
+            key: &PaymentKey,
             _payment: &PaymentSent,
         ) -> Result<ReceiptEvidence, EffectError> {
             if let Some(journal) = &self.ordering_journal {
@@ -1633,20 +1788,17 @@ mod tests {
             if self.fail_receipt {
                 return Err(EffectError::new("receipt relay unavailable"));
             }
-            let authority = authority();
-            Ok(ReceiptEvidence {
-                receipt_id: "receipt".into(),
-                author: if self.forged_receipt {
-                    public_key(9)
-                } else {
-                    authority.buyer
-                },
-                valid_signers: if self.forged_receipt {
-                    vec![authority.seller]
-                } else {
-                    vec![authority.buyer, authority.seller]
-                },
-            })
+            let mut evidence = valid_evidence(key);
+            if self.forged_receipt {
+                // Forge: seller co-signature by a non-anchor (attacker) key — a valid
+                // schnorr signature, but not by the anchored seller ⇒ must fail verify.
+                let digest = evidence.preimage.digest_bytes();
+                evidence.seller_signature = sign_hex(&attacker_keys(), digest);
+            }
+            if self.empty_receipt_relay {
+                evidence.relay_success.clear();
+            }
+            Ok(evidence)
         }
     }
 
@@ -1690,9 +1842,58 @@ mod tests {
     }
 
     fn authority() -> ReceiptAuthority {
+        // External anchors: buyer == offer author (key 1), seller == accepted-claim
+        // seller (key 2, == terms().seller_nostr_pubkey). Both are nostr identities.
         ReceiptAuthority {
-            buyer: public_key(1),
-            seller: public_key(2),
+            buyer: buyer_keys().public_key(),
+            seller: seller_keys().public_key(),
+        }
+    }
+
+    fn buyer_keys() -> nostr_sdk::Keys {
+        nostr_sdk::Keys::parse(&"01".repeat(32)).unwrap()
+    }
+
+    fn seller_keys() -> nostr_sdk::Keys {
+        // x-only pubkey == nostr_public_key(2) == terms().seller_nostr_pubkey.
+        nostr_sdk::Keys::parse(&"02".repeat(32)).unwrap()
+    }
+
+    fn attacker_keys() -> nostr_sdk::Keys {
+        nostr_sdk::Keys::parse(&"09".repeat(32)).unwrap()
+    }
+
+    /// The co-signed preimage a real buyer would reconstruct from the trade facts.
+    fn receipt_preimage(key: &PaymentKey) -> ReceiptPreimage {
+        ReceiptPreimage {
+            job_hash: key.job_hash.as_str().to_owned(),
+            offer_id: key.job_id.as_str().to_owned(),
+            amount: key.amount.to_u64(),
+            unit: key.unit.to_string(),
+            mint: key.mint.to_string(),
+            buyer_pubkey: buyer_keys().public_key().to_hex(),
+            seller_pubkey: seller_keys().public_key().to_hex(),
+            delivery_integrity_hash: key.delivery_integrity_hash.as_str().to_owned(),
+            delivery_kind: "fork".to_owned(),
+            exec_metadata_commitment: crate::receipt::EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
+        }
+    }
+
+    fn sign_hex(keys: &nostr_sdk::Keys, digest: [u8; 32]) -> String {
+        keys.sign_schnorr(&Message::from_digest(digest)).to_string()
+    }
+
+    /// A valid, real co-signed receipt over the trade's preimage.
+    fn valid_evidence(key: &PaymentKey) -> ReceiptEvidence {
+        let preimage = receipt_preimage(key);
+        let digest = preimage.digest_bytes();
+        ReceiptEvidence {
+            receipt_id: "aa".repeat(32),
+            author: buyer_keys().public_key(),
+            seller_signature: sign_hex(&seller_keys(), digest),
+            buyer_signature: sign_hex(&buyer_keys(), digest),
+            preimage,
+            relay_success: vec!["memory://relay".into()],
         }
     }
 

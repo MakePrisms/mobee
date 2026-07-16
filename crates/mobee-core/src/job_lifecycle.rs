@@ -151,6 +151,9 @@ pub struct ResultView {
     pub branch: Option<String>,
     pub commit_oid: Option<String>,
     pub amount_sats: Option<u64>,
+    /// Seller schnorr signature (hex) from the result's `["sig","seller",..]` tag — the
+    /// buyer counter-signs the same piece-9 receipt preimage to co-sign the kind-3400.
+    pub seller_signature: Option<String>,
 }
 
 /// Local accept-bind recorded by [`accept_claim`] for authorize_pay Gate D / D2.
@@ -167,6 +170,10 @@ pub struct AcceptedBind {
     pub amount_sats: u64,
     pub accept_event_id: String,
     pub accepted_at: u64,
+    /// Seller schnorr signature (hex) over the receipt preimage, captured from the
+    /// accepted result's `sig/seller` tag (piece-9). Empty for legacy/pre-piece-9 results.
+    #[serde(default)]
+    pub seller_signature: String,
 }
 
 /// Inputs for accepting a seller claim (and binding the matching result).
@@ -483,6 +490,8 @@ pub async fn accept_claim_async(
         amount_sats,
         accept_event_id: accept_event_id.clone(),
         accepted_at,
+        // Capture sig/seller so authorize_pay can co-sign the receipt preimage (piece-9).
+        seller_signature: result.seller_signature.clone().unwrap_or_default(),
     };
     write_accepted_bind(home, &bind)?;
 
@@ -573,6 +582,7 @@ pub fn authorize_request_from_bind(
         repo: bind.repo.clone(),
         branch: bind.branch.clone(),
         commit_oid: bind.commit_oid.clone(),
+        seller_signature: bind.seller_signature.clone(),
     })
 }
 
@@ -838,6 +848,7 @@ async fn fetch_job_view_async(
                 .as_ref()
                 .map(|d| d.commit_oid().as_str().to_owned()),
             amount_sats,
+            seller_signature: sig_seller_value(&draft.tags),
         });
     }
     results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -958,6 +969,17 @@ fn first_tag_value<'a>(tags: &'a [TagSpec], name: &str) -> Option<&'a str> {
     first_tag(tags, name).and_then(TagSpec::value)
 }
 
+/// Value of the `["sig","seller",<hex>]` tag, if present (piece-9 co-signature capture).
+fn sig_seller_value(tags: &[TagSpec]) -> Option<String> {
+    tags.iter()
+        .find(|tag| {
+            tag.0.first().map(String::as_str) == Some("sig")
+                && tag.0.get(1).map(String::as_str) == Some("seller")
+        })
+        .and_then(|tag| tag.0.get(2))
+        .map(String::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -987,6 +1009,7 @@ mod tests {
             amount_sats: 1,
             accept_event_id: "11".repeat(32),
             accepted_at: 1,
+            seller_signature: "ab".repeat(32),
         };
         write_accepted_bind(&home, &bind).expect("write");
         let loaded = load_accepted_bind(&home, &bind.job_id)
@@ -1010,6 +1033,7 @@ mod tests {
             amount_sats: 1,
             accept_event_id: "11".repeat(32),
             accepted_at: 1,
+            seller_signature: "ab".repeat(32),
         };
         let err = authorize_request_from_bind(&bind, 1, String::new()).expect_err("empty hash");
         assert!(err.to_string().contains("delivery_integrity_hash"));
@@ -1043,6 +1067,7 @@ mod tests {
             amount_sats: 1,
             accept_event_id: "11".repeat(32),
             accepted_at: 1,
+            seller_signature: "ab".repeat(32),
         };
         let bad_seller = "00".repeat(32);
         let err = assert_authorize_matches_bind(&bind, &bad_seller, &bind.result_id, &bind.commit_oid)

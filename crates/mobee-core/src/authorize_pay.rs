@@ -8,20 +8,24 @@ use std::fmt;
 use std::str::FromStr;
 
 use cashu::{Amount, CurrencyUnit, MintUrl, PublicKey as CashuPublicKey};
+use nostr_sdk::secp256k1::{Message, Secp256k1};
 use nostr_sdk::Keys;
 use nostr_sdk::PublicKey as NostrPublicKey;
+use nostr_sdk::Timestamp;
 
 use crate::budget::{BudgetGate, BudgetRefuse};
 use crate::buyer_fund::{self, FundError};
 use crate::delivery::{CommitOid, DeliveryError, GitDelivery};
 use crate::delivery_git::PayPathDeliveryVerifier;
+use crate::gateway;
 use crate::home::{self, MobeeHome, DEFAULT_MINT_URL};
 use crate::payment::{
-    DeliveryIntegrityHash, FsPaymentJournal, JobHash, JobId, PaymentError, PaymentKey,
+    DeliveryIntegrityHash, EffectError, FsPaymentJournal, JobHash, JobId, PaymentError, PaymentKey,
     PaymentService, PaymentState, PaymentTerms, ReceiptAuthority, ReceiptEvidence, ResultId,
 };
 use crate::payment_send::NostrPaymentSend;
 use crate::payment_wallet::{CdkPaymentEffects, PaymentWalletError};
+use crate::receipt::{DeliveryKind, ReceiptPreimage, EXEC_METADATA_COMMITMENT_EMPTY};
 
 /// Inputs for the authorize_pay composed path.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +40,10 @@ pub struct AuthorizePayRequest {
     pub repo: String,
     pub branch: String,
     pub commit_oid: String,
+    /// Seller schnorr signature (hex) over the piece-9 receipt preimage — read from the
+    /// accepted result's `sig/seller` tag. Empty ⇒ the buyer cannot co-sign a valid
+    /// receipt (the receipt authority fails closed at publish).
+    pub seller_signature: String,
 }
 
 /// Successful composed pay outcome (state + attempt id + spent accounting).
@@ -195,12 +203,17 @@ pub async fn authorize_pay_async(
     let keys = Keys::parse(&secret_hex)
         .map_err(|error| AuthorizePayError::Home(format!("buyer key parse: {error}")))?;
     let buyer_nostr = keys.public_key();
-    let buyer_cashu = cashu_compressed_from_nostr(&buyer_nostr)?;
-    let seller_cashu = terms.seller_p2pk_lock;
     let authority = ReceiptAuthority {
-        buyer: buyer_cashu,
-        seller: seller_cashu,
+        // External anchors (piece-9 Item 1): buyer == the offer's author (this buyer's own
+        // key), seller == the accepted-claim seller. NEVER the receipt's own p-tags.
+        buyer: buyer_nostr,
+        seller: seller_nostr,
     };
+    // Capture receipt-publish inputs before `keys` is moved into the payment sender.
+    let buyer_receipt_keys = keys.clone();
+    let receipt_relay = home.config.relay_url.clone();
+    let seller_hex = seller_nostr.to_hex();
+    let seller_signature = request.seller_signature.clone();
 
     let wallet = buyer_fund::open_testnut_wallet_async(home).await?;
     // Dust guard (live keyset N=1 floor, fail-closed). lock_or_reconcile re-checks
@@ -212,12 +225,14 @@ pub async fn authorize_pay_async(
     let mut effects = CdkPaymentEffects::spawn(
         wallet,
         payment_send,
-        move |_key: &PaymentKey, payment: &crate::payment_send::PaymentSent| {
-            Ok(ReceiptEvidence {
-                receipt_id: payment.payment_id.clone(),
-                author: buyer_cashu,
-                valid_signers: vec![buyer_cashu, seller_cashu],
-            })
+        move |key: &PaymentKey, _payment: &crate::payment_send::PaymentSent| {
+            build_and_publish_receipt(
+                &buyer_receipt_keys,
+                &receipt_relay,
+                &seller_hex,
+                &seller_signature,
+                key,
+            )
         },
     )
     .map_err(|error| AuthorizePayError::Effects(error.to_string()))?;
@@ -256,6 +271,134 @@ fn cashu_compressed_from_nostr(key: &NostrPublicKey) -> Result<CashuPublicKey, A
     })
 }
 
+/// Piece-9 Item 1: build + publish the buyer-authored kind-3400 receipt for a sent
+/// payment, and return the co-signature evidence the [`ReceiptAuthority`] verifies.
+///
+/// The buyer reconstructs the SAME receipt preimage the seller signed at delivery (binds
+/// the trade + the delivered git object, D4; `exec_metadata_commitment` = empty marker —
+/// exec-metadata is seller-claimed, not co-signed), counter-signs it deterministically,
+/// builds a deterministic-id kind-3400, and publishes it. `receipt_id` is that 3400 event
+/// id — NOT the kind-1059 payment envelope. Empty `relay_success` is enforced fail-closed
+/// by [`ReceiptAuthority::verify`]; piece-6 recovery re-runs only this idempotent publish.
+fn build_and_publish_receipt(
+    buyer_keys: &Keys,
+    relay_url: &str,
+    seller_hex: &str,
+    seller_signature: &str,
+    key: &PaymentKey,
+) -> Result<ReceiptEvidence, EffectError> {
+    let buyer_hex = buyer_keys.public_key().to_hex();
+    let mint = key.mint.to_string();
+    let amount = key.amount.to_u64();
+    // offer_id == job_id in this codebase (the offer event id is the job id).
+    let preimage = ReceiptPreimage {
+        job_hash: key.job_hash.as_str().to_owned(),
+        offer_id: key.job_id.as_str().to_owned(),
+        amount,
+        unit: key.unit.to_string(),
+        mint: mint.clone(),
+        buyer_pubkey: buyer_hex.clone(),
+        seller_pubkey: seller_hex.to_owned(),
+        delivery_integrity_hash: key.delivery_integrity_hash.as_str().to_owned(),
+        delivery_kind: DeliveryKind::Fork.as_str().to_owned(),
+        exec_metadata_commitment: EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
+    };
+    let digest = preimage.digest_bytes();
+    // Deterministic buyer counter-signature (no aux-rand): a `sig/buyer` tag that is a pure
+    // function of the preimage, so a recovery republish reproduces the same event id.
+    let secp = Secp256k1::new();
+    let keypair = buyer_keys.secret_key().keypair(&secp);
+    let buyer_signature = secp
+        .sign_schnorr_no_aux_rand(&Message::from_digest(digest), &keypair)
+        .to_string();
+
+    let draft = gateway::receipt_draft(
+        key.job_id.as_str(),
+        key.result_id.as_str(),
+        &buyer_hex,
+        seller_hex,
+        &mint,
+        amount,
+        key.job_hash.as_str(),
+        seller_signature,
+        &buyer_signature,
+        Some(gateway::ReceiptDelivery {
+            integrity_hash: key.delivery_integrity_hash.as_str(),
+            kind: DeliveryKind::Fork.as_str(),
+        }),
+        // No exec-metadata echo in this arc: the commitment is the empty marker, so echoing
+        // seller-claimed tags here would be cosmetic-only (a named follow-up).
+        &[],
+    );
+    let created_at = deterministic_created_at(&digest);
+    let builder = gateway::nostr::event_builder(&draft)
+        .map_err(|error| EffectError::new(format!("receipt event builder: {error}")))?;
+    let event = builder
+        .custom_created_at(Timestamp::from(created_at))
+        .sign_with_keys(buyer_keys)
+        .map_err(|error| EffectError::new(format!("receipt sign: {error}")))?;
+    let receipt_id = event.id.to_hex();
+    let relay_success = publish_receipt_event(relay_url, buyer_keys, &event)?;
+
+    Ok(ReceiptEvidence {
+        receipt_id,
+        author: buyer_keys.public_key(),
+        preimage,
+        seller_signature: seller_signature.to_owned(),
+        buyer_signature,
+        relay_success,
+    })
+}
+
+/// Pin `created_at` as a pure function of the signed preimage so a piece-6 recovery
+/// republish reproduces the SAME kind-3400 event id (idempotent). The value is windowed
+/// into a plausible range; only its determinism matters.
+fn deterministic_created_at(digest: &[u8; 32]) -> u64 {
+    const BASE: u64 = 1_700_000_000; // 2023-11-14
+    const WINDOW: u64 = 100_000_000; // ~3.17 years
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    BASE + (u64::from_be_bytes(head) % WINDOW)
+}
+
+/// Publish the signed kind-3400 to the relay and return the accepted relay set.
+///
+/// Runs on a fresh OS thread with its own current-thread runtime: publishing is async and
+/// the caller may already hold a Tokio runtime (a nested `block_on` would panic). Empty
+/// `relay_success` ⇒ [`ReceiptAuthority::verify`] fails closed and recovery republishes.
+fn publish_receipt_event(
+    relay_url: &str,
+    keys: &Keys,
+    event: &nostr_sdk::Event,
+) -> Result<Vec<String>, EffectError> {
+    use nostr_sdk::prelude::Client;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| EffectError::new(format!("receipt runtime: {error}")))?;
+                runtime.block_on(async {
+                    let client = Client::new(keys.clone());
+                    client.add_relay(relay_url).await.map_err(|error| {
+                        EffectError::new(format!("receipt add relay: {error}"))
+                    })?;
+                    client.connect().await;
+                    let output = client.send_event_to([relay_url], event).await;
+                    client.disconnect().await;
+                    let output = output
+                        .map_err(|error| EffectError::new(format!("receipt send: {error}")))?;
+                    Ok::<Vec<String>, EffectError>(
+                        output.success.iter().map(|url| url.to_string()).collect(),
+                    )
+                })
+            })
+            .join()
+            .map_err(|_| EffectError::new("receipt publisher thread panicked"))?
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +428,7 @@ mod tests {
             repo: "https://github.com/bitcoin/bips.git".into(),
             branch: "master".into(),
             commit_oid: "aa".repeat(20),
+            seller_signature: String::new(),
         };
         let err = authorize_pay(&home, &mut gate, request).expect_err("must refuse nested block_on");
         let message = err.to_string();
@@ -320,6 +464,7 @@ mod tests {
             branch: "master".into(),
             // Even if commit_oid is set, empty buyer hash must refuse (no auto-fill).
             commit_oid: "aa".repeat(20),
+            seller_signature: String::new(),
         };
         let err = authorize_pay(&home, &mut gate, request).expect_err("D2 empty");
         let message = err.to_string();
@@ -354,6 +499,7 @@ mod tests {
             repo: "https://github.com/bitcoin/bips.git".into(),
             branch: "master".into(),
             commit_oid: "cc".repeat(20),
+            seller_signature: String::new(),
         };
         let err = authorize_pay(&home, &mut gate, request).expect_err("D2 mismatch");
         let message = err.to_string();
@@ -392,6 +538,7 @@ mod tests {
             repo: "ext::sh -c evil".into(),
             branch: "main".into(),
             commit_oid: "aa".repeat(20),
+            seller_signature: String::new(),
         };
         let err = authorize_pay(&home, &mut gate, request.clone()).expect_err("ext refused");
         let message = err.to_string();

@@ -860,9 +860,17 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
     .iter()
     .all(|key| arguments.get(key).and_then(Value::as_str).is_some());
 
+    // Optional explicit co-signature (piece-9). The bind form carries it automatically; the
+    // explicit form may pass it, else it is filled from the accept-bind when one exists.
+    let seller_signature_arg = arguments
+        .get("seller_signature")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_default();
+
     #[cfg(feature = "wallet")]
     let request = if explicit {
-        let request = AuthorizePayRequest {
+        let mut request = AuthorizePayRequest {
             job_id: job_id.clone(),
             result_id: require_str("result_id")?,
             delivery_integrity_hash,
@@ -872,6 +880,7 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
             repo: require_str("repo")?,
             branch: require_str("branch")?,
             commit_oid: require_str("commit_oid")?,
+            seller_signature: seller_signature_arg.clone(),
         };
         if let Some(bind) = job_lifecycle::load_accepted_bind(&state.home, &job_id)
             .map_err(|error| error.to_string())?
@@ -883,6 +892,9 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
                 &request.commit_oid,
             )
             .map_err(|error| error.to_string())?;
+            if request.seller_signature.is_empty() {
+                request.seller_signature = bind.seller_signature.clone();
+            }
         }
         request
     } else {
@@ -908,6 +920,7 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
             repo: require_str("repo")?,
             branch: require_str("branch")?,
             commit_oid: require_str("commit_oid")?,
+            seller_signature: seller_signature_arg.clone(),
         }
     };
 
