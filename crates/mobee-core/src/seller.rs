@@ -314,12 +314,26 @@ pub async fn unwrap_own_payment_gift_wrap(
 }
 
 /// Derive the cashu P2PK signing key from the packaged nostr secret hex.
+///
+/// Buyer locks to BIP-340 even-y (`02||xonly`) because nostr only carries the
+/// 32-byte x-only coordinate. A raw secp secret may derive an odd-y (`03`)
+/// compressed pubkey — that key cannot witness a `02`-locked P2PK proof
+/// (Inputs:0). Normalize here: if the derived pubkey is odd-parity, negate the
+/// scalar (`d' = n − d`) so the signing keypair is even-y and matches the lock.
 #[cfg(feature = "wallet")]
 pub fn cashu_secret_from_nostr_hex(secret_hex: &str) -> Result<cashu::SecretKey, SellerError> {
+    use std::ops::Deref;
+
     let bytes = hex::decode(secret_hex.trim())
         .map_err(|error| SellerError::Payment(format!("secret hex decode: {error}")))?;
-    cashu::SecretKey::from_slice(&bytes)
-        .map_err(|error| SellerError::Payment(format!("cashu secret key: {error}")))
+    let key = cashu::SecretKey::from_slice(&bytes)
+        .map_err(|error| SellerError::Payment(format!("cashu secret key: {error}")))?;
+    // Compressed form: 0x02 = even-y, 0x03 = odd-y (BIP-340 / BIP-340-compatible).
+    if key.public_key().to_bytes()[0] == 0x03 {
+        Ok(cashu::SecretKey::from((*key.deref()).negate()))
+    } else {
+        Ok(key)
+    }
 }
 
 #[cfg(test)]
@@ -490,5 +504,59 @@ git_remote = "https://example.invalid/repo.git"
             )
             .expect_err("amount_received must == offer.amount");
         assert!(err.to_string().contains("offer.amount"));
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn cashu_secret_from_nostr_hex_normalizes_odd_y_to_even() {
+        // Find a raw secret whose uncompressed/compressed pubkey is odd-y (03…).
+        let odd_raw = (1u8..=u8::MAX)
+            .map(|byte| [byte; 32])
+            .find(|bytes| {
+                cashu::SecretKey::from_slice(bytes)
+                    .map(|key| key.public_key().to_bytes()[0] == 0x03)
+                    .unwrap_or(false)
+            })
+            .expect("an odd-parity secp secret exists");
+        let raw_key = cashu::SecretKey::from_slice(&odd_raw).expect("parse");
+        assert_eq!(raw_key.public_key().to_bytes()[0], 0x03, "precondition: odd-y");
+        let xonly_before = raw_key.public_key().x_only_public_key().to_string();
+
+        let normalized =
+            cashu_secret_from_nostr_hex(&hex::encode(odd_raw)).expect("normalize");
+        assert_eq!(
+            normalized.public_key().to_bytes()[0],
+            0x02,
+            "must force even-y compressed pubkey"
+        );
+        assert_eq!(
+            normalized.public_key().x_only_public_key().to_string(),
+            xonly_before,
+            "x-only coordinate must be unchanged by BIP-340 negation"
+        );
+        // Matches buyer lock shape: 02||xonly.
+        assert_eq!(
+            normalized.public_key().to_hex(),
+            format!("02{xonly_before}")
+        );
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn cashu_secret_from_nostr_hex_leaves_even_y_unchanged() {
+        let even_raw = (1u8..=u8::MAX)
+            .map(|byte| [byte; 32])
+            .find(|bytes| {
+                cashu::SecretKey::from_slice(bytes)
+                    .map(|key| key.public_key().to_bytes()[0] == 0x02)
+                    .unwrap_or(false)
+            })
+            .expect("an even-parity secp secret exists");
+        let raw_key = cashu::SecretKey::from_slice(&even_raw).expect("parse");
+        let before = raw_key.public_key().to_hex();
+        let normalized =
+            cashu_secret_from_nostr_hex(&hex::encode(even_raw)).expect("normalize");
+        assert_eq!(normalized.public_key().to_hex(), before);
+        assert_eq!(normalized.public_key().to_bytes()[0], 0x02);
     }
 }
