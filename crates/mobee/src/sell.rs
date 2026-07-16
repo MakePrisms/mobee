@@ -1,13 +1,19 @@
-//! `mobee sell` — seller daemon dual-mode setup + run.
+//! `mobee sell` — seller daemon with good defaults.
 //!
-//! - TTY (default): wizard prompts for missing `[seller]` fields, writes config, runs daemon.
-//! - `--non-interactive`: fail-closed naming each missing required field; then run.
-//! - Never accepts `--key` (key stays in `~/.mobee/nostr.key` via bootstrap; never argv).
+//! Required user choices: `--agent` (or `--agent-argv`) and `--rate-sats` on first run.
+//! Everything else defaults (relay, mint, key 0600, relay-git delivery) and persists to
+//! `config.toml` so subsequent launches are zero-prompt.
+//!
+//! Never accepts `--key` (key stays in `~/.mobee/key`; never argv).
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 
-use mobee_core::home::{self, MobeeHome, SellerConfig};
+use mobee_core::delivery_transport::is_relay_git_locator;
+use mobee_core::home::{self, MobeeHome, SellerConfig, DEFAULT_MINT_URL, DEFAULT_RELAY_URL};
+use mobee_core::profile::{self, SetProfileRequest};
+
+use crate::agent_presets;
 
 const SUCCESS: i32 = 0;
 const USAGE_ERROR: i32 = 1;
@@ -15,12 +21,18 @@ const RUNTIME_ERROR: i32 = 2;
 
 #[derive(Debug, Default)]
 struct SellOptions {
+    /// Force fail-closed naming of missing fields (no TTY prompts).
     non_interactive: bool,
-    /// Repeated `--agent-argv <part>` builds the argv array (no shell string).
+    /// Named preset: claude | cursor | codex.
+    agent: Option<String>,
+    /// Power-user escape hatch (repeatable).
     agent_argv: Vec<String>,
     rate_sats: Option<u64>,
     git_remote: Option<String>,
     job_timeout_secs: Option<u64>,
+    /// Opt-in to claim untargeted/open offers (default OFF).
+    claim_open_pool: Option<bool>,
+    name: Option<String>,
     home: Option<PathBuf>,
 }
 
@@ -68,6 +80,23 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
         RUNTIME_ERROR
     })?;
 
+    // Explicit good defaults (never prompt for these).
+    let mut defaults_touched = false;
+    if home.config.relay_url.trim().is_empty() {
+        home.config.relay_url = DEFAULT_RELAY_URL.to_owned();
+        defaults_touched = true;
+    }
+    if home.config.mint_url.trim().is_empty() {
+        home.config.mint_url = DEFAULT_MINT_URL.to_owned();
+        defaults_touched = true;
+    }
+    if defaults_touched {
+        home::save_config(&home).map_err(|error| {
+            let _ = writeln!(err, "{error}");
+            RUNTIME_ERROR
+        })?;
+    }
+
     // Status must never echo the secret key.
     let _ = writeln!(
         err,
@@ -80,14 +109,82 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
 
     ensure_seller_config(&mut home, &options, out, err)?;
 
+    if let Some(name) = options.name.as_ref() {
+        profile::set_profile(
+            &mut home,
+            SetProfileRequest {
+                name: Some(name.clone()),
+                about: None,
+            },
+        )
+        .map_err(|error| {
+            let _ = writeln!(err, "profile publish failed (fail-closed): {error}");
+            RUNTIME_ERROR
+        })?;
+    }
+
+    let seller = home.config.seller.clone().ok_or_else(|| {
+        let _ = writeln!(err, "missing [seller] after ensure");
+        RUNTIME_ERROR
+    })?;
+
+    // Relay-git: NIP-34 announce BEFORE any push (relay FORBIDs un-announced repos).
+    // Relay `.names/<d>` is GLOBAL — collisions accept the event but skip seeding →
+    // push 404s. Probe after announce so we never push into the void.
+    if is_relay_git_locator(&seller.git_remote) {
+        match profile::announce_seller_delivery_repo(&home, &seller.git_remote) {
+            Ok(event_id) => {
+                let _ = writeln!(
+                    err,
+                    "relay-git NIP-34 announce ok id={event_id} remote={}",
+                    seller.git_remote
+                );
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    err,
+                    "mobee-hosted delivery announce failed: {error}\n\
+                     provide --git-remote <https-url> to use BYO delivery, or retry when relay-git is reachable"
+                );
+                return Err(RUNTIME_ERROR);
+            }
+        }
+        if let Err(message) = probe_relay_git_seeded(&home, &seller.git_remote) {
+            let _ = writeln!(err, "{message}");
+            return Err(RUNTIME_ERROR);
+        }
+        let _ = writeln!(err, "relay-git seed probe ok (info/refs reachable)");
+    }
+
+    // Discoverability: clobber-safe kind-0 + idempotent NIP-89.
+    let disco = profile::publish_seller_discoverability(&mut home).map_err(|error| {
+        let _ = writeln!(
+            err,
+            "discoverability publish failed (fail-closed): {error}"
+        );
+        RUNTIME_ERROR
+    })?;
+    let _ = writeln!(
+        err,
+        "discoverable kind0={} nip89={} name={} pubkey={}",
+        disco.kind0_event_id,
+        disco.nip89_event_id,
+        disco.name.as_deref().unwrap_or(""),
+        disco.pubkey
+    );
+
     let daemon = mobee_core::seller_daemon::SellerDaemon::open(home).map_err(|error| {
         let _ = writeln!(err, "{error}");
         RUNTIME_ERROR
     })?;
     let _ = writeln!(
         err,
-        "seller starting pubkey={} (never-echo: key omitted)",
-        daemon.seller_pubkey()
+        "seller starting pubkey={} agent={} rate_sats={} claim_open_pool={} git_remote={} (never-echo: key omitted)",
+        daemon.seller_pubkey(),
+        seller.agent.as_deref().unwrap_or("custom"),
+        seller.rate_sats,
+        seller.claim_open_pool,
+        seller.git_remote
     );
     mobee_core::seller_daemon::run_forever_blocking(daemon).map_err(|error| {
         let _ = writeln!(err, "{error}");
@@ -104,15 +201,17 @@ fn ensure_seller_config(
     err: &mut dyn Write,
 ) -> Result<(), i32> {
     let existing = home.config.seller.clone();
+    let existing_agent = existing.as_ref().and_then(|s| s.agent.clone());
+    let steady_state = existing.is_some()
+        && options.agent.is_none()
+        && options.agent_argv.is_empty()
+        && options.rate_sats.is_none()
+        && options.git_remote.is_none();
 
-    let mut agent_command = if options.agent_argv.is_empty() {
-        existing
-            .as_ref()
-            .map(|seller| seller.agent_command.clone())
-            .unwrap_or_default()
-    } else {
-        options.agent_argv.clone()
-    };
+    // Agent: preset | argv hatch | persisted config. Never re-prompt argv in steady state.
+    let (mut agent_label, mut agent_command) =
+        resolve_agent(options, existing.as_ref(), out, err)?;
+
     let mut rate_sats = options
         .rate_sats
         .or_else(|| existing.as_ref().map(|seller| seller.rate_sats));
@@ -122,17 +221,35 @@ fn ensure_seller_config(
             .map(|seller| seller.git_remote.clone())
             .filter(|value| !value.trim().is_empty())
     });
-    let mut job_timeout_secs = options
+    let job_timeout_secs = options
         .job_timeout_secs
         .or_else(|| existing.as_ref().and_then(|seller| seller.job_timeout_secs));
+    let claim_open_pool = options
+        .claim_open_pool
+        .unwrap_or_else(|| existing.as_ref().map(|s| s.claim_open_pool).unwrap_or(false));
 
-    if options.non_interactive {
+    // Default delivery = relay-git (self-owned namespace).
+    if git_remote.as_ref().map(|v| v.trim().is_empty()).unwrap_or(true) {
+        let pubkey = home::public_key_hex(home).map_err(|error| {
+            let _ = writeln!(err, "{error}");
+            RUNTIME_ERROR
+        })?;
+        git_remote = Some(home::default_relay_git_remote(&pubkey));
+        let _ = writeln!(
+            err,
+            "git_remote defaulting to relay-git {}",
+            git_remote.as_deref().unwrap_or("")
+        );
+    }
+
+    let interactive = !options.non_interactive && !steady_state && atty_stderr();
+    if options.non_interactive || steady_state {
         let mut missing = Vec::new();
         if agent_command.is_empty() {
-            missing.push("agent_command");
+            missing.push("agent (--agent claude|cursor|codex, or --agent-argv)");
         }
         if rate_sats.is_none() {
-            missing.push("rate_sats");
+            missing.push("rate_sats (--rate-sats)");
         }
         if git_remote.as_ref().map(|v| v.trim().is_empty()).unwrap_or(true) {
             missing.push("git_remote");
@@ -140,55 +257,65 @@ fn ensure_seller_config(
         if !missing.is_empty() {
             let _ = writeln!(
                 err,
-                "mobee sell --non-interactive missing required field(s): {}",
+                "mobee sell missing required field(s): {}",
                 missing.join(", ")
             );
+            let available = agent_presets::detect_available_agents();
+            if !available.is_empty() {
+                let _ = writeln!(err, "agents detected on PATH: {}", available.join(", "));
+            }
             return Err(USAGE_ERROR);
         }
-    } else {
+    } else if interactive {
         if agent_command.is_empty() {
-            agent_command = prompt_agent_argv(out, err)?;
+            let available = agent_presets::detect_available_agents();
+            let suggestion = available.first().copied().unwrap_or("claude");
+            let detected = if available.is_empty() {
+                "none".to_owned()
+            } else {
+                available.join(", ")
+            };
+            let _ = writeln!(
+                out,
+                "Pick an agent preset (claude|cursor|codex). Detected: {detected}"
+            );
+            let picked = prompt_line(out, err, "Agent", suggestion)?;
+            let (label, argv) = agent_presets::resolve_agent_preset(&picked).map_err(|message| {
+                let _ = writeln!(err, "{message}");
+                USAGE_ERROR
+            })?;
+            agent_command = argv;
+            agent_label = Some(label.clone());
+            let _ = writeln!(err, "agent preset={label} argv0={}", agent_command[0]);
         }
         if rate_sats.is_none() {
             rate_sats = Some(prompt_u64(
                 out,
                 err,
                 "Seller rate_sats (claim floor, sats)",
-                21,
+                2,
             )?);
         }
-        if git_remote.as_ref().map(|v| v.trim().is_empty()).unwrap_or(true) {
-            git_remote = Some(prompt_line(
-                out,
-                err,
-                "Seller git_remote (https:// or relay-git only)",
-                "",
-            )?);
-            if git_remote.as_ref().map(|v| v.trim().is_empty()).unwrap_or(true) {
-                let _ = writeln!(err, "missing required field git_remote");
-                return Err(USAGE_ERROR);
-            }
-        }
-        if job_timeout_secs.is_none() {
-            let raw = prompt_line(
-                out,
-                err,
-                "Optional job_timeout_secs (empty = offer deadline / default 600)",
-                "",
-            )?;
-            if !raw.trim().is_empty() {
-                job_timeout_secs = Some(raw.trim().parse().map_err(|_| {
-                    let _ = writeln!(err, "job_timeout_secs must be a u64");
-                    USAGE_ERROR
-                })?);
-            }
-        }
+    } else if agent_command.is_empty() || rate_sats.is_none() {
+        // Non-TTY first run without flags.
+        let _ = writeln!(
+            err,
+            "mobee sell: pass --agent <claude|cursor|codex> --rate-sats <n> \
+             (or run in a TTY for the guided wizard)"
+        );
+        return Err(USAGE_ERROR);
     }
+
+    let agent = options
+        .agent
+        .clone()
+        .or(agent_label)
+        .or(existing_agent);
 
     let seller = SellerConfig {
         agent_command,
         rate_sats: rate_sats.ok_or_else(|| {
-            let _ = writeln!(err, "missing required field rate_sats");
+            let _ = writeln!(err, "missing required field rate_sats (--rate-sats)");
             USAGE_ERROR
         })?,
         git_remote: git_remote.ok_or_else(|| {
@@ -196,50 +323,102 @@ fn ensure_seller_config(
             USAGE_ERROR
         })?,
         job_timeout_secs,
+        agent,
+        claim_open_pool,
     };
     home.config.seller = Some(seller);
     home::save_config(home).map_err(|error| {
         let _ = writeln!(err, "{error}");
         RUNTIME_ERROR
     })?;
-    let _ = writeln!(err, "wrote [seller] to {}", home.root.join("config.toml").display());
+    let _ = writeln!(
+        err,
+        "wrote [seller] to {}",
+        home.root.join("config.toml").display()
+    );
     Ok(())
 }
 
-fn prompt_agent_argv(out: &mut dyn Write, err: &mut dyn Write) -> Result<Vec<String>, i32> {
-    let _ = writeln!(
-        out,
-        "Enter agent_command as argv parts (one per line; empty line ends)."
-    );
-    let _ = writeln!(
-        out,
-        "Example first line: cursor-agent   then: --print   (NOT a shell string)"
-    );
-    let _ = out.flush();
-    let stdin = io::stdin();
-    let mut lines = stdin.lock().lines();
-    let mut argv = Vec::new();
-    loop {
-        let _ = write!(out, "argv[{}]> ", argv.len());
-        let _ = out.flush();
-        let line = match lines.next() {
-            Some(Ok(line)) => line,
-            Some(Err(error)) => {
-                let _ = writeln!(err, "{error}");
-                return Err(RUNTIME_ERROR);
-            }
-            None => break,
-        };
-        if line.trim().is_empty() {
-            break;
+#[cfg(feature = "wallet")]
+fn resolve_agent(
+    options: &SellOptions,
+    existing: Option<&SellerConfig>,
+    _out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<(Option<String>, Vec<String>), i32> {
+    if !options.agent_argv.is_empty() {
+        if options.agent.is_some() {
+            let _ = writeln!(err, "refused: pass either --agent or --agent-argv, not both");
+            return Err(USAGE_ERROR);
         }
-        argv.push(line);
+        return Ok((None, options.agent_argv.clone()));
     }
-    if argv.is_empty() {
-        let _ = writeln!(err, "missing required field agent_command");
-        return Err(USAGE_ERROR);
+    if let Some(name) = options.agent.as_ref() {
+        let (label, argv) = agent_presets::resolve_agent_preset(name).map_err(|message| {
+            let _ = writeln!(err, "{message}");
+            USAGE_ERROR
+        })?;
+        let _ = writeln!(err, "agent preset={label} argv0={}", argv[0]);
+        return Ok((Some(label), argv));
     }
-    Ok(argv)
+    if let Some(seller) = existing {
+        return Ok((seller.agent.clone(), seller.agent_command.clone()));
+    }
+    Ok((None, Vec::new()))
+}
+
+fn atty_stderr() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal()
+}
+
+/// After NIP-34 announce, confirm the relay seeded the empty-manifest pointer.
+///
+/// Event-accept alone is insufficient: a global `.names/<d>` collision stores the
+/// kind-30617 but skips seed → later push 404s ("repository not found").
+#[cfg(feature = "wallet")]
+fn probe_relay_git_seeded(home: &MobeeHome, remote_url: &str) -> Result<(), String> {
+    use std::process::Command;
+
+    let helper = mobee_core::seller_git::resolve_git_credential_nostr().ok_or_else(|| {
+        "git-credential-nostr not found (set MOBEE_GIT_CREDENTIAL_NOSTR or install helper)"
+            .to_owned()
+    })?;
+    let helper_cfg = format!("credential.helper={}", helper.to_string_lossy());
+    let secret = home::read_secret_key_hex(home).map_err(|e| e.to_string())?;
+    let output = Command::new("git")
+        .args([
+            "-c",
+            helper_cfg.as_str(),
+            "-c",
+            "credential.useHttpPath=true",
+            "ls-remote",
+            remote_url,
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env_remove("BUZZ_PRIVATE_KEY")
+        .env("NOSTR_PRIVATE_KEY", &secret)
+        .output()
+        .map_err(|e| format!("relay-git seed probe failed to spawn git: {e}"))?;
+    drop(secret);
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    if stderr.contains("repository not found") || stderr.contains("404") {
+        return Err(format!(
+            "mobee-hosted delivery not seeded after NIP-34 announce (ls-remote 404).\n\
+             likely cause: relay-git global name collision on repo id, or seed side-effect failed.\n\
+             provide --git-remote <https-url> for BYO delivery, or pick a unique remote leaf.\n\
+             remote={remote_url}"
+        ));
+    }
+    Err(format!(
+        "mobee-hosted delivery seed probe failed (git ls-remote).\n\
+         provide --git-remote <https-url> for BYO delivery.\n\
+         remote={remote_url}"
+    ))
 }
 
 fn prompt_line(
@@ -287,11 +466,20 @@ impl SellOptions {
         while index < args.len() {
             match args[index].as_str() {
                 "--non-interactive" => options.non_interactive = true,
+                "--claim-open-pool" => options.claim_open_pool = Some(true),
+                "--no-claim-open-pool" => options.claim_open_pool = Some(false),
                 "--key" | "--secret-key" | "--private-key" => {
                     return Err(
                         "refused: --key / secret key argv is not allowed (key stays in home file)"
                             .into(),
                     );
+                }
+                "--agent" => {
+                    index += 1;
+                    let name = args
+                        .get(index)
+                        .ok_or_else(|| "missing value for --agent".to_owned())?;
+                    options.agent = Some(name.clone());
                 }
                 "--agent-argv" => {
                     index += 1;
@@ -331,6 +519,14 @@ impl SellOptions {
                             .map_err(|_| format!("--job-timeout-secs must be a u64, got {raw}"))?,
                     );
                 }
+                "--name" => {
+                    index += 1;
+                    options.name = Some(
+                        args.get(index)
+                            .ok_or_else(|| "missing value for --name".to_owned())?
+                            .clone(),
+                    );
+                }
                 "--home" => {
                     index += 1;
                     options.home = Some(PathBuf::from(
@@ -349,7 +545,7 @@ impl SellOptions {
 fn sell_usage(err: &mut dyn Write) {
     let _ = writeln!(
         err,
-        "Usage:\n  mobee sell\n  mobee sell --non-interactive --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n> --git-remote <url> [--job-timeout-secs <n>] [--home <dir>]\n\nNotes:\n  - agent_command is an argv array (repeat --agent-argv); shell strings refused\n  - no --key (packaged key file only)\n  - TTY wizard writes [seller]; --non-interactive names missing required fields"
+        "Usage:\n  mobee sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>]\n  mobee sell   # zero-prompt relaunch from config.toml\n  mobee sell --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://mobee-relay.orveth.dev mint=testnut git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in"
     );
 }
 
@@ -364,13 +560,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_agent_preset_and_rate() {
+        let options = SellOptions::parse(&[
+            "--agent".into(),
+            "claude".into(),
+            "--rate-sats".into(),
+            "2".into(),
+            "--claim-open-pool".into(),
+        ])
+        .expect("parse");
+        assert_eq!(options.agent.as_deref(), Some("claude"));
+        assert_eq!(options.rate_sats, Some(2));
+        assert_eq!(options.claim_open_pool, Some(true));
+    }
+
+    #[test]
     fn parses_agent_argv_array() {
         let options = SellOptions::parse(&[
             "--non-interactive".into(),
             "--agent-argv".into(),
             "cursor-agent".into(),
             "--agent-argv".into(),
-            "--print".into(),
+            "acp".into(),
             "--rate-sats".into(),
             "21".into(),
             "--git-remote".into(),
@@ -380,21 +591,18 @@ mod tests {
         assert!(options.non_interactive);
         assert_eq!(
             options.agent_argv,
-            vec!["cursor-agent".to_owned(), "--print".to_owned()]
+            vec!["cursor-agent".to_owned(), "acp".to_owned()]
         );
         assert_eq!(options.rate_sats, Some(21));
     }
 
     #[test]
-    fn non_interactive_names_missing_fields() {
+    fn missing_required_names_agent_and_rate() {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = run(
             &[
                 "--non-interactive".into(),
-                "--rate-sats".into(),
-                "1".into(),
-                // missing agent_command + git_remote
                 "--home".into(),
                 std::env::temp_dir()
                     .join(format!("mobee-sell-miss-{}", std::process::id()))
@@ -407,7 +615,7 @@ mod tests {
         assert_eq!(code, USAGE_ERROR);
         let rendered = String::from_utf8_lossy(&err);
         assert!(
-            rendered.contains("agent_command") && rendered.contains("git_remote"),
+            rendered.contains("agent") && rendered.contains("rate_sats"),
             "stderr={rendered}"
         );
         assert!(!rendered.to_ascii_lowercase().contains("nsec"));

@@ -38,6 +38,20 @@ pub struct SetProfileOutcome {
     pub relay_url: String,
 }
 
+/// Kind-0 + NIP-89 announce ids from seller discoverability publish.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SellerDiscoverabilityOutcome {
+    pub pubkey: String,
+    pub kind0_event_id: String,
+    pub nip89_event_id: String,
+    pub name: Option<String>,
+    pub relay_url: String,
+}
+
+/// NIP-89 handler information (kind 31990) — parameterized replaceable via `d`.
+const NIP89_HANDLER_KIND: u16 = 31990;
+const NIP89_HANDLER_D: &str = "mobee-seller";
+
 #[derive(Debug)]
 pub enum ProfileError {
     Input(String),
@@ -109,7 +123,8 @@ pub async fn set_profile_async(
 
     let profile = home.config.profile.clone().unwrap_or_default();
     let keys = buyer_keys(home)?;
-    let event_id = publish_metadata_async(home, &keys, &profile).await?;
+    // Fail-closed read-merge-write: never blind-overwrite a replaceable kind-0.
+    let event_id = publish_metadata_merged_async(home, &keys, &profile).await?;
 
     Ok(SetProfileOutcome {
         ok: true,
@@ -117,6 +132,84 @@ pub async fn set_profile_async(
         name: profile.name,
         about: profile.about,
         event_id,
+        relay_url: home.config.relay_url.clone(),
+    })
+}
+
+/// Seller start: publish clobber-safe kind-0 + idempotent NIP-89 (d=`mobee-seller`).
+///
+/// Kind-0: fetch → merge name/about → publish; **abort on fetch failure**.
+/// NIP-89: same `d` tag every launch (parameterized replaceable — not spam).
+pub fn publish_seller_discoverability(
+    home: &mut MobeeHome,
+) -> Result<SellerDiscoverabilityOutcome, ProfileError> {
+    crate::runtime_guard::refuse_nested_block_on("publish_seller_discoverability")
+        .map_err(ProfileError::Relay)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| ProfileError::Relay(error.to_string()))?;
+    runtime.block_on(publish_seller_discoverability_async(home))
+}
+
+/// Async twin of [`publish_seller_discoverability`].
+pub async fn publish_seller_discoverability_async(
+    home: &mut MobeeHome,
+) -> Result<SellerDiscoverabilityOutcome, ProfileError> {
+    home::reload_config(home)?;
+    let seller = home.config.seller.as_ref().ok_or_else(|| {
+        ProfileError::Input("missing [seller] config for discoverability publish".into())
+    })?;
+    let rate_sats = seller.rate_sats;
+    let claim_open_pool = seller.claim_open_pool;
+    let agent = seller.agent.clone();
+
+    // Ensure a display name exists (config or short-hex default).
+    let pubkey = home::public_key_hex(home)?;
+    let short = &pubkey[..8.min(pubkey.len())];
+    if home
+        .config
+        .profile
+        .as_ref()
+        .and_then(|p| p.name.as_ref())
+        .map(|n| n.trim().is_empty())
+        .unwrap_or(true)
+    {
+        profile_mut(home).name = Some(format!("mobee-seller-{short}"));
+        home::save_config(home)?;
+    }
+    if home
+        .config
+        .profile
+        .as_ref()
+        .and_then(|p| p.about.as_ref())
+        .is_none()
+    {
+        let agent_label = agent.as_deref().unwrap_or("agent");
+        profile_mut(home).about = Some(format!(
+            "mobee seller · {agent_label} · {rate_sats} sat/job · testnut"
+        ));
+        home::save_config(home)?;
+    }
+
+    let profile = home.config.profile.clone().unwrap_or_default();
+    let keys = buyer_keys(home)?;
+    let kind0_event_id = publish_metadata_merged_async(home, &keys, &profile).await?;
+    let nip89_event_id = publish_nip89_announce_async(
+        home,
+        &keys,
+        &profile,
+        rate_sats,
+        claim_open_pool,
+        agent.as_deref(),
+    )
+    .await?;
+
+    Ok(SellerDiscoverabilityOutcome {
+        pubkey: keys.public_key().to_hex(),
+        kind0_event_id,
+        nip89_event_id,
+        name: profile.name,
         relay_url: home.config.relay_url.clone(),
     })
 }
@@ -190,7 +283,7 @@ async fn publish_metadata_async(
     keys: &nostr_sdk::Keys,
     profile: &ProfileConfig,
 ) -> Result<String, ProfileError> {
-    use nostr_sdk::prelude::{Client, EventBuilder, Metadata};
+    use nostr_sdk::prelude::{EventBuilder, Metadata};
 
     let mut metadata = Metadata::new();
     if let Some(name) = &profile.name {
@@ -204,12 +297,75 @@ async fn publish_metadata_async(
         .sign_with_keys(keys)
         .map_err(|error| ProfileError::Relay(format!("sign kind-0: {error}")))?;
 
+    send_signed_event(home, keys, &event, "kind-0").await
+}
+
+/// Fail-closed read-merge-write for replaceable kind-0 (never blind-overwrite).
+async fn publish_metadata_merged_async(
+    home: &MobeeHome,
+    keys: &nostr_sdk::Keys,
+    profile: &ProfileConfig,
+) -> Result<String, ProfileError> {
+    use nostr_sdk::prelude::{Client, EventBuilder, Filter, Kind, Metadata};
+
     let client = Client::new(keys.clone());
     client
         .add_relay(&home.config.relay_url)
         .await
         .map_err(|error| ProfileError::Relay(format!("add relay: {error}")))?;
     client.connect().await;
+
+    let filter = Filter::new()
+        .author(keys.public_key())
+        .kind(Kind::Metadata)
+        .limit(1);
+    let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+    let fetched = client.fetch_events(filter, timeout).await;
+    let fetched = match fetched {
+        Ok(events) => events,
+        Err(error) => {
+            client.disconnect().await;
+            return Err(ProfileError::Relay(format!(
+                "kind-0 fetch failed (fail-closed, refuse blind overwrite): {error}"
+            )));
+        }
+    };
+
+    use nostr_sdk::JsonUtil;
+    let mut metadata = Metadata::new();
+    // Preserve existing fields when present; local config wins for name/about.
+    if let Some(existing) = fetched.into_iter().next() {
+        if let Ok(parsed) = Metadata::from_json(&existing.content) {
+            metadata = parsed;
+        } else {
+            // Defensive fallback: at least keep name/about if content is partial JSON.
+            if let Some(name) = parse_kind0_name(&existing.content) {
+                metadata = metadata.name(name);
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&existing.content) {
+                if let Some(about) = value
+                    .get("about")
+                    .and_then(|v| v.as_str())
+                    .and_then(|a| clamp_field(a, PROFILE_ABOUT_MAX))
+                {
+                    metadata = metadata.about(about);
+                }
+            }
+        }
+    }
+    if let Some(name) = &profile.name {
+        metadata = metadata.name(name);
+    }
+    if let Some(about) = &profile.about {
+        metadata = metadata.about(about);
+    }
+
+    let event = EventBuilder::metadata(&metadata)
+        .sign_with_keys(keys)
+        .map_err(|error| {
+            // disconnect best-effort before returning
+            ProfileError::Relay(format!("sign kind-0: {error}"))
+        })?;
     let output = client
         .send_event_to([&home.config.relay_url], &event)
         .await;
@@ -223,6 +379,128 @@ async fn publish_metadata_async(
             .collect();
         return Err(ProfileError::Relay(format!(
             "no relay accepted kind-0 ({})",
+            failed.join("; ")
+        )));
+    }
+    Ok(output.val.to_hex())
+}
+
+async fn publish_nip89_announce_async(
+    home: &MobeeHome,
+    keys: &nostr_sdk::Keys,
+    profile: &ProfileConfig,
+    rate_sats: u64,
+    claim_open_pool: bool,
+    agent: Option<&str>,
+) -> Result<String, ProfileError> {
+    use nostr_sdk::prelude::{EventBuilder, Kind, Tag};
+
+    let content = serde_json::json!({
+        "name": profile.name,
+        "about": profile.about,
+        "rate_sats": rate_sats,
+        "claim_open_pool": claim_open_pool,
+        "agent": agent,
+        "mint": "testnut",
+        "protocol": "mobee-seller",
+    })
+    .to_string();
+
+    let k_5109 = Tag::parse(["k", "5109"])
+        .map_err(|error| ProfileError::Relay(format!("NIP-89 k tag: {error}")))?;
+    let k_6109 = Tag::parse(["k", "6109"])
+        .map_err(|error| ProfileError::Relay(format!("NIP-89 k tag: {error}")))?;
+    let event = EventBuilder::new(Kind::Custom(NIP89_HANDLER_KIND), content)
+        .tags([Tag::identifier(NIP89_HANDLER_D), k_5109, k_6109])
+        .sign_with_keys(keys)
+        .map_err(|error| ProfileError::Relay(format!("sign NIP-89: {error}")))?;
+
+    send_signed_event(home, keys, &event, "NIP-89").await
+}
+
+/// NIP-34 kind-30617 announce for the seller delivery remote (required before push).
+///
+/// Parameterized replaceable via `d=<repo_id>` — idempotent across launches.
+pub fn announce_seller_delivery_repo(
+    home: &MobeeHome,
+    remote_url: &str,
+) -> Result<String, ProfileError> {
+    crate::runtime_guard::refuse_nested_block_on("announce_seller_delivery_repo")
+        .map_err(ProfileError::Relay)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| ProfileError::Relay(error.to_string()))?;
+    runtime.block_on(announce_seller_delivery_repo_async(home, remote_url))
+}
+
+/// Async twin of [`announce_seller_delivery_repo`].
+pub async fn announce_seller_delivery_repo_async(
+    home: &MobeeHome,
+    remote_url: &str,
+) -> Result<String, ProfileError> {
+    use nostr_sdk::nips::nip34::GitRepositoryAnnouncement;
+    use nostr_sdk::prelude::{EventBuilder, Url};
+
+    let repo_id = home::relay_git_repo_id(remote_url).ok_or_else(|| {
+        ProfileError::Input(format!(
+            "cannot derive NIP-34 repo id from git-remote {remote_url:?}"
+        ))
+    })?;
+    let clone = Url::parse(remote_url)
+        .map_err(|error| ProfileError::Input(format!("git-remote URL: {error}")))?;
+    let name = home
+        .config
+        .profile
+        .as_ref()
+        .and_then(|p| p.name.clone())
+        .unwrap_or_else(|| repo_id.clone());
+    let announcement = GitRepositoryAnnouncement {
+        id: repo_id,
+        name: Some(name),
+        description: Some("mobee seller delivery".into()),
+        web: Vec::new(),
+        clone: vec![clone],
+        relays: Vec::new(),
+        euc: None,
+        maintainers: Vec::new(),
+    };
+    let keys = buyer_keys(home)?;
+    let event = EventBuilder::git_repository_announcement(announcement)
+        .map_err(|error| ProfileError::Relay(format!("build NIP-34: {error}")))?
+        .sign_with_keys(&keys)
+        .map_err(|error| ProfileError::Relay(format!("sign NIP-34: {error}")))?;
+    send_signed_event(home, &keys, &event, "NIP-34").await
+}
+
+async fn send_signed_event(
+    home: &MobeeHome,
+    keys: &nostr_sdk::Keys,
+    event: &nostr_sdk::Event,
+    label: &str,
+) -> Result<String, ProfileError> {
+    use nostr_sdk::prelude::Client;
+
+    let client = Client::new(keys.clone());
+    client
+        .add_relay(&home.config.relay_url)
+        .await
+        .map_err(|error| ProfileError::Relay(format!("add relay: {error}")))?;
+    client.connect().await;
+    let output = client
+        .send_event_to([&home.config.relay_url], event)
+        .await;
+    client.disconnect().await;
+    let output =
+        output.map_err(|error| ProfileError::Relay(format!("send {label}: {error}")))?;
+    if output.success.is_empty() {
+        let failed: Vec<String> = output
+            .failed
+            .into_iter()
+            .map(|(url, err)| format!("{url}: {err}"))
+            .collect();
+        return Err(ProfileError::Relay(format!(
+            "no relay accepted {label} ({})",
             failed.join("; ")
         )));
     }

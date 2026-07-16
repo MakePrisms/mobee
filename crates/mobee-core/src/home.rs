@@ -57,6 +57,11 @@ pub struct ProfileConfig {
     pub about: Option<String>,
 }
 
+/// Default relay-git base (delivery). Live on mobee-relay (`/git/<owner>/<repo>.git`).
+pub const DEFAULT_RELAY_GIT_BASE: &str = "https://mobee-relay.orveth.dev/git";
+/// Legacy shared leaf — NOT used as default (relay name registry is global).
+pub const DEFAULT_RELAY_GIT_REPO: &str = "mobee-seller";
+
 /// Seller daemon config (`[seller]` in config.toml). Key never lives here.
 ///
 /// `agent_command` MUST be an argv array — a TOML string/shell value is refused at parse
@@ -70,6 +75,45 @@ pub struct SellerConfig {
     /// Job deadline override (seconds). Default: offer `deadline_unix`, else ~600s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_timeout_secs: Option<u64>,
+    /// Optional preset label (`claude` | `cursor` | `codex`) for rediscovery / status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Opt-in to claim untargeted/open offers. Default **false** (targeted-only).
+    #[serde(default)]
+    pub claim_open_pool: bool,
+}
+
+/// Per-seller NIP-34 `d` / path leaf. Relay `.names/` registry is GLOBAL across
+/// owners — a shared constant like `mobee-seller` collides and seeds fail silently.
+pub fn default_relay_git_repo_id(seller_pubkey_hex: &str) -> String {
+    let pk = seller_pubkey_hex.trim().to_ascii_lowercase();
+    let short = &pk[..16.min(pk.len())];
+    format!("m{short}")
+}
+
+/// Build the default relay-git remote for a seller pubkey (self-owned namespace).
+pub fn default_relay_git_remote(seller_pubkey_hex: &str) -> String {
+    let pk = seller_pubkey_hex.trim().to_ascii_lowercase();
+    let repo = default_relay_git_repo_id(&pk);
+    format!("{DEFAULT_RELAY_GIT_BASE}/{pk}/{repo}.git")
+}
+
+/// Repo `d`-tag / path leaf for a relay-git remote (`…/git/<owner>/<repo>[.git]`).
+pub fn relay_git_repo_id(remote_url: &str) -> Option<String> {
+    let lower = remote_url.trim().to_ascii_lowercase();
+    let idx = lower.find("/git/")?;
+    let prefix_len = "/git/".len();
+    let rest = remote_url.trim().get(idx + prefix_len..)?;
+    let mut parts = rest.split('/').filter(|p| !p.is_empty());
+    let _owner = parts.next()?;
+    let mut repo = parts.next()?.to_owned();
+    if let Some(stripped) = repo.strip_suffix(".git") {
+        repo = stripped.to_owned();
+    }
+    if repo.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(repo)
 }
 
 fn deserialize_agent_command_argv<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>

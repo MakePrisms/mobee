@@ -228,11 +228,24 @@ fn require_head_tree_nonempty(
     Ok(())
 }
 
+/// Optional NIP-98 auth for relay-git push (key never logged / never on argv).
+///
+/// `secret_key_hex` is injected into the **git subprocess env only** as
+/// `NOSTR_PRIVATE_KEY` for `git-credential-nostr`. Callers must not print it.
+#[derive(Debug, Clone)]
+pub struct PushAuth {
+    pub secret_key_hex: String,
+}
+
 /// Push `branch` from `workdir` to `remote_url` (allowlisted https / relay-git only).
 ///
 /// `seller_home` is the seller's packaged home root: scrubbed git sets `HOME` to this
 /// path so libcurl can read a seller-owned `.netrc` (mode `0600`) without rewriting
 /// the daemon process environment (nostr/TLS keep ambient HOME).
+///
+/// When `auth` is `Some` and the remote is relay-git, configures
+/// `credential.helper` → `git-credential-nostr` + `credential.useHttpPath=true` and
+/// sets `NOSTR_PRIVATE_KEY` **only** on the git child env (never argv, never logged).
 ///
 /// Returns the pushed commit OID (full hex). Unauthenticated / prompt-needing remotes
 /// fail closed (no hang) via `GIT_TERMINAL_PROMPT=0` + scrubbed ambient SSH/insteadOf.
@@ -242,36 +255,61 @@ pub fn push_branch(
     branch: &str,
     seller_home: &Path,
 ) -> Result<String, SellerGitError> {
+    push_branch_with_auth(workdir, remote_url, branch, seller_home, None)
+}
+
+/// Like [`push_branch`], with optional NIP-98 credential helper auth for relay-git.
+pub fn push_branch_with_auth(
+    workdir: &Path,
+    remote_url: &str,
+    branch: &str,
+    seller_home: &Path,
+    auth: Option<&PushAuth>,
+) -> Result<String, SellerGitError> {
     assert_allowed_repo_locator(remote_url)?;
     if branch.trim().is_empty() {
         return Err(SellerGitError::Io("branch must be non-empty".into()));
     }
 
     // Ensure origin points at the allowlisted remote for this push only.
-    let _ = scrubbed_git(workdir, seller_home, ["remote", "remove", "origin"]);
+    let _ = scrubbed_git_auth(workdir, seller_home, ["remote", "remove", "origin"], None);
     run_ok(
         "remote-add",
-        scrubbed_git(workdir, seller_home, ["remote", "add", "origin", remote_url])?,
+        scrubbed_git_auth(
+            workdir,
+            seller_home,
+            ["remote", "add", "origin", remote_url],
+            None,
+        )?,
     )?;
 
-    let push = scrubbed_git(workdir, seller_home, ["push", "-u", "origin", branch])?;
+    let use_nip98 = auth.is_some() && crate::delivery_transport::is_relay_git_locator(remote_url);
+    let push = scrubbed_git_auth(
+        workdir,
+        seller_home,
+        ["push", "-u", "origin", branch],
+        if use_nip98 { auth } else { None },
+    )?;
     if !push.status.success() {
-        let stderr = String::from_utf8_lossy(&push.stderr).to_lowercase();
+        let stderr_raw = String::from_utf8_lossy(&push.stderr);
+        let stderr = redact_secret(&stderr_raw, auth.map(|a| a.secret_key_hex.as_str())).to_lowercase();
         if stderr.contains("authentication")
             || stderr.contains("could not read username")
             || stderr.contains("permission denied")
             || stderr.contains("403")
             || stderr.contains("401")
             || stderr.contains("terminal prompts disabled")
+            || stderr.contains("repository not found")
+            || stderr.contains("forbidden")
         {
             return Err(SellerGitError::AuthFailed(
-                "unauthenticated or prompt-required remote (fail-closed)".into(),
+                "unauthenticated, unannounced, or prompt-required remote (fail-closed)".into(),
             ));
         }
         return Err(SellerGitError::CommandFailed("push"));
     }
 
-    let rev = scrubbed_git(workdir, seller_home, ["rev-parse", "HEAD"])?;
+    let rev = scrubbed_git_auth(workdir, seller_home, ["rev-parse", "HEAD"], None)?;
     run_ok("rev-parse", rev.clone())?;
     let oid = String::from_utf8_lossy(&rev.stdout).trim().to_owned();
     if oid.len() < 40 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -280,6 +318,47 @@ pub fn push_branch(
         )));
     }
     Ok(oid)
+}
+
+fn redact_secret(text: &str, secret: Option<&str>) -> String {
+    let Some(secret) = secret.filter(|s| s.len() >= 16) else {
+        return text.to_owned();
+    };
+    text.replace(secret, "<redacted-key>")
+}
+
+/// Resolve `git-credential-nostr` absolute path (PATH, env, dogfood locations).
+pub fn resolve_git_credential_nostr() -> Option<PathBuf> {
+    if let Ok(override_path) = std::env::var("MOBEE_GIT_CREDENTIAL_NOSTR") {
+        let path = PathBuf::from(override_path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    if let Ok(path) = which_bin("git-credential-nostr") {
+        return Some(path);
+    }
+    for candidate in [
+        "/srv/forge/workspaces/buzz/target/release/git-credential-nostr",
+        "/srv/forge/workspaces/buzz/target/debug/git-credential-nostr",
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn which_bin(name: &str) -> Result<PathBuf, ()> {
+    let path = std::env::var_os("PATH").ok_or(())?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(())
 }
 
 /// Empty global gitconfig — defeats `~/.gitconfig` / `$HOME/.gitconfig` insteadOf.
@@ -316,6 +395,19 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    scrubbed_git_auth(workdir, seller_home, args, None)
+}
+
+fn scrubbed_git_auth<I, S>(
+    workdir: &Path,
+    seller_home: &Path,
+    args: I,
+    auth: Option<&PushAuth>,
+) -> Result<Output, SellerGitError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut cmd = Command::new("git");
     // `-c` flags must precede the subcommand and beat local `.git/config` insteadOf
     // rewrites (agent-planted url.*.insteadOf → ssh/file/ext). Keep https + relay-git.
@@ -327,8 +419,34 @@ where
             "protocol.file.allow=never",
             "-c",
             "protocol.ext.allow=never",
-        ])
-        .args(args)
+        ]);
+
+    // Keep credential.helper string alive for the Command borrow.
+    let mut helper_cfg: Option<String> = None;
+    if auth.is_some() {
+        let helper = resolve_git_credential_nostr().ok_or_else(|| {
+            SellerGitError::AuthFailed(
+                "git-credential-nostr not found (set MOBEE_GIT_CREDENTIAL_NOSTR or install helper)"
+                    .into(),
+            )
+        })?;
+        helper_cfg = Some(format!("credential.helper={}", helper.to_string_lossy()));
+    }
+    if let Some(cfg) = helper_cfg.as_deref() {
+        cmd.args(["-c", cfg, "-c", "credential.useHttpPath=true"]);
+    }
+    if let Some(auth) = auth {
+        // Key ONLY on this child — strip ambient first so we never inherit a stranger key.
+        cmd.env_remove("NOSTR_PRIVATE_KEY");
+        cmd.env_remove("BUZZ_PRIVATE_KEY");
+        cmd.env("NOSTR_PRIVATE_KEY", &auth.secret_key_hex);
+    } else {
+        // Never leak ambient keys into scrubbed git children.
+        cmd.env_remove("NOSTR_PRIVATE_KEY");
+        cmd.env_remove("BUZZ_PRIVATE_KEY");
+    }
+
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -359,6 +477,23 @@ where
             {
                 cmd.env_remove(name);
             }
+        }
+    }
+
+    // Ensure helper binary is discoverable when referenced by basename.
+    if let Some(helper) = resolve_git_credential_nostr() {
+        if let Some(dir) = helper.parent() {
+            let mut path = std::env::var_os("PATH").unwrap_or_default();
+            let prefix = dir.as_os_str();
+            if !path.is_empty() {
+                let mut combined = prefix.to_os_string();
+                combined.push(":");
+                combined.push(&path);
+                path = combined;
+            } else {
+                path = prefix.to_os_string();
+            }
+            cmd.env("PATH", path);
         }
     }
 

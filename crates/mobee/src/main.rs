@@ -1,3 +1,4 @@
+mod agent_presets;
 mod cli;
 mod exec;
 mod mcp;

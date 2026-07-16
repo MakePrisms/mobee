@@ -200,7 +200,12 @@ impl SellerDaemon {
             return Ok(None);
         }
         let seller_cfg = require_seller_config(&self.home)?;
-        if let Err(error) = rate_gate_allows(&offer, &self.seller_pubkey, seller_cfg.rate_sats) {
+        if let Err(error) = rate_gate_allows(
+            &offer,
+            &self.seller_pubkey,
+            seller_cfg.rate_sats,
+            seller_cfg.claim_open_pool,
+        ) {
             // Soft skip (not our rate / not targeted) — not a hard daemon error.
             let _ = error;
             return Ok(None);
@@ -383,18 +388,26 @@ impl SellerDaemon {
             .current_dir(&active.workdir)
             .status();
 
-        let commit = match seller_git::push_branch(
+        // NIP-98: key from 0600 file → git child env only (never argv / never logged).
+        let push_secret = home::read_secret_key_hex(&self.home)?;
+        let push_auth = seller_git::PushAuth {
+            secret_key_hex: push_secret,
+        };
+        let commit = match seller_git::push_branch_with_auth(
             &active.workdir,
             &seller_cfg.git_remote,
             &branch,
             &self.home.root,
+            Some(&push_auth),
         ) {
             Ok(oid) => oid,
             Err(error) => {
+                // Display path must not echo the secret (SellerGitError is scrubbed).
                 self.fail_active(&error.to_string()).await?;
                 return Err(error.into());
             }
         };
+        drop(push_auth);
 
         let job_hash = job_hash_for_offer(&active.job_id, &active.offer.task, active.offer.amount);
         let seller_sig = sign_receipt_hash(&self.keys, &job_hash)?;
@@ -820,6 +833,8 @@ mod tests {
             rate_sats: 1,
             git_remote: "https://example.invalid/repo.git".into(),
             job_timeout_secs: None,
+            agent: None,
+            claim_open_pool: false,
         });
         home::save_config(&home).expect("save");
         let err = match SellerDaemon::open(home) {

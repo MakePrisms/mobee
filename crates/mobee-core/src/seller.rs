@@ -74,16 +74,21 @@ pub fn require_seller_config(home: &MobeeHome) -> Result<&SellerConfig, SellerEr
     Ok(seller)
 }
 
-/// B1 claim-floor: targeted-to-self AND `offer.amount ≥ rate_sats`. Untargeted → refuse.
+/// B1 claim-floor: targeted-to-self AND `offer.amount ≥ rate_sats`.
+///
+/// Untargeted/open offers refuse by default. Pass `claim_open_pool = true` (explicit
+/// seller opt-in) to allow untargeted offers that still clear the rate floor.
 pub fn rate_gate_allows(
     offer: &ParsedOffer,
     seller_pubkey: &str,
     rate_sats: u64,
+    claim_open_pool: bool,
 ) -> Result<(), SellerError> {
     match offer.seller_pubkey.as_deref() {
+        None if claim_open_pool => {}
         None => {
             return Err(SellerError::Policy(
-                "untargeted offer refused (seller claims only p-tag==self)".into(),
+                "untargeted offer refused (seller claims only p-tag==self; set claim_open_pool=true to opt in)".into(),
             ));
         }
         Some(target) if target != seller_pubkey => {
@@ -368,10 +373,12 @@ mod tests {
     #[test]
     fn rate_gate_floor_allows_above_rate_refuses_below_and_untargeted() {
         let seller = "aa".repeat(32);
-        rate_gate_allows(&offer(5, Some(&seller)), &seller, 3).expect("above floor");
-        rate_gate_allows(&offer(3, Some(&seller)), &seller, 3).expect("equal floor");
-        assert!(rate_gate_allows(&offer(2, Some(&seller)), &seller, 3).is_err());
-        assert!(rate_gate_allows(&offer(9, None), &seller, 1).is_err());
+        rate_gate_allows(&offer(5, Some(&seller)), &seller, 3, false).expect("above floor");
+        rate_gate_allows(&offer(3, Some(&seller)), &seller, 3, false).expect("equal floor");
+        assert!(rate_gate_allows(&offer(2, Some(&seller)), &seller, 3, false).is_err());
+        assert!(rate_gate_allows(&offer(9, None), &seller, 1, false).is_err());
+        rate_gate_allows(&offer(9, None), &seller, 1, true).expect("open-pool opt-in");
+        assert!(rate_gate_allows(&offer(0, None), &seller, 1, true).is_err());
     }
 
     #[test]
@@ -423,6 +430,8 @@ git_remote = "https://example.invalid/repo.git"
             rate_sats: 1,
             git_remote: "https://example.invalid/repo.git".into(),
             job_timeout_secs: None,
+            agent: None,
+            claim_open_pool: false,
         });
         home::save_config(&home).expect("save");
 
