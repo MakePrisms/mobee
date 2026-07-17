@@ -277,9 +277,11 @@ fn cashu_compressed_from_nostr(key: &NostrPublicKey) -> Result<CashuPublicKey, A
 /// The buyer reconstructs the SAME receipt preimage the seller signed at delivery (binds
 /// the trade + the delivered git object, D4; `exec_metadata_commitment` = empty marker —
 /// exec-metadata is seller-claimed, not co-signed), counter-signs it deterministically,
-/// builds a deterministic-id kind-3400, and publishes it. `receipt_id` is that 3400 event
-/// id — NOT the kind-1059 payment envelope. Empty `relay_success` is enforced fail-closed
-/// by [`ReceiptAuthority::verify`]; piece-6 recovery re-runs only this idempotent publish.
+/// builds the kind-3400 with a FRESH wall-clock `created_at`, and publishes it. `receipt_id`
+/// is that 3400 event id — NOT the kind-1059 payment envelope — and is now NON-deterministic
+/// per publish attempt (see [`receipt_created_at`]). Empty `relay_success` is enforced
+/// fail-closed by [`ReceiptAuthority::verify`]; piece-6 recovery re-runs this publish (a fresh
+/// id each attempt — verify-irrelevant, never a re-sent payment).
 fn build_and_publish_receipt(
     buyer_keys: &Keys,
     relay_url: &str,
@@ -304,8 +306,9 @@ fn build_and_publish_receipt(
         exec_metadata_commitment: EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
     };
     let digest = preimage.digest_bytes();
-    // Deterministic buyer counter-signature (no aux-rand): a `sig/buyer` tag that is a pure
-    // function of the preimage, so a recovery republish reproduces the same event id.
+    // Buyer counter-signature (no aux-rand): a `sig/buyer` tag that is a pure function of the
+    // preimage. This makes only the co-SIGNATURE deterministic — NOT the event id, which also
+    // hashes the (now fresh) `created_at` and so differs per publish (see `receipt_created_at`).
     let secp = Secp256k1::new();
     let keypair = buyer_keys.secret_key().keypair(&secp);
     let buyer_signature = secp
@@ -330,13 +333,14 @@ fn build_and_publish_receipt(
         // seller-claimed tags here would be cosmetic-only (a named follow-up).
         &[],
     );
-    let created_at = deterministic_created_at(&digest);
     let builder = gateway::nostr::event_builder(&draft)
         .map_err(|error| EffectError::new(format!("receipt event builder: {error}")))?;
     let event = builder
-        .custom_created_at(Timestamp::from(created_at))
+        .custom_created_at(receipt_created_at(&digest))
         .sign_with_keys(buyer_keys)
         .map_err(|error| EffectError::new(format!("receipt sign: {error}")))?;
+    // Non-deterministic per publish attempt now (fresh `created_at`); `receipt_id` records
+    // whichever id the accepted publish produced — verify-irrelevant metadata.
     let receipt_id = event.id.to_hex();
     let relay_success = publish_receipt_event(relay_url, buyer_keys, &event)?;
 
@@ -350,15 +354,33 @@ fn build_and_publish_receipt(
     })
 }
 
-/// Pin `created_at` as a pure function of the signed preimage so a piece-6 recovery
-/// republish reproduces the SAME kind-3400 event id (idempotent). The value is windowed
-/// into a plausible range; only its determinism matters.
-fn deterministic_created_at(digest: &[u8; 32]) -> u64 {
-    const BASE: u64 = 1_700_000_000; // 2023-11-14
-    const WINDOW: u64 = 100_000_000; // ~3.17 years
-    let mut head = [0u8; 8];
-    head.copy_from_slice(&digest[..8]);
-    BASE + (u64::from_be_bytes(head) % WINDOW)
+/// FRESH wall-clock `created_at` for each kind-3400 receipt publish attempt.
+///
+/// SUPERSEDES the former `deterministic_created_at`, which derived `created_at` from the
+/// preimage digest (windowed into 2023-11 .. ~2027) so a recovery republish reproduced the
+/// SAME event id — relay-native idempotency (a relay stores an event once, by id). But that
+/// digest-derived timestamp almost never fell inside a real relay's accept window (mobee-relay
+/// ≈ ±30 min of server time), so the receipt was rejected and the payment held at `Sent`
+/// forever. A fresh wall-clock timestamp satisfies the relay window, so the receipt publishes.
+///
+/// DELIBERATE TRADE-OFF (a deterministic id and a fresh timestamp are mutually exclusive — the
+/// event id hashes `created_at`): the receipt event id is now NON-deterministic per attempt.
+/// Money-safe: [`ReceiptAuthority::verify`] never uses the id (it gates on relay acceptance +
+/// author + preimage + both schnorr co-signatures), and re-publishing a receipt never re-sends
+/// money (the send is durable at `Sent`; the reducer re-runs only the receipt leg). In the
+/// normal path the first attempt publishes and the state advances `Sent`→`ReceiptPublished`,
+/// so there is no second attempt. A duplicate (inert) kind-3400 is possible ONLY if the process
+/// crashes AFTER the relay accepts but BEFORE the WAL records `ReceiptPublished`; nothing in the
+/// money path reads kind-3400 back, so it is harmless today.
+///
+/// FOLLOW-UP (named, NOT built here — branch scribe/receipt-created-at-fix): if/when a Rust
+/// receipts-reader is added it MUST dedup on read by (author, job-hash), NOT by event id, to
+/// collapse such a duplicate — this replaces the removed relay-native id-dedup.
+///
+/// `_digest` is accepted only for call-site parity with the superseded digest-derived form and
+/// is intentionally unused: the timestamp must track wall-clock, never the preimage.
+fn receipt_created_at(_digest: &[u8; 32]) -> Timestamp {
+    Timestamp::now()
 }
 
 /// Publish the signed kind-3400 to the relay and return the accepted relay set.
@@ -371,7 +393,8 @@ fn deterministic_created_at(digest: &[u8; 32]) -> u64 {
 /// payment WRAP path already authenticates, only this receipt path did not. On auth
 /// timeout/failure the send is NOT reached and an empty `relay_success` is returned (never a
 /// forced success) ⇒ [`ReceiptAuthority::verify`] fails closed, the payment reducer holds at
-/// `Sent`, and the deterministic-id receipt republishes idempotently on recovery.
+/// `Sent`, and the receipt republishes on recovery (a FRESH id per attempt — see
+/// [`receipt_created_at`] — verify-irrelevant and never a re-sent payment).
 fn publish_receipt_event(
     relay_url: &str,
     keys: &Keys,
@@ -426,6 +449,21 @@ fn publish_receipt_event(
                         client.disconnect().await;
                         let output = output
                             .map_err(|error| EffectError::new(format!("receipt send: {error}")))?;
+                        // Diagnostic (NOT money-semantics): surface the relay's per-relay
+                        // rejection reason (e.g. "invalid: event timestamp too far from server
+                        // time") — previously discarded. Relay URL + reason only; no key
+                        // material. This is the string that named the created_at + auth bugs.
+                        if !output.failed.is_empty() {
+                            let reasons: Vec<String> = output
+                                .failed
+                                .iter()
+                                .map(|(url, reason)| format!("{url}: {reason}"))
+                                .collect();
+                            eprintln!(
+                                "receipt publish: relay rejected kind-3400 ({})",
+                                reasons.join("; ")
+                            );
+                        }
                         output.success.iter().map(|url| url.to_string()).collect()
                     } else {
                         client.disconnect().await;
@@ -692,6 +730,93 @@ mod tests {
         assert!(
             !wait_for_nip42_auth(&mut rx, Duration::from_secs(20)).await,
             "notification channel closed before auth must fail closed"
+        );
+    }
+
+    // --- created_at freshness (the receipt-created-at fix) --------------------------------
+    // The receipt event's `created_at` must be FRESH wall-clock per publish (so a real relay's
+    // ±time-window accepts it), NOT derived from the preimage digest. Red-on-revert: restoring
+    // the superseded digest-derived body makes `created` land in 2023..2027 (≈1_747_303_441 for
+    // this fixed digest), OUTSIDE [before, after], and this assert FAILS.
+    #[test]
+    fn receipt_created_at_is_fresh_wall_clock_not_digest_derived() {
+        let digest = [0x11u8; 32];
+        let before = Timestamp::now().as_secs();
+        let created = receipt_created_at(&digest).as_secs();
+        let after = Timestamp::now().as_secs();
+        assert!(
+            (before..=after).contains(&created),
+            "receipt created_at {created} is not fresh wall-clock (expected within [{before}, {after}])"
+        );
+    }
+
+    // A fresh `created_at` must NOT disturb the co-signed receipt CONTENT: the built + signed
+    // kind-3400 still carries the job-hash and BOTH schnorr co-signature tags (only `created_at`
+    // — and therefore the event id — changed).
+    #[test]
+    fn receipt_event_binds_cosigned_content_with_fresh_created_at() {
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let job_hash = "cc".repeat(32);
+        let integrity = "aa".repeat(20); // 40-char oid
+        let draft = gateway::receipt_draft(
+            "offer-id",
+            "result-id",
+            &buyer_hex,
+            "seller-hex",
+            "https://testnut.cashu.space",
+            7,
+            &job_hash,
+            "seller-sig-hex",
+            "buyer-sig-hex",
+            Some(gateway::ReceiptDelivery {
+                integrity_hash: &integrity,
+                kind: "fork",
+            }),
+            &[],
+        );
+        let before = Timestamp::now().as_secs();
+        let event = gateway::nostr::event_builder(&draft)
+            .expect("event builder")
+            .custom_created_at(receipt_created_at(&[0x22u8; 32]))
+            .sign_with_keys(&buyer)
+            .expect("sign");
+        let after = Timestamp::now().as_secs();
+        assert!(
+            (before..=after).contains(&event.created_at.as_secs()),
+            "signed receipt created_at is not fresh wall-clock"
+        );
+        assert_eq!(event.kind.as_u16(), gateway::JOB_RECEIPT_KIND);
+        let tag_value = |name: &str, at: usize| -> Option<String> {
+            event.tags.iter().find_map(|tag| {
+                let slice = tag.as_slice();
+                if slice.first().map(String::as_str) == Some(name) {
+                    slice.get(at).cloned()
+                } else {
+                    None
+                }
+            })
+        };
+        assert_eq!(tag_value("job-hash", 1).as_deref(), Some(job_hash.as_str()));
+        let sig_labels: Vec<String> = event
+            .tags
+            .iter()
+            .filter_map(|tag| {
+                let slice = tag.as_slice();
+                if slice.first().map(String::as_str) == Some("sig") {
+                    slice.get(1).cloned()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            sig_labels.iter().any(|label| label == "seller"),
+            "sig/seller tag missing"
+        );
+        assert!(
+            sig_labels.iter().any(|label| label == "buyer"),
+            "sig/buyer tag missing"
         );
     }
 }
