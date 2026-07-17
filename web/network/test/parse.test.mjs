@@ -445,7 +445,7 @@ bothStore.ingest(
     content: "delivery commit c0ffee",
   }),
 );
-bothStore.ingest(paidReceipt); // same offer (paidOffer) → receipt wins
+bothStore.ingest(paidReceipt); // same offer (paidOffer) → receipt wins STATUS, result fills USAGE
 const bothRows = bothStore.economics().rows.filter((r) => r.source);
 assert.equal(
   bothRows.filter((r) => r.source === "delivered").length,
@@ -457,5 +457,85 @@ assert.equal(
   1,
   "the settled job shows exactly one paid row",
 );
+// JOIN: the single paid row carries the RESULT's usage (not receipt dashes).
+const bothPaid = bothRows.find((r) => r.source === "paid");
+assert.equal(bothPaid.total_tokens, 5, "paid row JOINS the result's tokens (offer fallback)");
+assert.equal(bothPaid.input_tokens, 3);
+assert.equal(bothPaid.output_tokens, 2);
+assert.equal(bothPaid.harness_family, "claude");
+assert.equal(bothPaid.usage_transport, "acp-native");
+
+// ——— JOIN via the receipt's exact reply-tag binding → PAID row shows the result's usage ———
+const joinStore = createStore();
+const jOffer = "d0".padEnd(64, "0");
+const jResultId = "d1".padEnd(64, "0");
+joinStore.ingest(
+  ok({
+    id: jResultId,
+    pubkey: "d2".padEnd(64, "0"),
+    kind: 6109,
+    created_at: 800,
+    tags: [
+      ["e", jOffer, "", "root"],
+      ["amount", "9", "sat"],
+      ["harness", "claude-agent-acp"],
+      ["usage_transport", "acp-native"],
+      ["tokens", "140", "total"],
+      ["tokens", "100", "input"],
+      ["tokens", "40", "output"],
+    ],
+    content: "delivery commit d0ffee",
+  }),
+);
+const jReceipt = ok({
+  id: "d3".padEnd(64, "0"),
+  pubkey: "d4".padEnd(64, "0"),
+  kind: 3400,
+  created_at: 810,
+  tags: [
+    ["amount", "9", "sat"],
+    ["e", jOffer, "", "root"],
+    ["e", jResultId, "", "reply"], // binds THIS result
+    ["mint", "https://testnut.cashu.space"],
+  ],
+  content: "",
+});
+joinStore.ingest(jReceipt);
+const jRows = joinStore.economics().rows;
+assert.equal(
+  jRows.filter((r) => r.source === "delivered").length,
+  0,
+  "no duplicate delivered row for a paid job",
+);
+const jPaid = jRows.find((r) => r.id === jReceipt.id);
+assert.ok(jPaid, "receipt row present");
+assert.equal(jPaid.source, "paid");
+assert.equal(jPaid.total_tokens, 140, "PAID row shows the bound RESULT's tokens, not dashes");
+assert.equal(jPaid.input_tokens, 100);
+assert.equal(jPaid.output_tokens, 40);
+assert.equal(jPaid.harness_family, "claude");
+assert.equal(jPaid.usage_transport, "acp-native");
+
+// receipt with NO visible result → PAID with usage dashes (honest, never fabricated).
+const orphanStore = createStore();
+const orphanReceipt = ok({
+  id: "e9".padEnd(64, "0"),
+  pubkey: "ea".padEnd(64, "0"),
+  kind: 3400,
+  created_at: 820,
+  tags: [
+    ["amount", "9", "sat"],
+    ["e", "eb".padEnd(64, "0"), "", "root"],
+    ["e", "ec".padEnd(64, "0"), "", "reply"],
+    ["mint", "https://testnut.cashu.space"],
+  ],
+  content: "",
+});
+orphanStore.ingest(orphanReceipt);
+const orphanRow = orphanStore.economics().rows.find((r) => r.id === orphanReceipt.id);
+assert.equal(orphanRow.source, "paid");
+assert.equal(orphanRow.total_tokens, null, "receipt with no result → usage dashes, not fabricated");
+assert.equal(orphanRow.input_tokens, null);
+assert.equal(orphanRow.output_tokens, null);
 
 console.log("ok — parse/store suite passed");

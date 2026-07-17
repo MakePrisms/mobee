@@ -158,22 +158,44 @@ export function createStore() {
   function economics() {
     /** @type {any[]} */
     const rows = [];
+    // Resolve the usage a receipt's PAID job actually incurred — it lives on the kind-6109
+    // RESULT the receipt settles (usage tags ride the result, not the receipt). Prefer the
+    // exact result the receipt binds (its reply-tag id); else the newest result for the same
+    // offer. Returns null when no result is visible → the paid row shows usage dashes.
+    const resultUsageForReceipt = (receiptEv) => {
+      const rid = receiptEv.receipt?.resultId;
+      if (rid) {
+        const bound = byId.get(rid);
+        if (bound?.role === "result" && bound.result?.usage) return bound.result.usage;
+      }
+      const offerId = receiptEv.receipt?.offerId;
+      const list = offerId ? resultsByOffer.get(offerId) : null;
+      if (list && list.length) {
+        const newest = list.reduce((a, b) => (b.created_at > a.created_at ? b : a));
+        if (newest.result?.usage) return newest.result.usage;
+      }
+      return null;
+    };
     for (const list of receiptsByOffer.values()) {
       for (const ev of list) {
-        const u = ev.receipt?.usage || emptyUsage();
+        const receiptUsage = ev.receipt?.usage || emptyUsage();
+        // JOIN (not replace): a kind-3400 receipt backs this row → PAID, and it keeps STATUS +
+        // paid_price_sats. But the USAGE fields come from the settled RESULT (that is where the
+        // token/transport/harness tags are) so a paid row shows its real usage, not dashes. No
+        // bound result → fall back to the receipt's own usage (echo, if any), else dashes.
+        const joined = resultUsageForReceipt(ev) || receiptUsage;
         rows.push({
           id: ev.id,
           created_at: ev.created_at,
-          // A kind-3400 co-signed receipt backs this row → the trade is PAID.
           source: "paid",
-          paid_price_sats: u.paid_price_sats ?? ev.receipt?.amount_sats ?? null,
-          paid_price_tokens: u.paid_price_tokens,
-          measured_cost_tokens: u.measured_cost_tokens,
-          total_tokens: u.total_tokens,
-          input_tokens: u.input_tokens,
-          output_tokens: u.output_tokens,
-          usage_transport: u.usage_transport,
-          harness_family: u.harness_family,
+          paid_price_sats: receiptUsage.paid_price_sats ?? ev.receipt?.amount_sats ?? null,
+          paid_price_tokens: receiptUsage.paid_price_tokens,
+          measured_cost_tokens: receiptUsage.measured_cost_tokens,
+          total_tokens: joined.total_tokens,
+          input_tokens: joined.input_tokens,
+          output_tokens: joined.output_tokens,
+          usage_transport: joined.usage_transport,
+          harness_family: joined.harness_family,
         });
       }
     }
