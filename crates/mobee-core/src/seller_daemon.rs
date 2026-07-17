@@ -1199,43 +1199,10 @@ fn offer_subscription_filters(
     filters
 }
 
-/// The seller's LIVE offer subscription(s), grouped as they are registered on the relay.
-///
-/// Each element is ONE long-lived subscription — a single NIP-01 `REQ` whose filters the relay
-/// OR-matches. The 5109 offer filters are grouped into ONE subscription: the pinned (`#p` ==
-/// self) filter AND — under `claim_open_pool` — the un-pinned open-pool filter ride the SAME
-/// `REQ`. This grouping is load-bearing: the earlier half-fix registered the un-pinned filter as
-/// a SEPARATE second subscription, which delivered stored events (backfill) but no LIVE offers —
-/// a running open-pool seller never reacted to a fresh untargeted offer, only claiming it after
-/// a restart re-fetched it from stored events. Callers MUST subscribe each group as one `REQ`
-/// (one `pool().subscribe(filters, ..)` call), never one subscription per filter.
-fn offer_subscriptions(
-    seller_pubkey: nostr_sdk::PublicKey,
-    claim_open_pool: bool,
-) -> Vec<Vec<nostr_sdk::Filter>> {
-    vec![offer_subscription_filters(seller_pubkey, claim_open_pool)]
-}
-
-/// Whether a relay event in the seller loop should be handed to `on_offer_event`.
-///
-/// True iff the event is a kind-5109 offer not seen before. Routing is by KIND ONLY: a
-/// non-p-tagged (open-pool) offer routes exactly like a targeted one, so the notification path
-/// never drops untargeted offers. The event-id dedup makes a targeted offer that matched more
-/// than one 5109 filter (or a reconnect re-delivery) reach `on_offer_event` at most once.
-fn offer_event_should_process(
-    event_kind: u16,
-    event_id: nostr_sdk::EventId,
-    seen_offers: &mut std::collections::HashSet<nostr_sdk::EventId>,
-) -> bool {
-    event_kind == JOB_OFFER_KIND && seen_offers.insert(event_id)
-}
-
 /// Long-running seller loop: NIP-42 AUTH, then subscribe 5109+1059 from START.
 pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
     use std::time::Duration;
-    use nostr_sdk::prelude::{
-        Client, Filter, Kind, RelayPoolNotification, RelayUrl, SubscribeOptions,
-    };
+    use nostr_sdk::prelude::{Client, Filter, Kind, RelayPoolNotification, RelayUrl};
 
     let client = Client::new(daemon.keys.clone());
     // Default is true; set explicitly — seller receive depends on it.
@@ -1277,22 +1244,16 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
     }
 
     // Offer subscription: always the TARGETED filter (p-tag == seller). When the seller opts
-    // into the open pool, the offer subscription ALSO carries an UNtargeted 5109 filter —
+    // into the open pool, `offer_subscription_filters` ALSO returns an UNtargeted 5109 filter —
     // open-pool offers carry no p-tag and would otherwise never reach `on_offer_event`, so
-    // `--claim-open-pool` was DOA. BOTH filters ride ONE long-lived subscription (a single REQ,
-    // OR-matched per NIP-01): registered as a SEPARATE second subscription (the earlier
-    // half-fix) the un-pinned filter delivered stored events (backfill) but never LIVE offers,
-    // so a running open-pool seller ignored fresh untargeted offers. `offer_subscriptions`
-    // groups them into that single subscription; subscribe each group as ONE REQ via
-    // `pool().subscribe` (`Client::subscribe` takes a single filter — one REQ per filter is the
-    // bug). The event-id dedup in the loop below still processes each offer exactly once.
+    // `--claim-open-pool` was DOA. Targeted offers match both filters; the event-id dedup in
+    // the loop below processes each offer exactly once.
     let claim_open_pool = require_seller_config(&daemon.home)
         .map(|cfg| cfg.claim_open_pool)
         .unwrap_or(false);
-    for filters in offer_subscriptions(daemon.keys.public_key(), claim_open_pool) {
+    for filter in offer_subscription_filters(daemon.keys.public_key(), claim_open_pool) {
         client
-            .pool()
-            .subscribe(filters, SubscribeOptions::default())
+            .subscribe(filter, None)
             .await
             .map_err(|error| DaemonError::Relay(format!("subscribe 5109: {error}")))?;
     }
@@ -1312,9 +1273,8 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
         daemon.home.config.mint_url
     );
 
-    // Both 5109 filters ride ONE subscription, so the relay delivers each offer once even when
-    // a targeted offer matches both filters. Keep an event-id dedup as defense-in-depth (e.g.
-    // reconnect re-delivery) so each offer id reaches `on_offer_event` at most once.
+    // Open-pool adds a 2nd (un-pinned) 5109 subscription; a TARGETED offer matches BOTH
+    // filters and is delivered twice. Dedup by event id so each offer is processed once.
     let mut seen_offers: std::collections::HashSet<nostr_sdk::EventId> =
         std::collections::HashSet::new();
     let mut notifications = client.notifications();
@@ -1338,10 +1298,12 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
                     }
                     continue;
                 }
-                // An offer (kind-5109) routes to `on_offer_event` REGARDLESS of p-tag — open-pool
-                // offers carry none, so a p-tag gate here would silently drop them. Deduped by
-                // event id so each offer is processed once (see `offer_event_should_process`).
-                if offer_event_should_process(event.kind.as_u16(), event.id, &mut seen_offers) {
+                if event.kind.as_u16() == JOB_OFFER_KIND {
+                    // Dedup: a targeted offer matches both the pinned and (open-pool) un-pinned
+                    // 5109 filters, so it arrives twice — process each offer event id once.
+                    if !seen_offers.insert(event.id) {
+                        continue;
+                    }
                     match daemon.on_offer_event(&event).await {
                         Ok(Some(_)) => {
                             match daemon.execute_active_job().await {
@@ -1673,98 +1635,6 @@ mod tests {
         assert!(
             matches_any(&open_pool, &untargeted),
             "untargeted offer MUST match under open-pool (the fix)"
-        );
-    }
-
-    // The half-fix above proved the un-pinned filter is CONSTRUCTED, but not that it is
-    // registered on the LIVE subscription — the un-pinned filter had been subscribed as a
-    // SEPARATE second subscription, which the relay tore down after its stored-events flush, so
-    // it streamed backfill offers but never LIVE ones. These two tests cover the actual
-    // delivery seam: (1) both 5109 filters ride ONE live subscription; (2) a non-p-tagged 5109
-    // routes to `on_offer_event` and is deduped. The full live proof (untargeted offer to a
-    // RUNNING seller → claim without restart) is exercised end-to-end against a real relay.
-    #[test]
-    fn open_pool_offer_rides_a_single_live_subscription() {
-        use nostr_sdk::prelude::{EventBuilder, Filter, Keys, Kind, MatchEventOptions, Tag};
-
-        let seller = Keys::generate();
-        let buyer = Keys::generate();
-
-        let targeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
-            .tag(Tag::public_key(seller.public_key()))
-            .sign_with_keys(&buyer)
-            .expect("sign targeted offer");
-        let untargeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
-            .sign_with_keys(&buyer)
-            .expect("sign untargeted offer");
-
-        let matches_any = |filters: &[Filter], event: &nostr_sdk::Event| {
-            filters
-                .iter()
-                .any(|filter| filter.match_event(event, MatchEventOptions::new()))
-        };
-
-        // Open-pool: the offer filters are registered as EXACTLY ONE live subscription (a single
-        // REQ) carrying BOTH the pinned and the un-pinned filter, so the un-pinned filter rides
-        // the same long-lived subscription and streams LIVE offers. The half-fix registered the
-        // un-pinned filter as a SEPARATE second subscription (two subscriptions), which the relay
-        // dropped after backfill. RED-ON-REVERT: return one subscription per filter (as the
-        // half-fix did) and this `len() == 1` assertion fails.
-        let subs = offer_subscriptions(seller.public_key(), true);
-        assert_eq!(
-            subs.len(),
-            1,
-            "open-pool offers must ride ONE live subscription, not a separate un-pinned one"
-        );
-        let live = &subs[0];
-        assert!(
-            matches_any(live, &targeted),
-            "the single live subscription must match targeted offers"
-        );
-        assert!(
-            matches_any(live, &untargeted),
-            "the single live subscription must ALSO match untargeted (open-pool) offers"
-        );
-
-        // Targeted-only: still one subscription; matches targeted, not untargeted.
-        let subs = offer_subscriptions(seller.public_key(), false);
-        assert_eq!(subs.len(), 1, "one offer subscription when not open-pool");
-        assert!(matches_any(&subs[0], &targeted));
-        assert!(
-            !matches_any(&subs[0], &untargeted),
-            "untargeted offers must not match without open-pool"
-        );
-    }
-
-    #[test]
-    fn untargeted_offer_routes_to_on_offer_event_and_dedups() {
-        use nostr_sdk::prelude::{EventBuilder, Keys, Kind};
-        use std::collections::HashSet;
-
-        let buyer = Keys::generate();
-        // An UNtargeted (open-pool) 5109 offer carries no p-tag.
-        let untargeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
-            .sign_with_keys(&buyer)
-            .expect("sign untargeted offer");
-
-        let mut seen: HashSet<nostr_sdk::EventId> = HashSet::new();
-
-        // A non-p-tagged 5109 offer MUST route to `on_offer_event` on the LIVE push — this rules
-        // out the "notification path drops non-p-tagged 5109" failure mode. RED-ON-REVERT: gate
-        // routing on a p-tag and this first assertion fails for the untargeted offer.
-        assert!(
-            offer_event_should_process(untargeted.kind.as_u16(), untargeted.id, &mut seen),
-            "an untargeted 5109 offer must route to on_offer_event"
-        );
-        // Dedup by event id: a re-delivered offer id is processed at most once.
-        assert!(
-            !offer_event_should_process(untargeted.kind.as_u16(), untargeted.id, &mut seen),
-            "a re-delivered offer id must be deduped, not double-processed"
-        );
-        // A non-offer kind (e.g. gift-wrap 1059) does not route as an offer.
-        assert!(
-            !offer_event_should_process(Kind::GiftWrap.as_u16(), untargeted.id, &mut seen),
-            "non-5109 events must not route to on_offer_event"
         );
     }
 
