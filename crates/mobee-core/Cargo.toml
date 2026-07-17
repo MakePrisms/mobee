@@ -10,7 +10,7 @@ publish.workspace = true
 default = []
 acp = []
 gateway = ["dep:nostr-sdk"]
-git-delivery = []
+git-delivery = ["dep:wait-timeout"]
 wallet = ["git-delivery", "gateway", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "tokio/sync", "tokio/time"]
 test-support = []
 
@@ -26,6 +26,8 @@ serde_json.workspace = true
 sha2 = "0.11.0"
 tokio = { version = "1.52.0", default-features = false, features = ["rt", "macros"] }
 toml = "0.8"
+# In-process timeout for the pay-path `git fetch` (no external `timeout(1)` — macOS/BusyBox safe).
+wait-timeout = { version = "0.2", optional = true }
 
 [dev-dependencies]
 async-trait = "0.1.89"

@@ -118,6 +118,12 @@ pub enum DeliveryError {
     InvalidBranch,
     Transport(crate::delivery_transport::TransportRefuse),
     GitUnavailable,
+    /// A required child process (e.g. `git`) could not be spawned. Names the program
+    /// and the `io::ErrorKind` so a missing binary is not misreported as "git unavailable".
+    GitSpawnFailed {
+        program: &'static str,
+        kind: std::io::ErrorKind,
+    },
     GitCommandFailed(&'static str),
     MissingFetchedTip,
     TipMismatch {
@@ -137,6 +143,9 @@ impl fmt::Display for DeliveryError {
             Self::InvalidBranch => formatter.write_str("delivery branch is invalid"),
             Self::Transport(refuse) => write!(formatter, "{refuse}"),
             Self::GitUnavailable => formatter.write_str("git executable is unavailable"),
+            Self::GitSpawnFailed { program, kind } => {
+                write!(formatter, "failed to spawn {program}: {kind:?}")
+            }
             Self::GitCommandFailed(operation) => write!(formatter, "git {operation} failed"),
             Self::MissingFetchedTip => {
                 formatter.write_str("git fetch did not produce one commit tip")

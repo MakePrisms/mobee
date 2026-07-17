@@ -1,8 +1,12 @@
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
 use std::time::Duration;
+
+use wait_timeout::ChildExt;
 
 use crate::delivery::{CommitOid, DeliveryError, DeliveryVerifier, GitDelivery, VerifiedDelivery};
 use crate::delivery_transport::AllowlistedDeliveryVerifier;
@@ -186,29 +190,84 @@ where
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
         .output()
-        .map_err(|_| DeliveryError::GitUnavailable)
+        .map_err(|e| DeliveryError::GitSpawnFailed {
+            program: "git",
+            kind: e.kind(),
+        })
 }
 
-/// Like [`git_output`], but kills the child on `timeout` via `timeout(1)` (fail-closed).
+/// Like [`git_output`], but bounds the child by `timeout` **in-process** and fails CLOSED.
+///
+/// Spawns `git` directly (no external `timeout(1)` — macOS ships none, and BusyBox's exit
+/// codes differ) and waits with [`wait_timeout`](wait_timeout::ChildExt::wait_timeout):
+/// - the child exits in-window → return its real [`Output`] so `require_success` sees the
+///   true status (a failing fetch stays a failure; there is no fail-OPEN exit-code class);
+/// - the timeout expires → kill + reap the child and return `GitCommandFailed("fetch-timeout")`,
+///   so a hung fetch never owns the MCP stdio loop and never yields a verified delivery.
+///
+/// stdout/stderr are drained on reader threads while we wait: a fetch chatty enough to fill
+/// the ~64KB pipe buffer would otherwise block on write and never exit, and a genuinely
+/// successful large fetch must still be able to complete within the window.
 fn git_output_timed<I, S>(args: I, timeout: Duration) -> Result<Output, DeliveryError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let secs = timeout.as_secs().max(1);
-    let mut command = Command::new("timeout");
-    command
-        .arg(format!("{secs}s"))
-        .arg("git")
+    let mut child = Command::new("git")
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never");
-    let output = command.output().map_err(|_| DeliveryError::GitUnavailable)?;
-    // GNU timeout: 124 = command timed out; 137 = killed by SIGKILL after grace.
-    if matches!(output.status.code(), Some(124) | Some(137)) {
-        return Err(DeliveryError::GitCommandFailed("fetch-timeout"));
+        .env("GCM_INTERACTIVE", "never")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| DeliveryError::GitSpawnFailed {
+            program: "git",
+            kind: e.kind(),
+        })?;
+
+    // Drain both pipes concurrently so a chatty fetch can't deadlock on a full pipe buffer
+    // before it exits (or before the timeout fires).
+    let stdout = child.stdout.take().expect("piped stdout is present");
+    let stderr = child.stderr.take().expect("piped stderr is present");
+    let stdout_reader = thread::spawn(move || drain_to_end(stdout));
+    let stderr_reader = thread::spawn(move || drain_to_end(stderr));
+
+    match child
+        .wait_timeout(timeout)
+        .map_err(|e| DeliveryError::GitSpawnFailed {
+            program: "git",
+            kind: e.kind(),
+        })? {
+        Some(status) => {
+            // Child exited on its own → its pipe write ends are closed, so the readers
+            // hit EOF and join promptly with the full output.
+            let stdout = stdout_reader.join().unwrap_or_default();
+            let stderr = stderr_reader.join().unwrap_or_default();
+            Ok(Output {
+                status,
+                stdout,
+                stderr,
+            })
+        }
+        None => {
+            // Fail CLOSED: kill the hung fetch and reap it, then report a timeout WITHOUT
+            // blocking on the readers. Joining here could re-hang if an orphaned transport
+            // helper still held a pipe open, which would defeat the whole point of the
+            // timeout (a hung fetch must not own the MCP stdio loop). We discard output on
+            // the timeout path anyway; the detached readers exit once the pipes close.
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(DeliveryError::GitCommandFailed("fetch-timeout"))
+        }
     }
-    Ok(output)
+}
+
+/// Reads a child pipe to EOF, discarding any read error (best-effort output capture).
+fn drain_to_end<R: Read>(mut reader: R) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    let _ = reader.read_to_end(&mut buffer);
+    buffer
 }
 
 fn require_success(operation: &'static str, output: Output) -> Result<(), DeliveryError> {
@@ -407,5 +466,73 @@ mod tests {
             err,
             DeliveryError::Transport(crate::delivery_transport::TransportRefuse::LocalPath)
         ));
+    }
+
+    #[test]
+    fn hanging_remote_fetch_fails_closed_via_in_process_timeout() {
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        // Deterministic "remote hangs" reproduction: a local listener that accepts git's
+        // connection, consumes its request, then never answers the ref advertisement — so
+        // git blocks reading. git:// uses git's built-in transport (no helper subprocess),
+        // so killing the child fully tears the fetch down.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind hang listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        let accepter = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut scratch = [0u8; 256];
+                let _ = stream.read(&mut scratch);
+                // Hold the socket open so git keeps blocking. Bounded so that if the
+                // in-process kill were removed (red-on-revert), git eventually errors
+                // rather than hanging the suite forever.
+                thread::sleep(Duration::from_secs(10));
+                drop(stream);
+            }
+        });
+        // Detach: the fixed path kills git well before this sleep ends; joining would make
+        // the passing test wait out the full hold.
+        drop(accepter);
+
+        // git fetch needs a real local repo to fetch *into* before it reaches the transport.
+        let fixture = Fixture::new();
+        run(
+            ["init", "--bare", fixture.custody.to_str().expect("custody path")],
+            None,
+        );
+
+        let url = format!("git://127.0.0.1:{port}/hang.git");
+        let refspec = "+refs/heads/main:refs/mobee/deliveries/hang";
+        let timeout = Duration::from_secs(1);
+
+        let started = Instant::now();
+        let result = git_output_timed(
+            [
+                OsStr::new("-C"),
+                fixture.custody.as_os_str(),
+                OsStr::new("fetch"),
+                OsStr::new("--no-tags"),
+                OsStr::new("--force"),
+                OsStr::new("--end-of-options"),
+                OsStr::new(&url),
+                OsStr::new(refspec),
+            ],
+            timeout,
+        );
+        let elapsed = started.elapsed();
+
+        // FAIL-CLOSED: an unresponsive fetch surfaces as a timeout error, never as a success
+        // `Output` that could slip through `require_success` into a paid delivery.
+        assert_eq!(
+            result,
+            Err(DeliveryError::GitCommandFailed("fetch-timeout")),
+            "hung fetch must fail closed as a timeout"
+        );
+        // PROMPT: killed near the 1s window by the in-process timeout, not left to hang on
+        // git's (indefinite) native-protocol read. Generous epsilon keeps this non-flaky.
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "hung fetch must be killed promptly; took {elapsed:?}"
+        );
     }
 }
