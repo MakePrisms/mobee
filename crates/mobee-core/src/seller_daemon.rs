@@ -44,6 +44,11 @@ static FLIGHT: AtomicBool = AtomicBool::new(false);
 /// Reaching it back-pressures new claims with a logged skip reason (never a silent drop).
 const AWAITING_PAYMENT_CAP: usize = 16;
 
+/// Item #16(c): bound on agent attempts per job. A transient agent error is retried up to
+/// this many times, but only while the job deadline still has room — the retry loop never
+/// outlives the deadline (see [`run_agent_with_retry`]).
+const MAX_AGENT_ATTEMPTS: u32 = 3;
+
 #[derive(Debug)]
 pub enum DaemonError {
     Seller(SellerError),
@@ -609,15 +614,25 @@ impl SellerDaemon {
             return Err(error.into());
         }
         let run_started = std::time::Instant::now();
-        // Item #16(b): one coherent deadline — the agent runs under the job's remaining
-        // timeout, not a hardcoded 300s.
-        let job_timeout = unified_job_timeout(active.deadline_unix, now_unix());
-        let run_result = run_agent_job(
-            &seller_cfg.agent_command,
-            &active.offer.task,
-            &active.workdir,
-            &identity,
-            job_timeout,
+        // Item #16(c): retry a transient agent error while the deadline still has room. The
+        // kind-7000 error (fail_active, below) is published only after the attempt budget or
+        // the deadline is spent — a transient failure never burns the claim early.
+        let run_result = run_agent_with_retry(
+            active.deadline_unix,
+            MAX_AGENT_ATTEMPTS,
+            now_unix,
+            |_attempt| {
+                // Item #16(b): each attempt runs under the job's *remaining* deadline, not a
+                // hardcoded 300s.
+                let job_timeout = unified_job_timeout(active.deadline_unix, now_unix());
+                run_agent_job(
+                    &seller_cfg.agent_command,
+                    &active.offer.task,
+                    &active.workdir,
+                    &identity,
+                    job_timeout,
+                )
+            },
         )
         .await;
         // Wall-time is always measurable; token/model/cost ride out on `usage` only when the
@@ -887,6 +902,38 @@ fn now_unix() -> u64 {
 /// cleanly at the deadline rather than hanging.
 fn unified_job_timeout(deadline_unix: u64, now_unix: u64) -> Duration {
     Duration::from_secs(deadline_unix.saturating_sub(now_unix))
+}
+
+/// Item #16(c): run the agent with bounded retries that stay WITHIN the job deadline.
+///
+/// A transient agent error is retried until either the attempt budget (`max_attempts`) is
+/// spent OR the deadline (`deadline_unix`, checked against injected `now`) passes. The error
+/// is surfaced to the caller — which then publishes the kind-7000 error exactly once — ONLY
+/// after one of those limits is reached. This stops a transient failure from immediately
+/// burning the claim while the deadline still has room (job 0867a213 failed where 4d982c54
+/// paid). `run` is invoked with the 1-based attempt number and awaited to completion before
+/// any retry, so attempts never overlap.
+async fn run_agent_with_retry<F, Fut>(
+    deadline_unix: u64,
+    max_attempts: u32,
+    now: impl Fn() -> u64,
+    mut run: F,
+) -> Result<Option<UsageMetadata>, DaemonError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<UsageMetadata>, DaemonError>>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match run(attempt).await {
+            Ok(usage) => return Ok(usage),
+            // Retry only while BOTH an attempt and the deadline remain; otherwise surface the
+            // error so the caller publishes kind-7000 exactly once (past deadline / exhausted).
+            Err(_) if attempt < max_attempts && now() < deadline_unix => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 async fn publish_draft(
@@ -1347,6 +1394,62 @@ mod tests {
         // At/past the deadline ⇒ ZERO (fail cleanly at the deadline, never hang, never wrap).
         assert_eq!(unified_job_timeout(1_000, 1_000), Duration::ZERO);
         assert_eq!(unified_job_timeout(1_000, 5_000), Duration::ZERO);
+    }
+
+    // Item #16(c): a transient agent error is retried WITHIN the deadline; kind-7000 is
+    // published only after the attempt budget or the deadline is spent.
+    #[tokio::test]
+    async fn retry_recovers_from_a_transient_error_within_the_deadline() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0u32);
+        // Deadline far away ⇒ never the limiter; a transient first error must be retried,
+        // NOT burn the claim (publish 7000) while the deadline still has room.
+        let out = run_agent_with_retry(u64::MAX, 3, || 0, |attempt| {
+            attempts.set(attempt);
+            async move {
+                if attempt < 2 {
+                    Err(DaemonError::Agent("transient".into()))
+                } else {
+                    Ok::<Option<UsageMetadata>, DaemonError>(None)
+                }
+            }
+        })
+        .await;
+        assert!(out.is_ok(), "transient error retried within deadline, not fatal: {out:?}");
+        assert_eq!(attempts.get(), 2, "retried once, then succeeded");
+    }
+
+    #[tokio::test]
+    async fn retry_exhausts_bounded_attempts_then_surfaces_the_error() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0u32);
+        // Deadline never the limiter (u64::MAX) — only the attempt budget stops the loop.
+        let out = run_agent_with_retry(u64::MAX, 3, || 0, |attempt| {
+            attempts.set(attempt);
+            async move {
+                Err::<Option<UsageMetadata>, DaemonError>(DaemonError::Agent("always".into()))
+            }
+        })
+        .await;
+        assert!(out.is_err(), "exhausted retries ⇒ error so caller publishes kind-7000");
+        assert_eq!(attempts.get(), 3, "bounded to the attempt budget");
+    }
+
+    #[tokio::test]
+    async fn retry_past_deadline_makes_one_attempt_then_surfaces_the_error() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0u32);
+        // `now` (5_000) is already past the deadline (1_000) ⇒ no retry budget at all: one
+        // attempt, then the error surfaces so the caller publishes kind-7000.
+        let out = run_agent_with_retry(1_000, 3, || 5_000, |attempt| {
+            attempts.set(attempt);
+            async move {
+                Err::<Option<UsageMetadata>, DaemonError>(DaemonError::Agent("late".into()))
+            }
+        })
+        .await;
+        assert!(out.is_err(), "past deadline ⇒ error (caller publishes kind-7000)");
+        assert_eq!(attempts.get(), 1, "no retry once the deadline has passed");
     }
 
     #[test]
