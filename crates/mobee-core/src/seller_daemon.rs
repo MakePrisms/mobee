@@ -614,6 +614,9 @@ impl SellerDaemon {
             return Err(error.into());
         }
         let run_started = std::time::Instant::now();
+        // Item #16(e): the daemon OWNS delivery — append explicit, secret-free instructions so
+        // the agent commits its deliverable to git (the daemon pushes it) instead of guessing.
+        let prompt = compose_agent_prompt(&active.offer.task, &seller_cfg.git_remote);
         // Item #16(c): retry a transient agent error while the deadline still has room. The
         // kind-7000 error (fail_active, below) is published only after the attempt budget or
         // the deadline is spent — a transient failure never burns the claim early.
@@ -627,7 +630,7 @@ impl SellerDaemon {
                 let job_timeout = unified_job_timeout(active.deadline_unix, now_unix());
                 run_agent_job(
                     &seller_cfg.agent_command,
-                    &active.offer.task,
+                    &prompt,
                     &active.workdir,
                     &identity,
                     job_timeout,
@@ -936,6 +939,26 @@ where
     }
 }
 
+/// Item #16(e): daemon-owned delivery. The daemon appends explicit, secret-free delivery
+/// instructions to the agent's task prompt so the agent delivers by committing its work to
+/// the git repository in its working directory — rather than guessing a delivery channel.
+/// The daemon performs the authenticated push of the committed branch to the bound remote
+/// (NIP-98; the agent is never handed a key), so this text carries NO secret — it is public
+/// prompt text built only from the task and the (public) remote URL.
+fn compose_agent_prompt(task: &str, git_remote: &str) -> String {
+    format!(
+        "{task}\n\n\
+         ---\n\
+         DELIVERY (required). Deliver your work by committing it with git in your current \
+         working directory:\n\
+         - Make one or more non-empty commits authored by you. Do not leave the deliverable \
+         uncommitted and do not only print it to the console.\n\
+         - You do NOT need to push and you are NOT handed any credentials: the daemon pushes \
+         your committed branch to the bound git remote ({git_remote}) on your behalf.\n\
+         Anything not committed to git will not be delivered."
+    )
+}
+
 async fn publish_draft(
     home: &MobeeHome,
     keys: &nostr_sdk::Keys,
@@ -970,7 +993,7 @@ async fn publish_draft(
 #[cfg(feature = "acp")]
 async fn run_agent_job(
     agent_command: &[String],
-    task: &str,
+    prompt: &str,
     workdir: &Path,
     identity: &seller_git::DeliveryAgentIdentity,
     timeout: Duration,
@@ -1001,14 +1024,14 @@ async fn run_agent_job(
         },
         prompt: PromptTurn {
             input: vec![ContentBlock::Text {
-                text: task.to_owned(),
+                text: prompt.to_owned(),
             }],
         },
     };
     let outcome = run_job(
         &mut driver,
         &mut log,
-        &JobId(format!("seller-{}", short_hash(task))),
+        &JobId(format!("seller-{}", short_hash(prompt))),
         params,
         &mut |_| {},
     )
@@ -1023,7 +1046,7 @@ async fn run_agent_job(
 #[cfg(not(feature = "acp"))]
 async fn run_agent_job(
     _agent_command: &[String],
-    _task: &str,
+    _prompt: &str,
     _workdir: &Path,
     _identity: &seller_git::DeliveryAgentIdentity,
     _timeout: Duration,
@@ -1450,6 +1473,31 @@ mod tests {
         .await;
         assert!(out.is_err(), "past deadline ⇒ error (caller publishes kind-7000)");
         assert_eq!(attempts.get(), 1, "no retry once the deadline has passed");
+    }
+
+    // Item #16(e): the daemon appends explicit, secret-free delivery instructions.
+    #[test]
+    fn composed_prompt_carries_task_and_daemon_owned_delivery_instructions() {
+        let remote = "https://relay.example/git/abc.git";
+        let prompt = compose_agent_prompt("build a widget", remote);
+        // The original task stays up front.
+        assert!(prompt.starts_with("build a widget"), "task preserved: {prompt}");
+        // Explicit, daemon-owned delivery instructions are appended.
+        assert!(prompt.contains("DELIVERY"), "has a delivery section: {prompt}");
+        assert!(
+            prompt.contains("commit") || prompt.contains("Commit"),
+            "tells the agent to commit: {prompt}"
+        );
+        assert!(prompt.contains("git"), "delivery is via git: {prompt}");
+        assert!(
+            prompt.contains(remote),
+            "names the bound remote so delivery is not guessed: {prompt}"
+        );
+        // Public prompt text — never embeds a secret.
+        let lower = prompt.to_lowercase();
+        assert!(!prompt.contains("nsec"), "no nostr secret key");
+        assert!(!lower.contains("private key"), "no private key");
+        assert!(!lower.contains("secret"), "no secret material");
     }
 
     #[test]
