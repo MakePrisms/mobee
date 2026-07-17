@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "acp")]
 use sha2::{Digest, Sha256};
@@ -609,9 +609,17 @@ impl SellerDaemon {
             return Err(error.into());
         }
         let run_started = std::time::Instant::now();
-        let run_result =
-            run_agent_job(&seller_cfg.agent_command, &active.offer.task, &active.workdir, &identity)
-                .await;
+        // Item #16(b): one coherent deadline — the agent runs under the job's remaining
+        // timeout, not a hardcoded 300s.
+        let job_timeout = unified_job_timeout(active.deadline_unix, now_unix());
+        let run_result = run_agent_job(
+            &seller_cfg.agent_command,
+            &active.offer.task,
+            &active.workdir,
+            &identity,
+            job_timeout,
+        )
+        .await;
         // Wall-time is always measurable; token/model/cost ride out on `usage` only when the
         // ACP driver actually surfaced them (absent-stays-absent → `None`).
         let wall_time_ms = run_started.elapsed().as_millis() as u64;
@@ -870,6 +878,17 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Item #16(b): the ONE coherent job timeout. The ACP driver's idle/response timeout is
+/// derived from the job's own deadline (`--job-timeout-secs` → offer deadline → default, via
+/// [`job_deadline_unix`]) so a job has a single predictable deadline. Before this the driver
+/// used a hardcoded 300s idle-timeout that silently conflicted with `--job-timeout-secs`
+/// (a live codex seller hung ~300s on an ACP request while the job deadline said otherwise).
+/// Saturating: a non-positive remaining window yields `Duration::ZERO`, which fails the run
+/// cleanly at the deadline rather than hanging.
+fn unified_job_timeout(deadline_unix: u64, now_unix: u64) -> Duration {
+    Duration::from_secs(deadline_unix.saturating_sub(now_unix))
+}
+
 async fn publish_draft(
     home: &MobeeHome,
     keys: &nostr_sdk::Keys,
@@ -907,9 +926,8 @@ async fn run_agent_job(
     task: &str,
     workdir: &Path,
     identity: &seller_git::DeliveryAgentIdentity,
+    timeout: Duration,
 ) -> Result<Option<UsageMetadata>, DaemonError> {
-    use std::time::Duration;
-
     use crate::driver::{AcpDriver, AgentCommand, ContentBlock, PromptTurn, SessionConfig};
     use crate::engine::{RunParams, run_job};
     use crate::event::JobId;
@@ -918,10 +936,12 @@ async fn run_agent_job(
     if agent_command.is_empty() {
         return Err(DaemonError::Config("agent_command empty".into()));
     }
+    // Item #16(b): the ACP idle/response timeout IS the unified job timeout — never a
+    // hardcoded 300s that could override or conflict with `--job-timeout-secs`.
     let mut driver = AcpDriver::new(
         AgentCommand::new(agent_command[0].clone(), agent_command[1..].to_vec()),
         crate::driver::PermissionOutcome::Allow,
-        Duration::from_secs(300),
+        timeout,
     );
     let log_path = workdir.join("seller-run.jsonl");
     let mut log = EventLog::open(&log_path)
@@ -959,6 +979,7 @@ async fn run_agent_job(
     _task: &str,
     _workdir: &Path,
     _identity: &seller_git::DeliveryAgentIdentity,
+    _timeout: Duration,
 ) -> Result<Option<UsageMetadata>, DaemonError> {
     Err(DaemonError::AcpRequired)
 }
@@ -1308,6 +1329,24 @@ mod tests {
         SellerDaemon::end_flight();
         assert!(SellerDaemon::try_begin_flight());
         SellerDaemon::end_flight();
+    }
+
+    // Item #16(b): the ACP timeout is unified with `--job-timeout-secs` — one deadline.
+    #[test]
+    fn unified_job_timeout_is_the_remaining_deadline_not_a_hardcoded_constant() {
+        // The effective timeout is strictly the remaining window to the job's deadline.
+        assert_eq!(unified_job_timeout(1_000, 940), Duration::from_secs(60));
+        assert_eq!(unified_job_timeout(1_000, 100), Duration::from_secs(900));
+        // Two different deadlines ⇒ two different timeouts — proves it is DERIVED from the
+        // deadline, not a fixed 300s that could override or conflict with `--job-timeout-secs`.
+        assert_ne!(
+            unified_job_timeout(1_000, 940),
+            unified_job_timeout(1_000, 100)
+        );
+        assert_ne!(unified_job_timeout(1_000, 940), Duration::from_secs(300));
+        // At/past the deadline ⇒ ZERO (fail cleanly at the deadline, never hang, never wrap).
+        assert_eq!(unified_job_timeout(1_000, 1_000), Duration::ZERO);
+        assert_eq!(unified_job_timeout(1_000, 5_000), Duration::ZERO);
     }
 
     #[test]
@@ -1718,9 +1757,15 @@ mod tests {
     #[tokio::test]
     async fn agent_run_fail_closed_without_acp_feature() {
         let identity = seller_git::DeliveryAgentIdentity::for_seller(&"aa".repeat(32));
-        let err = run_agent_job(&["echo".into()], "task", Path::new("."), &identity)
-            .await
-            .expect_err("acp required");
+        let err = run_agent_job(
+            &["echo".into()],
+            "task",
+            Path::new("."),
+            &identity,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("acp required");
         assert!(matches!(err, DaemonError::AcpRequired));
         assert!(err.to_string().contains("acp"));
     }
