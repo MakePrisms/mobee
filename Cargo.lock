@@ -1770,6 +1770,7 @@ dependencies = [
  "cdk-sqlite",
  "getrandom 0.3.4",
  "hex",
+ "nostr-relay-builder",
  "nostr-sdk",
  "serde",
  "serde_json",
@@ -1847,6 +1848,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ade30de16869618919c6b5efc8258f47b654a98b51541eb77f85e8ec5e3c83a6"
 dependencies = [
  "nostr",
+]
+
+[[package]]
+name = "nostr-relay-builder"
+version = "0.44.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08ed09e8363503c6f464087b530a1f43cf68be6292bd4928b5ea1141b03dc11c"
+dependencies = [
+ "async-utility",
+ "async-wsocket",
+ "atomic-destructor",
+ "hex",
+ "negentropy",
+ "nostr",
+ "nostr-database",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

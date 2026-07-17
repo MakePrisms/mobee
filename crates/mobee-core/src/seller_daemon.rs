@@ -1129,7 +1129,16 @@ pub fn run_forever_blocking(daemon: SellerDaemon) -> Result<(), DaemonError> {
     runtime.block_on(run_forever(daemon))
 }
 
-/// Drain `notifications` until NIP-42 AUTH succeeds (or fail closed).
+/// Outcome of [`wait_for_nip42_auth`].
+enum AuthWait {
+    /// The relay issued a NIP-42 challenge and `automatic_authentication` completed it.
+    Authenticated,
+    /// The relay issued NO challenge within the window. NOT a failure (see the fn doc).
+    NoChallenge,
+}
+
+/// Drain `notifications` until the relay's NIP-42 AUTH completes, the relay actively rejects
+/// auth (fatal), or the window elapses with no challenge (`NoChallenge`, non-fatal).
 ///
 /// Caller must subscribe `relay.notifications()` **before** `connect` so the
 /// `Authenticated` event cannot be missed.
@@ -1138,17 +1147,24 @@ pub fn run_forever_blocking(daemon: SellerDaemon) -> Result<(), DaemonError> {
 /// `CLOSED` with `restricted:` (not `auth-required:`). nostr-sdk 0.44 treats
 /// `restricted:` as `Remove` — the sub is dropped, so the post-auth
 /// `resubscribe()` never restores it. Auth **before** the 1059 subscribe is
-/// therefore load-bearing for seller receive.
+/// therefore load-bearing for seller receive, and mobee-relay challenges on connect so
+/// `Authenticated` arrives in milliseconds.
+///
+/// A window with NO challenge is reported as `NoChallenge` rather than a fatal error: a relay
+/// that challenges only lazily (on the first `REQ`/`EVENT`, e.g. the in-process test relay) will
+/// challenge when the daemon subscribes below, and `automatic_authentication` completes auth
+/// then. The caller logs the degrade loudly. An ACTIVE rejection (`AuthenticationFailed`) or a
+/// relay shutdown stays fatal (fail-closed), unchanged.
 async fn wait_for_nip42_auth(
     notifications: &mut tokio::sync::broadcast::Receiver<nostr_sdk::pool::RelayNotification>,
     timeout: std::time::Duration,
-) -> Result<(), DaemonError> {
+) -> Result<AuthWait, DaemonError> {
     use nostr_sdk::pool::RelayNotification;
 
-    tokio::time::timeout(timeout, async {
+    let within_window = tokio::time::timeout(timeout, async {
         loop {
             match notifications.recv().await {
-                Ok(RelayNotification::Authenticated) => return Ok(()),
+                Ok(RelayNotification::Authenticated) => return Ok(AuthWait::Authenticated),
                 Ok(RelayNotification::AuthenticationFailed) => {
                     return Err(DaemonError::Relay(
                         "NIP-42 authentication failed (required for kind-1059 p-gated receive)"
@@ -1169,12 +1185,11 @@ async fn wait_for_nip42_auth(
             }
         }
     })
-    .await
-    .map_err(|_| {
-        DaemonError::Relay(
-            "timed out waiting for NIP-42 authentication (required for kind-1059 receive)".into(),
-        )
-    })?
+    .await;
+
+    // Elapsed with no challenge → NoChallenge (non-fatal). Within the window → the loop's result
+    // (Authenticated, or a fatal active failure).
+    within_window.unwrap_or(Ok(AuthWait::NoChallenge))
 }
 
 /// Build the seller's kind-5109 offer subscription filter(s).
@@ -1184,25 +1199,96 @@ async fn wait_for_nip42_auth(
 /// pubkey-pinned filter alone never delivers them and `--claim-open-pool` is DOA. A targeted
 /// offer matches BOTH filters (deduped by event id at the call site); the downstream rate-gate
 /// (`rate_gate_allows`) still decides whether an untargeted offer is actually claimed.
+///
+/// The un-pinned open-pool filter is BOUNDED to NEW offers only — `since(now)` + `limit(0)`.
+/// Without the bound it is a full-history 5109 FIREHOSE (`kind:5109` with no `#p`/`since`/`limit`):
+/// a running seller replayed the relay's entire stored 5109 history on startup (field runs saw
+/// 60+ historical offers; the flood grows linearly with relay history). The seller wants to react
+/// to offers posted WHILE it runs, so the un-pinned filter streams only offers dated at/after
+/// subscribe time and requests zero stored events. The TARGETED `#p==self` filter keeps its shape
+/// (stored targeted offers still backfill on (re)subscribe — those are addressed to this seller).
 fn offer_subscription_filters(
     seller_pubkey: nostr_sdk::PublicKey,
     claim_open_pool: bool,
 ) -> Vec<nostr_sdk::Filter> {
-    use nostr_sdk::prelude::{Filter, Kind};
+    use nostr_sdk::prelude::{Filter, Kind, Timestamp};
     let mut filters = vec![Filter::new()
         .kind(Kind::Custom(JOB_OFFER_KIND))
         .pubkey(seller_pubkey)];
     if claim_open_pool {
-        // Second, un-pinned filter: matches untargeted (open-pool) 5109 offers.
-        filters.push(Filter::new().kind(Kind::Custom(JOB_OFFER_KIND)));
+        // Second, un-pinned filter: matches untargeted (open-pool) 5109 offers, BOUNDED to new
+        // offers (`since(now)` + `limit(0)`) so a running seller streams fresh untargeted offers
+        // without replaying the relay's full 5109 history.
+        filters.push(
+            Filter::new()
+                .kind(Kind::Custom(JOB_OFFER_KIND))
+                .since(Timestamp::now())
+                .limit(0),
+        );
     }
     filters
 }
 
+/// The seller's LIVE offer subscription(s), grouped as they are registered on the relay.
+///
+/// Each element is ONE long-lived subscription — a single NIP-01 `REQ` whose filters the relay
+/// OR-matches. The 5109 offer filters are grouped into ONE subscription: the pinned (`#p` ==
+/// self) filter AND — under `claim_open_pool` — the un-pinned open-pool filter ride the SAME
+/// `REQ`. This grouping is load-bearing: an earlier half-fix registered the un-pinned filter as
+/// a SEPARATE second subscription, which delivered stored events (backfill) but no LIVE offers —
+/// a running open-pool seller never reacted to a fresh untargeted offer, only claiming it after
+/// a restart re-fetched it from stored events. Callers MUST subscribe each group as one `REQ`
+/// (one `pool().subscribe(filters, ..)` call), never one subscription per filter.
+fn offer_subscriptions(
+    seller_pubkey: nostr_sdk::PublicKey,
+    claim_open_pool: bool,
+) -> Vec<Vec<nostr_sdk::Filter>> {
+    vec![offer_subscription_filters(seller_pubkey, claim_open_pool)]
+}
+
+/// Whether a relay event in the seller loop should be handed to `on_offer_event`.
+///
+/// True iff the event is a kind-5109 offer not seen before. Routing is by KIND ONLY: a
+/// non-p-tagged (open-pool) offer routes exactly like a targeted one, so the notification path
+/// never drops untargeted offers. The event-id dedup makes a targeted offer that matched more
+/// than one 5109 filter (or a reconnect re-delivery) reach `on_offer_event` at most once.
+fn offer_event_should_process(
+    event_kind: u16,
+    event_id: nostr_sdk::EventId,
+    seen_offers: &mut std::collections::HashSet<nostr_sdk::EventId>,
+) -> bool {
+    event_kind == JOB_OFFER_KIND && seen_offers.insert(event_id)
+}
+
+/// Optional hooks for the seller loop, kept crate-internal so the public entrypoint stays a
+/// one-arg [`run_forever`]. Production uses [`RunHooks::default`]; the integration test supplies
+/// a readiness sender and a short auth-wait to drive the loop deterministically.
+#[derive(Default)]
+pub(crate) struct RunHooks {
+    /// Fires once, right after the daemon is online (subscribed + past the NIP-42 auth wait) —
+    /// i.e. the point at which it will react to LIVE offers. The test owns the receiver and uses
+    /// it to assert readiness instead of scraping stderr.
+    pub ready: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    /// Override the NIP-42 auth wait. `None` = production default (20s). A challenge-on-connect
+    /// relay authenticates in milliseconds regardless of this value.
+    pub auth_wait: Option<std::time::Duration>,
+}
+
 /// Long-running seller loop: NIP-42 AUTH, then subscribe 5109+1059 from START.
-pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
+pub async fn run_forever(daemon: SellerDaemon) -> Result<(), DaemonError> {
+    run_forever_hooked(daemon, RunHooks::default()).await
+}
+
+/// [`run_forever`] with test/observability hooks (see [`RunHooks`]).
+pub(crate) async fn run_forever_hooked(
+    mut daemon: SellerDaemon,
+    hooks: RunHooks,
+) -> Result<(), DaemonError> {
     use std::time::Duration;
-    use nostr_sdk::prelude::{Client, Filter, Kind, RelayPoolNotification, RelayUrl};
+    use nostr_sdk::prelude::{
+        Client, Filter, Kind, RelayMessage, RelayPoolNotification, RelayUrl, SubscribeOptions,
+        SubscriptionId,
+    };
 
     let client = Client::new(daemon.keys.clone());
     // Default is true; set explicitly — seller receive depends on it.
@@ -1227,7 +1313,19 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
     let mut relay_notifications = relay.notifications();
     client.connect().await;
     client.wait_for_connection(Duration::from_secs(20)).await;
-    wait_for_nip42_auth(&mut relay_notifications, Duration::from_secs(20)).await?;
+    let auth_wait = hooks.auth_wait.unwrap_or(Duration::from_secs(20));
+    let nip42_label = match wait_for_nip42_auth(&mut relay_notifications, auth_wait).await? {
+        AuthWait::Authenticated => "authenticated",
+        AuthWait::NoChallenge => {
+            eprintln!(
+                "seller WARN: relay issued no NIP-42 AUTH challenge within {auth_wait:?}; \
+                 proceeding (automatic_authentication stays ON, so a relay that challenges on a \
+                 REQ is still authenticated). If this relay p-gates kind-1059, seller receive may \
+                 be degraded until auth completes."
+            );
+            "no-challenge"
+        }
+    };
 
     // Restart-reconcile: release any orphaned in-flight claims from a prior run BEFORE
     // serving new offers, so a claim left live by a crash never reads "processing" forever
@@ -1243,23 +1341,28 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
         Err(error) => eprintln!("seller reconcile failed on startup (continuing): {error}"),
     }
 
-    // Offer subscription: always the TARGETED filter (p-tag == seller). When the seller opts
-    // into the open pool, `offer_subscription_filters` ALSO returns an UNtargeted 5109 filter —
-    // open-pool offers carry no p-tag and would otherwise never reach `on_offer_event`, so
-    // `--claim-open-pool` was DOA. Targeted offers match both filters; the event-id dedup in
-    // the loop below processes each offer exactly once.
+    // Offer subscription: the TARGETED filter (p-tag == seller) AND — under open-pool — the
+    // BOUNDED un-pinned filter ride ONE long-lived subscription (a single REQ, OR-matched per
+    // NIP-01) via `offer_subscriptions` + `pool().subscribe`. Registered as a SEPARATE second
+    // subscription (the earlier half-fix) the un-pinned filter delivered stored events (backfill)
+    // but never LIVE offers, so a running open-pool seller ignored fresh untargeted offers. Group
+    // them into ONE REQ (`Client::subscribe` takes a single filter — one REQ per filter is the
+    // bug). The event-id dedup in the loop still processes each offer exactly once. Sub id(s) are
+    // captured so the Loud-Closed fallback can detect a relay CLOSE of the offer subscription.
+    let seller_pubkey = daemon.keys.public_key();
     let claim_open_pool = require_seller_config(&daemon.home)
         .map(|cfg| cfg.claim_open_pool)
         .unwrap_or(false);
-    for filter in offer_subscription_filters(daemon.keys.public_key(), claim_open_pool) {
-        client
-            .subscribe(filter, None)
+    let mut offer_sub_ids: Vec<SubscriptionId> = Vec::new();
+    for filters in offer_subscriptions(seller_pubkey, claim_open_pool) {
+        let output = client
+            .pool()
+            .subscribe(filters, SubscribeOptions::default())
             .await
             .map_err(|error| DaemonError::Relay(format!("subscribe 5109: {error}")))?;
+        offer_sub_ids.push(output.val);
     }
-    let wrap_filter = Filter::new()
-        .kind(Kind::GiftWrap)
-        .pubkey(daemon.keys.public_key());
+    let wrap_filter = Filter::new().kind(Kind::GiftWrap).pubkey(seller_pubkey);
     client
         .subscribe(wrap_filter, None)
         .await
@@ -1267,16 +1370,23 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
 
     // Status line: never echo secrets.
     eprintln!(
-        "seller daemon online pubkey={} relay={} mint={} nip42=authenticated",
+        "seller daemon online pubkey={} relay={} mint={} nip42={nip42_label}",
         daemon.seller_pubkey(),
         daemon.home.config.relay_url,
         daemon.home.config.mint_url
     );
+    // Readiness hook: online + subscribed ⇒ ready to react to LIVE offers.
+    if let Some(ready) = &hooks.ready {
+        let _ = ready.send(());
+    }
 
-    // Open-pool adds a 2nd (un-pinned) 5109 subscription; a TARGETED offer matches BOTH
-    // filters and is delivered twice. Dedup by event id so each offer is processed once.
+    // Both 5109 filters ride ONE subscription, so the relay delivers each offer once even when
+    // a targeted offer matches both filters. Keep an event-id dedup as defense-in-depth (e.g.
+    // reconnect re-delivery) so each offer id reaches `on_offer_event` at most once.
     let mut seen_offers: std::collections::HashSet<nostr_sdk::EventId> =
         std::collections::HashSet::new();
+    // Loud-Closed fallback fires at most once (targeted-only is not itself broad-filtered).
+    let mut offer_fallback_done = false;
     let mut notifications = client.notifications();
     while let Ok(notification) = notifications.recv().await {
         match notification {
@@ -1298,12 +1408,10 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
                     }
                     continue;
                 }
-                if event.kind.as_u16() == JOB_OFFER_KIND {
-                    // Dedup: a targeted offer matches both the pinned and (open-pool) un-pinned
-                    // 5109 filters, so it arrives twice — process each offer event id once.
-                    if !seen_offers.insert(event.id) {
-                        continue;
-                    }
+                // An offer (kind-5109) routes to `on_offer_event` REGARDLESS of p-tag — open-pool
+                // offers carry none, so a p-tag gate here would silently drop them. Deduped by
+                // event id so each offer is processed once (see `offer_event_should_process`).
+                if offer_event_should_process(event.kind.as_u16(), event.id, &mut seen_offers) {
                     match daemon.on_offer_event(&event).await {
                         Ok(Some(_)) => {
                             match daemon.execute_active_job().await {
@@ -1333,12 +1441,56 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
                     }
                 }
             }
+            // Loud-Closed fallback (hardening #3): the relay CLOSED a subscription. If it's the
+            // grouped OFFER subscription (e.g. the relay restricts the broad open-pool filter),
+            // the seller would go SILENTLY deaf to offers. LOG IT LOUDLY and degrade to the
+            // TARGETED-only 5109 filter (`#p==self`) — which a relay that only objects to the
+            // broad filter still accepts — so the seller stays targeted-alive with a visible log
+            // instead of dying quietly. nostr-sdk removes a CLOSED (error/restricted/blocked) sub
+            // and does not re-subscribe it, so this re-subscribe is the recovery path.
+            RelayPoolNotification::Message {
+                message: RelayMessage::Closed { subscription_id, message },
+                ..
+            } => {
+                let is_offer_sub = offer_sub_ids.iter().any(|id| id == subscription_id.as_ref());
+                if is_offer_sub && !offer_fallback_done {
+                    offer_fallback_done = true;
+                    eprintln!(
+                        "seller WARN: relay CLOSED the offer subscription (sub_id={}): \"{}\". \
+                         Falling back to the TARGETED-only 5109 filter (#p==self); open-pool \
+                         (untargeted) offers will NOT be received until the relay accepts the \
+                         grouped subscription again.",
+                        subscription_id.as_ref(),
+                        message
+                    );
+                    match client
+                        .pool()
+                        .subscribe(
+                            offer_subscription_filters(seller_pubkey, false),
+                            SubscribeOptions::default(),
+                        )
+                        .await
+                    {
+                        Ok(output) => offer_sub_ids.push(output.val),
+                        Err(error) => eprintln!(
+                            "seller ERROR: targeted-only fallback subscribe failed: {error}"
+                        ),
+                    }
+                }
+            }
             RelayPoolNotification::Shutdown => break,
             _ => {}
         }
     }
     Ok(())
 }
+
+/// Serialises tests that touch the process-global single-flight lock [`FLIGHT`]: the local-relay
+/// daemon integration tests (which claim offers, taking `FLIGHT`) and `single_flight_mutex`.
+/// Without this they race on `FLIGHT` when cargo runs tests concurrently. Poison-tolerant at the
+/// lock sites (a panicking test must not wedge the others).
+#[cfg(test)]
+static FLIGHT_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -1394,6 +1546,8 @@ mod tests {
 
     #[test]
     fn single_flight_mutex() {
+        // Serialise against the daemon integration tests: both touch the global FLIGHT lock.
+        let _guard = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         assert!(SellerDaemon::try_begin_flight());
         assert!(!SellerDaemon::try_begin_flight());
         SellerDaemon::end_flight();
@@ -1591,8 +1745,10 @@ mod tests {
     }
 
     #[test]
-    fn open_pool_filter_lands_untargeted_offer_only_when_enabled() {
-        use nostr_sdk::prelude::{EventBuilder, Filter, Keys, Kind, MatchEventOptions, Tag};
+    fn open_pool_filter_lands_fresh_untargeted_offer_only_when_enabled_and_bounds_history() {
+        use nostr_sdk::prelude::{
+            EventBuilder, Filter, Keys, Kind, MatchEventOptions, Tag, Timestamp,
+        };
 
         let seller = Keys::generate();
         let buyer = Keys::generate();
@@ -1602,9 +1758,17 @@ mod tests {
             .tag(Tag::public_key(seller.public_key()))
             .sign_with_keys(&buyer)
             .expect("sign targeted offer");
-        let untargeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
+        // A FRESH untargeted offer (dated after the filter's `since(now)`). Built in the future
+        // so it deterministically clears the bound regardless of sub-second test timing.
+        let fresh_untargeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
+            .custom_created_at(Timestamp::now() + 60u64)
             .sign_with_keys(&buyer)
-            .expect("sign untargeted offer");
+            .expect("sign fresh untargeted offer");
+        // A STALE untargeted offer (an hour old) — the relay's 5109 history.
+        let stale_untargeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
+            .custom_created_at(Timestamp::from(Timestamp::now().as_secs().saturating_sub(3600)))
+            .sign_with_keys(&buyer)
+            .expect("sign stale untargeted offer");
 
         let matches_any = |filters: &[Filter], event: &nostr_sdk::Event| {
             filters
@@ -1620,21 +1784,116 @@ mod tests {
             "targeted offer must match the pinned filter"
         );
         assert!(
-            !matches_any(&targeted_only, &untargeted),
+            !matches_any(&targeted_only, &fresh_untargeted),
             "untargeted offer must NOT match without open-pool"
         );
 
-        // Open-pool (claim_open_pool = true): the 2nd un-pinned filter lands the untargeted
+        // Open-pool (claim_open_pool = true): the 2nd un-pinned filter lands the FRESH untargeted
         // offer. RED-ON-REVERT: drop the `filters.push(...)` in offer_subscription_filters and
-        // this final assert fails — the untargeted offer no longer matches, so no claim fires.
+        // this assert fails — the untargeted offer no longer matches, so no claim fires.
         let open_pool = offer_subscription_filters(seller.public_key(), true);
         assert!(
             matches_any(&open_pool, &targeted),
             "targeted offer still matches under open-pool"
         );
         assert!(
-            matches_any(&open_pool, &untargeted),
-            "untargeted offer MUST match under open-pool (the fix)"
+            matches_any(&open_pool, &fresh_untargeted),
+            "fresh untargeted offer MUST match under open-pool (the fix)"
+        );
+        // The un-pinned filter is BOUNDED (`since(now)`): a STALE (historical) untargeted offer
+        // does NOT match, so a running seller does not replay the relay's 5109 history.
+        // RED-ON-REVERT: drop `.since(..).limit(0)` and this assert fails (the flood returns).
+        assert!(
+            !matches_any(&open_pool, &stale_untargeted),
+            "stale (historical) untargeted offer MUST NOT match the bounded open-pool filter"
+        );
+    }
+
+    #[test]
+    fn open_pool_offers_ride_one_grouped_subscription() {
+        use nostr_sdk::prelude::{
+            EventBuilder, Filter, Keys, Kind, MatchEventOptions, Tag, Timestamp,
+        };
+
+        let seller = Keys::generate();
+        let buyer = Keys::generate();
+
+        let targeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
+            .tag(Tag::public_key(seller.public_key()))
+            .sign_with_keys(&buyer)
+            .expect("sign targeted offer");
+        let fresh_untargeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
+            .custom_created_at(Timestamp::now() + 60u64)
+            .sign_with_keys(&buyer)
+            .expect("sign fresh untargeted offer");
+
+        let matches_any = |filters: &[Filter], event: &nostr_sdk::Event| {
+            filters
+                .iter()
+                .any(|filter| filter.match_event(event, MatchEventOptions::new()))
+        };
+
+        // Open-pool: the offer filters are registered as EXACTLY ONE live subscription (a single
+        // REQ) carrying BOTH the pinned and the (bounded) un-pinned filter, so the un-pinned
+        // filter rides the same long-lived subscription and streams LIVE offers. The half-fix
+        // registered the un-pinned filter as a SEPARATE second subscription (two subscriptions),
+        // which the relay dropped after backfill. RED-ON-REVERT: return one subscription per
+        // filter (as the half-fix did) and this `len() == 1` assertion fails.
+        let subs = offer_subscriptions(seller.public_key(), true);
+        assert_eq!(
+            subs.len(),
+            1,
+            "open-pool offers must ride ONE live subscription, not a separate un-pinned one"
+        );
+        let live = &subs[0];
+        assert!(
+            matches_any(live, &targeted),
+            "the single live subscription must match targeted offers"
+        );
+        assert!(
+            matches_any(live, &fresh_untargeted),
+            "the single live subscription must ALSO match fresh untargeted (open-pool) offers"
+        );
+
+        // Targeted-only: still one subscription; matches targeted, not untargeted.
+        let subs = offer_subscriptions(seller.public_key(), false);
+        assert_eq!(subs.len(), 1, "one offer subscription when not open-pool");
+        assert!(matches_any(&subs[0], &targeted));
+        assert!(
+            !matches_any(&subs[0], &fresh_untargeted),
+            "untargeted offers must not match without open-pool"
+        );
+    }
+
+    #[test]
+    fn untargeted_offer_routes_to_on_offer_event_and_dedups() {
+        use nostr_sdk::prelude::{EventBuilder, Keys, Kind};
+        use std::collections::HashSet;
+
+        let buyer = Keys::generate();
+        // An UNtargeted (open-pool) 5109 offer carries no p-tag.
+        let untargeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
+            .sign_with_keys(&buyer)
+            .expect("sign untargeted offer");
+
+        let mut seen: HashSet<nostr_sdk::EventId> = HashSet::new();
+
+        // A non-p-tagged 5109 offer MUST route to `on_offer_event` on the LIVE push — this rules
+        // out the "notification path drops non-p-tagged 5109" failure mode. RED-ON-REVERT: gate
+        // routing on a p-tag and this first assertion fails for the untargeted offer.
+        assert!(
+            offer_event_should_process(untargeted.kind.as_u16(), untargeted.id, &mut seen),
+            "an untargeted 5109 offer must route to on_offer_event"
+        );
+        // Dedup by event id: a re-delivered offer id is processed at most once.
+        assert!(
+            !offer_event_should_process(untargeted.kind.as_u16(), untargeted.id, &mut seen),
+            "a re-delivered offer id must be deduped, not double-processed"
+        );
+        // A non-offer kind (e.g. gift-wrap 1059) does not route as an offer.
+        assert!(
+            !offer_event_should_process(Kind::GiftWrap.as_u16(), untargeted.id, &mut seen),
+            "non-5109 events must not route to on_offer_event"
         );
     }
 
@@ -1919,5 +2178,383 @@ mod tests {
         .expect_err("acp required");
         assert!(matches!(err, DaemonError::AcpRequired));
         assert!(err.to_string().contains("acp"));
+    }
+}
+
+/// LOCAL-RELAY integration tests: drive [`run_forever_hooked`] end-to-end against an in-process
+/// NIP-01 relay (`nostr-relay-builder`) and assert on RELAY TRAFFIC + TIMING — never on
+/// stderr/scrollback. They prove the open-pool live-delivery behaviour:
+///  * **A** — the daemon reaches READY quickly (mpsc readiness hook, not a log scrape);
+///  * **B** — a running seller does NOT replay the relay's 5109 history (bounded startup ingest);
+///  * **C** — a fresh UNtargeted 5109 offer posted to a RUNNING seller is CLAIMED without a
+///    restart (relay receives the seller's kind-7000 `status=processing` tagged `e=<offer id>`) —
+///    the "untargeted offer → claim without restart" proof that was previously never obtained;
+///  * **D** — if the relay CLOSES the broad open-pool subscription, the daemon still reaches READY
+///    and degrades to the TARGETED-only filter, still claiming a fresh targeted offer (the
+///    Loud-Closed fallback).
+///
+/// NIP-42 deviation (noted): the in-process relay issues AUTH challenges only LAZILY (on the
+/// first REQ/EVENT), whereas mobee-relay challenges on connect. So these tests run the relay
+/// WITHOUT NIP-42 gating and rely on the daemon's non-fatal `NoChallenge` auth path (a
+/// challenge-on-connect relay still authenticates in milliseconds — unchanged behaviour there).
+/// Offer DELIVERY is the behaviour under test here; the p-gated kind-1059 receive (money path) is
+/// exercised separately against a real relay.
+#[cfg(test)]
+mod local_relay_it {
+    use super::*;
+    use crate::gateway::{self, OfferDraft};
+    use crate::home::{self, SellerConfig, DEFAULT_MINT_URL};
+    use nostr_relay_builder::prelude::{
+        Alphabet, BoxedFuture, LocalRelay, PolicyResult, QueryPolicy, RelayBuilder, SingleLetterTag,
+    };
+    use nostr_sdk::prelude::{
+        Client, Filter, Keys, Kind, PublicKey, RelayPoolNotification, Timestamp,
+    };
+    use std::collections::HashSet;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    static IT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_root(label: &str) -> std::path::PathBuf {
+        let n = IT_SEQ.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("mobee-it-{label}-{}-{n}", std::process::id()))
+    }
+
+    /// Bootstrap a seller home bound to `relay_url` (mint stays the fail-closed testnut default).
+    fn seller_home(root: &std::path::Path, relay_url: &str, claim_open_pool: bool) -> home::MobeeHome {
+        let mut h = home::bootstrap(root).expect("bootstrap seller home");
+        h.config.relay_url = relay_url.to_string();
+        assert_eq!(
+            h.config.mint_url, DEFAULT_MINT_URL,
+            "home mint must be the fail-closed testnut default"
+        );
+        h.config.seller = Some(SellerConfig {
+            // Stub agent: the CLAIM (kind-7000 processing) is published in `on_offer_event` BEFORE
+            // execution, so no real ACP agent is needed — execution fails fast after the claim we
+            // assert on, releasing single-flight.
+            agent_command: vec!["true".into()],
+            rate_sats: 1,
+            git_remote: "https://example.invalid/mobee-it.git".into(),
+            job_timeout_secs: Some(5),
+            agent: None,
+            claim_open_pool,
+        });
+        h
+    }
+
+    /// Start the in-process relay from `builder`. Keep the returned handle alive for the whole
+    /// test — dropping every clone shuts the relay down.
+    async fn start_relay(builder: RelayBuilder) -> (LocalRelay, String) {
+        let relay = LocalRelay::new(builder);
+        relay.run().await.expect("relay run");
+        let url = relay.url().await.to_string();
+        (relay, url)
+    }
+
+    async fn connect_client(relay_url: &str) -> Client {
+        let client = Client::new(Keys::generate());
+        client.add_relay(relay_url).await.expect("add relay");
+        client.connect().await;
+        client.wait_for_connection(Duration::from_secs(5)).await;
+        client
+    }
+
+    /// Build an offer draft carrying the fail-closed testnut mint (so it is never skipped for the
+    /// wrong reason). `targeted_to = Some(hex)` ⇒ a `#p`-tagged (targeted) offer; `None` ⇒ open.
+    fn offer_draft(targeted_to: Option<&str>) -> OfferDraft {
+        match targeted_to {
+            Some(pk) => OfferDraft::new("do a task", "text", 10, 0, DEFAULT_MINT_URL, pk),
+            None => OfferDraft::untargeted("do a task", "text", 10, 0, DEFAULT_MINT_URL),
+        }
+    }
+
+    /// Sign an offer with `buyer` via the SAME event bridge the buyer CLI uses, then publish it.
+    async fn publish_offer(
+        client: &Client,
+        buyer: &Keys,
+        draft: &OfferDraft,
+        created_at: Option<Timestamp>,
+    ) -> nostr_sdk::EventId {
+        let mut builder =
+            gateway::nostr::event_builder(&draft.to_event_draft()).expect("offer event builder");
+        if let Some(ts) = created_at {
+            builder = builder.custom_created_at(ts);
+        }
+        let event = builder.sign_with_keys(buyer).expect("sign offer");
+        let id = event.id;
+        client.send_event(&event).await.expect("publish offer");
+        id
+    }
+
+    fn tag_value(event: &nostr_sdk::Event, name: &str) -> Option<String> {
+        event.tags.iter().find_map(|t| {
+            let slice = t.as_slice();
+            (slice.first().map(String::as_str) == Some(name))
+                .then(|| slice.get(1).cloned())
+                .flatten()
+        })
+    }
+
+    /// Collect every kind-7000 the seller publishes as `(e-tag, status)`. The receiver is created
+    /// before the daemon starts so no startup claim is missed.
+    fn spawn_claim_collector(
+        client: &Client,
+        seller_pk: PublicKey,
+    ) -> Arc<Mutex<Vec<(String, String)>>> {
+        let claims: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = claims.clone();
+        let mut notif = client.notifications();
+        tokio::spawn(async move {
+            while let Ok(n) = notif.recv().await {
+                if let RelayPoolNotification::Event { event, .. } = n {
+                    if event.kind.as_u16() == gateway::JOB_FEEDBACK_KIND && event.pubkey == seller_pk
+                    {
+                        if let Some(e) = tag_value(&event, "e") {
+                            let status = tag_value(&event, "status").unwrap_or_default();
+                            sink.lock().unwrap_or_else(|e| e.into_inner()).push((e, status));
+                        }
+                    }
+                }
+            }
+        });
+        claims
+    }
+
+    fn claims_contain(claims: &Arc<Mutex<Vec<(String, String)>>>, offer_id: &str, status: &str) -> bool {
+        claims
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|(e, s)| e == offer_id && s == status)
+    }
+
+    /// Poll `cond` until true or `timeout` elapses.
+    async fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut cond: F) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if cond() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn hooks(ready: tokio::sync::mpsc::UnboundedSender<()>) -> RunHooks {
+        RunHooks {
+            ready: Some(ready),
+            // Short auth-wait: the ungated in-process relay never challenges, so proceed fast.
+            auth_wait: Some(Duration::from_millis(500)),
+        }
+    }
+
+    /// Run the daemon on a dedicated OS thread with its own current-thread runtime — mirroring
+    /// production `run_forever_blocking`. This sidesteps `tokio::spawn`'s `Send` bound: under the
+    /// `acp` feature the daemon future is not `Send` (`AcpDriver` holds a non-`Sync` mpsc
+    /// receiver). The daemon reaches the relay over localhost and signals READY over `ready`.
+    fn spawn_daemon_thread(
+        daemon: SellerDaemon,
+        ready: tokio::sync::mpsc::UnboundedSender<()>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("daemon runtime");
+            let _ = rt.block_on(run_forever_hooked(daemon, hooks(ready)));
+        })
+    }
+
+    // ── Assertions A + B + C on one running open-pool seller ────────────────────────────────
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_untargeted_delivery_to_running_open_pool_seller() {
+        let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // Clear any single-flight left by a prior test's (now relay-less) daemon thread.
+        SellerDaemon::end_flight();
+
+        let (relay, relay_url) = start_relay(RelayBuilder::default()).await;
+
+        // Seed the relay's 5109 HISTORY: M offers dated 2 min in the PAST (mix untargeted +
+        // targeted-foreign), all with the fail-closed testnut mint. A BOUNDED running seller must
+        // ingest ~none of these; an unbounded one would fetch them all and claim one.
+        let buyer = Keys::generate();
+        let foreign_seller = Keys::generate().public_key().to_hex();
+        let seeder = connect_client(&relay_url).await;
+        let past = Timestamp::from(Timestamp::now().as_secs().saturating_sub(120));
+        const M: usize = 60;
+        let mut historical_ids: HashSet<String> = HashSet::new();
+        for i in 0..M {
+            let draft = if i % 2 == 0 {
+                offer_draft(None)
+            } else {
+                offer_draft(Some(&foreign_seller))
+            };
+            let id = publish_offer(&seeder, &buyer, &draft, Some(past)).await;
+            historical_ids.insert(id.to_hex());
+        }
+
+        // Open the seller daemon (open-pool) and capture its pubkey.
+        let home = seller_home(&unique_root("live"), &relay_url, true);
+        let daemon = SellerDaemon::open(home).expect("open seller daemon");
+        let seller_pk = PublicKey::parse(daemon.seller_pubkey()).expect("seller pubkey");
+
+        // Observer collects the seller's kind-7000 BEFORE the daemon starts.
+        let observer = connect_client(&relay_url).await;
+        observer
+            .subscribe(
+                Filter::new()
+                    .kind(Kind::Custom(gateway::JOB_FEEDBACK_KIND))
+                    .author(seller_pk),
+                None,
+            )
+            .await
+            .expect("observer subscribe");
+        let claims = spawn_claim_collector(&observer, seller_pk);
+
+        // Start the daemon (own thread + current-thread runtime) with the readiness hook.
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _daemon = spawn_daemon_thread(daemon, ready_tx);
+
+        // A. READY ≤ 10s (mpsc hook — not a stderr scrape).
+        let ready = tokio::time::timeout(Duration::from_secs(10), ready_rx.recv()).await;
+        assert!(
+            matches!(ready, Ok(Some(()))),
+            "A: daemon must reach READY within 10s (got {ready:?})"
+        );
+
+        // B. BOUNDED startup ingest: after a settle window a bounded seller has claimed ZERO
+        // historical offers. On the unbounded/ungrouped filter it would fetch all M and claim ≥1.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        {
+            let claimed = claims.lock().unwrap_or_else(|e| e.into_inner());
+            let historical_hits: Vec<&(String, String)> = claimed
+                .iter()
+                .filter(|(e, _)| historical_ids.contains(e))
+                .collect();
+            assert!(
+                historical_hits.is_empty(),
+                "B: bounded seller must NOT claim historical offers; saw {} historical claim(s): {:?}",
+                historical_hits.len(),
+                historical_hits
+            );
+        }
+
+        // C. LIVE untargeted delivery (THE goal proof): publish a FRESH untargeted offer to the
+        // RUNNING seller and assert the relay receives its kind-7000 status=processing claim
+        // (e=<offer id>) within 10s — an untargeted offer claimed WITHOUT a restart.
+        let live_id = publish_offer(&seeder, &buyer, &offer_draft(None), None)
+            .await
+            .to_hex();
+        let claimed_live = wait_until(Duration::from_secs(10), || {
+            claims_contain(&claims, &live_id, "processing")
+        })
+        .await;
+        assert!(
+            claimed_live,
+            "C: running open-pool seller must CLAIM a fresh untargeted offer (kind-7000 \
+             processing e={live_id}) within 10s — the live untargeted-delivery proof"
+        );
+
+        // Quiesce: let execution finish so single-flight is released before the guard drops.
+        wait_until(Duration::from_secs(8), || !SellerDaemon::in_flight()).await;
+        relay.shutdown();
+    }
+
+    // ── D: relay restricts the broad open-pool filter → seller degrades to targeted ──────────
+
+    /// A [`QueryPolicy`] that rejects a REQ carrying a broad 5109 filter (kind-5109, no authors,
+    /// no `#p`) — i.e. the un-pinned open-pool filter — while allowing the targeted `#p==self`
+    /// filter. Models a relay that refuses to serve the open-pool firehose.
+    #[derive(Debug)]
+    struct RejectBroadOfferQueries;
+
+    impl QueryPolicy for RejectBroadOfferQueries {
+        fn admit_query<'a>(
+            &'a self,
+            query: &'a Filter,
+            _addr: &'a SocketAddr,
+        ) -> BoxedFuture<'a, PolicyResult> {
+            Box::pin(async move {
+                let is_offer_kind = query
+                    .kinds
+                    .as_ref()
+                    .is_some_and(|ks| ks.contains(&Kind::Custom(gateway::JOB_OFFER_KIND)));
+                let has_authors = query.authors.as_ref().is_some_and(|a| !a.is_empty());
+                let has_p_tag = query
+                    .generic_tags
+                    .contains_key(&SingleLetterTag::lowercase(Alphabet::P));
+                if is_offer_kind && !has_authors && !has_p_tag {
+                    PolicyResult::Reject("blocked: broad open-pool 5109 filter".to_string())
+                } else {
+                    PolicyResult::Accept
+                }
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn relay_restricts_broad_filter_seller_degrades_to_targeted() {
+        let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        SellerDaemon::end_flight();
+
+        let (relay, relay_url) =
+            start_relay(RelayBuilder::default().query_policy(RejectBroadOfferQueries)).await;
+
+        let home = seller_home(&unique_root("fallback"), &relay_url, true);
+        let daemon = SellerDaemon::open(home).expect("open seller daemon");
+        let seller_pk = PublicKey::parse(daemon.seller_pubkey()).expect("seller pubkey");
+        let seller_hex = daemon.seller_pubkey().to_string();
+
+        let observer = connect_client(&relay_url).await;
+        observer
+            .subscribe(
+                Filter::new()
+                    .kind(Kind::Custom(gateway::JOB_FEEDBACK_KIND))
+                    .author(seller_pk),
+                None,
+            )
+            .await
+            .expect("observer subscribe");
+        let claims = spawn_claim_collector(&observer, seller_pk);
+
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _daemon = spawn_daemon_thread(daemon, ready_tx);
+
+        // D-1: the daemon still reaches READY even though the relay CLOSES the broad grouped offer
+        // subscription (ready fires after subscribe; the CLOSED is handled in the loop after).
+        let ready = tokio::time::timeout(Duration::from_secs(10), ready_rx.recv()).await;
+        assert!(
+            matches!(ready, Ok(Some(()))),
+            "D-1: daemon must reach READY despite the broad-filter CLOSE (got {ready:?})"
+        );
+
+        // Give the CLOSED → targeted-only fallback subscribe time to land.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // D-2: publish a FRESH TARGETED offer; assert it is CLAIMED via the targeted-only
+        // fallback — proving the seller degraded to targeted-alive instead of going silently deaf.
+        let buyer = Keys::generate();
+        let seeder = connect_client(&relay_url).await;
+        let targeted_id = publish_offer(&seeder, &buyer, &offer_draft(Some(&seller_hex)), None)
+            .await
+            .to_hex();
+        let claimed = wait_until(Duration::from_secs(10), || {
+            claims_contain(&claims, &targeted_id, "processing")
+        })
+        .await;
+        assert!(
+            claimed,
+            "D-2: after the broad-filter CLOSE, the seller must still CLAIM a fresh TARGETED offer \
+             (kind-7000 processing e={targeted_id}) within 10s via the targeted-only fallback"
+        );
+
+        // Quiesce: let execution finish so single-flight is released before the guard drops.
+        wait_until(Duration::from_secs(8), || !SellerDaemon::in_flight()).await;
+        relay.shutdown();
     }
 }
