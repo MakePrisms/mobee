@@ -1246,16 +1246,68 @@ fn offer_subscriptions(
     vec![offer_subscription_filters(seller_pubkey, claim_open_pool)]
 }
 
+/// Cap on the number of most-recently-seen offer ids retained for in-loop dedup.
+///
+/// The dedup set is DEFENSE-IN-DEPTH only (see [`offer_event_should_process`]): it collapses an
+/// offer that matched >1 filter, or a reconnect re-delivery, into one `on_offer_event` call. It
+/// is NOT the money-idempotency guard — that is the DURABLE journal `has_claim` check in
+/// `classify_offer`, which skips any already-claimed offer regardless of this set (and which the
+/// daemon relies on wholesale after any restart, when this set starts empty). So forgetting the
+/// OLDEST ids is safe: it cannot enable a second claim, only a re-check against the journal.
+/// Without a bound the set would grow by one `EventId` per offer for the seller's whole lifetime
+/// (a slow leak); 10k recent ids is ample to dedup filter-overlap and reconnect re-delivery.
+const SEEN_OFFERS_CAP: usize = 10_000;
+
+/// Insertion-ordered bounded set of seen offer ids.
+///
+/// A `VecDeque` holds ids in insertion order (oldest at the front) for O(1) eviction; the
+/// `HashSet` gives O(1) membership. On an insert that grows the set past [`SEEN_OFFERS_CAP`] the
+/// oldest id is evicted from BOTH. A recently-seen id is still reported "already seen"; only ids
+/// older than the last `SEEN_OFFERS_CAP` distinct ids are forgotten. The two structures stay in
+/// lockstep: an id is pushed to `order` exactly when it is newly added to `set`, and eviction
+/// pops the front of `order` and removes that same id from `set`, so `order` never holds a
+/// duplicate and `order.len() == set.len()` always.
+#[derive(Default)]
+struct BoundedSeen {
+    order: VecDeque<nostr_sdk::EventId>,
+    set: std::collections::HashSet<nostr_sdk::EventId>,
+}
+
+impl BoundedSeen {
+    /// Insert `id`, returning `true` iff it was NEW — matching the `HashSet::insert` bool
+    /// semantic [`offer_event_should_process`] relies on. A currently-retained id returns
+    /// `false` (already seen). When the insert grows the set past [`SEEN_OFFERS_CAP`], the
+    /// oldest retained id is evicted from both structures.
+    fn insert(&mut self, id: nostr_sdk::EventId) -> bool {
+        if !self.set.insert(id) {
+            return false;
+        }
+        self.order.push_back(id);
+        if self.order.len() > SEEN_OFFERS_CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
 /// Whether a relay event in the seller loop should be handed to `on_offer_event`.
 ///
 /// True iff the event is a kind-5109 offer not seen before. Routing is by KIND ONLY: a
 /// non-p-tagged (open-pool) offer routes exactly like a targeted one, so the notification path
 /// never drops untargeted offers. The event-id dedup makes a targeted offer that matched more
-/// than one 5109 filter (or a reconnect re-delivery) reach `on_offer_event` at most once.
+/// than one 5109 filter (or a reconnect re-delivery) reach `on_offer_event` at most once. The
+/// set is bounded ([`BoundedSeen`]); forgetting an OLD id is money-safe (durable `has_claim`).
 fn offer_event_should_process(
     event_kind: u16,
     event_id: nostr_sdk::EventId,
-    seen_offers: &mut std::collections::HashSet<nostr_sdk::EventId>,
+    seen_offers: &mut BoundedSeen,
 ) -> bool {
     event_kind == JOB_OFFER_KIND && seen_offers.insert(event_id)
 }
@@ -1382,9 +1434,10 @@ pub(crate) async fn run_forever_hooked(
 
     // Both 5109 filters ride ONE subscription, so the relay delivers each offer once even when
     // a targeted offer matches both filters. Keep an event-id dedup as defense-in-depth (e.g.
-    // reconnect re-delivery) so each offer id reaches `on_offer_event` at most once.
-    let mut seen_offers: std::collections::HashSet<nostr_sdk::EventId> =
-        std::collections::HashSet::new();
+    // reconnect re-delivery) so each offer id reaches `on_offer_event` at most once. Bounded to
+    // the most-recent `SEEN_OFFERS_CAP` ids so it can't leak over the seller's lifetime; an
+    // evicted-then-re-delivered claimed offer is still caught by the durable journal `has_claim`.
+    let mut seen_offers = BoundedSeen::default();
     // Loud-Closed fallback fires at most once (targeted-only is not itself broad-filtered).
     let mut offer_fallback_done = false;
     let mut notifications = client.notifications();
@@ -1868,7 +1921,6 @@ mod tests {
     #[test]
     fn untargeted_offer_routes_to_on_offer_event_and_dedups() {
         use nostr_sdk::prelude::{EventBuilder, Keys, Kind};
-        use std::collections::HashSet;
 
         let buyer = Keys::generate();
         // An UNtargeted (open-pool) 5109 offer carries no p-tag.
@@ -1876,7 +1928,7 @@ mod tests {
             .sign_with_keys(&buyer)
             .expect("sign untargeted offer");
 
-        let mut seen: HashSet<nostr_sdk::EventId> = HashSet::new();
+        let mut seen = BoundedSeen::default();
 
         // A non-p-tagged 5109 offer MUST route to `on_offer_event` on the LIVE push — this rules
         // out the "notification path drops non-p-tagged 5109" failure mode. RED-ON-REVERT: gate
@@ -1894,6 +1946,65 @@ mod tests {
         assert!(
             !offer_event_should_process(Kind::GiftWrap.as_u16(), untargeted.id, &mut seen),
             "non-5109 events must not route to on_offer_event"
+        );
+    }
+
+    /// A distinct, deterministic `EventId` per index — a zero-padded 64-char hex (32 bytes).
+    /// Avoids signing thousands of real events just to fill the bounded set in the cap test.
+    fn eid(i: usize) -> nostr_sdk::EventId {
+        nostr_sdk::EventId::from_hex(&format!("{i:064x}")).expect("valid 32-byte event-id hex")
+    }
+
+    #[test]
+    fn bounded_seen_caps_and_forgets_oldest() {
+        // (a) CAP + eviction. Insert CAP+K distinct ids; the set must retain at most CAP, and
+        // the OLDEST K (the first inserted) must be FORGOTTEN — a forgotten id re-inserts as
+        // NEW (true) again. RED-ON-REVERT: drop the cap/eviction (plain HashSet) and the set
+        // grows to CAP+K (the `<= CAP` assert fails) AND forgotten ids read as already-seen
+        // (the "re-inserts as NEW" assert flips to false).
+        const K: usize = 5;
+        let mut seen = BoundedSeen::default();
+        for i in 0..(SEEN_OFFERS_CAP + K) {
+            assert!(
+                seen.insert(eid(i)),
+                "each of the first CAP+K distinct ids is new on first sight: {i}"
+            );
+        }
+        assert!(
+            seen.len() <= SEEN_OFFERS_CAP,
+            "bounded set must never exceed the cap (held {})",
+            seen.len()
+        );
+        assert_eq!(
+            seen.len(),
+            SEEN_OFFERS_CAP,
+            "after CAP+K inserts the set holds exactly CAP (oldest K evicted)"
+        );
+        // The oldest K ids (0..K) were evicted → each re-inserts as NEW.
+        for i in 0..K {
+            assert!(
+                seen.insert(eid(i)),
+                "a forgotten (oldest, evicted) id must re-insert as NEW: {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_seen_dedups_recent_id() {
+        // (b) window dedup. A recently-inserted id is "already seen": first insert is NEW
+        // (true), a second insert within the retained window returns false (skip) — the
+        // semantic `offer_event_should_process` relies on for filter-overlap / re-delivery.
+        let mut seen = BoundedSeen::default();
+        let id = eid(42);
+        assert!(seen.insert(id), "first sight of an id is NEW");
+        assert!(!seen.insert(id), "a recently-seen id is already seen (deduped)");
+        // Interleave other ids while staying well under the cap — the recent id is retained.
+        for i in 100..200 {
+            seen.insert(eid(i));
+        }
+        assert!(
+            !seen.insert(id),
+            "an id still within the retained window stays already-seen"
         );
     }
 
