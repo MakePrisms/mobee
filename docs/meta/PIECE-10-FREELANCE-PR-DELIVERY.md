@@ -3,7 +3,8 @@
 **The forge hires its own sellers.** This chapter makes mobee do real work *for the forge*: the
 **forge itself becomes a BUYER**, posting jobs against **forge repos it owns**, and mobee **sellers**
 (turtle or external) do the work and deliver it as a **pull request** — fork the target, run the agent,
-push a branch, and the **buyer/forge reviews, merges, and pays**. This fits how the forge team already
+push a branch, and the **buyer/forge verifies, pays, then merges** ("accepts the PR") — one ordering,
+stated in full under § Delivery model. This fits how the forge team already
 collaborates: sellers publish to their own **relay-git namespaces** and **announce via NIP-34**
 (kind-30617); the targets are **relay-git-hosted forge repos**. "Freelance-PR" is that primitive —
 agent labor delivered as a mergeable contribution, settled on-chain-adjacent through the existing money
@@ -15,15 +16,35 @@ a base commit, and the seller delivers a change *against that repo*. Two seller 
 **fork** (push to the seller's own relay-git namespace) or **NIP-34 patch** (kind-1617). **v1 ships
 fork-only**; patch is designed below and explicitly deferred.
 
-> **v3 — a refinement of the v2 adversarial draft (compose → blinded adversarial (Opus) → codex). v2's
-> reshape is PRESERVED in full.** v3 folds the now-**RESOLVED** operator rulings, reframes the goal
-> (forge-as-buyer), separates delivery from settlement, adds a chapter-level acceptance, and
-> **re-verifies every code ref against dev tip `0f05d9b`**. The money path is **commit-oid-typed end to
-> end**; the descendant gate is still **greenfield** (no spike code in the source tree); **the receipt
-> now DOES attest the delivered object** — piece-9 v3 landed the delivery binding (**option (a)**, @
-> `4190a15`); **replay/lift (authorship bind) is still open**. freelance-PR remains a **full
-> money-adjacent build, not an additive doc change** (size acknowledged by gudnuf). This piece goes to a
-> fresh **codex-deep design pass + coordinator shape review** before any build.
+> **v4 — folds a codex-deep design review (compose → blinded adversarial (Opus) → codex, complete)**
+> into the strong v3 draft. **v3 is preserved; v4 SHARPENS MECHANISMS — it does not re-open the design.**
+> The refinements: the **authorship bind is re-centred on the seller's schnorr-signed kind-6109 result**
+> (which commits to `{job_id, seller_pubkey, target_repo, base_oid, fork_ref, commit_oid}`) — a git
+> commit-**trailer** is **downgraded to optional** in-commit provenance; delivery is stated as **ONE
+> state machine — `verify → pay → merge`** (FF-preferred, buyer-custody); `base_oid` is resolved from the
+> **pinned `target_repo`**, not the seller echo; seller result fields are **equality-checked against the
+> buyer's signed offer, never treated as authority**; the content gate is **honestly scoped** (stops
+> **empty / out-of-scope**, NOT worthless-in-scope — quality-judging stays deferred to the
+> payment-and-reputation chapter); **custody-retention** is added (the buyer fetches + retains the paid
+> object and merges by the local oid); and the new fields are enumerated as schema/state additions
+> **adjacent to** authorization (frozen money-core stays byte-scope).
+>
+> **Two items were flagged PROPOSED-PENDING-COORDINATOR and are now CONFIRMED at coordinator
+> shape-review** (folded below as RESOLVED, no longer pending): **(1)** the chapter-acceptance pay-bind
+> wording — *pay binds the delivered FORK-TIP `commit_oid` (== the seller-signed 6109 `commit_oid`),
+> merged/FF'd into target; a merge commit is NOT the paid object*; **(2)** the receipt stays **as-is**
+> (attests the delivered object + `delivery_kind`, already landed in piece-9) with **no re-lock** —
+> contribution-context (`target_repo`, `base_oid`) rides the **signed kind-6109** + the buyer's
+> accept-bind/journal, so a receipt extension is not warranted (see § Receipt binding).
+>
+> **v3 lineage (preserved):** a refinement of the v2 adversarial draft (compose → blinded adversarial
+> (Opus) → codex). v2's reshape is PRESERVED in full. v3 folds the now-**RESOLVED** operator rulings,
+> reframes the goal (forge-as-buyer), separates delivery from settlement, adds a chapter-level
+> acceptance, and **re-verifies every code ref against dev tip `0f05d9b`**. The money path is
+> **commit-oid-typed end to end**; the descendant gate is still **greenfield** (no spike code in the
+> source tree); **the receipt now DOES attest the delivered object** — piece-9 v3 landed the delivery
+> binding (**option (a)**, @ `4190a15`). freelance-PR remains a **full money-adjacent build, not an
+> additive doc change** (size acknowledged by gudnuf).
 
 Class: **MONEY-adjacent** → composition + adversarial + codex + operator gate. **Re-verified against
 `origin/dev` `0f05d9b`** (dev tip): `authorize_pay.rs`, `receipt.rs`, `payment.rs`, `delivery.rs`,
@@ -47,12 +68,31 @@ The coordinator's names, used consistently throughout this doc:
   buyer fetches and later merges).
 - **`commit_oid`** — the **fork tip** commit the seller advertises and the buyer pays against.
 
-**Flow:** offer (`target_repo` + `base_oid`) → seller forks + runs its agent + pushes `fork_ref` →
-seller **result advertises `{target_repo, base_oid, fork_ref, commit_oid}`** → **buyer verify**: fetch
-the fork commit → assert it **descends from `base_oid`** (ancestry) → **tip-match** (fetched tip ==
-`commit_oid`) → **bind payment to `commit_oid`** → **merge** = the buyer/forge merges `fork_ref` into
-`target_repo` ("accept the PR") → receipt closes. Merge is a **buyer-custody** action (accepting the
-PR); it is **not** what payment binds — payment binds the verified `commit_oid`.
+**Flow — ONE state machine (`verify → pay → merge`, stated identically everywhere):**
+offer (pinned `target_repo` + `base_oid`) → seller forks + runs its agent + pushes `fork_ref` → seller
+**result advertises `{target_repo, base_oid, fork_ref, commit_oid}` inside its schnorr-signed kind-6109**
+→ **buyer verify** (all pre-pay, all against BUYER-CONTROLLED inputs):
+
+1. **Custody fetch** — fetch the fork tip into a **buyer-controlled ref / object-store** (custody);
+   record that local ref in the accept-bind. The buyer thereafter operates on the **local custody oid**,
+   never the live fork branch name.
+2. **base resolved from the PIN** — fetch `base_oid` from the **pinned `target_repo` (`naddr`)** into the
+   same custody odb (NOT the seller-echoed value); fail-closed if `base_oid` is missing from the pinned
+   target.
+3. **Descendant** — peel both as commits; `git merge-base --is-ancestor <base_oid> <commit_oid>`.
+4. **Tip-match** — fetched custody tip == `commit_oid`.
+5. **Authorship** — verify the **seller's kind-6109 signature** over the tuple and that the fetched/paid
+   commit == the signed `commit_oid` (the seller's own sig binds `seller_pubkey` → `commit_oid`).
+6. **Content gate** — non-empty + in-scope (MUST #5; a floor, **not** a quality bar).
+
+The seller-echoed `{target_repo, base_oid, fork_ref}` are **equality-checked against the buyer's signed
+offer/accept-bind only** — a cross-check input, never authority; all fetch/merge policy comes from the
+buyer's signed offer. → **`authorize_pay` binds payment to the delivered FORK-TIP `commit_oid`** (the
+existing money path, unchanged) → **THEN merge** = the buyer/forge merges the **custodied `commit_oid`**
+into `target_repo` ("accept the PR"), **FF-preferred** so the merged oid == the paid fork-tip → receipt
+closes. Merge is a **buyer-custody** action and is **not** what payment binds — **payment binds the
+verified FORK-TIP `commit_oid`, never a merge commit** (a non-FF merge commit is a different oid and is
+not the paid object).
 
 ---
 
@@ -107,36 +147,61 @@ design is specified below (§ Path B) but marked **NOT-v1**.
 The seller branches off the offer's `base_oid`, commits its agent's work, and pushes to its **own**
 relay-git namespace (`default_relay_git_remote`, `home.rs:95` — owner-scoped push forces the fork; no
 write access to the buyer's `target_repo`). It announces the fork (kind-30617, `profile.rs:421`) and its
-kind-6109 **result advertises `{target_repo, base_oid, fork_ref, commit_oid}`** (`fork_ref` = fork repo
-+ branch; `commit_oid` = the fork tip). **Binding: `delivery_integrity_hash = commit_oid`** (the fork
-tip) — the existing commit-oid tip-match (`delivery.rs:86` `from_fetched_tip`), so v1 reuses the money
-path unchanged. Post-pay, the buyer **merges `fork_ref` into `target_repo`** ("accept the PR") — a
-buyer-custody action, not what payment binds.
+kind-6109 **result advertises `{target_repo, base_oid, fork_ref, commit_oid}` inside the seller's schnorr
+signature** (`fork_ref` = fork repo + branch; `commit_oid` = the fork tip). **Binding:
+`delivery_integrity_hash = commit_oid`** (the fork tip) — the existing commit-oid tip-match
+(`delivery.rs:86` `from_fetched_tip`), so v1 reuses the money path unchanged. Ordering is the ONE state
+machine (**`verify → pay → merge`**): after the buyer binds payment to the fork-tip `commit_oid`, it
+**merges the custodied `commit_oid` into `target_repo`** ("accept the PR", **FF-preferred**) — a
+buyer-custody action, **not** what payment binds.
 
 **MUSTs added for contribution (all NEW build — none exist today):**
 
-1. **Thread `base_oid`** from the offer → accept-bind → pay request → verifier. Without it the
-   descendant gate cannot run and the offer's target is decorative. (Today: **0 hits** for `base_oid` in
-   source.)
-2. **Descendant gate (greenfield).** Fetch `base_oid` into the same custody odb; refuse unless
-   `git merge-base --is-ancestor <base_oid> <commit_oid>`. Closes unrelated-history / swapped-base
-   advertisement. (New build — no `verify_git_descendant`/`merge-base` in source.)
-3. **Authorship bind (closes replay/lift).** The delivered commit MUST carry a trailer binding
-   `job_id` + `seller_pubkey`; verify it pre-pay. Without it a seller can advertise a **third party's**
-   public fork tip that descends from `base_oid` and be paid for work it did not do (`job_hash` and
-   `sig/seller` cover only the job-hash, not the commit).
-4. **Pin `target_repo` as an `naddr`** (owner pubkey + relay/clone URL), **not** a bare `d`-tag
-   (`.names` is global across owners → spoofable, `home.rs:86-87`). The pay path MUST bind the
-   **offer's** `target_repo` + `base_oid`, not accept the seller result's repo unchecked.
-5. **Content / non-empty gate (autonomous MUST).** v1 contribution is autonomous (no human reads the
-   diff before pay), so refuse a delivery whose diff against `base_oid` is empty or does not touch the
-   offered paths — else an empty-but-descendant commit passes descendant + tip-match and is paid
-   (paid-worthless grief). Resolves the blind-vs-human ambiguity: v1 is blind → a content gate is
-   required. (Note: the post-pay **merge** is a separate human/forge review step — but pay must not
-   depend on it; the content gate is the autonomous floor.)
-6. **Per-job unique ref** (full `job_id`, not the `mobee/<job_id[:8]>` prefix that collides) and
-   **no-force-push as a contribution MUST** (a later push must not move the advertised `commit_oid` out
-   from under a paid receipt — do not leave it deferred here).
+1. **Thread the contribution binds** — `base_oid`, the pinned `target_repo`, `fork_ref`, and the
+   **buyer-custody local ref** — from the offer → accept-bind → pay request → verifier (enumerated as
+   schema/state additions in § Money-gate). Without `base_oid` the descendant gate cannot run and the
+   offer's target is decorative. (Today: **0 hits** for `base_oid` in source.)
+2. **Descendant gate (greenfield), base resolved from the PIN.** `base_oid` MUST be resolved/fetched
+   from the **pinned `target_repo` (`naddr`)** — **NOT the seller-echoed value** — into the **same
+   custody odb** as the fork tip; peel both as commits and refuse unless
+   `git merge-base --is-ancestor <base_oid> <commit_oid>`; **fail-closed if `base_oid` is missing from
+   the pinned target**. Closes unrelated-history / swapped-base advertisement. Ancestry proves lineage,
+   **not meaningfulness** — any meaningful-contribution limits (diff-scope / object-size) live in the
+   MUST #5 policy hook, not here. (New build — no `verify_git_descendant`/`merge-base` in source.)
+3. **Authorship bind (closes replay/lift) — the seller's SIGNED kind-6109 result IS the bind.** A git
+   trailer is **NOT sufficient**: trailer text is copyable and proves text-inclusion, not seller
+   authorship, so a seller could be **paid for a third party's commit**. Instead, the seller's kind-6109
+   **result event (already schnorr-signed by the seller)** MUST commit, in its signed payload, to the
+   tuple `{job_id, seller_pubkey, target_repo, base_oid, fork_ref, commit_oid}`; the buyer verifies
+   **(a)** the seller signature and **(b)** that the fetched/paid commit == the signed `commit_oid`. The
+   seller's own signature thus cryptographically ties `seller_pubkey` → this `job_id` → this exact
+   `commit_oid` — it **cannot be paid for a third party's commit**. The git commit-**trailer** is
+   **downgraded to OPTIONAL** in-commit provenance (not the security bind). Optionally **also** require a
+   git commit **signature** by the seller key where practical (belt-and-suspenders). (`job_hash` /
+   `sig/seller` cover only the job-hash, not the commit — hence the signed tuple.)
+4. **Pin `target_repo` as an `naddr` (owner pubkey + relay/clone URL), not a bare `d`-tag** (`.names` is
+   global across owners → spoofable, `home.rs:86-87`). **Authority is the buyer's SIGNED offer, never the
+   seller echo:** the seller result's `{target_repo, base_oid, fork_ref}` are **equality-checked against
+   the buyer's signed offer / accept-bind ONLY** (a cross-check input), and **all fetch/merge policy —
+   which repo, which base, where to fetch/merge — comes from the buyer's signed offer**. This closes the
+   confused-deputy: the buyer never fetches, bases, or merges against a seller-provided value.
+5. **Content / non-empty gate (autonomous MUST) — honestly scoped.** v1 contribution is autonomous (no
+   human reads the diff before pay), so refuse a delivery whose diff against `base_oid` is **empty or
+   out-of-scope** (does not touch the offered paths). **This is the floor, and only the floor: it stops
+   EMPTY / OUT-OF-SCOPE deliveries — it is NOT a quality gate.** An in-scope-but-worthless diff can still
+   pass and be paid; **judging quality is the hard problem, deferred to the payment-and-reputation
+   chapter** (§ Settlement). Do **not** overclaim this gate as paid-worthless-grief prevention — it is
+   not. To let a buyer tighten the floor, v1 exposes a **configurable buyer POLICY HOOK** (path allowlist
+   + forbidden paths + max-diff-size + an optional CI/tests predicate) that **MAY** gate pre-pay; it is
+   the home for any meaningful-contribution limits. (The post-pay **merge** is a separate forge review
+   step, but pay must not depend on it — the content gate + policy hook are the autonomous floor.)
+6. **Ref stability + custody retention.** Use a **per-job unique ref** (full `job_id`, not the
+   `mobee/<job_id[:8]>` prefix that collides) and enforce **no-force-push as a contribution MUST** (a
+   later push must not move the advertised `commit_oid` out from under a paid receipt). **Custody
+   retention (NEW):** the verifier MUST fetch `commit_oid` into a **buyer-controlled ref / object-store**,
+   **record that local ref in the accept-bind**, and **merge by the LOCAL `commit_oid`** — never the live
+   fork branch name — so a seller who **deletes or moves the fork after pay cannot strand the buyer**.
+   (No-force-push covers tip-move; custody-retention covers deletion too.)
 
 ## Path B — NIP-34 patch (kind-1617) — DEFERRED (design only, NOT v1)
 
@@ -149,7 +214,8 @@ Requires the parallel typed money-path (above) plus:
   parties compute different trees (false refuse) or an attacker games normalization.
 - **Strict apply against `base_oid`:** no 3-way, no fuzz; clean-apply-failure = fail-closed refuse; the
   patch event pins `base_oid` so the tree is unambiguously against the named base.
-- Same authorship bind + `target_repo` pin as Path A.
+- Same authorship bind (the seller's signed kind-6109 tuple — with the patch's **tree oid** as the bound
+  delivered object) + `target_repo` pin + equality-check-not-authority as Path A.
 - **`delivery_kind = patch`** in the receipt binding (the tag already exists — `gateway.rs:530`,
   `receipt.rs:112`) discriminates commit-vs-tree in the co-signed preimage.
 
@@ -202,6 +268,17 @@ present in code at dev tip:
 > Note for the contribution build: `delivery_kind` is the wire/preimage name of the "path" discriminator
 > the coordinator's charter called a *path tag*; it carries `fork`|`patch`. Option (b) (local-journal
 > only) is **not** taken.
+>
+> **Contribution-context — RESOLVED (keep the piece-9 receipt AS-IS; NO re-lock).** The kind-3400 receipt
+> object + `delivery_kind` stay exactly as they landed in piece-9. Rationale: the seller's **signed
+> kind-6109** already carries and signs `{target_repo, base_oid, commit_oid}` (and MUST #3 makes that
+> signature the authorship anchor), so the contribution context is **already cryptographically recorded**
+> there; the receipt itself already binds the paid `commit_oid` via `delivery_integrity_hash` + both
+> co-sigs. Duplicating `target_repo` / `base_oid` into the kind-3400 would be **redundant if unsigned**
+> (tamperable) or a **piece-9 re-lock if signed** (money-code churn on a LOCKED, teeth'd artifact — not
+> warranted). Contribution context therefore lives authoritative in the **buyer accept-bind / journal +
+> the signed kind-6109**. A self-describing receipt is an **optional FUTURE observatory follow-up, not
+> this arc.**
 
 ## Offer shape (contribution mode; additive)
 
@@ -212,17 +289,23 @@ present in code at dev tip:
 | `base` | `["base","<base_branch>","<base_oid>"]` | base branch + the exact `base_oid` the contribution must descend from |
 | `accepts` | `["accepts","fork"]` (v1) | positional multi-value (`["accepts","fork","patch"]` when patch ships) — not comma-joined |
 
-The kind-6109 **result** echoes `target_repo` + `base_oid` (so the buyer can bind them to the offer) and
-adds `fork_ref` (repo + branch) + `commit_oid` (the advertised tip).
+The kind-6109 **result** echoes `target_repo` + `base_oid` and adds `fork_ref` (repo + branch) +
+`commit_oid` (the advertised tip) — **all inside the seller's schnorr signature**. The echoed
+`target_repo` / `base_oid` are a **cross-check input only** (equality-checked against the buyer's signed
+offer); **authority is the buyer's signed offer** — the buyer resolves `base_oid` from the pinned
+`target_repo`, never from the seller echo (MUST #2, MUST #4).
 
-## Back-compat (runtime teeth, not honor-system)
+## Back-compat (buyer refusal is the security boundary)
 
 - **From-scratch unchanged** (no `job-class` ⇒ existing path).
-- A seller **without** contribution support MUST emit a kind-7000 `status=error` on a
-  `job-class=contribution` offer — it MUST NOT silently run it as from-scratch and push to its own repo
-  (which would let the buyer pay against a non-descendant commit with no error).
-- A buyer MUST **refuse** a result whose delivery does not satisfy the contribution binds
-  (descendant + authorship + `target_repo`/`base_oid` match + content gate).
+- **Seller kind-7000 refusal = INTEROP courtesy, not a security control.** A seller without contribution
+  support *should* emit a kind-7000 `status=error` on a `job-class=contribution` offer rather than
+  silently run it as from-scratch and push to its own repo — but this is a **courtesy a legacy or
+  malicious seller can ignore**, so **no money decision may rest on it**.
+- **The NORMATIVE SECURITY BOUNDARY is BUYER-side.** The buyer MUST **refuse** any result whose delivery
+  does not satisfy the contribution binds — custody fetch + descendant (base-from-pin) + authorship
+  (seller-signed kind-6109 tuple) + `target_repo` / `base_oid` equality-check + content gate. **Only the
+  buyer's refusal protects the money;** a well-behaved seller is a convenience, never the guarantee.
 
 ## Money-gate (coordinator's money bar)
 
@@ -233,6 +316,13 @@ dual-review (both frames).** The **frozen money-core** (`payment_wallet.rs` / `a
 `payment.rs`) stays **byte-scope** — unchanged unless the build genuinely requires it, and any such need
 is **flagged explicitly** for the coordinator (the new binds add threading + a verifier gate; they should
 not need to rewrite the frozen wallet/authorize/payment core).
+
+**Fields threaded (schema/state additions ADJACENT to authorization — NOT wallet/payment rewrites):** the
+accept-bind + `authorize_request` gain `base_oid`, the pinned `target_repo` (`naddr`), `fork_ref`, and the
+**buyer-custody local ref**. These sit next to the existing `commit_oid` bind; the **frozen money-core**
+(`payment_wallet.rs` / `authorize_pay.rs` / `payment.rs`) stays **byte-scope**. The **receipt is not
+extended** by this chapter (RESOLVED — see § Receipt binding): contribution-context rides the signed
+kind-6109 + the buyer accept-bind/journal, so no kind-3400 re-lock is warranted.
 
 ## Findings — RESOLVED
 
@@ -246,6 +336,15 @@ not need to rewrite the frozen wallet/authorize/payment core).
    (`base_oid` threading + greenfield descendant gate + authorship bind + `target_repo` pin + content
    gate + runtime refuse) — **not** the additive doc change the original charter framed. gudnuf
    **size-acked** this. The fork path fits the existing commit-typed money bind; the rest is new.
+4. **codex-deep design refinements — FOLDED (v4).** The compose→adversarial→codex pass sharpened
+   mechanisms without re-opening the design: authorship re-centred on the **seller-signed kind-6109
+   tuple** (git trailer → optional, MUST #3); ONE `verify → pay → merge` state machine, FF-preferred,
+   buyer custody (§ Delivery model, MUST #6); `base_oid` resolved from the pin (MUST #2); seller fields
+   **equality-checked, not authority** (MUST #4); content gate **honestly scoped** to empty/out-of-scope
+   + policy hook (MUST #5); fields enumerated adjacent to authorization (§ Money-gate); buyer-refusal as
+   the security boundary (§ Back-compat). The two items flagged PROPOSED-PENDING were **CONFIRMED at
+   coordinator shape-review** (RESOLVED): the chapter-acceptance pay-bind wording, and no receipt
+   extension (contribution-context rides the signed kind-6109 + accept-bind — § Receipt binding).
 
 ## Acceptance — SPEC-DOC bar
 
@@ -254,14 +353,21 @@ not need to rewrite the frozen wallet/authorize/payment core).
 - Offer fields (contribution) specified + differ from from-scratch.
 - **Fork path (v1)** fully specified incl. the six MUSTs; patch path designed + explicitly deferred with
   the reason (money-path retyping).
-- Pay binding per path stated (fork = commit-oid tip-match reused; patch = tree-oid, deferred) with the
-  commit-vs-tree type-confusion + determinism hazards named.
-- Descendant + authorship + `target_repo`-identity gates specified as NEW MUSTs (greenfield).
-- Receipt binding resolved (option (a), landed @ `4190a15`) — recorded, not left open.
+- **Delivery is ONE state machine — `verify → pay → merge`** (FF-preferred, buyer-custody) — stated
+  identically in the intro, § Delivery model, Path A, and both acceptance bars.
+- Pay binding per path stated (fork = the delivered **FORK-TIP `commit_oid`** tip-match reused, **never a
+  merge commit**; patch = tree-oid, deferred) with the commit-vs-tree type-confusion + determinism
+  hazards named.
+- Descendant (base-from-pin) + authorship (**seller-signed kind-6109 tuple**, git trailer optional) +
+  `target_repo`-identity (equality-check, not authority) + custody-retention + honestly-scoped content
+  gate specified as NEW MUSTs (greenfield).
+- Receipt binding resolved (option (a), landed @ `4190a15`) — recorded, not left open; v4 **confirms the
+  receipt is NOT extended** (contribution-context rides the signed kind-6109 + accept-bind).
 - Delivery ⊥ settlement; settlement is status-quo verify-then-pay AS-IS; grace + escrow + reputation
   deferred to a future payment-and-reputation chapter (quality-judging is the hard problem, not
   atomicity), with freelance-PR as its testing vehicle.
-- Back-compat with runtime teeth (kind-7000 refuse; buyer refuse), not honor-system.
+- Back-compat: **buyer-refusal is the normative security boundary**; the seller kind-7000 refusal is an
+  interop courtesy, not honor-system money protection.
 - Code refs re-verified against dev tip `0f05d9b`; moved refs updated.
 
 ## Acceptance — CHAPTER (freelance-PR is REAL)
@@ -271,21 +377,28 @@ hiring a mobee to do forge work)*
 
 ```
 acceptance (chapter):
+  # ordering is ONE state machine: verify -> pay -> merge (see § Delivery model)
   return_predicate: >
     A REAL forge job targeting a REAL relay-git forge repo is posted; a mobee seller
-    (turtle or external) forks the target, runs its agent, and delivers a result advertising
-    {target_repo, base_oid, fork_ref, commit_oid} where the commit DESCENDS from base_oid;
-    the BUYER verify-path fetches the fork commit, asserts base-ancestry + tip-match, and
-    binds payment to commit_oid; the forge reviews + MERGES fork_ref into the target and PAYS;
-    a kind-3400 receipt closes with BOTH co-sigs verifying (independent teeth); full suite
-    green on the frozen FF candidate; NON-mock — the PR is agent-authored real work merged
-    into a real forge repo.
+    (turtle or external) forks the target, runs its agent, and delivers a kind-6109 result
+    SCHNORR-SIGNED BY THE SELLER over {job_id, seller_pubkey, target_repo, base_oid, fork_ref,
+    commit_oid}, where commit_oid DESCENDS from base_oid; the BUYER verify-path fetches the fork
+    commit INTO BUYER CUSTODY, resolves base_oid from the PINNED target, and asserts
+    base-ancestry + tip-match + seller-authorship (the 6109 signature binds seller_pubkey to
+    commit_oid) + content gate; pay binds the delivered FORK-TIP commit_oid (== the seller-signed
+    6109 commit_oid), merged/FF'd into target; a merge commit is NOT the paid object; a
+    kind-3400 receipt closes with BOTH co-sigs verifying (independent teeth); full suite green on
+    the frozen FF candidate; NON-mock — the PR is agent-authored real work merged into a real
+    forge repo.
   non_counting:
     - a from-scratch artifact job (not a contribution against a target repo)
     - a contribution "delivery" that is never actually merged into the target
     - suite-green without a live real-forge-job -> PR -> merge -> pay leg
     - base-ancestry left unchecked
-    - payment bound to anything other than the merged commit_oid
+    - pay bound to a commit_oid != the seller-signed kind-6109 commit_oid
+    - authorship established by a git trailer rather than the signed kind-6109
+    - verify that binds/pays BEFORE fetching commit_oid into buyer custody
+    - base_oid taken from the seller echo rather than the buyer's pinned target
 ```
 
 ## Fence / reality class
@@ -293,8 +406,9 @@ acceptance (chapter):
 **SPEC-DRAFT (design).** No code lands here. Reality: from-scratch delivery **PROVEN** (c/c2), and the
 collect leg is **REAL-AND-LIVE**; contribution is **NOT BUILT** — fork-path v1 is buildable on the
 existing commit-typed money path (receipt binding already landed) **plus** the new gates (base_oid
-threading, descendant, authorship, target_repo pin, content); patch path needs a parallel typed
-money-path (deferred).
+threading + base-from-pin, descendant, authorship via the seller-signed kind-6109 tuple, target_repo
+equality-check, content gate + policy hook, and buyer-custody retention); patch path needs a parallel
+typed money-path (deferred).
 
 ## Reference
 
