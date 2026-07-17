@@ -388,9 +388,15 @@ assert.ok(tRow, "tagged 6109 result fills an economics row");
 assert.equal(tRow.total_tokens, 140);
 assert.equal(tRow.harness_family, "claude");
 assert.equal(tRow.usage_transport, "acp-native");
+// input / output columns fill from the ["tokens",N,"input"|"output"] tags.
+assert.equal(tRow.input_tokens, 100, "input column fills from the input tag");
+assert.equal(tRow.output_tokens, 40, "output column fills from the output tag");
 assert.ok(uRow, "untagged 6109 result still rows out");
 assert.equal(uRow.total_tokens, null, "untagged usage stays dashed — never fabricated");
 assert.equal(uRow.harness_family, null);
+// absent input/output → dash (null), NEVER a fabricated 0.
+assert.equal(uRow.input_tokens, null, "absent input → dash, never a fabricated 0");
+assert.equal(uRow.output_tokens, null, "absent output → dash, never a fabricated 0");
 
 // ——— row SOURCE: "delivered" (6109-only) must never read as "paid" (3400-backed) ———
 

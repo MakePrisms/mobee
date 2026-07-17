@@ -170,6 +170,8 @@ export function createStore() {
           paid_price_tokens: u.paid_price_tokens,
           measured_cost_tokens: u.measured_cost_tokens,
           total_tokens: u.total_tokens,
+          input_tokens: u.input_tokens,
+          output_tokens: u.output_tokens,
           usage_transport: u.usage_transport,
           harness_family: u.harness_family,
         });
@@ -194,6 +196,8 @@ export function createStore() {
           paid_price_tokens: u.paid_price_tokens,
           measured_cost_tokens: u.measured_cost_tokens,
           total_tokens: u.total_tokens,
+          input_tokens: u.input_tokens,
+          output_tokens: u.output_tokens,
           usage_transport: u.usage_transport,
           harness_family: u.harness_family,
         });
