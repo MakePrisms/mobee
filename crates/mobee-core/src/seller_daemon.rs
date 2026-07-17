@@ -635,8 +635,12 @@ impl SellerDaemon {
         // Piece-9 Item 2: harness-generic PUBLIC seller-claimed usage block (opportunistic;
         // absent fields stay absent). `usage` carries the ACP-native token/model/cost the driver
         // surfaced this run — `None` when the harness exposed nothing.
-        let exec_metadata =
-            seller_exec_metadata(&seller_cfg.agent_command, wall_time_ms, usage.as_ref());
+        let exec_metadata = seller_exec_metadata(
+            &seller_cfg.agent_command,
+            seller_cfg.agent.as_deref(),
+            wall_time_ms,
+            usage.as_ref(),
+        );
         let draft = git_result_draft(
             &active.job_id,
             &active.buyer_pubkey,
@@ -688,9 +692,9 @@ fn mint_url(raw: &str) -> Result<cashu::MintUrl, DaemonError> {
 /// Build the piece-9 Item-2 seller-claimed PUBLIC usage block for a kind-6109 result.
 ///
 /// Per gudnuf's Q2 ruling this block is PUBLIC and harness-generic. It is **opportunistic**:
-/// emit only fields the seller can source. `harness` is derived from the configured agent
-/// command (USAGE-MATRIX checkpoint-b), `wall_time` is measured, and `metadata_trust=
-/// seller-claimed` is required whenever any field is present (anchor rule).
+/// emit only fields the seller can source. `harness` is resolved from the configured preset
+/// label (else the agent command — USAGE-MATRIX checkpoint-b), `wall_time` is measured, and
+/// `metadata_trust=seller-claimed` is required whenever any field is present (anchor rule).
 ///
 /// `usage_transport` reflects **reality**: when the ACP driver actually captured usage this
 /// run it is that surface (`acp-native`); otherwise the harness's declared axis.
@@ -702,10 +706,11 @@ fn mint_url(raw: &str) -> Result<cashu::MintUrl, DaemonError> {
 /// four tags — legacy/no-capture trades stay honestly dashed.
 fn seller_exec_metadata(
     agent_command: &[String],
+    agent_preset: Option<&str>,
     wall_time_ms: u64,
     usage: Option<&UsageMetadata>,
 ) -> Vec<TagSpec> {
-    let (harness, static_transport) = harness_and_transport(agent_command);
+    let (harness, static_transport) = harness_and_transport(agent_command, agent_preset);
     let transport = usage
         .and_then(|u| u.transport)
         .map(|t| t.as_str())
@@ -761,18 +766,39 @@ fn seller_exec_metadata(
     tags
 }
 
-/// Best-effort harness id + usage transport (USAGE-MATRIX checkpoint-b) from the configured
-/// agent command. Unknown harness ⇒ the command basename + the conservative `side-channel`.
-fn harness_and_transport(agent_command: &[String]) -> (String, &'static str) {
-    let program = agent_command.first().map(String::as_str).unwrap_or("");
-    let lower = program.to_ascii_lowercase();
-    if lower.contains("codex") {
+/// Best-effort harness id + usage transport (USAGE-MATRIX checkpoint-b).
+///
+/// The configured **preset label** (`claude`|`cursor`|`codex`, [`SellerConfig::agent`]) is the
+/// authoritative harness/adapter identity and is preferred over argv inspection: presets launch
+/// the ACP adapter via `npx <adapter-package>` (argv0 = `npx`), so an argv0-naive id emitted
+/// `npx` — which the observatory (`harnessFamilyFromId`) maps to `harness_family="other"`, hiding
+/// real claude/codex/cursor jobs on the dashboard. When no preset label is present (raw
+/// `--agent-argv` power-user hatch) fall back to scanning the FULL adapter argv (not just argv0):
+/// the adapter package name (e.g. `@agentclientprotocol/claude-agent-acp`) still carries the
+/// family. Unknown ⇒ the command basename + the conservative `side-channel`.
+fn harness_and_transport(
+    agent_command: &[String],
+    agent_preset: Option<&str>,
+) -> (String, &'static str) {
+    // Preset label is authoritative — resolve from the adapter identity, never argv0.
+    if let Some(preset) = agent_preset {
+        match preset.trim().to_ascii_lowercase().as_str() {
+            "claude" => return ("claude-agent-acp".to_owned(), "side-channel"),
+            "codex" => return ("codex-acp-ng".to_owned(), "acp-native"),
+            "cursor" => return ("cursor-agent".to_owned(), "side-channel"),
+            _ => {}
+        }
+    }
+    // Hatch fallback: scan the FULL argv (adapter identity), not just argv0.
+    let joined = agent_command.join(" ").to_ascii_lowercase();
+    if joined.contains("codex") {
         ("codex-acp-ng".to_owned(), "acp-native")
-    } else if lower.contains("cursor") {
+    } else if joined.contains("cursor") {
         ("cursor-agent".to_owned(), "side-channel")
-    } else if lower.contains("claude") {
+    } else if joined.contains("claude") {
         ("claude-agent-acp".to_owned(), "side-channel")
     } else {
+        let program = agent_command.first().map(String::as_str).unwrap_or("");
         let basename = program.rsplit('/').next().unwrap_or(program);
         let harness = if basename.is_empty() {
             "unknown".to_owned()
@@ -1199,7 +1225,7 @@ mod tests {
 
         // claude ⇒ side-channel; codex ⇒ acp-native; unknown ⇒ basename + side-channel.
         // `None` usage: the pre-capture block — token/model/cost stay absent.
-        let claude = seller_exec_metadata(&["claude".into(), "--print".into()], 1234, None);
+        let claude = seller_exec_metadata(&["claude".into(), "--print".into()], None, 1234, None);
         assert_eq!(value(&claude, "harness").as_deref(), Some("claude-agent-acp"));
         assert_eq!(value(&claude, "usage_transport").as_deref(), Some("side-channel"));
         // Anchor rule: metadata_trust present whenever any field is present.
@@ -1210,13 +1236,73 @@ mod tests {
         assert!(value(&claude, "model").is_none());
         assert!(value(&claude, "cost").is_none());
 
-        let codex = seller_exec_metadata(&["/nix/store/x/bin/codex-acp".into()], 5, None);
+        let codex = seller_exec_metadata(&["/nix/store/x/bin/codex-acp".into()], None, 5, None);
         assert_eq!(value(&codex, "harness").as_deref(), Some("codex-acp-ng"));
         assert_eq!(value(&codex, "usage_transport").as_deref(), Some("acp-native"));
 
-        let unknown = seller_exec_metadata(&["/opt/tools/mytool".into()], 5, None);
+        let unknown = seller_exec_metadata(&["/opt/tools/mytool".into()], None, 5, None);
         assert_eq!(value(&unknown, "harness").as_deref(), Some("mytool"));
         assert_eq!(value(&unknown, "usage_transport").as_deref(), Some("side-channel"));
+    }
+
+    #[test]
+    fn claude_preset_resolves_harness_family_claude_despite_npx_argv0() {
+        // Mirror the observatory reader (web/network/js/parse.js `harnessFamilyFromId`):
+        // a family substring wins; present-but-unrecognized (e.g. "npx") → "other".
+        fn harness_family(id: &str) -> &'static str {
+            let s = id.to_ascii_lowercase();
+            if s.contains("claude") {
+                "claude"
+            } else if s.contains("cursor") {
+                "cursor"
+            } else if s.contains("codex") {
+                "codex"
+            } else {
+                "other"
+            }
+        }
+        let value = |tags: &[TagSpec], name: &str| -> Option<String> {
+            tags.iter()
+                .find(|tag| tag.first() == Some(name))
+                .and_then(|tag| tag.value().map(str::to_owned))
+        };
+
+        // The `claude` preset launches the ACP adapter via `npx` (argv0 = "npx"). An argv0-naive
+        // id emits "npx" → harness_family "other" (the gudnuf-visible dashboard bug). The preset
+        // label must drive resolution to "claude-agent-acp" → family "claude".
+        let npx_claude = vec![
+            "/usr/bin/npx".to_string(),
+            "-y".to_string(),
+            "@agentclientprotocol/claude-agent-acp".to_string(),
+        ];
+        let tags = seller_exec_metadata(&npx_claude, Some("claude"), 100, None);
+        let harness = value(&tags, "harness").expect("harness tag");
+        assert_eq!(harness, "claude-agent-acp");
+        assert_eq!(
+            harness_family(&harness),
+            "claude",
+            "claude preset must map to harness_family 'claude', not 'other'"
+        );
+
+        // Preset label is authoritative even when the argv carries no family hint at all.
+        let opaque = vec![
+            "/usr/bin/npx".to_string(),
+            "-y".to_string(),
+            "@acp/opaque-adapter".to_string(),
+        ];
+        let opaque_tags = seller_exec_metadata(&opaque, Some("claude"), 100, None);
+        assert_eq!(
+            harness_family(&value(&opaque_tags, "harness").expect("harness")),
+            "claude"
+        );
+
+        // Regression guard: bare argv0 = "npx" with NO preset label used to yield "other";
+        // the full-argv fallback now recovers "claude" from the adapter package name.
+        let hatch = seller_exec_metadata(&npx_claude, None, 100, None);
+        assert_eq!(
+            harness_family(&value(&hatch, "harness").expect("harness")),
+            "claude"
+        );
     }
 
     #[test]
@@ -1249,7 +1335,7 @@ mod tests {
             transport: Some(UsageTransport::AcpNative),
         };
         // claude command would statically declare side-channel; a REAL acp-native capture wins.
-        let tags = seller_exec_metadata(&["claude".into()], 4321, Some(&usage));
+        let tags = seller_exec_metadata(&["claude".into()], None, 4321, Some(&usage));
 
         assert_eq!(value(&tags, "usage_transport").as_deref(), Some("acp-native"));
         assert_eq!(value(&tags, "model").as_deref(), Some("claude-opus-4-8"));
@@ -1273,7 +1359,7 @@ mod tests {
             transport: Some(UsageTransport::AcpNative),
             ..UsageMetadata::default()
         };
-        let partial_tags = seller_exec_metadata(&["claude".into()], 1, Some(&partial));
+        let partial_tags = seller_exec_metadata(&["claude".into()], None, 1, Some(&partial));
         assert_eq!(qualified(&partial_tags, "tokens", "total"), None);
         assert_eq!(qualified(&partial_tags, "tokens", "output").as_deref(), Some("40"));
     }
