@@ -404,18 +404,48 @@ fn permission_request_from_params(params: &Value) -> Option<PermissionRequest> {
 }
 
 fn permission_response_result(params: &Value, policy: &PermissionOutcome) -> Option<Value> {
-    let wanted = match policy {
+    let options = params
+        .get("options")
+        .or_else(|| params.get("request")?.get("options"))?
+        .as_array()?;
+
+    // ACP `PermissionOption.optionId` is an ARBITRARY, agent-chosen string; the SEMANTIC
+    // category lives in `kind` (allow_once | allow_always | reject_once | reject_always).
+    // Select by `kind` so the choice is harness-agnostic: claude-agent-acp names its
+    // allow-once option `optionId: "allow"` while codex-acp names it `optionId: "allow_once"`,
+    // but BOTH set `kind: "allow_once"`. The previous code matched the raw `optionId` against a
+    // literal "allow"/"reject", which silently found nothing for codex — so no response was
+    // ever written and the agent blocked the whole `session/prompt` turn (the "ACP request 3"
+    // timeout). The legacy optionId-string match is kept as a fallback ONLY for agents that
+    // omit `kind`.
+    let wanted_kinds: &[&str] = match policy {
+        PermissionOutcome::Allow => &["allow_once", "allow_always"],
+        PermissionOutcome::AllowAlways => &["allow_always", "allow_once"],
+        PermissionOutcome::Deny => &["reject_once", "reject_always"],
+    };
+    let legacy_id = match policy {
         PermissionOutcome::Allow => "allow",
         PermissionOutcome::AllowAlways => "allow_always",
         PermissionOutcome::Deny => "reject",
     };
-    let option_id = params
-        .get("options")
-        .or_else(|| params.get("request")?.get("options"))?
-        .as_array()?
+
+    let option_id = wanted_kinds
         .iter()
-        .filter_map(permission_option_id)
-        .find(|option_id| option_id == wanted)?;
+        .find_map(|wanted_kind| {
+            options.iter().find_map(|option| {
+                let kind = option.get("kind").and_then(Value::as_str)?;
+                (kind == *wanted_kind)
+                    .then(|| permission_option_id(option))
+                    .flatten()
+            })
+        })
+        .or_else(|| {
+            options
+                .iter()
+                .filter_map(permission_option_id)
+                .find(|option_id| option_id == legacy_id)
+        })?;
+
     Some(json!({
         "outcome": {
             "outcome": "selected",
@@ -788,6 +818,66 @@ mod tests {
                 }
             ),
             PermissionOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn codex_permission_options_are_answered_by_kind_not_hung() {
+        // Regression for the codex-harness "ACP request 3 timeout": codex-acp names its
+        // permission options by `kind` (optionId "allow_once"/"allow_always"/"reject_once"),
+        // NEVER the literal "allow"/"reject" that claude-agent-acp happens to use. The reader
+        // thread must select by the spec `kind` and write a permission RESPONSE — otherwise
+        // codex blocks awaiting a decision that never comes and the whole `session/prompt`
+        // turn hangs until the job deadline. Exercised through `route_wire_message` so the test
+        // covers the exact auto-answer path the live hang takes.
+        let codex_request = |policy| {
+            let (response_tx, _response_rx) = mpsc::channel();
+            let (update_tx, _update_rx) = mpsc::channel();
+            let mut permission_responses = Vec::new();
+            route_wire_message(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "session/request_permission",
+                    "params": {
+                        "sessionId": "codex-session",
+                        "options": [
+                            {"optionId": "allow_once", "name": "Allow Once", "kind": "allow_once"},
+                            {"optionId": "allow_always", "name": "Allow for Session", "kind": "allow_always"},
+                            {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}
+                        ]
+                    }
+                }),
+                &response_tx,
+                &update_tx,
+                policy,
+                &mut |id, result| permission_responses.push(response_value(id, result)),
+            );
+            permission_responses
+        };
+
+        let selected = |option_id: &str| {
+            vec![json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {"outcome": {"outcome": "selected", "optionId": option_id}}
+            })]
+        };
+
+        // The live default (seller_daemon: PermissionOutcome::Allow) MUST resolve — this is the
+        // case that hung. Deny/AllowAlways selected by kind too.
+        assert_eq!(
+            codex_request(&PermissionOutcome::Allow),
+            selected("allow_once"),
+            "codex allow must be answered, not dropped (the ACP request 3 hang)"
+        );
+        assert_eq!(
+            codex_request(&PermissionOutcome::AllowAlways),
+            selected("allow_always")
+        );
+        assert_eq!(
+            codex_request(&PermissionOutcome::Deny),
+            selected("reject_once")
         );
     }
 
