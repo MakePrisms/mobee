@@ -81,6 +81,29 @@ impl std::fmt::Display for DaemonError {
 
 impl std::error::Error for DaemonError {}
 
+/// Whether a pay-path error is an EXPECTED idempotent re-see of an already-redeemed kind-1059
+/// (the payment landed on an earlier delivery — a relay re-delivery of the gift-wrap, or a
+/// restart). Two idempotent surfaces reach the pay-path log: the journal's pay-once guard
+/// (`SellerError::Journal` "already receipted") and the mint reporting the proofs already spent
+/// (cdk `TokenAlreadySpent`, surfaced as a `PaymentWalletError::Wallet` string). Both mean the
+/// sats are already ours, so the re-see is logged at info, not error.
+///
+/// LOGGING classification ONLY — redeem, matching, reconcile and control flow are unchanged;
+/// the error is still returned and handled identically, only the log line's severity differs.
+fn is_idempotent_already_redeemed(error: &DaemonError) -> bool {
+    // Journal pay-once guard: typed variant + our own stable message.
+    if let DaemonError::Seller(SellerError::Journal(message)) = error {
+        if message.to_ascii_lowercase().contains("already receipted") {
+            return true;
+        }
+    }
+    // Mint-level already-spent. cdk surfaces `TokenAlreadySpent` ("Token Already Spent") as a
+    // string in `PaymentWalletError::Wallet` — there is no typed variant to match, so this
+    // substring check is interim (TODO: expose a typed cdk-already-spent error to match on).
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("already spent") || message.contains("already redeemed")
+}
+
 impl From<SellerError> for DaemonError {
     fn from(value: SellerError) -> Self {
         Self::Seller(value)
@@ -1149,6 +1172,10 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
                             );
                         }
                         Ok(None) => {}
+                        // Idempotent re-see (info, not error): the sats already landed.
+                        Err(error) if is_idempotent_already_redeemed(&error) => eprintln!(
+                            "seller pay: kind-1059 already redeemed (idempotent re-see, no action): {error}"
+                        ),
                         Err(error) => eprintln!("seller pay path: {error}"),
                     }
                     continue;
@@ -1173,6 +1200,10 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
                                             receipt.job_id, receipt.amount_received
                                         ),
                                         Ok(None) => {}
+                                        // Idempotent re-see (info, not error): sats already landed.
+                                        Err(error) if is_idempotent_already_redeemed(&error) => eprintln!(
+                                            "seller reconcile: kind-1059 already redeemed (idempotent re-see, no action): {error}"
+                                        ),
                                         Err(error) => eprintln!("seller reconcile: {error}"),
                                     }
                                 }
@@ -1388,6 +1419,34 @@ mod tests {
             matches_any(&open_pool, &untargeted),
             "untargeted offer MUST match under open-pool (the fix)"
         );
+    }
+
+    #[test]
+    fn already_redeemed_1059_classified_info_not_error() {
+        // Journal pay-once guard = idempotent already-redeemed re-see → info, not error.
+        let journal_dup = DaemonError::Seller(SellerError::Journal(
+            "job abcd already receipted (pay-once)".into(),
+        ));
+        assert!(
+            is_idempotent_already_redeemed(&journal_dup),
+            "journal pay-once re-see is idempotent (logged info)"
+        );
+
+        // Mint says the proofs are already spent (cdk TokenAlreadySpent) → info, not error.
+        let mint_spent =
+            DaemonError::Wallet(PaymentWalletError::Wallet("Token Already Spent".into()));
+        assert!(
+            is_idempotent_already_redeemed(&mint_spent),
+            "mint already-spent re-see is idempotent (logged info)"
+        );
+
+        // Genuine failures are NOT downgraded — they stay on the error channel.
+        assert!(!is_idempotent_already_redeemed(&DaemonError::Relay(
+            "connection refused".into()
+        )));
+        assert!(!is_idempotent_already_redeemed(&DaemonError::Policy(
+            "payment bind refused: payload job/result mismatch".into()
+        )));
     }
 
     #[test]
