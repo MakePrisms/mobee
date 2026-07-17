@@ -1036,6 +1036,28 @@ async fn wait_for_nip42_auth(
     })?
 }
 
+/// Build the seller's kind-5109 offer subscription filter(s).
+///
+/// Always includes the TARGETED filter (`#p` == seller pubkey). When `claim_open_pool` is set,
+/// ALSO returns an UNtargeted filter (no pubkey pin): open-pool offers carry no `p` tag, so a
+/// pubkey-pinned filter alone never delivers them and `--claim-open-pool` is DOA. A targeted
+/// offer matches BOTH filters (deduped by event id at the call site); the downstream rate-gate
+/// (`rate_gate_allows`) still decides whether an untargeted offer is actually claimed.
+fn offer_subscription_filters(
+    seller_pubkey: nostr_sdk::PublicKey,
+    claim_open_pool: bool,
+) -> Vec<nostr_sdk::Filter> {
+    use nostr_sdk::prelude::{Filter, Kind};
+    let mut filters = vec![Filter::new()
+        .kind(Kind::Custom(JOB_OFFER_KIND))
+        .pubkey(seller_pubkey)];
+    if claim_open_pool {
+        // Second, un-pinned filter: matches untargeted (open-pool) 5109 offers.
+        filters.push(Filter::new().kind(Kind::Custom(JOB_OFFER_KIND)));
+    }
+    filters
+}
+
 /// Long-running seller loop: NIP-42 AUTH, then subscribe 5109+1059 from START.
 pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
     use std::time::Duration;
@@ -1080,17 +1102,23 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
         Err(error) => eprintln!("seller reconcile failed on startup (continuing): {error}"),
     }
 
-    let offer_filter = Filter::new()
-        .kind(Kind::Custom(JOB_OFFER_KIND))
-        .pubkey(daemon.keys.public_key());
+    // Offer subscription: always the TARGETED filter (p-tag == seller). When the seller opts
+    // into the open pool, `offer_subscription_filters` ALSO returns an UNtargeted 5109 filter —
+    // open-pool offers carry no p-tag and would otherwise never reach `on_offer_event`, so
+    // `--claim-open-pool` was DOA. Targeted offers match both filters; the event-id dedup in
+    // the loop below processes each offer exactly once.
+    let claim_open_pool = require_seller_config(&daemon.home)
+        .map(|cfg| cfg.claim_open_pool)
+        .unwrap_or(false);
+    for filter in offer_subscription_filters(daemon.keys.public_key(), claim_open_pool) {
+        client
+            .subscribe(filter, None)
+            .await
+            .map_err(|error| DaemonError::Relay(format!("subscribe 5109: {error}")))?;
+    }
     let wrap_filter = Filter::new()
         .kind(Kind::GiftWrap)
         .pubkey(daemon.keys.public_key());
-
-    client
-        .subscribe(offer_filter, None)
-        .await
-        .map_err(|error| DaemonError::Relay(format!("subscribe 5109: {error}")))?;
     client
         .subscribe(wrap_filter, None)
         .await
@@ -1104,6 +1132,10 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
         daemon.home.config.mint_url
     );
 
+    // Open-pool adds a 2nd (un-pinned) 5109 subscription; a TARGETED offer matches BOTH
+    // filters and is delivered twice. Dedup by event id so each offer is processed once.
+    let mut seen_offers: std::collections::HashSet<nostr_sdk::EventId> =
+        std::collections::HashSet::new();
     let mut notifications = client.notifications();
     while let Ok(notification) = notifications.recv().await {
         match notification {
@@ -1122,6 +1154,11 @@ pub async fn run_forever(mut daemon: SellerDaemon) -> Result<(), DaemonError> {
                     continue;
                 }
                 if event.kind.as_u16() == JOB_OFFER_KIND {
+                    // Dedup: a targeted offer matches both the pinned and (open-pool) un-pinned
+                    // 5109 filters, so it arrives twice — process each offer event id once.
+                    if !seen_offers.insert(event.id) {
+                        continue;
+                    }
                     match daemon.on_offer_event(&event).await {
                         Ok(Some(_)) => {
                             match daemon.execute_active_job().await {
@@ -1302,6 +1339,54 @@ mod tests {
         assert_eq!(
             harness_family(&value(&hatch, "harness").expect("harness")),
             "claude"
+        );
+    }
+
+    #[test]
+    fn open_pool_filter_lands_untargeted_offer_only_when_enabled() {
+        use nostr_sdk::prelude::{EventBuilder, Filter, Keys, Kind, MatchEventOptions, Tag};
+
+        let seller = Keys::generate();
+        let buyer = Keys::generate();
+
+        // A TARGETED offer carries a p-tag == seller; an UNtargeted (open-pool) offer has none.
+        let targeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
+            .tag(Tag::public_key(seller.public_key()))
+            .sign_with_keys(&buyer)
+            .expect("sign targeted offer");
+        let untargeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
+            .sign_with_keys(&buyer)
+            .expect("sign untargeted offer");
+
+        let matches_any = |filters: &[Filter], event: &nostr_sdk::Event| {
+            filters
+                .iter()
+                .any(|filter| filter.match_event(event, MatchEventOptions::new()))
+        };
+
+        // Targeted-only (claim_open_pool = false): the targeted offer matches, the untargeted
+        // (open-pool) offer does NOT — this is exactly why --claim-open-pool was DOA.
+        let targeted_only = offer_subscription_filters(seller.public_key(), false);
+        assert!(
+            matches_any(&targeted_only, &targeted),
+            "targeted offer must match the pinned filter"
+        );
+        assert!(
+            !matches_any(&targeted_only, &untargeted),
+            "untargeted offer must NOT match without open-pool"
+        );
+
+        // Open-pool (claim_open_pool = true): the 2nd un-pinned filter lands the untargeted
+        // offer. RED-ON-REVERT: drop the `filters.push(...)` in offer_subscription_filters and
+        // this final assert fails — the untargeted offer no longer matches, so no claim fires.
+        let open_pool = offer_subscription_filters(seller.public_key(), true);
+        assert!(
+            matches_any(&open_pool, &targeted),
+            "targeted offer still matches under open-pool"
+        );
+        assert!(
+            matches_any(&open_pool, &untargeted),
+            "untargeted offer MUST match under open-pool (the fix)"
         );
     }
 
