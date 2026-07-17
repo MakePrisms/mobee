@@ -104,6 +104,22 @@ fn is_idempotent_already_redeemed(error: &DaemonError) -> bool {
     message.contains("already spent") || message.contains("already redeemed")
 }
 
+/// (g) Collect-leg observability: the single, key-material-free line logged the moment a
+/// kind-1059 payment is redeemed (proofs swapped at the mint), so the collect leg is
+/// diagnosable in the daemon's stderr. NEVER includes the token or any secret.
+fn collect_ok_log_line(
+    job_id: &str,
+    result_id: &str,
+    amount_received: u64,
+    expected: u64,
+    mint: &str,
+) -> String {
+    format!(
+        "seller collect ok: job_id={job_id} result_id={result_id} \
+         amount_received={amount_received} expected={expected} mint={mint}"
+    )
+}
+
 impl From<SellerError> for DaemonError {
     fn from(value: SellerError) -> Self {
         Self::Seller(value)
@@ -535,6 +551,17 @@ impl SellerDaemon {
         let adapter = CdkSellerReceive::new(&wallet, cashu_key);
         let amount = adapter.receive(&received.payload.token, &terms).await?;
         let amount_received = amount.to_u64();
+        // (g) collect-leg observability: sats redeemed at the mint (no key/token material).
+        eprintln!(
+            "{}",
+            collect_ok_log_line(
+                &local_job,
+                &local_result,
+                amount_received,
+                expected_amount,
+                &mint
+            )
+        );
 
         self.journal.append_receipt(
             &local_job,
@@ -1447,6 +1474,23 @@ mod tests {
         assert!(!is_idempotent_already_redeemed(&DaemonError::Policy(
             "payment bind refused: payload job/result mismatch".into()
         )));
+    }
+
+    #[test]
+    fn collect_ok_log_line_carries_amount_and_no_key_material() {
+        let line = collect_ok_log_line("job1", "res1", 5, 5, "https://testnut.example");
+        assert!(
+            line.contains("amount_received=5"),
+            "collect log must surface the collected amount"
+        );
+        assert!(line.contains("job_id=job1") && line.contains("result_id=res1"));
+        assert!(line.contains("mint=https://testnut.example"));
+        // No key/token material ever in the collect log.
+        let lower = line.to_ascii_lowercase();
+        assert!(
+            !lower.contains("token") && !lower.contains("secret") && !lower.contains("nsec"),
+            "collect log must never carry token/key material"
+        );
     }
 
     #[test]
