@@ -199,7 +199,7 @@ fn tools() -> Value {
         },
         {
             "name": "post_job",
-            "description": "Publish a real kind-5109 job offer to the configured mobee relay. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. Never echoes secrets.",
+            "description": "Publish a real kind-5109 job offer to the configured mobee relay. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job (unchanged). Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -216,7 +216,28 @@ fn tools() -> Value {
                     },
                     "deadline_unix": { "type": "integer", "minimum": 0 },
                     "repo": { "type": "string", "description": "Optional https git repo for delivery bind" },
-                    "branch": { "type": "string" }
+                    "branch": { "type": "string" },
+                    "target_repo_owner": {
+                        "type": "string",
+                        "description": "Contribution mode: owner pubkey (64 hex) of the target repo you own. Requires target_repo_url + base_branch + base_oid."
+                    },
+                    "target_repo_url": {
+                        "type": "string",
+                        "description": "Contribution mode: https/relay-git clone URL of the target repo (ext::/file/ssh refused). Requires target_repo_owner + base_branch + base_oid."
+                    },
+                    "base_branch": {
+                        "type": "string",
+                        "description": "Contribution mode: base branch the contribution must descend from. Requires target_repo_owner + target_repo_url + base_oid."
+                    },
+                    "base_oid": {
+                        "type": "string",
+                        "description": "Contribution mode: exact base commit oid (40 or 64 hex) the contribution must descend from. Requires target_repo_owner + target_repo_url + base_branch."
+                    },
+                    "accepts": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Contribution mode (optional): accepted delivery forms. Defaults to [\"fork\"] and must include \"fork\" (v1 fork-only)."
+                    }
                 },
                 "required": ["task", "output", "amount_sats"],
                 "additionalProperties": false
@@ -1076,6 +1097,15 @@ async fn post_job_tool_async(state: &McpState, arguments: &Value) -> Result<Valu
         .get("branch")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let opt_str = |key: &str| -> Option<String> {
+        arguments.get(key).and_then(Value::as_str).map(str::to_owned)
+    };
+    let accepts = arguments.get("accepts").and_then(Value::as_array).map(|values| {
+        values
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect::<Vec<String>>()
+    });
 
     let outcome = job_lifecycle::post_job_async(
         &state.home,
@@ -1088,6 +1118,11 @@ async fn post_job_tool_async(state: &McpState, arguments: &Value) -> Result<Valu
             deadline_unix,
             repo,
             branch,
+            target_repo_owner: opt_str("target_repo_owner"),
+            target_repo_url: opt_str("target_repo_url"),
+            base_branch: opt_str("base_branch"),
+            base_oid: opt_str("base_oid"),
+            accepts,
         },
     )
     .await

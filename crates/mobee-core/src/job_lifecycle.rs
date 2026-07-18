@@ -50,6 +50,18 @@ pub struct PostJobRequest {
     /// Optional git delivery bind tags on the offer (repo + branch).
     pub repo: Option<String>,
     pub branch: Option<String>,
+    /// Piece-10 contribution-offer params (§ Offer shape). OPTIONAL and **ALL-OR-NOTHING**: if any
+    /// of these is present this is a `job-class=contribution` offer and `target_repo_owner`,
+    /// `target_repo_url`, `base_branch`, `base_oid` are ALL required; absent entirely ⇒ from-scratch
+    /// (no additive tags, byte-identical to a pre-contribution offer). See
+    /// [`contribution_offer_from_request`].
+    pub target_repo_owner: Option<String>,
+    pub target_repo_url: Option<String>,
+    pub base_branch: Option<String>,
+    pub base_oid: Option<String>,
+    /// Positional `accepts` values; defaults to `["fork"]` when contribution params are present.
+    /// v1 supports fork only, so a supplied `accepts` MUST include `"fork"`.
+    pub accepts: Option<Vec<String>>,
 }
 
 /// Outcome of a successful `post_job`.
@@ -318,6 +330,14 @@ pub async fn post_job_async(
         }
         _ => {}
     }
+    // Piece-10: validate the optional contribution params up front (fail-closed, before the wallet
+    // opens). `None` ⇒ from-scratch (no additive tags). Emission happens in `build_offer_draft`.
+    let contribution = contribution_offer_from_request(&request)?;
+
+    // F2 buyer-fix: refuse a post whose amount exceeds the per-job budget cap AT POST — a job you
+    // can post but can never pay (authorize_pay refuses at the SAME cap) is a UX trap. Read the
+    // cap from the SAME config the budget gate uses (`home.config.per_job_budget_sats`).
+    assert_amount_within_budget_cap(request.amount_sats, home.config.per_job_budget_sats)?;
 
     // Dust guard: live keyset N=1 floor, fail-closed (no hardcoded fee=1).
     #[cfg(feature = "wallet")]
@@ -337,31 +357,12 @@ pub async fn post_job_async(
             .unwrap_or(DEFAULT_DEADLINE_SECS)
     });
 
-    let offer = if request.untargeted {
-        OfferDraft::untargeted(
-            request.task.clone(),
-            request.output.clone(),
-            request.amount_sats,
-            deadline_unix,
-            home.config.mint_url.clone(),
-        )
-    } else {
-        OfferDraft::new(
-            request.task.clone(),
-            request.output.clone(),
-            request.amount_sats,
-            deadline_unix,
-            home.config.mint_url.clone(),
-            request.seller_pubkey.clone().expect("checked"),
-        )
-    };
-
-    let mut draft = offer.to_event_draft();
-    if let (Some(repo), Some(branch)) = (&request.repo, &request.branch) {
-        draft.tags.push(TagSpec::new(["delivery", "git"]));
-        draft.tags.push(TagSpec::new(["repo", repo]));
-        draft.tags.push(TagSpec::new(["branch", branch]));
-    }
+    let draft = build_offer_draft(
+        &request,
+        &home.config.mint_url,
+        deadline_unix,
+        contribution.as_ref(),
+    )?;
 
     let keys = buyer_keys(home)?;
     let event_id = publish_draft_async(home, &keys, &draft).await?;
@@ -378,6 +379,177 @@ pub async fn post_job_async(
         task: request.task,
         output: request.output,
     })
+}
+
+/// F2 buyer-fix: refuse a post whose `amount_sats` exceeds the per-job budget cap. Mirrors the
+/// budget gate's refuse condition (`amount > per_job_cap`; see [`crate::budget`]) at POST time so a
+/// buyer never posts a job that can never be paid. At-cap and under-cap pass unchanged. The message
+/// NAMES the config key + both numbers + the remedy; it never auto-raises — the cap is a safety
+/// control.
+fn assert_amount_within_budget_cap(
+    amount_sats: u64,
+    per_job_cap: u64,
+) -> Result<(), JobLifecycleError> {
+    if amount_sats > per_job_cap {
+        return Err(JobLifecycleError::Input(format!(
+            "post_job refused: amount {amount_sats} sat exceeds the per-job budget cap \
+             {per_job_cap} sat (config key `per_job_budget_sats`). A job posted over the cap can \
+             never be paid — authorize_pay refuses at the same cap. Raise `per_job_budget_sats` in \
+             config.toml and RESTART the process (config is read at startup); the cap is a safety \
+             control and is never auto-raised."
+        )));
+    }
+    Ok(())
+}
+
+/// Build the kind-5109 offer event draft. The optional git-delivery tags **and** the piece-10
+/// contribution tags are emitted HERE so the post path and its round-trip test share ONE
+/// tag-emission seam (pure — no publish, no wallet). `contribution` is the pre-validated canonical
+/// offer from [`contribution_offer_from_request`]; `None` ⇒ from-scratch, so NO additive
+/// contribution tags are emitted (byte-identical to a pre-contribution offer).
+fn build_offer_draft(
+    request: &PostJobRequest,
+    mint_url: &str,
+    deadline_unix: u64,
+    contribution: Option<&crate::contribution::ContributionOffer>,
+) -> Result<EventDraft, JobLifecycleError> {
+    let offer = if request.untargeted {
+        OfferDraft::untargeted(
+            request.task.clone(),
+            request.output.clone(),
+            request.amount_sats,
+            deadline_unix,
+            mint_url.to_owned(),
+        )
+    } else {
+        OfferDraft::new(
+            request.task.clone(),
+            request.output.clone(),
+            request.amount_sats,
+            deadline_unix,
+            mint_url.to_owned(),
+            request.seller_pubkey.clone().ok_or_else(|| {
+                JobLifecycleError::Input(
+                    "post_job requires seller_pubkey (targeted default) or untargeted=true".into(),
+                )
+            })?,
+        )
+    };
+
+    let mut draft = offer.to_event_draft();
+    if let (Some(repo), Some(branch)) = (&request.repo, &request.branch) {
+        draft.tags.push(TagSpec::new(["delivery", "git"]));
+        draft.tags.push(TagSpec::new(["repo", repo]));
+        draft.tags.push(TagSpec::new(["branch", branch]));
+    }
+    // Emit contribution tags via the CANONICAL constructor (never hand-rolled) — the buyer offer
+    // and the seller echo therefore serialize the same shape.
+    if let Some(contribution) = contribution {
+        for tag in crate::contribution::contribution_offer_tags(contribution) {
+            draft.tags.push(tag);
+        }
+    }
+    Ok(draft)
+}
+
+/// Validate the OPTIONAL piece-10 contribution params on a [`PostJobRequest`] and build the
+/// canonical [`ContributionOffer`](crate::contribution::ContributionOffer) (§ Offer shape).
+///
+/// - **Absent entirely** (no owner / url / branch / oid / accepts) ⇒ `Ok(None)` — from-scratch.
+/// - **ALL-OR-NOTHING:** if ANY contribution field is present, ALL required (owner, url, branch,
+///   oid) MUST be present; a partial set is REFUSED fail-closed, naming every missing field.
+/// - When present: owner (64-hex) + branch/oid are validated by the canonical constructors
+///   ([`TargetRepoPin`](crate::contribution::TargetRepoPin) /
+///   [`ContributionBase`](crate::contribution::ContributionBase)), and the clone URL additionally
+///   passes the SAME transport allowlist the pay path fetches under — `ext::`/file/ssh are refused
+///   at POST time so a buyer never publishes an offer nobody can safely verify. `accepts` defaults
+///   to `["fork"]` and MUST include `"fork"` (v1 fork-only).
+fn contribution_offer_from_request(
+    request: &PostJobRequest,
+) -> Result<Option<crate::contribution::ContributionOffer>, JobLifecycleError> {
+    use crate::contribution::{ContributionBase, ContributionOffer, TargetRepoPin, ACCEPTS_FORK};
+
+    let opt_trimmed = |value: &Option<String>| -> Option<String> {
+        value
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let owner = opt_trimmed(&request.target_repo_owner);
+    let url = opt_trimmed(&request.target_repo_url);
+    let branch = opt_trimmed(&request.base_branch);
+    let oid = opt_trimmed(&request.base_oid);
+    let accepts: Vec<String> = request
+        .accepts
+        .as_ref()
+        .map(|values| {
+            values
+                .iter()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Absent entirely ⇒ from-scratch (byte-identical, no additive tags).
+    if owner.is_none() && url.is_none() && branch.is_none() && oid.is_none() && accepts.is_empty() {
+        return Ok(None);
+    }
+
+    // All-or-nothing: name EVERY missing required field so a partial set fails closed clearly.
+    let mut missing = Vec::new();
+    if owner.is_none() {
+        missing.push("target_repo_owner");
+    }
+    if url.is_none() {
+        missing.push("target_repo_url");
+    }
+    if branch.is_none() {
+        missing.push("base_branch");
+    }
+    if oid.is_none() {
+        missing.push("base_oid");
+    }
+    if !missing.is_empty() {
+        return Err(JobLifecycleError::Input(format!(
+            "contribution offer is all-or-nothing: missing required field(s) [{}] (required: \
+             target_repo_owner, target_repo_url, base_branch, base_oid)",
+            missing.join(", ")
+        )));
+    }
+    let owner = owner.expect("checked present");
+    let url = url.expect("checked present");
+    let branch = branch.expect("checked present");
+    let oid = oid.expect("checked present");
+
+    // Transport allowlist at POST time (https + relay-git only; ext::/file/ssh/local refused) —
+    // don't let a buyer publish an offer nobody can safely verify. The pay-path verifier re-checks
+    // under the SAME allowlist (defense in depth).
+    crate::delivery_transport::assert_allowed_repo_locator(&url).map_err(|refusal| {
+        JobLifecycleError::Input(format!("contribution target_repo_url refused: {refusal}"))
+    })?;
+
+    let target =
+        TargetRepoPin::new(owner, url).map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+    let base =
+        ContributionBase::new(branch, oid).map_err(|e| JobLifecycleError::Input(e.to_string()))?;
+    let accepts = if accepts.is_empty() {
+        vec![ACCEPTS_FORK.to_owned()]
+    } else {
+        accepts
+    };
+    if !accepts.iter().any(|a| a == ACCEPTS_FORK) {
+        return Err(JobLifecycleError::Input(format!(
+            "contribution accepts must include \"fork\" (v1 supports fork only); got {accepts:?}"
+        )));
+    }
+
+    Ok(Some(ContributionOffer {
+        target,
+        base,
+        accepts,
+    }))
 }
 
 /// Read offer / claims / results from the relay. Local accept-bind is attached if present.
@@ -1423,6 +1595,11 @@ mod tests {
                 deadline_unix: Some(1_800_000_000),
                 repo: None,
                 branch: None,
+                target_repo_owner: None,
+                target_repo_url: None,
+                base_branch: None,
+                base_oid: None,
+                accepts: None,
             },
         )
         .expect_err("seller required");
@@ -1458,6 +1635,11 @@ mod tests {
                 deadline_unix: Some(1_800_000_000),
                 repo: None,
                 branch: None,
+                target_repo_owner: None,
+                target_repo_url: None,
+                base_branch: None,
+                base_oid: None,
+                accepts: None,
             },
         )
         .expect_err("must refuse nested block_on");
@@ -1715,5 +1897,286 @@ mod tests {
             crate::contribution::JOB_CLASS_CONTRIBUTION,
         ])];
         assert!(contribution_offer_view(&malformed).is_none());
+    }
+
+    // ── Piece-10 buyer POST-path: contribution offer params (all-or-nothing + tag emission) ─────
+    fn contribution_post_request(
+        owner: Option<&str>,
+        url: Option<&str>,
+        branch: Option<&str>,
+        oid: Option<&str>,
+        accepts: Option<Vec<String>>,
+    ) -> PostJobRequest {
+        PostJobRequest {
+            task: "t".into(),
+            output: "text/plain".into(),
+            amount_sats: 1,
+            seller_pubkey: None,
+            untargeted: true,
+            deadline_unix: Some(10),
+            repo: None,
+            branch: None,
+            target_repo_owner: owner.map(str::to_owned),
+            target_repo_url: url.map(str::to_owned),
+            base_branch: branch.map(str::to_owned),
+            base_oid: oid.map(str::to_owned),
+            accepts,
+        }
+    }
+
+    #[test]
+    fn post_job_contribution_round_trip_offer_tags_bind_to_offer_values() {
+        // The load-bearing round-trip: post_job contribution params -> BUILT event tags ->
+        // parse_contribution_offer yields exactly {owner,url,branch,oid} -> emitted tags ARE the
+        // canonical constructor output (no drift) -> the accept-path binds to the OFFER's values.
+        let owner = "aa".repeat(32);
+        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let base_oid = "77".repeat(20);
+        let request =
+            contribution_post_request(Some(&owner), Some(url), Some("main"), Some(&base_oid), None);
+
+        let contribution = contribution_offer_from_request(&request)
+            .expect("valid contribution params")
+            .expect("is a contribution offer");
+        let draft =
+            build_offer_draft(&request, "https://testnut.cashudevkit.org", 10, Some(&contribution))
+                .expect("draft built");
+
+        // (a) canonical parse of the BUILT tags yields exactly the pinned values.
+        let parsed = crate::contribution::parse_contribution_offer(&draft.tags)
+            .expect("parse ok")
+            .expect("is a contribution");
+        assert_eq!(parsed.target.owner_pubkey(), owner);
+        assert_eq!(parsed.target.clone_url(), url);
+        assert_eq!(parsed.base.branch(), "main");
+        assert_eq!(parsed.base.oid(), base_oid);
+        assert!(parsed.accepts_fork());
+
+        // (b) emitted tags ARE the canonical constructor output (no drift).
+        let expected_tags = crate::contribution::contribution_offer_tags(&contribution);
+        assert!(
+            draft.tags.ends_with(&expected_tags),
+            "emitted contribution tags must equal the canonical constructor output"
+        );
+
+        // (c) the accept-path binds to the OFFER's values, threaded from the EMITTED tags.
+        let mut offer_view = offer_view_contribution(&owner, url, "main", &base_oid);
+        offer_view.contribution = contribution_offer_view(&draft.tags);
+        let result = result_view_contribution(&owner, url, "main", &base_oid, "sigbytes");
+        let bind = resolve_accepted_contribution(&offer_view, &result, &"ee".repeat(20))
+            .expect("resolve ok")
+            .expect("is a contribution");
+        assert_eq!(bind.target_owner_pubkey, owner);
+        assert_eq!(bind.target_clone_url, url);
+        assert_eq!(bind.base_branch, "main");
+        assert_eq!(bind.base_oid, base_oid);
+    }
+
+    #[test]
+    fn post_job_from_scratch_emits_byte_identical_tags() {
+        // No contribution params ⇒ Ok(None) ⇒ built tags are byte-identical to the bare offer.
+        let request = PostJobRequest {
+            task: "t".into(),
+            output: "text/plain".into(),
+            amount_sats: 3,
+            seller_pubkey: Some("bb".repeat(32)),
+            untargeted: false,
+            deadline_unix: Some(10),
+            repo: None,
+            branch: None,
+            target_repo_owner: None,
+            target_repo_url: None,
+            base_branch: None,
+            base_oid: None,
+            accepts: None,
+        };
+        let contribution = contribution_offer_from_request(&request).expect("ok");
+        assert!(contribution.is_none(), "no params ⇒ from-scratch");
+        let draft = build_offer_draft(
+            &request,
+            "https://testnut.cashudevkit.org",
+            10,
+            contribution.as_ref(),
+        )
+        .expect("draft");
+        let expected = OfferDraft::new(
+            "t",
+            "text/plain",
+            3,
+            10,
+            "https://testnut.cashudevkit.org",
+            "bb".repeat(32),
+        )
+        .to_event_draft();
+        assert_eq!(draft, expected, "from-scratch draft must be byte-identical");
+        assert!(!crate::contribution::is_contribution_tags(&draft.tags));
+        // F2: the budget guard fires ONLY over-cap and does NOT touch tag emission — a normal
+        // within-cap post (amount 3 <= default cap 21) passes the guard, so emitted tags for a
+        // normal post are unchanged (byte-identical, asserted above).
+        assert!(
+            assert_amount_within_budget_cap(3, crate::home::DEFAULT_PER_JOB_BUDGET_SATS).is_ok(),
+            "a within-cap post must pass the budget guard"
+        );
+    }
+
+    #[test]
+    fn post_job_contribution_partial_params_refuse_naming_missing_fields() {
+        let owner = "aa".repeat(32);
+        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let base_oid = "77".repeat(20);
+        // owner alone ⇒ refuse, naming the three missing required fields.
+        let err = contribution_offer_from_request(&contribution_post_request(
+            Some(&owner),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .expect_err("partial refused");
+        let msg = err.to_string();
+        assert!(msg.contains("target_repo_url"), "{msg}");
+        assert!(msg.contains("base_branch"), "{msg}");
+        assert!(msg.contains("base_oid"), "{msg}");
+        // missing only owner ⇒ names owner.
+        let err = contribution_offer_from_request(&contribution_post_request(
+            None,
+            Some(url),
+            Some("main"),
+            Some(&base_oid),
+            None,
+        ))
+        .expect_err("partial refused");
+        assert!(err.to_string().contains("target_repo_owner"), "{err}");
+        // accepts alone (no pins) is still a contribution param present ⇒ refuse, naming the pins.
+        let err = contribution_offer_from_request(&contribution_post_request(
+            None,
+            None,
+            None,
+            None,
+            Some(vec!["fork".into()]),
+        ))
+        .expect_err("accepts-only refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("target_repo_owner") && msg.contains("base_oid"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn post_job_contribution_bad_fields_refuse() {
+        let owner = "aa".repeat(32);
+        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let oid = "77".repeat(20);
+        // bad owner (not 64-hex)
+        assert!(contribution_offer_from_request(&contribution_post_request(
+            Some("nothex"),
+            Some(url),
+            Some("main"),
+            Some(&oid),
+            None
+        ))
+        .is_err());
+        // bad oid (not 40/64-hex)
+        assert!(contribution_offer_from_request(&contribution_post_request(
+            Some(&owner),
+            Some(url),
+            Some("main"),
+            Some("xyz"),
+            None
+        ))
+        .is_err());
+        // bad base branch (leading dash)
+        assert!(contribution_offer_from_request(&contribution_post_request(
+            Some(&owner),
+            Some(url),
+            Some("-x"),
+            Some(&oid),
+            None
+        ))
+        .is_err());
+        // bad url (forbidden scheme via the transport allowlist)
+        assert!(contribution_offer_from_request(&contribution_post_request(
+            Some(&owner),
+            Some("file:///tmp/repo.git"),
+            Some("main"),
+            Some(&oid),
+            None
+        ))
+        .is_err());
+        // accepts present but without "fork" (v1 fork-only) ⇒ refuse.
+        assert!(contribution_offer_from_request(&contribution_post_request(
+            Some(&owner),
+            Some(url),
+            Some("main"),
+            Some(&oid),
+            Some(vec!["patch".into()])
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn post_job_contribution_refuses_ext_url_at_post() {
+        // ext:: clone URL refused at POST time — a buyer must not publish an unverifiable offer.
+        let owner = "aa".repeat(32);
+        let oid = "77".repeat(20);
+        let err = contribution_offer_from_request(&contribution_post_request(
+            Some(&owner),
+            Some("ext::sh -c evil"),
+            Some("main"),
+            Some(&oid),
+            None,
+        ))
+        .expect_err("ext refused at post");
+        assert!(err.to_string().contains("refused"), "{err}");
+    }
+
+    // ── F2 buyer-fix: post-time per-job budget-cap validation ───────────────────────────────────
+    #[test]
+    fn budget_cap_guard_over_cap_refuses_at_and_under_cap_pass() {
+        // over-cap ⇒ refuse, naming the config key + BOTH numbers + the restart remedy.
+        let err = assert_amount_within_budget_cap(40, 21).expect_err("over-cap refused");
+        let msg = err.to_string();
+        assert!(msg.contains("per_job_budget_sats"), "names the config key: {msg}");
+        assert!(msg.contains("40"), "names the amount: {msg}");
+        assert!(msg.contains("21"), "names the cap: {msg}");
+        assert!(msg.contains("RESTART"), "names the remedy: {msg}");
+        // at-cap ⇒ passes (mirrors the budget gate's `amount > cap` refuse condition).
+        assert!(assert_amount_within_budget_cap(21, 21).is_ok(), "at-cap must pass");
+        // under-cap ⇒ passes, unchanged.
+        assert!(assert_amount_within_budget_cap(20, 21).is_ok(), "under-cap must pass");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_job_over_budget_cap_refused_before_wallet_or_publish() {
+        // An over-cap post refuses AT POST (before the wallet opens / anything publishes), so this
+        // runs fully offline. Field case: amount 40 with per_job_budget_sats = 21.
+        let (root, mut home) = temp_job_home("over-cap");
+        home.config.per_job_budget_sats = 21;
+        let err = post_job_async(
+            &home,
+            PostJobRequest {
+                task: "t".into(),
+                output: "text/plain".into(),
+                amount_sats: 40,
+                seller_pubkey: Some("aa".repeat(32)),
+                untargeted: false,
+                deadline_unix: Some(1_800_000_000),
+                repo: None,
+                branch: None,
+                target_repo_owner: None,
+                target_repo_url: None,
+                base_branch: None,
+                base_oid: None,
+                accepts: None,
+            },
+        )
+        .await
+        .expect_err("over-cap post must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("per_job_budget_sats"), "{msg}");
+        assert!(msg.contains("40") && msg.contains("21"), "{msg}");
+        assert!(msg.contains("RESTART"), "{msg}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
