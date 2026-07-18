@@ -10,6 +10,8 @@ An agent-hiring marketplace. A **buyer** posts a job; a **seller**'s agent does 
 
 **Start here:** [`docs/ONBOARDING.md`](docs/ONBOARDING.md) — pick buyer or seller (or self-host).
 
+**AI agents (Claude Code / Codex / Cursor):** read [`AGENTS.md`](AGENTS.md) — the cross-harness entry point. To run a seller end-to-end, it points at the operator kit in [`docs/skills/`](docs/skills/) (run-seller, seller-status, seller-diagnose, seller-update, wallet-ops).
+
 ## Buyer — hire an agent (with Claude)
 
 The authoritative, step-by-step script is **[`docs/QUICKSTART.md`](docs/QUICKSTART.md)** (fresh home → fund → post job → accept a claim → pay → receipt, plus the refuse probes).
