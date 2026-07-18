@@ -42,24 +42,25 @@ grep -E "rate_sats|claim_open_pool" "$MOBEE_HOME/config.toml"     # what did the
 
 ---
 
-## B. "Daemon is up but it ignores offers that already existed" — live-only subscriptions
+## B. "Daemon is up but it ignores offers that already existed" — the backfill window
 
-**Cause.** Offer subscriptions are **live-by-design**. The targeted filter (`#p == self`) DOES
-backfill stored offers addressed to you, but the **open-pool** (untargeted) filter is bounded to
-NEW offers only (`since(now)` + `limit(0)`) so a running seller does not replay the relay's entire
-5109 history (a real field flood). So an *open* offer posted **before** the daemon started is
-invisible to it. Grounds: `seller_daemon.rs:1210-1230` (targeted backfills, open-pool bounded to
-`since(now)`).
+**How offer pickup works.** The targeted filter (`#p == self`) backfills stored offers addressed
+to you in full. The **open-pool** (untargeted) filter backfills a bounded window:
+**`offer_backfill_secs`** in `config.toml` (default **1200** = 20 min) widens its `since` to
+`now − N` with a flood cap (`limit(500)`), so a daemon that starts AFTER an open offer was posted
+still claims it if the offer is within the window. `offer_backfill_secs = 0` = live-only
+(`since(now)` + `limit(0)` — no stored open offers).
 
-**Fix (today).** Have the buyer re-post the offer while the daemon is running, or target the offer
-to your pubkey (`#p`) so it backfills. Restarting the daemon re-arms `since(now)` at the new start
-time (still forward-only for open pool).
+**Money-safety on backfilled offers (always-on, not window side-effects):** an offer past its own
+deadline is **refused with a logged reason** — never claimed, never given a fresh deadline (this
+guard covers targeted history too); an offer already claimed live by another seller, or already
+settled/delivered, is skipped with a logged reason (fail-closed on relay-read errors); the rate
+gate applies as always.
 
-**Provisional future flag — `offer_backfill_secs` (NAMED GAP, not in this build).** A configurable
-open-pool backfill window (claim untargeted offers posted up to N seconds before start) is landing
-in a parallel arc. As of this branch the flag **does not exist** — do not pass it; it will error as
-an unknown option. The concept: it would widen the open-pool filter's `since` to `now − N`. Treat
-the name as provisional until it lands.
+**If an old open offer still isn't picked up:** it is older than the window (raise
+`offer_backfill_secs` and **restart** — config is read at startup, §J), past its deadline (look
+for the logged `expired` skip — the buyer must re-post), or already claimed elsewhere (logged
+skip). Targeting the offer to your pubkey (`#p`) always backfills regardless of the window.
 
 ---
 
@@ -241,7 +242,7 @@ grep "seller reconcile" "$MOBEE_HOME/sell.log" | tail   # released N orphaned cl
 
 ```
 → for a no-claim: distinguishes below-rate (logged skip) from untargeted-not-subscribed (no log) and names the config fix
-→ names live-only subscriptions for pre-existing open offers; marks offer_backfill_secs PROVISIONAL/absent
+→ names the open-pool backfill window (offer_backfill_secs, default 1200, 0=live-only) + the always-on deadline/claimed/settled guards with logged skips
 → names CLAUDE_CODE_EXECUTABLE (NixOS), codex spend-cap+raw-`codex exec` discriminator, cursor login/model/quota
 → explains HANG-consumes-window vs fast-fail-retries and points at --job-timeout-secs
 → ties "can't receive" to nip42= banner; ties relay-git failures to helper/seed/BYO
@@ -253,7 +254,7 @@ grep "seller reconcile" "$MOBEE_HOME/sell.log" | tail   # released N orphaned cl
 ## Grounding (source file:line)
 
 - Rate gate / targeting: `crates/mobee-core/src/seller.rs:81-108`; skip logs `crates/mobee-core/src/seller_daemon.rs:205-222`, `:315`
-- Live-only / bounded open-pool subscription: `seller_daemon.rs:1210-1230`; `offer_backfill_secs` absent (grep: only "backfill" comments at `:1238`, `:1399`, `:1893`)
+- Backfill window: filters `seller_daemon.rs:1381` (`offer_subscription_filters` — targeted unbounded, open-pool `since(now−N)` + cap); config `home.rs:95-101` (`offer_backfill_secs`, serde default 1200); deadline-expiry refusal `seller_daemon.rs:426` (`DeadlineExpired`, logged)
 - ACP idle timeout + retry semantics: `seller_daemon.rs:50`, `:899-908`, `:919-940`, `:1009-1015`; `crates/mobee-core/src/driver/acp_driver.rs:169`; codex kind-answer regression `:824-832`
 - NIP-42 auth + p-gate: `seller_daemon.rs:1140-1157`, `:1158-1193`, `:1424-1429`, no-challenge WARN `:1372-1380`
 - Relay-git announce/seed/helper: `crates/mobee/src/sell.rs:131-157`, `:379-422`; `seller_git.rs:269`, `:331-351`, `:393-501`, `:427-431`
