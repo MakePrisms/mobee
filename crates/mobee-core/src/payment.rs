@@ -526,6 +526,42 @@ impl ReceiptAuthority {
             receipt_kind: RECEIPT_EVENT_KIND,
         })
     }
+
+    /// THE load-bearing PRE-SPEND tooth (cross-bind / forged-cosig).
+    ///
+    /// Verifies the seller's schnorr co-signature over the canonical receipt preimage
+    /// (`receipt.rs` `ReceiptPreimage::canonical_json` → `digest_bytes`) against the
+    /// **external claim-seller anchor** ([`Self::seller`]) — never the receipt's own p-tags.
+    /// The caller passes the EXACT preimage the pay path will co-sign and publish, so the
+    /// bytes verified here are byte-identical to the bytes published later.
+    ///
+    /// This runs BEFORE any spend (before `authorize_pay` commits budget / opens the wallet /
+    /// enters the payment SM). A missing / malformed / cross-authored / tampered signature
+    /// fails CLOSED, so the buyer refuses with **zero spend** rather than spending and only
+    /// detecting the bad receipt afterwards — which is what the post-spend [`Self::verify`]
+    /// does at the `Sent → ReceiptPublished` transition (detection, not prevention).
+    ///
+    /// SHARED SEAM — do NOT inline this at call sites. It is the single pre-pay point at which
+    /// every seller bind is checked. Only the receipt (job-hash) preimage signature is checked
+    /// today; piece-10 Step-1 (freelance-PR fork, `docs/meta/PIECE-10-FREELANCE-PR-DELIVERY.md`)
+    /// EXTENDS THIS POINT with a valid seller signature over its signed-6109 tuple bind
+    /// `{job_id, seller_pubkey, target_repo, base_oid, fork_ref, commit_oid}` — an additional
+    /// checked seller bind here, never a parallel pre-pay gate.
+    pub fn verify_seller_prepay_cosig(
+        &self,
+        preimage: &ReceiptPreimage,
+        seller_signature_hex: &str,
+    ) -> Result<(), PaymentError> {
+        let message = Message::from_digest(preimage.digest_bytes());
+        verify_schnorr_hex(seller_signature_hex, &message, &self.seller).map_err(|_| {
+            PaymentError::Refused(format!(
+                "pre-pay seller co-signature invalid: the accepted result's sig/seller does not \
+                 verify over the receipt preimage against claim seller {} (zero spend; refused \
+                 before payment)",
+                self.seller.to_hex()
+            ))
+        })
+    }
 }
 
 /// Verify one schnorr signature (hex) over `message` against a nostr x-only anchor.

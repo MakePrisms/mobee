@@ -935,10 +935,25 @@ fn select_result<'a>(
     result_id: Option<&str>,
 ) -> Result<&'a ResultView, JobLifecycleError> {
     if let Some(id) = result_id {
-        return results
+        let result = results
             .iter()
             .find(|result| result.result_id == id)
-            .ok_or_else(|| JobLifecycleError::NotFound(format!("result {id}")));
+            .ok_or_else(|| JobLifecycleError::NotFound(format!("result {id}")))?;
+        // CROSS-BIND TOOTH: a result is bindable to this claim ONLY if the result's author
+        // (its kind-6109 event pubkey) IS the claim seller. NEVER trust an operator-supplied
+        // `result_id` to override this — accepting seller A's claim with seller B's result is
+        // the live 21-sat cross-bind (the buyer pays A, who is p2pk-locked into the token, for
+        // B's artifact). The `result_id == None` branch below already author-filters; this
+        // closes the explicit-id hole. Refuse naming BOTH public keys (public keys only).
+        if result.seller_pubkey != seller_pubkey {
+            return Err(JobLifecycleError::Targeting(format!(
+                "result {id} is authored by seller {} but the accepted claim's seller is {} — \
+                 cross-authored result refused (the buyer must not pay one seller for another \
+                 seller's result)",
+                result.seller_pubkey, seller_pubkey
+            )));
+        }
+        return Ok(result);
     }
     results
         .iter()
@@ -1073,6 +1088,57 @@ mod tests {
         let err = assert_authorize_matches_bind(&bind, &bad_seller, &bind.result_id, &bind.commit_oid)
             .expect_err("mismatch");
         assert!(err.to_string().contains("seller"));
+    }
+
+    fn result_view(result_id: &str, seller_pubkey: &str) -> ResultView {
+        ResultView {
+            result_id: result_id.to_owned(),
+            created_at: 100,
+            seller_pubkey: seller_pubkey.to_owned(),
+            display_name: None,
+            job_hash: Some("ff".repeat(32)),
+            repo: Some("https://github.com/bitcoin/bips.git".into()),
+            branch: Some("master".into()),
+            commit_oid: Some("ee".repeat(20)),
+            amount_sats: Some(1),
+            seller_signature: Some("ab".repeat(64)),
+        }
+    }
+
+    // CROSS-BIND TOOTH (accept path): an explicit `result_id` authored by a DIFFERENT seller
+    // than the accepted claim's seller is REFUSED (the tool must not trust operator input) —
+    // the live 21-sat cross-bind fixture shape (claim A + result B). An own-authored result,
+    // selected explicitly OR auto, is unchanged.
+    #[test]
+    fn select_result_refuses_cross_authored_explicit_result_id() {
+        let seller_a = "aa".repeat(32);
+        let seller_b = "bb".repeat(32);
+        let results = vec![
+            result_view("result-b", &seller_b),
+            result_view("result-a", &seller_a),
+        ];
+
+        // Claim seller A, explicit result authored by B → refuse, naming BOTH pubkeys.
+        let err = select_result(&results, &seller_a, Some("result-b"))
+            .expect_err("cross-authored explicit result_id must refuse");
+        let message = err.to_string();
+        assert!(
+            message.contains(&seller_a) && message.contains(&seller_b),
+            "refusal must name both the claim seller and the result author: {message}"
+        );
+        assert!(
+            message.contains("cross-authored"),
+            "refusal must be a clear cross-authored refusal: {message}"
+        );
+
+        // A's own result, selected explicitly → accepted unchanged.
+        let own = select_result(&results, &seller_a, Some("result-a")).expect("own result ok");
+        assert_eq!(own.result_id, "result-a");
+        assert_eq!(own.seller_pubkey, seller_a);
+
+        // Auto-select (no explicit id) → author-filtered to A, unchanged.
+        let auto = select_result(&results, &seller_a, None).expect("auto own result ok");
+        assert_eq!(auto.seller_pubkey, seller_a);
     }
 
     fn claim_view(claim_id: &str, created_at: u64, status: &str) -> ClaimView {

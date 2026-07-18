@@ -695,6 +695,9 @@ impl SellerDaemon {
         // delivered git object, D4) — not the bare job-hash. The buyer reconstructs this
         // exact preimage and co-signs it. `exec_metadata_commitment` is the empty marker:
         // exec-metadata is NOT covered by the co-signature (Item 2, seller-claimed).
+        // Derive the delivery discriminator from the SAME typed `Delivery` the buyer's pay path
+        // uses (was a `DeliveryKind::Fork` hardcode) so both sides agree by construction ("fork").
+        let delivery_kind = seller_delivery_kind(&seller_cfg.git_remote, &branch, &commit)?;
         let preimage = crate::receipt::ReceiptPreimage {
             job_hash: job_hash.clone(),
             offer_id: active.job_id.clone(),
@@ -704,7 +707,7 @@ impl SellerDaemon {
             buyer_pubkey: active.buyer_pubkey.clone(),
             seller_pubkey: self.seller_pubkey.clone(),
             delivery_integrity_hash: commit.clone(),
-            delivery_kind: crate::receipt::DeliveryKind::Fork.as_str().to_owned(),
+            delivery_kind: delivery_kind.as_str().to_owned(),
             exec_metadata_commitment: crate::receipt::EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
         };
         let seller_sig = sign_receipt_hash(&self.keys, &preimage.digest_hex())?;
@@ -763,6 +766,29 @@ fn mint_url(raw: &str) -> Result<cashu::MintUrl, DaemonError> {
     use std::str::FromStr;
     cashu::MintUrl::from_str(raw)
         .map_err(|error| DaemonError::Policy(format!("invalid mint url: {error}")))
+}
+
+/// Delivery discriminator for the seller's commit/fork delivery, derived from the SAME typed
+/// [`Delivery`](crate::delivery::Delivery) the buyer's pay path uses (PIECE-12) — NOT a
+/// hardcoded label — so buyer and seller derive it from one abstraction. Commit/fork ⇒
+/// `"fork"`, byte-identical to the former `DeliveryKind::Fork` hardcode. Fails closed if the
+/// just-pushed fields somehow do not type (impossible on the success path — a git push returns
+/// a canonical oid); never silently relabels or emits a bogus kind.
+fn seller_delivery_kind(
+    git_remote: &str,
+    branch: &str,
+    commit_oid: &str,
+) -> Result<crate::receipt::DeliveryKind, DaemonError> {
+    let delivery = crate::delivery::Delivery::Commit(
+        crate::delivery::GitDelivery::new(
+            git_remote.to_owned(),
+            branch.to_owned(),
+            crate::delivery::CommitOid::parse(commit_oid.to_owned())
+                .map_err(|error| DaemonError::Policy(format!("delivery oid: {error}")))?,
+        )
+        .map_err(|error| DaemonError::Policy(format!("delivery typing: {error}")))?,
+    );
+    Ok(delivery.delivery_kind())
 }
 
 /// Build the piece-9 Item-2 seller-claimed PUBLIC usage block for a kind-6109 result.
@@ -1559,6 +1585,21 @@ mod tests {
             "mobee-seller-daemon-{label}-{}-{id}",
             std::process::id()
         ))
+    }
+
+    // RIDER: the seller-side receipt-preimage delivery discriminator is DERIVED from the typed
+    // `Delivery` (Commit → "fork"), not a hardcoded label — buyer and seller now agree by
+    // construction. Behavior-identical ("fork"), byte-identical to the former hardcode.
+    #[test]
+    fn seller_delivery_kind_derives_fork_from_typed_delivery() {
+        let kind = seller_delivery_kind(
+            "https://relay.example/git/job.git",
+            "mobee/abcd1234",
+            &"a".repeat(40),
+        )
+        .expect("commit delivery types");
+        assert_eq!(kind, crate::receipt::DeliveryKind::Fork);
+        assert_eq!(kind.as_str(), "fork");
     }
 
     #[test]

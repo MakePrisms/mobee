@@ -222,6 +222,20 @@ pub async fn authorize_pay_async(
     let seller_hex = seller_nostr.to_hex();
     let seller_signature = request.seller_signature.clone();
 
+    // THE LOAD-BEARING PRE-PAY TOOTH (cross-bind / forged-cosig). Rebuild the EXACT receipt
+    // preimage the pay path will co-sign and publish (same `receipt_preimage_for` constructor
+    // as `build_and_publish_receipt`, so the verified bytes cannot drift from the published
+    // bytes) and verify the seller's `sig/seller` over it against the claim-seller anchor —
+    // BEFORE the budget gate commits spent and BEFORE the wallet opens. Fail-closed here ⇒
+    // ZERO spend: no `authorize_then_attempt`, no lock/mint/send, no receipt, no journal
+    // record. This is the single seam piece-10's signed-6109 tuple bind extends (see
+    // `ReceiptAuthority::verify_seller_prepay_cosig`).
+    let prepay_preimage =
+        receipt_preimage_for(&key, &buyer_nostr.to_hex(), &seller_hex, delivery_kind);
+    authority
+        .verify_seller_prepay_cosig(&prepay_preimage, &request.seller_signature)
+        .map_err(AuthorizePayError::Payment)?;
+
     let wallet = buyer_fund::open_testnut_wallet_async(home).await?;
     // Dust guard (live keyset N=1 floor, fail-closed). lock_or_reconcile re-checks
     // against CDK input-count send_fee after prepare_send.
@@ -279,6 +293,34 @@ fn cashu_compressed_from_nostr(key: &NostrPublicKey) -> Result<CashuPublicKey, A
     })
 }
 
+/// The SINGLE co-signed-receipt-preimage constructor for this trade.
+///
+/// Used by BOTH the pre-pay seller-cosig tooth (before any spend) and
+/// [`build_and_publish_receipt`] (at publish), so the bytes the buyer verifies pre-spend are
+/// byte-identical to the bytes it later co-signs and publishes — the two can never drift.
+/// `delivery_kind` is derived from the typed [`Delivery`] variant (`Commit` → `"fork"`);
+/// `exec_metadata_commitment` is the empty marker (exec-metadata is seller-claimed, not
+/// co-signed — piece-9 Item 2). Field set / order matches `receipt.rs` `ReceiptPreimage`.
+fn receipt_preimage_for(
+    key: &PaymentKey,
+    buyer_pubkey_hex: &str,
+    seller_pubkey_hex: &str,
+    delivery_kind: DeliveryKind,
+) -> ReceiptPreimage {
+    ReceiptPreimage {
+        job_hash: key.job_hash.as_str().to_owned(),
+        offer_id: key.job_id.as_str().to_owned(),
+        amount: key.amount.to_u64(),
+        unit: key.unit.to_string(),
+        mint: key.mint.to_string(),
+        buyer_pubkey: buyer_pubkey_hex.to_owned(),
+        seller_pubkey: seller_pubkey_hex.to_owned(),
+        delivery_integrity_hash: key.delivery_integrity_hash.as_str().to_owned(),
+        delivery_kind: delivery_kind.as_str().to_owned(),
+        exec_metadata_commitment: EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
+    }
+}
+
 /// Piece-9 Item 1: build + publish the buyer-authored kind-3400 receipt for a sent
 /// payment, and return the co-signature evidence the [`ReceiptAuthority`] verifies.
 ///
@@ -301,20 +343,10 @@ fn build_and_publish_receipt(
     let buyer_hex = buyer_keys.public_key().to_hex();
     let mint = key.mint.to_string();
     let amount = key.amount.to_u64();
-    // offer_id == job_id in this codebase (the offer event id is the job id).
-    let preimage = ReceiptPreimage {
-        job_hash: key.job_hash.as_str().to_owned(),
-        offer_id: key.job_id.as_str().to_owned(),
-        amount,
-        unit: key.unit.to_string(),
-        mint: mint.clone(),
-        buyer_pubkey: buyer_hex.clone(),
-        seller_pubkey: seller_hex.to_owned(),
-        delivery_integrity_hash: key.delivery_integrity_hash.as_str().to_owned(),
-        // Derived from the delivery variant (was a `DeliveryKind::Fork` hardcode); `Commit` → "fork".
-        delivery_kind: delivery_kind.as_str().to_owned(),
-        exec_metadata_commitment: EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
-    };
+    // offer_id == job_id in this codebase (the offer event id is the job id). Built via the
+    // SINGLE shared constructor the pre-pay tooth also uses, so the co-signed bytes published
+    // here are byte-identical to the bytes verified before the spend (they cannot drift).
+    let preimage = receipt_preimage_for(key, &buyer_hex, seller_hex, delivery_kind);
     let digest = preimage.digest_bytes();
     // Buyer counter-signature (no aux-rand): a `sig/buyer` tag that is a pure function of the
     // preimage. This makes only the co-SIGNATURE deterministic — NOT the event id, which also
@@ -647,6 +679,14 @@ mod tests {
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         // Fee-safe tiny amount (testnut fee=1 → need ≥2) within default caps.
         // Dust guard runs before delivery verify; amount=1 would false-pass this test.
+        // A VALID seller co-signature is now required to reach this point: the pre-pay tooth
+        // runs first, so a bad/empty sig would refuse at ZERO spend and this test would no
+        // longer exercise the write-before-effect (spent==2) path it guards. Signing here lets
+        // the pre-pay gate PASS, so the pay path still refuses at the ext locator AFTER spent.
+        let valid_sig = seller_cosig(
+            &home,
+            &prepay_preimage(&home, "job-ext", "result-ext", &"bb".repeat(32), &"aa".repeat(20), 2),
+        );
         let request = AuthorizePayRequest {
             job_id: "job-ext".into(),
             result_id: "result-ext".into(),
@@ -657,7 +697,7 @@ mod tests {
             repo: "ext::sh -c evil".into(),
             branch: "main".into(),
             commit_oid: "aa".repeat(20),
-            seller_signature: String::new(),
+            seller_signature: valid_sig,
         };
         let err = authorize_pay(&home, &mut gate, request.clone()).expect_err("ext refused");
         let message = err.to_string();
@@ -680,6 +720,172 @@ mod tests {
         assert_eq!(gate.spent(), 2, "retry must not double-count spent");
         let reloaded = BudgetGate::from_home(&home).expect("reload");
         assert_eq!(reloaded.spent(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- PRE-PAY seller-cosig tooth (the cross-bind / forged-cosig fix) ------------------
+    // Rebuild the co-signed receipt preimage EXACTLY as `authorize_pay_async` does (via the
+    // shared `receipt_preimage_for`), for a home where buyer == seller == the home key. Used to
+    // mint a REAL seller co-signature (or one over tampered bytes) for the pre-pay tooth.
+    fn prepay_preimage(
+        home: &MobeeHome,
+        job_id: &str,
+        result_id: &str,
+        job_hash: &str,
+        oid: &str,
+        amount_sats: u64,
+    ) -> ReceiptPreimage {
+        let hex = home::public_key_hex(home).expect("pubkey");
+        let seller_nostr = NostrPublicKey::parse(&hex).expect("seller nostr");
+        let seller_p2pk = cashu_compressed_from_nostr(&seller_nostr).expect("p2pk");
+        let terms = PaymentTerms::new(
+            MintUrl::from_str(DEFAULT_MINT_URL).expect("mint"),
+            Amount::from(amount_sats),
+            CurrencyUnit::Sat,
+            seller_nostr,
+            seller_p2pk,
+        );
+        let key = PaymentKey::new(
+            JobId::new(job_id).expect("job id"),
+            ResultId::new(result_id).expect("result id"),
+            DeliveryIntegrityHash::from_hex(oid).expect("oid"),
+            JobHash::from_hex(job_hash).expect("job hash"),
+            &terms,
+        );
+        // buyer == seller == home key in these tests; `Commit` → delivery_kind "fork".
+        receipt_preimage_for(&key, &hex, &hex, DeliveryKind::Fork)
+    }
+
+    fn seller_cosig(home: &MobeeHome, preimage: &ReceiptPreimage) -> String {
+        let secret = home::read_secret_key_hex(home).expect("secret");
+        let keys = Keys::parse(&secret).expect("keys");
+        keys.sign_schnorr(&Message::from_digest(preimage.digest_bytes()))
+            .to_string()
+    }
+
+    // THE LOAD-BEARING TOOTH: a forged/mismatched seller signature — a REAL schnorr sig by an
+    // unrelated key over the CORRECT preimage (buyer-cosig would PASS / seller-cosig FAILs: the
+    // live 21-sat receipt shape) — refuses BEFORE any spend. gate.spent()==0, no wallet opened,
+    // no payment journal, never Sent. `repo: ext::…` is chosen so that a REVERTED gate
+    // (red-on-revert) still refuses hermetically at the pay-path verifier — but only AFTER
+    // committing spent, so removing this tooth flips gate.spent() 0→2.
+    #[test]
+    fn authorize_pay_refuses_forged_seller_signature_with_zero_spend() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-authorize-pay-forged-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let mut gate = BudgetGate::from_home(&home).expect("gate");
+        let oid = "aa".repeat(20);
+        let job_hash = "bb".repeat(32);
+        let preimage = prepay_preimage(&home, "job-forged", "result-forged", &job_hash, &oid, 2);
+        // Real schnorr signature, but by an unrelated key — not the claim seller.
+        let attacker = Keys::generate();
+        let forged_sig = attacker
+            .sign_schnorr(&Message::from_digest(preimage.digest_bytes()))
+            .to_string();
+        let request = AuthorizePayRequest {
+            job_id: "job-forged".into(),
+            result_id: "result-forged".into(),
+            delivery_integrity_hash: oid.clone(),
+            job_hash,
+            seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
+            amount_sats: 2,
+            repo: "ext::sh -c evil".into(),
+            branch: "main".into(),
+            commit_oid: oid,
+            seller_signature: forged_sig,
+        };
+        let err = authorize_pay(&home, &mut gate, request).expect_err("forged sig refused pre-pay");
+        assert!(
+            err.to_string().contains("pre-pay seller co-signature invalid"),
+            "must be the pre-pay tooth refusal, got: {err}"
+        );
+        assert_eq!(gate.spent(), 0, "forged-sig refuse must be ZERO spend (pre-pay tooth)");
+        assert!(
+            !home.root.join("payment-journal").exists(),
+            "no payment journal may be created (refused before the payment SM / any Sent)"
+        );
+        let reloaded = BudgetGate::from_home(&home).expect("reload");
+        assert_eq!(reloaded.spent(), 0, "durable spent must stay 0");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Tampered-field parity: a seller signature over the honest preimage no longer verifies
+    // once ANY covered field is flipped post-signing (the sig covers the exact canonical
+    // bytes). Same refusal, zero spend — checked for the amount field and the delivery oid.
+    #[test]
+    fn authorize_pay_refuses_tampered_preimage_field_with_zero_spend() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-authorize-pay-tamper-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let seller_hex = home::public_key_hex(&home).expect("pubkey");
+        let honest_oid = "aa".repeat(20);
+        let honest_hash = "bb".repeat(32);
+
+        // (a) amount tampered: seller signed amount=2, request carries amount=3.
+        let sig_over_2 = seller_cosig(
+            &home,
+            &prepay_preimage(&home, "job-tamper", "result-tamper", &honest_hash, &honest_oid, 2),
+        );
+        let mut gate = BudgetGate::from_home(&home).expect("gate");
+        let tampered_amount = AuthorizePayRequest {
+            job_id: "job-tamper".into(),
+            result_id: "result-tamper".into(),
+            delivery_integrity_hash: honest_oid.clone(),
+            job_hash: honest_hash.clone(),
+            seller_pubkey: seller_hex.clone(),
+            amount_sats: 3,
+            repo: "ext::sh -c evil".into(),
+            branch: "main".into(),
+            commit_oid: honest_oid.clone(),
+            seller_signature: sig_over_2,
+        };
+        let err = authorize_pay(&home, &mut gate, tampered_amount).expect_err("tampered amount");
+        assert!(
+            err.to_string().contains("pre-pay seller co-signature invalid"),
+            "amount tamper must refuse at the pre-pay tooth, got: {err}"
+        );
+        assert_eq!(gate.spent(), 0, "tampered amount must be zero spend");
+
+        // (b) delivery oid tampered: seller signed oid=aa.., request binds oid=cc..
+        let tampered_oid = "cc".repeat(20);
+        let sig_over_aa = seller_cosig(
+            &home,
+            &prepay_preimage(&home, "job-tamper2", "result-tamper2", &honest_hash, &honest_oid, 2),
+        );
+        let mut gate2 = BudgetGate::from_home(&home).expect("gate");
+        let tampered_delivery = AuthorizePayRequest {
+            job_id: "job-tamper2".into(),
+            result_id: "result-tamper2".into(),
+            delivery_integrity_hash: tampered_oid.clone(),
+            job_hash: honest_hash,
+            seller_pubkey: seller_hex,
+            amount_sats: 2,
+            repo: "ext::sh -c evil".into(),
+            branch: "main".into(),
+            commit_oid: tampered_oid,
+            seller_signature: sig_over_aa,
+        };
+        let err2 = authorize_pay(&home, &mut gate2, tampered_delivery).expect_err("tampered oid");
+        assert!(
+            err2.to_string().contains("pre-pay seller co-signature invalid"),
+            "oid tamper must refuse at the pre-pay tooth, got: {err2}"
+        );
+        assert_eq!(gate2.spent(), 0, "tampered oid must be zero spend");
         let _ = std::fs::remove_dir_all(&root);
     }
 
