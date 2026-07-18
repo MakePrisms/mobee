@@ -732,7 +732,11 @@ fn derive_claim_liveness(
     live_claim_id
 }
 
-async fn fetch_job_view_async(
+/// Read one job's offer + claims + results from the relay, with claim liveness derived
+/// against `now` (a `processing` claim past the offer deadline is EXPIRED, not live). Exposed
+/// `pub(crate)` so the seller daemon can run the backfill money-safety pre-claim check
+/// (already-delivered / live-claimed-by-another) without duplicating the relay read.
+pub(crate) async fn fetch_job_view_async(
     home: &MobeeHome,
     keys: &nostr_sdk::Keys,
     job_id: &str,

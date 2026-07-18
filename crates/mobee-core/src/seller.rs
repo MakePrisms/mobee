@@ -536,6 +536,41 @@ git_remote = "https://example.invalid/repo.git"
         let seller = config.seller.expect("seller");
         assert_eq!(seller.agent_command, vec!["claude", "--print"]);
         assert_eq!(seller.rate_sats, 7);
+        // offer_backfill_secs ABSENT ⇒ serde default of 1200s (20 min).
+        assert_eq!(
+            seller.offer_backfill_secs, 1200,
+            "absent offer_backfill_secs must default to 1200"
+        );
+    }
+
+    #[test]
+    fn offer_backfill_secs_parses_custom_and_zero() {
+        let base = |backfill: &str| {
+            format!(
+                r#"
+relay_url = "wss://example.invalid"
+mint_url = "https://testnut.cashudevkit.org"
+per_job_budget_sats = 21
+total_budget_sats = 100
+
+[seller]
+agent_command = ["claude", "--print"]
+rate_sats = 7
+git_remote = "https://example.invalid/repo.git"
+offer_backfill_secs = {backfill}
+"#
+            )
+        };
+        // Custom window.
+        let custom: MobeeConfig = toml::from_str(&base("300")).expect("parse custom");
+        assert_eq!(custom.seller.expect("seller").offer_backfill_secs, 300);
+        // Explicit 0 = live-only (must NOT fall back to the default).
+        let zero: MobeeConfig = toml::from_str(&base("0")).expect("parse zero");
+        assert_eq!(
+            zero.seller.expect("seller").offer_backfill_secs,
+            0,
+            "explicit 0 must parse as live-only, not the default"
+        );
     }
 
     #[test]
@@ -550,6 +585,7 @@ git_remote = "https://example.invalid/repo.git"
             job_timeout_secs: None,
             agent: None,
             claim_open_pool: false,
+            offer_backfill_secs: 0,
         });
         home::save_config(&home).expect("save");
 

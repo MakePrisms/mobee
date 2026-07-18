@@ -81,6 +81,21 @@ pub struct SellerConfig {
     /// Opt-in to claim untargeted/open offers. Default **false** (targeted-only).
     #[serde(default)]
     pub claim_open_pool: bool,
+    /// Backfill window (seconds) for the seller's kind-5109 offer subscription(s). On
+    /// (re)subscribe the offer filters request stored offers dated at/after `now - this`, so a
+    /// daemon started AFTER an offer was posted still SEES it (and claims it iff every
+    /// money-safety guard passes: not deadline-expired, clears the rate floor, not already
+    /// delivered/settled, not live-claimed by another seller). Default **1200** (20 min).
+    /// **`0` = live-only** — byte-identical pre-backfill subscription shape (`since(now)`,
+    /// untargeted `limit(0)`): no stored offers, only offers posted while the daemon runs.
+    #[serde(default = "default_offer_backfill_secs")]
+    pub offer_backfill_secs: u64,
+}
+
+/// serde default for [`SellerConfig::offer_backfill_secs`]: 1200s (20 min). A `[seller]` block
+/// written before this field existed parses to this default; `0` must be set explicitly.
+pub fn default_offer_backfill_secs() -> u64 {
+    1200
 }
 
 /// Per-seller NIP-34 `d` / path leaf. Relay `.names/` registry is GLOBAL across

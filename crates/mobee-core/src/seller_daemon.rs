@@ -49,6 +49,12 @@ const AWAITING_PAYMENT_CAP: usize = 16;
 /// outlives the deadline (see [`run_agent_with_retry`]).
 const MAX_AGENT_ATTEMPTS: u32 = 3;
 
+/// Relay-read timeout for the backfill pre-claim money-safety check ([`SellerDaemon::
+/// backfill_offer_blocked`]). Matches the job-lifecycle fetch budget: fetches terminate on the
+/// relay's EOSE, so this is an upper bound, not a fixed wait. On a slow/unreachable relay the
+/// check fails CLOSED (skip), so a small budget is safe.
+const BACKFILL_CHECK_TIMEOUT_SECS: u64 = 5;
+
 #[derive(Debug)]
 pub enum DaemonError {
     Seller(SellerError),
@@ -191,6 +197,12 @@ pub enum OfferSkip {
     Unparseable,
     /// Offer mint is not the fail-closed testnut mint.
     NonTestnutMint { mint_url: String },
+    /// Offer's own deadline (`param deadline`, absolute unix) has already passed at `now`.
+    /// Money-safety: a lapsed offer is REFUSED so a backfilled (stored) offer can never be
+    /// resurrected with a fresh `now + timeout` deadline (the pre-backfill hazard in
+    /// `job_deadline_unix`). A pure function of the offer event + `now`, so it holds for a
+    /// live offer too — an offer whose deadline already passed is dead regardless of delivery.
+    DeadlineExpired { deadline_unix: u64, now: u64 },
     /// Rate-gate refused (not targeted to us / below rate / untargeted without opt-in).
     RateGate { reason: String },
     /// Journal already has a claim/receipt/release for this job (dedup).
@@ -209,6 +221,9 @@ impl OfferSkip {
             Self::NotAnOffer { kind } => format!("not a kind-{JOB_OFFER_KIND} offer (kind {kind})"),
             Self::Unparseable => "offer tags did not parse".to_string(),
             Self::NonTestnutMint { mint_url } => format!("non-testnut mint {mint_url}"),
+            Self::DeadlineExpired { deadline_unix, now } => format!(
+                "offer deadline {deadline_unix} already passed at now={now} (expired; refused — a lapsed offer is never claimed or resurrected)"
+            ),
             Self::RateGate { reason } => format!("rate-gate: {reason}"),
             Self::AlreadyProcessed => "already claimed/receipted/released (journal dedup)".to_string(),
             Self::ProcessingBusy { job_id } => {
@@ -313,6 +328,12 @@ impl SellerDaemon {
         let intent = match self.classify_offer(event, now)? {
             OfferDisposition::Skip(skip) => {
                 eprintln!("seller skip offer {}: {}", event.id.to_hex(), skip.reason());
+                // Bundled buyer-visibility: a TARGETED-to-self under-rate refusal also emits a
+                // kind-7000 `status=error` so the buyer learns why. Open-pool under-rate stays
+                // log-only (spam guard). No-op for every other skip reason.
+                if matches!(skip, OfferSkip::RateGate { .. }) {
+                    self.publish_under_rate_error_if_targeted(event).await;
+                }
                 return Ok(None);
             }
             OfferDisposition::Claim(intent) => intent,
@@ -391,6 +412,18 @@ impl SellerDaemon {
                 mint_url: offer.mint_url.clone(),
             }));
         }
+        // Offer-freshness gate (money-safety, backfill guard #a). The offer carries its own
+        // absolute deadline (`param deadline`, always present — `parse_offer` requires it). If
+        // it has already passed we REFUSE here, BEFORE `job_deadline_unix` — which would
+        // otherwise hand a stale (backfilled) offer a fresh `now + timeout` deadline and
+        // resurrect a lapsed job. `offer.deadline_unix > now` is exactly the still-usable branch
+        // of `job_deadline_unix`, so this gate is its safe complement. Pure over (offer, now).
+        if offer.deadline_unix <= now {
+            return Ok(OfferDisposition::Skip(OfferSkip::DeadlineExpired {
+                deadline_unix: offer.deadline_unix,
+                now,
+            }));
+        }
         let seller_cfg = require_seller_config(&self.home)?;
         if let Err(error) = rate_gate_allows(
             &offer,
@@ -425,6 +458,97 @@ impl SellerDaemon {
             offer,
             deadline_unix,
         }))
+    }
+
+    /// Backfill pre-claim money-safety check (guards #c/#d) for a BACKFILLED offer — one posted
+    /// before the daemon came online. Reads the job's current relay state (offer + kind-7000
+    /// claims + kind-6109 results, with claim liveness derived against `now`) and returns
+    /// `Some(reason)` if the offer must be SKIPPED, `None` to proceed to the normal claim path.
+    ///
+    /// This is the guard that stops a stored offer from stomping a trade that already moved on
+    /// while the daemon was offline:
+    ///  * **#c** any kind-6109 result exists (from ANY seller) ⇒ already delivered/settled;
+    ///  * **#d** a LIVE claim (kind-7000 `processing`, not past the offer deadline) is held by
+    ///    ANOTHER seller ⇒ an in-flight trade — do not stomp it.
+    ///
+    /// FAIL-CLOSED: if the relay read errors (cannot determine current state) the offer is
+    /// SKIPPED with a logged reason rather than optimistically claimed. Never runs on the
+    /// live path (see the caller's `created_at < daemon_start_unix` gate), so it adds no relay
+    /// round-trip to offers posted while the daemon runs.
+    async fn backfill_offer_blocked(&self, event: &nostr_sdk::Event) -> Option<String> {
+        let job_id = event.id.to_hex();
+        let now = now_unix();
+        let view = match crate::job_lifecycle::fetch_job_view_async(
+            &self.home,
+            &self.keys,
+            &job_id,
+            Duration::from_secs(BACKFILL_CHECK_TIMEOUT_SECS),
+            now,
+        )
+        .await
+        {
+            Ok(view) => view,
+            Err(error) => {
+                return Some(format!(
+                    "backfill relay pre-claim check failed (fail-closed skip): {error}"
+                ));
+            }
+        };
+        // #c — already delivered/settled by ANY seller (a kind-6109 result exists).
+        if let Some(result) = view.results.first() {
+            return Some(format!(
+                "already delivered: {} kind-6109 result(s) on relay (newest {} by {}); not re-claiming a settled job",
+                view.results.len(),
+                result.result_id,
+                result.seller_pubkey
+            ));
+        }
+        // #d — a LIVE claim held by ANOTHER seller (don't stomp an in-flight trade). Expired
+        // claims are already excluded from `live_claim_id` (liveness derived vs the offer
+        // deadline); our OWN prior claim is caught by the durable journal in `classify_offer`.
+        if let Some(live_id) = &view.live_claim_id {
+            if let Some(claim) = view.claims.iter().find(|c| &c.claim_id == live_id) {
+                if claim.seller_pubkey != self.seller_pubkey {
+                    return Some(format!(
+                        "live claim {live_id} held by another seller {} (offer in-flight); not stomping",
+                        claim.seller_pubkey
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// Bundled buyer-visibility (step 5): when a **targeted-to-self** offer is refused only for
+    /// being below the seller's rate floor, publish a kind-7000 `status=error` so the buyer
+    /// learns WHY (in addition to the local skip log). OPEN-POOL / untargeted under-rate refusals
+    /// stay LOG-ONLY (a fleet of rate-N sellers each 7000-ing every cheap open offer would spam
+    /// the relay). Publish failure is logged, never fatal. Called only on a `RateGate` skip.
+    async fn publish_under_rate_error_if_targeted(&self, event: &nostr_sdk::Event) {
+        let draft = event_to_draft(event);
+        let Ok(offer) = parse_offer(&draft) else {
+            return;
+        };
+        let Ok(seller_cfg) = require_seller_config(&self.home) else {
+            return;
+        };
+        let targeted_to_self = offer.seller_pubkey.as_deref() == Some(self.seller_pubkey.as_str());
+        if !(targeted_to_self && offer.amount < seller_cfg.rate_sats) {
+            return; // open-pool / wrong-target / not-under-rate ⇒ log-only (handled by caller).
+        }
+        let error = error_draft(&event.id.to_hex(), &event.pubkey.to_hex(), &self.seller_pubkey);
+        match publish_draft(&self.home, &self.keys, &error).await {
+            Ok(id) => eprintln!(
+                "seller under-rate refusal surfaced: kind-7000 error={id} offer={} (amount {} < rate_sats {})",
+                event.id.to_hex(),
+                offer.amount,
+                seller_cfg.rate_sats
+            ),
+            Err(error) => eprintln!(
+                "seller WARN: under-rate refusal kind-7000 publish failed offer={}: {error}",
+                event.id.to_hex()
+            ),
+        }
     }
 
     /// DELIVERED transition: move the PROCESSING job to `awaiting_payment` and free the
@@ -1218,39 +1342,64 @@ async fn wait_for_nip42_auth(
     within_window.unwrap_or(Ok(AuthWait::NoChallenge))
 }
 
-/// Build the seller's kind-5109 offer subscription filter(s).
+/// Cap on the number of STORED offers any one 5109 filter requests on (re)subscribe — a flood
+/// guard on the INITIAL query only. nostr 0.44 `Filter::limit` is "maximum number of events
+/// returned in the initial query" (`nostr-0.44.4/src/filter.rs`): it bounds the stored-events
+/// burst, does NOT affect live streaming, and is NOT part of `match_event`. So even a very large
+/// `offer_backfill_secs` can pull at most this many stored offers per filter (the rest arrive
+/// live). Distinct from `limit(0)` (the live-only sentinel: request ZERO stored offers).
+const OFFER_BACKFILL_LIMIT: usize = 500;
+
+/// Build the seller's kind-5109 offer subscription filter(s), anchored at `subscribe_now` with a
+/// `backfill_secs` stored-offer window.
 ///
 /// Always includes the TARGETED filter (`#p` == seller pubkey). When `claim_open_pool` is set,
 /// ALSO returns an UNtargeted filter (no pubkey pin): open-pool offers carry no `p` tag, so a
 /// pubkey-pinned filter alone never delivers them and `--claim-open-pool` is DOA. A targeted
-/// offer matches BOTH filters (deduped by event id at the call site); the downstream rate-gate
-/// (`rate_gate_allows`) still decides whether an untargeted offer is actually claimed.
+/// offer matches BOTH filters (deduped by event id at the call site); the downstream money-safety
+/// gates (`classify_offer` rate/expiry + the backfill pre-claim check) still decide whether any
+/// backfilled offer is actually claimed.
 ///
-/// The un-pinned open-pool filter is BOUNDED to NEW offers only — `since(now)` + `limit(0)`.
-/// Without the bound it is a full-history 5109 FIREHOSE (`kind:5109` with no `#p`/`since`/`limit`):
-/// a running seller replayed the relay's entire stored 5109 history on startup (field runs saw
-/// 60+ historical offers; the flood grows linearly with relay history). The seller wants to react
-/// to offers posted WHILE it runs, so the un-pinned filter streams only offers dated at/after
-/// subscribe time and requests zero stored events. The TARGETED `#p==self` filter keeps its shape
-/// (stored targeted offers still backfill on (re)subscribe — those are addressed to this seller).
+/// Backfill window (both filters): `since(subscribe_now - backfill_secs)`, so a daemon started
+/// AFTER an offer was posted still receives it if it is within the window — the gap this fixes
+/// (a seller that missed an offer posted seconds before it came online).
+///  * `backfill_secs == 0` → **live-only** (pre-backfill shape): both filters `since(now)`; the
+///    untargeted filter also `limit(0)` (request ZERO stored offers). Only offers posted WHILE
+///    the daemon runs are delivered — no full-history 5109 firehose on startup.
+///  * `backfill_secs > 0` → both filters `since(now - backfill_secs).limit(OFFER_BACKFILL_LIMIT)`.
+///    The untargeted filter DROPS `limit(0)` (which would suppress every stored offer and defeat
+///    the window) for the bounded cap instead.
 fn offer_subscription_filters(
     seller_pubkey: nostr_sdk::PublicKey,
     claim_open_pool: bool,
+    subscribe_now: nostr_sdk::Timestamp,
+    backfill_secs: u64,
 ) -> Vec<nostr_sdk::Filter> {
     use nostr_sdk::prelude::{Filter, Kind, Timestamp};
-    let mut filters = vec![Filter::new()
+    // `since` anchor: `now - backfill_secs` (saturating). backfill_secs == 0 ⇒ `since(now)`.
+    let since = Timestamp::from(subscribe_now.as_secs().saturating_sub(backfill_secs));
+
+    // TARGETED (`#p == self`). Always `since`-bounded; capped when a window is requested.
+    let mut targeted = Filter::new()
         .kind(Kind::Custom(JOB_OFFER_KIND))
-        .pubkey(seller_pubkey)];
+        .pubkey(seller_pubkey)
+        .since(since);
+    if backfill_secs > 0 {
+        targeted = targeted.limit(OFFER_BACKFILL_LIMIT);
+    }
+    let mut filters = vec![targeted];
+
     if claim_open_pool {
-        // Second, un-pinned filter: matches untargeted (open-pool) 5109 offers, BOUNDED to new
-        // offers (`since(now)` + `limit(0)`) so a running seller streams fresh untargeted offers
-        // without replaying the relay's full 5109 history.
-        filters.push(
-            Filter::new()
-                .kind(Kind::Custom(JOB_OFFER_KIND))
-                .since(Timestamp::now())
-                .limit(0),
-        );
+        // UNtargeted (open-pool): no `#p` pin.
+        let mut untargeted = Filter::new().kind(Kind::Custom(JOB_OFFER_KIND)).since(since);
+        untargeted = if backfill_secs > 0 {
+            // Window requested: bounded stored-offer burst (drop the live-only `limit(0)`).
+            untargeted.limit(OFFER_BACKFILL_LIMIT)
+        } else {
+            // Live-only: `limit(0)` requests ZERO stored offers (byte-identical pre-backfill).
+            untargeted.limit(0)
+        };
+        filters.push(untargeted);
     }
     filters
 }
@@ -1268,8 +1417,15 @@ fn offer_subscription_filters(
 fn offer_subscriptions(
     seller_pubkey: nostr_sdk::PublicKey,
     claim_open_pool: bool,
+    subscribe_now: nostr_sdk::Timestamp,
+    backfill_secs: u64,
 ) -> Vec<Vec<nostr_sdk::Filter>> {
-    vec![offer_subscription_filters(seller_pubkey, claim_open_pool)]
+    vec![offer_subscription_filters(
+        seller_pubkey,
+        claim_open_pool,
+        subscribe_now,
+        backfill_secs,
+    )]
 }
 
 /// Cap on the number of most-recently-seen offer ids retained for in-loop dedup.
@@ -1365,7 +1521,7 @@ pub(crate) async fn run_forever_hooked(
     use std::time::Duration;
     use nostr_sdk::prelude::{
         Client, Filter, Kind, RelayMessage, RelayPoolNotification, RelayUrl, SubscribeOptions,
-        SubscriptionId,
+        SubscriptionId, Timestamp,
     };
 
     let client = Client::new(daemon.keys.clone());
@@ -1428,11 +1584,22 @@ pub(crate) async fn run_forever_hooked(
     // bug). The event-id dedup in the loop still processes each offer exactly once. Sub id(s) are
     // captured so the Loud-Closed fallback can detect a relay CLOSE of the offer subscription.
     let seller_pubkey = daemon.keys.public_key();
-    let claim_open_pool = require_seller_config(&daemon.home)
-        .map(|cfg| cfg.claim_open_pool)
-        .unwrap_or(false);
+    let (claim_open_pool, offer_backfill_secs) = require_seller_config(&daemon.home)
+        .map(|cfg| (cfg.claim_open_pool, cfg.offer_backfill_secs))
+        .unwrap_or((false, 0));
+    // Single subscribe anchor, shared by the offer filters (`since(now - window)`) and the
+    // backfill discriminator below (`created_at < daemon_start_unix` ⇒ posted before we came
+    // online ⇒ subject to the pre-claim money-safety check). Captured once so the filter bound
+    // and the discriminator agree.
+    let subscribe_now = Timestamp::now();
+    let daemon_start_unix = subscribe_now.as_secs();
     let mut offer_sub_ids: Vec<SubscriptionId> = Vec::new();
-    for filters in offer_subscriptions(seller_pubkey, claim_open_pool) {
+    for filters in offer_subscriptions(
+        seller_pubkey,
+        claim_open_pool,
+        subscribe_now,
+        offer_backfill_secs,
+    ) {
         let output = client
             .pool()
             .subscribe(filters, SubscribeOptions::default())
@@ -1491,6 +1658,18 @@ pub(crate) async fn run_forever_hooked(
                 // offers carry none, so a p-tag gate here would silently drop them. Deduped by
                 // event id so each offer is processed once (see `offer_event_should_process`).
                 if offer_event_should_process(event.kind.as_u16(), event.id, &mut seen_offers) {
+                    // BACKFILL money-safety pre-claim check (guards #c/#d), for offers posted
+                    // BEFORE we came online (`created_at < daemon_start_unix`). A live offer
+                    // (posted while we run) keeps the byte-identical fast path — no relay query.
+                    // This gates on backfilled-vs-live, NOT on window size, so it holds for ANY
+                    // `offer_backfill_secs`. Fail-closed: an inconclusive relay read SKIPS. Every
+                    // outcome is logged with a reason (never a silent drop).
+                    if event.created_at.as_secs() < daemon_start_unix {
+                        if let Some(reason) = daemon.backfill_offer_blocked(&event).await {
+                            eprintln!("seller skip offer {}: {reason}", event.id.to_hex());
+                            continue;
+                        }
+                    }
                     match daemon.on_offer_event(&event).await {
                         Ok(Some(_)) => {
                             match daemon.execute_active_job().await {
@@ -1542,10 +1721,18 @@ pub(crate) async fn run_forever_hooked(
                         subscription_id.as_ref(),
                         message
                     );
+                    // Re-subscribe with the SAME backfill window (fresh `now` anchor at resubscribe
+                    // time) so the degraded targeted-only filter still backfills offers posted
+                    // while the grouped subscription was down.
                     match client
                         .pool()
                         .subscribe(
-                            offer_subscription_filters(seller_pubkey, false),
+                            offer_subscription_filters(
+                                seller_pubkey,
+                                false,
+                                Timestamp::now(),
+                                offer_backfill_secs,
+                            ),
                             SubscribeOptions::default(),
                         )
                         .await
@@ -1615,6 +1802,7 @@ mod tests {
             job_timeout_secs: None,
             agent: None,
             claim_open_pool: false,
+            offer_backfill_secs: 0,
         });
         home::save_config(&home).expect("save");
         let err = match SellerDaemon::open(home) {
@@ -1870,9 +2058,14 @@ mod tests {
                 .any(|filter| filter.match_event(event, MatchEventOptions::new()))
         };
 
+        // A 300s backfill window: comfortably covers the `now`/`now+60` offers, excludes the
+        // hour-old one. (`match_event` only consults `since`, not `limit`.)
+        let window = 300u64;
+
         // Targeted-only (claim_open_pool = false): the targeted offer matches, the untargeted
         // (open-pool) offer does NOT — this is exactly why --claim-open-pool was DOA.
-        let targeted_only = offer_subscription_filters(seller.public_key(), false);
+        let targeted_only =
+            offer_subscription_filters(seller.public_key(), false, Timestamp::now(), window);
         assert!(
             matches_any(&targeted_only, &targeted),
             "targeted offer must match the pinned filter"
@@ -1885,7 +2078,8 @@ mod tests {
         // Open-pool (claim_open_pool = true): the 2nd un-pinned filter lands the FRESH untargeted
         // offer. RED-ON-REVERT: drop the `filters.push(...)` in offer_subscription_filters and
         // this assert fails — the untargeted offer no longer matches, so no claim fires.
-        let open_pool = offer_subscription_filters(seller.public_key(), true);
+        let open_pool =
+            offer_subscription_filters(seller.public_key(), true, Timestamp::now(), window);
         assert!(
             matches_any(&open_pool, &targeted),
             "targeted offer still matches under open-pool"
@@ -1894,12 +2088,12 @@ mod tests {
             matches_any(&open_pool, &fresh_untargeted),
             "fresh untargeted offer MUST match under open-pool (the fix)"
         );
-        // The un-pinned filter is BOUNDED (`since(now)`): a STALE (historical) untargeted offer
-        // does NOT match, so a running seller does not replay the relay's 5109 history.
-        // RED-ON-REVERT: drop `.since(..).limit(0)` and this assert fails (the flood returns).
+        // The un-pinned filter is BOUNDED (`since(now - window)`): an offer OLDER than the window
+        // does NOT match, so a running seller never replays the relay's full 5109 history.
+        // RED-ON-REVERT: drop the `.since(..)` bound and this assert fails (the flood returns).
         assert!(
             !matches_any(&open_pool, &stale_untargeted),
-            "stale (historical) untargeted offer MUST NOT match the bounded open-pool filter"
+            "an untargeted offer older than the backfill window MUST NOT match the bounded filter"
         );
     }
 
@@ -1933,7 +2127,7 @@ mod tests {
         // registered the un-pinned filter as a SEPARATE second subscription (two subscriptions),
         // which the relay dropped after backfill. RED-ON-REVERT: return one subscription per
         // filter (as the half-fix did) and this `len() == 1` assertion fails.
-        let subs = offer_subscriptions(seller.public_key(), true);
+        let subs = offer_subscriptions(seller.public_key(), true, Timestamp::now(), 300);
         assert_eq!(
             subs.len(),
             1,
@@ -1950,7 +2144,7 @@ mod tests {
         );
 
         // Targeted-only: still one subscription; matches targeted, not untargeted.
-        let subs = offer_subscriptions(seller.public_key(), false);
+        let subs = offer_subscriptions(seller.public_key(), false, Timestamp::now(), 300);
         assert_eq!(subs.len(), 1, "one offer subscription when not open-pool");
         assert!(matches_any(&subs[0], &targeted));
         assert!(
@@ -2195,6 +2389,7 @@ mod tests {
             job_timeout_secs: None,
             agent: None,
             claim_open_pool: false,
+            offer_backfill_secs: 0,
         });
         home::save_config(&home).expect("save");
         let keys = nostr_sdk::Keys::generate();
@@ -2315,6 +2510,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Money-safety guard #a (PURE): an offer whose OWN deadline already passed is REFUSED, so a
+    // (backfilled) offer can never be resurrected with a fresh `now + timeout` deadline. Injected
+    // `now` keeps it deterministic — no wall clock.
+    #[test]
+    fn classify_refuses_offer_past_its_own_deadline() {
+        let (root, daemon) = test_daemon("expired");
+        let seller_pk = daemon.seller_pubkey().to_owned();
+        let buyer = nostr_sdk::Keys::generate();
+        let now = 1_000_000u64;
+
+        // Deadline in the PAST ⇒ DeadlineExpired skip with a named, non-empty reason.
+        let expired = offer_event(&buyer, &seller_pk, 5, now - 1);
+        match daemon.classify_offer(&expired, now).expect("classify expired") {
+            OfferDisposition::Skip(skip) => {
+                assert!(matches!(skip, OfferSkip::DeadlineExpired { .. }), "got {skip:?}");
+                let reason = skip.reason();
+                assert!(
+                    !reason.is_empty() && reason.contains("expired"),
+                    "skip reason must name expiry (never silent): {reason}"
+                );
+            }
+            other => panic!("an offer past its deadline must be REFUSED, got {other:?}"),
+        }
+
+        // Boundary: deadline == now is refused (`<= now`); a strictly-future deadline is admitted.
+        assert!(
+            matches!(
+                daemon.classify_offer(&offer_event(&buyer, &seller_pk, 5, now), now).expect("at-now"),
+                OfferDisposition::Skip(OfferSkip::DeadlineExpired { .. })
+            ),
+            "deadline == now must be refused"
+        );
+        assert!(
+            matches!(
+                daemon.classify_offer(&offer_event(&buyer, &seller_pk, 5, now + 1), now).expect("future"),
+                OfferDisposition::Claim(_)
+            ),
+            "a strictly-future deadline must be admitted"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // window == 0 reproduces the pre-backfill LIVE-ONLY subscription shape byte-identically:
+    // untargeted `since(now) + limit(0)` (zero stored offers), targeted `since(now)`.
+    #[test]
+    fn window_zero_reproduces_live_only_filter_shape() {
+        use nostr_sdk::prelude::{Keys, Timestamp};
+        let seller = Keys::generate();
+        let now = Timestamp::now();
+        let filters = offer_subscription_filters(seller.public_key(), true, now, 0);
+        assert_eq!(filters.len(), 2, "open-pool ⇒ targeted + untargeted filter");
+        // Targeted: since(now), NO stored-offer cap.
+        assert_eq!(filters[0].since, Some(now), "window=0 targeted must be since(now)");
+        assert_eq!(filters[0].limit, None, "window=0 targeted must carry no limit");
+        // Untargeted: since(now) + limit(0) — the byte-identical live-only shape.
+        assert_eq!(filters[1].since, Some(now), "window=0 untargeted must be since(now)");
+        assert_eq!(
+            filters[1].limit,
+            Some(0),
+            "window=0 untargeted must keep limit(0) (request ZERO stored offers)"
+        );
+    }
+
+    // window > 0 bounds BOTH filters to `since(now - window)` and caps the stored-offer burst;
+    // the untargeted filter DROPS limit(0) (which would otherwise suppress every stored offer).
+    #[test]
+    fn positive_window_bounds_and_caps_both_filters() {
+        use nostr_sdk::prelude::{Keys, Timestamp};
+        let seller = Keys::generate();
+        let now = Timestamp::now();
+        let window = 1200u64;
+        let expected_since = Timestamp::from(now.as_secs() - window);
+        let filters = offer_subscription_filters(seller.public_key(), true, now, window);
+        assert_eq!(filters.len(), 2);
+        // Targeted: since(now - window) + flood cap.
+        assert_eq!(filters[0].since, Some(expected_since), "targeted since must be now-window");
+        assert_eq!(
+            filters[0].limit,
+            Some(OFFER_BACKFILL_LIMIT),
+            "targeted must carry the stored-offer flood cap when a window is set"
+        );
+        // Untargeted: since(now - window) + flood cap; limit(0) dropped.
+        assert_eq!(filters[1].since, Some(expected_since), "untargeted since must be now-window");
+        assert_eq!(
+            filters[1].limit,
+            Some(OFFER_BACKFILL_LIMIT),
+            "untargeted must DROP limit(0) for the flood cap when window > 0"
+        );
+    }
+
     #[cfg(not(feature = "acp"))]
     #[tokio::test]
     async fn agent_run_fail_closed_without_acp_feature() {
@@ -2376,7 +2661,13 @@ mod local_relay_it {
     }
 
     /// Bootstrap a seller home bound to `relay_url` (mint stays the fail-closed testnut default).
-    fn seller_home(root: &std::path::Path, relay_url: &str, claim_open_pool: bool) -> home::MobeeHome {
+    /// `offer_backfill_secs` sets the offer-backfill window (0 = live-only, pre-backfill shape).
+    fn seller_home(
+        root: &std::path::Path,
+        relay_url: &str,
+        claim_open_pool: bool,
+        offer_backfill_secs: u64,
+    ) -> home::MobeeHome {
         let mut h = home::bootstrap(root).expect("bootstrap seller home");
         h.config.relay_url = relay_url.to_string();
         assert_eq!(
@@ -2393,6 +2684,7 @@ mod local_relay_it {
             job_timeout_secs: Some(5),
             agent: None,
             claim_open_pool,
+            offer_backfill_secs,
         });
         h
     }
@@ -2415,11 +2707,18 @@ mod local_relay_it {
     }
 
     /// Build an offer draft carrying the fail-closed testnut mint (so it is never skipped for the
-    /// wrong reason). `targeted_to = Some(hex)` ⇒ a `#p`-tagged (targeted) offer; `None` ⇒ open.
+    /// wrong reason) and a FUTURE deadline (~1h out) so the offer-freshness gate does not refuse
+    /// it. `targeted_to = Some(hex)` ⇒ a `#p`-tagged (targeted) offer; `None` ⇒ open.
     fn offer_draft(targeted_to: Option<&str>) -> OfferDraft {
+        offer_draft_with_deadline(targeted_to, now_unix() + 3_600)
+    }
+
+    /// Like [`offer_draft`] but with an explicit `deadline_unix` — used to build an already-lapsed
+    /// offer (deadline in the past) for the deadline-expiry money-safety test.
+    fn offer_draft_with_deadline(targeted_to: Option<&str>, deadline_unix: u64) -> OfferDraft {
         match targeted_to {
-            Some(pk) => OfferDraft::new("do a task", "text", 10, 0, DEFAULT_MINT_URL, pk),
-            None => OfferDraft::untargeted("do a task", "text", 10, 0, DEFAULT_MINT_URL),
+            Some(pk) => OfferDraft::new("do a task", "text", 10, deadline_unix, DEFAULT_MINT_URL, pk),
+            None => OfferDraft::untargeted("do a task", "text", 10, deadline_unix, DEFAULT_MINT_URL),
         }
     }
 
@@ -2551,7 +2850,7 @@ mod local_relay_it {
         }
 
         // Open the seller daemon (open-pool) and capture its pubkey.
-        let home = seller_home(&unique_root("live"), &relay_url, true);
+        let home = seller_home(&unique_root("live"), &relay_url, true, 0);
         let daemon = SellerDaemon::open(home).expect("open seller daemon");
         let seller_pk = PublicKey::parse(daemon.seller_pubkey()).expect("seller pubkey");
 
@@ -2657,7 +2956,7 @@ mod local_relay_it {
         let (relay, relay_url) =
             start_relay(RelayBuilder::default().query_policy(RejectBroadOfferQueries)).await;
 
-        let home = seller_home(&unique_root("fallback"), &relay_url, true);
+        let home = seller_home(&unique_root("fallback"), &relay_url, true, 0);
         let daemon = SellerDaemon::open(home).expect("open seller daemon");
         let seller_pk = PublicKey::parse(daemon.seller_pubkey()).expect("seller pubkey");
         let seller_hex = daemon.seller_pubkey().to_string();
@@ -2707,6 +3006,212 @@ mod local_relay_it {
 
         // Quiesce: let execution finish so single-flight is released before the guard drops.
         wait_until(Duration::from_secs(8), || !SellerDaemon::in_flight()).await;
+        relay.shutdown();
+    }
+
+    // ── Backfill window: a daemon started AFTER an offer was posted ──────────────────────────
+
+    /// Publish a kind-7000 `status=processing` claim for `offer_id` signed by `seller` — models
+    /// a DIFFERENT seller having already claimed the offer. Reuses the daemon's own claim draft.
+    async fn publish_claim(
+        client: &Client,
+        seller: &Keys,
+        offer_id: &str,
+        buyer_pubkey: &str,
+    ) -> nostr_sdk::EventId {
+        let draft = gateway::claim_draft(offer_id, buyer_pubkey, &seller.public_key().to_hex());
+        let event = gateway::nostr::event_builder(&draft)
+            .expect("claim event builder")
+            .sign_with_keys(seller)
+            .expect("sign claim");
+        let id = event.id;
+        client.send_event(&event).await.expect("publish claim");
+        id
+    }
+
+    /// Boot a seller daemon (own thread + readiness hook) with a kind-7000 claim collector.
+    /// Returns the live observer client (KEEP it bound — dropping it ends the collector task),
+    /// the collected-claims handle, and the daemon join handle. Asserts READY within 10s.
+    async fn start_collected_seller(
+        label: &str,
+        relay_url: &str,
+        claim_open_pool: bool,
+        offer_backfill_secs: u64,
+    ) -> (
+        Client,
+        Arc<Mutex<Vec<(String, String)>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let home = seller_home(&unique_root(label), relay_url, claim_open_pool, offer_backfill_secs);
+        let daemon = SellerDaemon::open(home).expect("open seller daemon");
+        let seller_pk = PublicKey::parse(daemon.seller_pubkey()).expect("seller pubkey");
+
+        let observer = connect_client(relay_url).await;
+        observer
+            .subscribe(
+                Filter::new()
+                    .kind(Kind::Custom(gateway::JOB_FEEDBACK_KIND))
+                    .author(seller_pk),
+                None,
+            )
+            .await
+            .expect("observer subscribe");
+        let claims = spawn_claim_collector(&observer, seller_pk);
+
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = spawn_daemon_thread(daemon, ready_tx);
+        let ready = tokio::time::timeout(Duration::from_secs(10), ready_rx.recv()).await;
+        assert!(
+            matches!(ready, Ok(Some(()))),
+            "daemon must reach READY within 10s (got {ready:?})"
+        );
+        (observer, claims, handle)
+    }
+
+    /// THE acceptance fixture: post an OPEN-POOL offer, THEN start the daemon, and the daemon
+    /// BACKFILLS + CLAIMS it (kind-7000 `processing` e=<offer id>) within the poll interval.
+    ///
+    /// RED-ON-REVERT (the since-window mechanic): restore `since(now)` / `limit(0)` in
+    /// `offer_subscription_filters` (ignore `backfill_secs`) and this fixture goes RED — the
+    /// pre-posted offer is never delivered, so never claimed (assert fails, rc=101).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn backfilled_in_window_offer_is_claimed_after_daemon_start() {
+        let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        SellerDaemon::end_flight();
+
+        let (relay, relay_url) = start_relay(RelayBuilder::default()).await;
+
+        // Publish an OPEN-POOL offer BEFORE the daemon exists, dated 30s in the PAST so it is
+        // unambiguously earlier than the daemon's subscribe time (deterministic: on the
+        // reverted `since(now)` filter it is excluded; within the 20-min window it backfills).
+        // Future deadline so it is not expiry-refused. Open-pool is the real field gap.
+        let buyer = Keys::generate();
+        let seeder = connect_client(&relay_url).await;
+        let recent = Timestamp::from(Timestamp::now().as_secs().saturating_sub(30));
+        let offer_id = publish_offer(&seeder, &buyer, &offer_draft(None), Some(recent))
+            .await
+            .to_hex();
+
+        // Start the daemon AFTER the offer is on the relay, with a 20-min backfill window.
+        let (_observer, claims, _daemon) =
+            start_collected_seller("backfill-in", &relay_url, true, 1200).await;
+
+        let claimed = wait_until(Duration::from_secs(10), || {
+            claims_contain(&claims, &offer_id, "processing")
+        })
+        .await;
+        assert!(
+            claimed,
+            "a daemon started AFTER the offer was posted must BACKFILL + CLAIM it (kind-7000 \
+             processing e={offer_id}) within 10s — the start-after-post delivery proof"
+        );
+
+        wait_until(Duration::from_secs(8), || !SellerDaemon::in_flight()).await;
+        relay.shutdown();
+    }
+
+    /// An offer OLDER than the backfill window is NOT delivered (the relay's `since(now-window)`
+    /// bound excludes it) and therefore never claimed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn out_of_window_offer_is_not_claimed() {
+        let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        SellerDaemon::end_flight();
+
+        let (relay, relay_url) = start_relay(RelayBuilder::default()).await;
+
+        // Offer dated an hour ago (future deadline, so ONLY the window — not expiry — excludes it).
+        let buyer = Keys::generate();
+        let seeder = connect_client(&relay_url).await;
+        let past = Timestamp::from(Timestamp::now().as_secs().saturating_sub(3_600));
+        let offer_id = publish_offer(&seeder, &buyer, &offer_draft(None), Some(past))
+            .await
+            .to_hex();
+
+        // 60s window ≪ 1h age ⇒ out of window.
+        let (_observer, claims, _daemon) =
+            start_collected_seller("backfill-out", &relay_url, true, 60).await;
+
+        let claimed = wait_until(Duration::from_secs(6), || {
+            claims_contain(&claims, &offer_id, "processing")
+        })
+        .await;
+        assert!(
+            !claimed,
+            "an offer older than the backfill window MUST NOT be delivered or claimed (e={offer_id})"
+        );
+
+        relay.shutdown();
+    }
+
+    /// Money-safety guard #a end-to-end: a backfilled offer WITHIN the window but PAST its own
+    /// deadline is delivered, then REFUSED by the offer-freshness gate — never claimed, never
+    /// resurrected with a fresh deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn backfilled_expired_offer_is_refused_never_claimed() {
+        let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        SellerDaemon::end_flight();
+
+        let (relay, relay_url) = start_relay(RelayBuilder::default()).await;
+
+        let now = Timestamp::now().as_secs();
+        // created_at 30s ago (well inside a 300s window) but deadline already lapsed 5s ago.
+        let recent = Timestamp::from(now.saturating_sub(30));
+        let draft = offer_draft_with_deadline(None, now.saturating_sub(5));
+        let buyer = Keys::generate();
+        let seeder = connect_client(&relay_url).await;
+        let offer_id = publish_offer(&seeder, &buyer, &draft, Some(recent))
+            .await
+            .to_hex();
+
+        let (_observer, claims, _daemon) =
+            start_collected_seller("backfill-exp", &relay_url, true, 300).await;
+
+        let claimed = wait_until(Duration::from_secs(6), || {
+            claims_contain(&claims, &offer_id, "processing")
+        })
+        .await;
+        assert!(
+            !claimed,
+            "a backfilled offer past its deadline MUST be refused (never claimed/resurrected) e={offer_id}"
+        );
+
+        relay.shutdown();
+    }
+
+    /// Money-safety guard #d end-to-end: a backfilled offer already LIVE-CLAIMED by ANOTHER
+    /// seller is skipped — the daemon does not stomp an in-flight trade.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn backfilled_offer_live_claimed_by_another_seller_is_skipped() {
+        let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        SellerDaemon::end_flight();
+
+        let (relay, relay_url) = start_relay(RelayBuilder::default()).await;
+
+        let now = Timestamp::now().as_secs();
+        let recent = Timestamp::from(now.saturating_sub(30));
+        let buyer = Keys::generate();
+        let seeder = connect_client(&relay_url).await;
+        // Offer within the window, future deadline (so the foreign claim reads LIVE, not expired).
+        let offer_id = publish_offer(&seeder, &buyer, &offer_draft(None), Some(recent))
+            .await
+            .to_hex();
+        // A DIFFERENT seller has already claimed it (live kind-7000 processing).
+        let foreign_seller = Keys::generate();
+        publish_claim(&seeder, &foreign_seller, &offer_id, &buyer.public_key().to_hex()).await;
+
+        let (_observer, claims, _daemon) =
+            start_collected_seller("backfill-claimed", &relay_url, true, 300).await;
+
+        // OUR seller (the collector filters to our pubkey) must publish NO processing claim.
+        let stomped = wait_until(Duration::from_secs(6), || {
+            claims_contain(&claims, &offer_id, "processing")
+        })
+        .await;
+        assert!(
+            !stomped,
+            "must NOT claim an offer already live-claimed by another seller (no stomping) e={offer_id}"
+        );
+
         relay.shutdown();
     }
 }
