@@ -15,7 +15,7 @@ use nostr_sdk::Timestamp;
 
 use crate::budget::{BudgetGate, BudgetRefuse};
 use crate::buyer_fund::{self, FundError};
-use crate::delivery::{CommitOid, DeliveryError, GitDelivery};
+use crate::delivery::{CommitOid, Delivery, DeliveryError, GitDelivery};
 use crate::delivery_git::PayPathDeliveryVerifier;
 use crate::gateway;
 use crate::home::{self, MobeeHome, DEFAULT_MINT_URL};
@@ -196,7 +196,14 @@ pub async fn authorize_pay_async(
     let attempt_id = key.attempt_id();
 
     let commit_oid = CommitOid::parse(request.commit_oid)?;
-    let delivery = GitDelivery::new(request.repo, request.branch, commit_oid)?;
+    // Re-type onto the typed [`Delivery`]: the sole live variant is `Commit` (fork tip). Its
+    // `delivery_kind()` (→ `Fork`/`"fork"`) replaces the former hardcode in the receipt preimage;
+    // for `Commit` this is byte-identical. The buyer tip-match gate above stays a raw compare of
+    // `delivery_integrity_hash == commit_oid` — for `Commit`, `commit_oid` IS the variant's bound
+    // oid (routing it through the parsed `Delivery::bound_oid()` would lowercase the oid and
+    // reorder the parse-vs-gate refusals, i.e. change behavior on the refuse path).
+    let delivery = Delivery::Commit(GitDelivery::new(request.repo, request.branch, commit_oid)?);
+    let delivery_kind = delivery.delivery_kind();
 
     let secret_hex = home::read_secret_key_hex(home)
         .map_err(|error| AuthorizePayError::Home(error.to_string()))?;
@@ -231,6 +238,7 @@ pub async fn authorize_pay_async(
                 &receipt_relay,
                 &seller_hex,
                 &seller_signature,
+                delivery_kind,
                 key,
             )
         },
@@ -287,6 +295,7 @@ fn build_and_publish_receipt(
     relay_url: &str,
     seller_hex: &str,
     seller_signature: &str,
+    delivery_kind: DeliveryKind,
     key: &PaymentKey,
 ) -> Result<ReceiptEvidence, EffectError> {
     let buyer_hex = buyer_keys.public_key().to_hex();
@@ -302,7 +311,8 @@ fn build_and_publish_receipt(
         buyer_pubkey: buyer_hex.clone(),
         seller_pubkey: seller_hex.to_owned(),
         delivery_integrity_hash: key.delivery_integrity_hash.as_str().to_owned(),
-        delivery_kind: DeliveryKind::Fork.as_str().to_owned(),
+        // Derived from the delivery variant (was a `DeliveryKind::Fork` hardcode); `Commit` → "fork".
+        delivery_kind: delivery_kind.as_str().to_owned(),
         exec_metadata_commitment: EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
     };
     let digest = preimage.digest_bytes();
@@ -327,7 +337,7 @@ fn build_and_publish_receipt(
         &buyer_signature,
         Some(gateway::ReceiptDelivery {
             integrity_hash: key.delivery_integrity_hash.as_str(),
-            kind: DeliveryKind::Fork.as_str(),
+            kind: delivery_kind.as_str(),
         }),
         // No exec-metadata echo in this arc: the commitment is the empty marker, so echoing
         // seller-claimed tags here would be cosmetic-only (a named follow-up).
