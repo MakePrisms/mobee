@@ -304,7 +304,7 @@ present in code at dev tip:
 | tag | shape | meaning |
 |-----|-------|---------|
 | `job-class` | `["job-class","contribution"]` | absent ⇒ from-scratch (back-compat) |
-| `target-repo` | `["target-repo","<naddr>"]` | the buyer's `target_repo`, pinned by **owner pubkey + URL** (not a bare `d`-tag) |
+| `target-repo` | `["target-repo","<owner_pubkey_hex>","<clone_url>"]` | the buyer's `target_repo`, pinned by **owner pubkey + explicit clone URL** (positional — nostr 0.44's `Nip19Coordinate` cannot carry an https clone URL, so v1 carries the naddr's money-relevant payload positionally; canonical bech32 `naddr` rendering = named observatory-interop follow-up). **`owner_pubkey` is BOUND, not fetch-enforced, by design (v1):** it rides the buyer's signed offer, the seller-signed authorship tuple, and the accept-time echo equality-check; fetch scoping rests on the buyer-signed `clone_url` (buyer authority — no confused-deputy). A fetch-time owner↔namespace cross-check folds into the bech32 follow-up. |
 | `base` | `["base","<base_branch>","<base_oid>"]` | base branch + the exact `base_oid` the contribution must descend from |
 | `accepts` | `["accepts","fork"]` (v1) | positional multi-value (`["accepts","fork","patch"]` when patch ships) — not comma-joined |
 
@@ -427,13 +427,17 @@ acceptance (chapter):
 
 ## Fence / reality class
 
-**SPEC-DRAFT (design).** No code lands here. Reality: from-scratch delivery **PROVEN** (c/c2), and the
-collect leg is **REAL-AND-LIVE**; contribution is **NOT BUILT** — fork-path v1 is buildable on the
-foundation's `Delivery::Commit` variant ([PIECE-12](PIECE-12-TYPED-DELIVERY-ABSTRACTION.md); the
-behavior-preserving re-type of the commit path, receipt binding already landed) **plus** the new gates
-(base_oid threading + base-from-pin, descendant, authorship via the seller-signed kind-6109 tuple,
-target_repo equality-check, content gate + policy hook, and buyer-custody retention); the patch path is
-the additive `Delivery::Tree` variant (designed, not built).
+**FORK PATH BUILT (Step-1 landed); chapter close pending the natural trade.** From-scratch delivery is
+**PROVEN** and the collect leg **REAL-AND-LIVE**. The fork contribution path is **BUILT on
+`Delivery::Commit`** ([PIECE-12](PIECE-12-TYPED-DELIVERY-ABSTRACTION.md)) with all six MUSTs live —
+base-from-pin, descendant, authorship via the seller-signed kind-6109 tuple (extending the pre-pay
+co-sig seam), target_repo equality-check, content gate + policy hook, buyer-custody retention — and the
+assembled verify→pay glue is **live-proven** (a full contribution trade against a real relay-git target:
+fork → signed tuple → custody fetch → descendant → pay → co-signed receipt, both signatures verified).
+A contribution offer cannot be paid without its gates (the explicit pay form refuses fail-closed absent
+an accept-bind). Remaining: the buyer **post-path wiring** for contribution offers (thin follow-up — the
+canonical tag constructor exists; the MCP post tool does not yet emit it), after which the chapter closes
+on a natural forge-hire. The patch path stays the additive `Delivery::Tree` variant (designed, not built).
 
 ## Reference
 

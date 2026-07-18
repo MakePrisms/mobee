@@ -162,6 +162,15 @@ pub fn authorize_pay(
 ///
 /// LOGIC identical to the sync path — only wallet open is `await` (no nested
 /// `block_on`). Verify-fetch timeout still fails CLOSED (no pay / zero burn).
+///
+/// CALLER CONTRACT (contribution gating): this function trusts `request.contribution` —
+/// `None` is treated as a from-scratch job, so the four contribution gates + the
+/// authorship-tuple bind are skipped. The offer's `job-class` lives on the relay, which this
+/// function deliberately does not read (no network beyond the delivery fetch). EVERY
+/// production caller therefore inherits the guard obligation: refuse to pay a
+/// `job-class=contribution` offer with `contribution: None` (the MCP pay tool re-derives the
+/// class and refuses fail-closed; a bind-built request resolves it at accept). A new caller
+/// that skips this check reopens the gate bypass this contract exists to prevent.
 pub async fn authorize_pay_async(
     home: &MobeeHome,
     gate: &mut BudgetGate,

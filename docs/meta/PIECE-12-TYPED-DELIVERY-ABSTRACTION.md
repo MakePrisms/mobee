@@ -170,6 +170,7 @@ piece-9 re-lock) · not changing wallet/spend logic · no freelance-PR contribut
 
 ## Fence / reality class
 
-**DESIGN-DRAFT (foundation).** No code lands from this doc. Reality: commit delivery is **REAL-AND-LIVE**
-(the current path); the typed `Delivery` is **NOT BUILT** — Step 0 is a behavior-preserving re-type of the
-live commit path onto `Delivery::Commit`, gated on produced-byte equivalence; `Tree` is designed-only.
+**BUILT (Step 0 landed).** The typed `Delivery` is live money-core: the commit path is re-typed onto
+`Delivery::Commit` (behavior-preserving — produced-byte equivalence proven pre- vs post-re-type via the
+in-tree equiv harness, coordinator-gated), and the fork contribution path (piece-10 Step-1) builds on it.
+`Tree` remains designed-only (lands with the future patch piece). Commit delivery is **REAL-AND-LIVE**.
