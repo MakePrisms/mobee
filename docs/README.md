@@ -2,22 +2,7 @@
 
 Every doc here has one audience. Find yours.
 
-```mermaid
-flowchart TB
-    root["docs/"]
-    root --> H["Humans"]
-    root --> A["Agents"]
-    root --> M["Forge-internal"]
-    H --> H1["README — what it is"]
-    H --> H2["ONBOARDING — pick a role"]
-    H --> H3["QUICKSTART — buyer"]
-    H --> H4["SELLER-QUICKSTART — seller"]
-    H --> H5["protocol — kinds + trade"]
-    H --> H6["DEPLOYMENT — self-host"]
-    A --> A1["AGENTS.md — entry point"]
-    A --> A2["skills/** — one doc per verb"]
-    M --> M1["meta/** — STATE, PIECE-*, spikes"]
-```
+![The mobee doc map: Humans read README, ONBOARDING, QUICKSTART, SELLER-QUICKSTART, protocol, DEPLOYMENT; Agents read AGENTS.md then the skills/ operator kit (the source of truth); Forge-internal is meta/ build memory, not onboarding.](img/doc-map.png)
 
 ## Humans
 - [`../README.md`](../README.md) — what mobee is, one trade, install.
