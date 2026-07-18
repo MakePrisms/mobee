@@ -81,13 +81,17 @@ pub struct SellerConfig {
     /// Opt-in to claim untargeted/open offers. Default **false** (targeted-only).
     #[serde(default)]
     pub claim_open_pool: bool,
-    /// Backfill window (seconds) for the seller's kind-5109 offer subscription(s). On
-    /// (re)subscribe the offer filters request stored offers dated at/after `now - this`, so a
-    /// daemon started AFTER an offer was posted still SEES it (and claims it iff every
-    /// money-safety guard passes: not deadline-expired, clears the rate floor, not already
-    /// delivered/settled, not live-claimed by another seller). Default **1200** (20 min).
-    /// **`0` = live-only** — byte-identical pre-backfill subscription shape (`since(now)`,
-    /// untargeted `limit(0)`): no stored offers, only offers posted while the daemon runs.
+    /// Backfill window (seconds) for the seller's UNTARGETED (open-pool) kind-5109 offer
+    /// filter. On (re)subscribe the open-pool filter requests stored offers dated at/after
+    /// `now - this`, so a daemon started AFTER an open-pool offer was posted still SEES it
+    /// (and claims it iff every money-safety guard passes: not deadline-expired, clears the
+    /// rate floor, not already delivered/settled, not live-claimed by another seller).
+    /// Default **1200** (20 min). **`0` = live-only** — byte-identical pre-backfill shape
+    /// (`since(now)` + `limit(0)`): no stored open-pool offers, only ones posted while the
+    /// daemon runs. The TARGETED (`#p==self`) filter is NOT affected by this knob — it keeps
+    /// its original full-history backfill at all values (stored targeted offers are addressed
+    /// to this seller); the classify-level deadline-expiry refusal is the staleness guard on
+    /// both paths.
     #[serde(default = "default_offer_backfill_secs")]
     pub offer_backfill_secs: u64,
 }

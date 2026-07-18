@@ -32,7 +32,8 @@ struct SellOptions {
     job_timeout_secs: Option<u64>,
     /// Opt-in to claim untargeted/open offers (default OFF).
     claim_open_pool: Option<bool>,
-    /// Offer-backfill window in seconds (default 1200 / 20 min; 0 = live-only).
+    /// Open-pool offer-backfill window in seconds (default 1200 / 20 min; 0 = live-only).
+    /// Targeted offers are unaffected (they always backfill in full).
     offer_backfill_secs: Option<u64>,
     name: Option<String>,
     home: Option<PathBuf>,
@@ -565,7 +566,7 @@ impl SellOptions {
 fn sell_usage(err: &mut dyn Write) {
     let _ = writeln!(
         err,
-        "Usage:\n  mobee sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>]\n  mobee sell   # zero-prompt relaunch from config.toml\n  mobee sell --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://mobee-relay.orveth.dev mint=testnut git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in\n  - --offer-backfill-secs <n>: see offers posted up to n seconds before startup (default 1200; 0 = live-only)"
+        "Usage:\n  mobee sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--name <display>] [--home <dir>]\n  mobee sell   # zero-prompt relaunch from config.toml\n  mobee sell --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://mobee-relay.orveth.dev mint=testnut git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - open-pool claiming is OFF by default; pass --claim-open-pool to opt in\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)"
     );
 }
 

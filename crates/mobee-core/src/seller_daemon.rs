@@ -412,12 +412,16 @@ impl SellerDaemon {
                 mint_url: offer.mint_url.clone(),
             }));
         }
-        // Offer-freshness gate (money-safety, backfill guard #a). The offer carries its own
-        // absolute deadline (`param deadline`, always present — `parse_offer` requires it). If
-        // it has already passed we REFUSE here, BEFORE `job_deadline_unix` — which would
-        // otherwise hand a stale (backfilled) offer a fresh `now + timeout` deadline and
-        // resurrect a lapsed job. `offer.deadline_unix > now` is exactly the still-usable branch
-        // of `job_deadline_unix`, so this gate is its safe complement. Pure over (offer, now).
+        // Offer-freshness gate (money-safety, backfill guard #a) — a deliberate ALWAYS-ON
+        // refusal on EVERY offer path (live, open-pool backfill, AND the targeted filter's
+        // full-history backfill; classify-level, so no filter shape can bypass it). The offer
+        // carries its own absolute deadline (`param deadline`, always present — `parse_offer`
+        // requires it). If it has already passed we REFUSE here, BEFORE `job_deadline_unix` —
+        // which would otherwise hand a stale offer a fresh `now + timeout` deadline and
+        // resurrect a lapsed job (the pre-existing hazard: stored targeted offers were
+        // re-deliverable on every restart and got fresh deadlines). `offer.deadline_unix > now`
+        // is exactly the still-usable branch of `job_deadline_unix`, so this gate is its safe
+        // complement. Pure over (offer, now).
         if offer.deadline_unix <= now {
             return Ok(OfferDisposition::Skip(OfferSkip::DeadlineExpired {
                 deadline_unix: offer.deadline_unix,
@@ -1342,33 +1346,38 @@ async fn wait_for_nip42_auth(
     within_window.unwrap_or(Ok(AuthWait::NoChallenge))
 }
 
-/// Cap on the number of STORED offers any one 5109 filter requests on (re)subscribe — a flood
-/// guard on the INITIAL query only. nostr 0.44 `Filter::limit` is "maximum number of events
-/// returned in the initial query" (`nostr-0.44.4/src/filter.rs`): it bounds the stored-events
-/// burst, does NOT affect live streaming, and is NOT part of `match_event`. So even a very large
-/// `offer_backfill_secs` can pull at most this many stored offers per filter (the rest arrive
-/// live). Distinct from `limit(0)` (the live-only sentinel: request ZERO stored offers).
+/// Cap on the number of STORED offers the UNTARGETED (open-pool) 5109 filter requests on
+/// (re)subscribe when a backfill window is set — a flood guard on the INITIAL query only.
+/// nostr 0.44 `Filter::limit` is "maximum number of events returned in the initial query"
+/// (`nostr-0.44.4/src/filter.rs`): it bounds the stored-events burst, does NOT affect live
+/// streaming, and is NOT part of `match_event`. So even a very large `offer_backfill_secs` can
+/// pull at most this many stored open-pool offers (the rest arrive live). Distinct from
+/// `limit(0)` (the live-only sentinel: request ZERO stored events).
 const OFFER_BACKFILL_LIMIT: usize = 500;
 
-/// Build the seller's kind-5109 offer subscription filter(s), anchored at `subscribe_now` with a
-/// `backfill_secs` stored-offer window.
+/// Build the seller's kind-5109 offer subscription filter(s).
 ///
-/// Always includes the TARGETED filter (`#p` == seller pubkey). When `claim_open_pool` is set,
-/// ALSO returns an UNtargeted filter (no pubkey pin): open-pool offers carry no `p` tag, so a
-/// pubkey-pinned filter alone never delivers them and `--claim-open-pool` is DOA. A targeted
-/// offer matches BOTH filters (deduped by event id at the call site); the downstream money-safety
-/// gates (`classify_offer` rate/expiry + the backfill pre-claim check) still decide whether any
-/// backfilled offer is actually claimed.
+/// Always includes the TARGETED filter (`#p` == seller pubkey) in its ORIGINAL shape — no
+/// `since`, no `limit` — at ALL `backfill_secs` values: stored targeted offers are addressed to
+/// this seller and have always backfilled in full on (re)subscribe (p-pinned + low-volume ⇒ no
+/// firehose risk; bounding it would be a pure regression). Staleness
+/// protection on this path is the classify-level deadline-expiry refusal, not a filter bound.
 ///
-/// Backfill window (both filters): `since(subscribe_now - backfill_secs)`, so a daemon started
-/// AFTER an offer was posted still receives it if it is within the window — the gap this fixes
-/// (a seller that missed an offer posted seconds before it came online).
-///  * `backfill_secs == 0` → **live-only** (pre-backfill shape): both filters `since(now)`; the
-///    untargeted filter also `limit(0)` (request ZERO stored offers). Only offers posted WHILE
-///    the daemon runs are delivered — no full-history 5109 firehose on startup.
-///  * `backfill_secs > 0` → both filters `since(now - backfill_secs).limit(OFFER_BACKFILL_LIMIT)`.
-///    The untargeted filter DROPS `limit(0)` (which would suppress every stored offer and defeat
-///    the window) for the bounded cap instead.
+/// When `claim_open_pool` is set, ALSO returns an UNtargeted filter (no pubkey pin): open-pool
+/// offers carry no `p` tag, so a pubkey-pinned filter alone never delivers them and
+/// `--claim-open-pool` is DOA. A targeted offer matches BOTH filters (deduped by event id at
+/// the call site); the downstream money-safety gates (`classify_offer` rate/expiry + the
+/// backfill pre-claim check) still decide whether any backfilled offer is actually claimed.
+///
+/// The backfill window applies to the UNTARGETED filter ONLY — the field gap it fixes is an
+/// open-pool offer posted before the daemon came online, invisible by design
+/// under the live-only bound:
+///  * `backfill_secs == 0` → **live-only** (byte-identical pre-backfill shape):
+///    `since(subscribe_now)` + `limit(0)` (request ZERO stored events). Only open-pool offers
+///    posted WHILE the daemon runs are delivered — no full-history 5109 firehose on startup.
+///  * `backfill_secs > 0` → `since(subscribe_now - backfill_secs).limit(OFFER_BACKFILL_LIMIT)`:
+///    stored open-pool offers within the window backfill (bounded burst); `limit(0)` is DROPPED
+///    (it would suppress every stored event and defeat the window).
 fn offer_subscription_filters(
     seller_pubkey: nostr_sdk::PublicKey,
     claim_open_pool: bool,
@@ -1376,27 +1385,22 @@ fn offer_subscription_filters(
     backfill_secs: u64,
 ) -> Vec<nostr_sdk::Filter> {
     use nostr_sdk::prelude::{Filter, Kind, Timestamp};
-    // `since` anchor: `now - backfill_secs` (saturating). backfill_secs == 0 ⇒ `since(now)`.
-    let since = Timestamp::from(subscribe_now.as_secs().saturating_sub(backfill_secs));
 
-    // TARGETED (`#p == self`). Always `since`-bounded; capped when a window is requested.
-    let mut targeted = Filter::new()
+    // TARGETED (`#p == self`): ORIGINAL shape, untouched by the window knob.
+    let mut filters = vec![Filter::new()
         .kind(Kind::Custom(JOB_OFFER_KIND))
-        .pubkey(seller_pubkey)
-        .since(since);
-    if backfill_secs > 0 {
-        targeted = targeted.limit(OFFER_BACKFILL_LIMIT);
-    }
-    let mut filters = vec![targeted];
+        .pubkey(seller_pubkey)];
 
     if claim_open_pool {
-        // UNtargeted (open-pool): no `#p` pin.
-        let mut untargeted = Filter::new().kind(Kind::Custom(JOB_OFFER_KIND)).since(since);
-        untargeted = if backfill_secs > 0 {
+        // UNtargeted (open-pool): the backfill window applies HERE only. `since` anchor:
+        // `now - backfill_secs` (saturating); backfill_secs == 0 ⇒ `since(now)`.
+        let since = Timestamp::from(subscribe_now.as_secs().saturating_sub(backfill_secs));
+        let untargeted = Filter::new().kind(Kind::Custom(JOB_OFFER_KIND)).since(since);
+        let untargeted = if backfill_secs > 0 {
             // Window requested: bounded stored-offer burst (drop the live-only `limit(0)`).
             untargeted.limit(OFFER_BACKFILL_LIMIT)
         } else {
-            // Live-only: `limit(0)` requests ZERO stored offers (byte-identical pre-backfill).
+            // Live-only: `limit(0)` requests ZERO stored events (byte-identical pre-backfill).
             untargeted.limit(0)
         };
         filters.push(untargeted);
@@ -1587,10 +1591,11 @@ pub(crate) async fn run_forever_hooked(
     let (claim_open_pool, offer_backfill_secs) = require_seller_config(&daemon.home)
         .map(|cfg| (cfg.claim_open_pool, cfg.offer_backfill_secs))
         .unwrap_or((false, 0));
-    // Single subscribe anchor, shared by the offer filters (`since(now - window)`) and the
-    // backfill discriminator below (`created_at < daemon_start_unix` ⇒ posted before we came
-    // online ⇒ subject to the pre-claim money-safety check). Captured once so the filter bound
-    // and the discriminator agree.
+    // Single subscribe anchor, shared by the UNTARGETED filter's window (`since(now - window)`;
+    // the targeted filter carries no time bound) and the backfill discriminator below
+    // (`created_at < daemon_start_unix` ⇒ posted before we came online ⇒ subject to the
+    // pre-claim money-safety check, on BOTH paths — targeted-history backfill included).
+    // Captured once so the filter bound and the discriminator agree.
     let subscribe_now = Timestamp::now();
     let daemon_start_unix = subscribe_now.as_secs();
     let mut offer_sub_ids: Vec<SubscriptionId> = Vec::new();
@@ -1721,9 +1726,11 @@ pub(crate) async fn run_forever_hooked(
                         subscription_id.as_ref(),
                         message
                     );
-                    // Re-subscribe with the SAME backfill window (fresh `now` anchor at resubscribe
-                    // time) so the degraded targeted-only filter still backfills offers posted
-                    // while the grouped subscription was down.
+                    // Re-subscribe targeted-only. The targeted filter carries no time bound
+                    // (original full-backfill shape at all window values), so stored targeted
+                    // offers — including any posted while the grouped subscription was down —
+                    // are re-delivered; the window/anchor args are passed for signature
+                    // uniformity and unused on this path (`claim_open_pool = false`).
                     match client
                         .pool()
                         .subscribe(
@@ -2552,8 +2559,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // window == 0 reproduces the pre-backfill LIVE-ONLY subscription shape byte-identically:
-    // untargeted `since(now) + limit(0)` (zero stored offers), targeted `since(now)`.
+    // window == 0 reproduces the pre-backfill subscription shape byte-identically PER FILTER:
+    // targeted = ORIGINAL no-since/no-limit (full targeted-history backfill, always the
+    // behavior); untargeted = `since(now) + limit(0)` (live-only, zero stored offers).
     #[test]
     fn window_zero_reproduces_live_only_filter_shape() {
         use nostr_sdk::prelude::{Keys, Timestamp};
@@ -2561,9 +2569,9 @@ mod tests {
         let now = Timestamp::now();
         let filters = offer_subscription_filters(seller.public_key(), true, now, 0);
         assert_eq!(filters.len(), 2, "open-pool ⇒ targeted + untargeted filter");
-        // Targeted: since(now), NO stored-offer cap.
-        assert_eq!(filters[0].since, Some(now), "window=0 targeted must be since(now)");
-        assert_eq!(filters[0].limit, None, "window=0 targeted must carry no limit");
+        // Targeted: ORIGINAL shape — no time bound, no stored-offer cap.
+        assert_eq!(filters[0].since, None, "window=0 targeted must carry NO since (original shape)");
+        assert_eq!(filters[0].limit, None, "window=0 targeted must carry NO limit (original shape)");
         // Untargeted: since(now) + limit(0) — the byte-identical live-only shape.
         assert_eq!(filters[1].since, Some(now), "window=0 untargeted must be since(now)");
         assert_eq!(
@@ -2573,10 +2581,13 @@ mod tests {
         );
     }
 
-    // window > 0 bounds BOTH filters to `since(now - window)` and caps the stored-offer burst;
-    // the untargeted filter DROPS limit(0) (which would otherwise suppress every stored offer).
+    // window > 0 bounds + caps the UNTARGETED (open-pool) filter ONLY: `since(now - window)`
+    // with the flood cap replacing limit(0). The TARGETED filter keeps its original
+    // no-since/no-limit shape at ALL window values (the field gap was
+    // open-pool; bounding the p-pinned filter would be a pure regression — the deadline-expiry
+    // refusal in classify_offer is the staleness guard on both paths).
     #[test]
-    fn positive_window_bounds_and_caps_both_filters() {
+    fn positive_window_bounds_and_caps_untargeted_filter_only() {
         use nostr_sdk::prelude::{Keys, Timestamp};
         let seller = Keys::generate();
         let now = Timestamp::now();
@@ -2584,13 +2595,9 @@ mod tests {
         let expected_since = Timestamp::from(now.as_secs() - window);
         let filters = offer_subscription_filters(seller.public_key(), true, now, window);
         assert_eq!(filters.len(), 2);
-        // Targeted: since(now - window) + flood cap.
-        assert_eq!(filters[0].since, Some(expected_since), "targeted since must be now-window");
-        assert_eq!(
-            filters[0].limit,
-            Some(OFFER_BACKFILL_LIMIT),
-            "targeted must carry the stored-offer flood cap when a window is set"
-        );
+        // Targeted: shape UNCHANGED by the window knob.
+        assert_eq!(filters[0].since, None, "targeted must carry NO since at any window value");
+        assert_eq!(filters[0].limit, None, "targeted must carry NO limit at any window value");
         // Untargeted: since(now - window) + flood cap; limit(0) dropped.
         assert_eq!(filters[1].since, Some(expected_since), "untargeted since must be now-window");
         assert_eq!(
