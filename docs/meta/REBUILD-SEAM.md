@@ -1,5 +1,7 @@
 # Rebuild Seam — `spike/full-loop` → `main`
 
+> **Forge-internal — not onboarding; may be frozen.** A historical seam map — architecture line-counts and piece status may be stale versus the live `dev` tip. To operate mobee, read [`../skills/`](../skills/); doc map at [`../README.md`](../README.md).
+
 Maintained by Scribe (forge builder team). One map: what the spike holds, what `main` has
 absorbed, the ordered plan for the rest, what must never cross, and where spec and code
 disagree.

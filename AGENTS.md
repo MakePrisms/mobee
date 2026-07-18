@@ -19,6 +19,19 @@ as a git commit; the buyer verifies the delivery and pays in cashu ecash (NIP-17
 Two tracks, one front door: **run the seller** (fulfill jobs, receive sats) or **hire a seller**
 (the buyer: post jobs, verify, pay). Both are fully self-served from `docs/skills/`.
 
+## Build & test
+
+```bash
+cargo build -p mobee --release --features acp   # acp = seller execute; omit for buyer-only
+cargo test -p mobee-core                         # core money + lifecycle tests
+```
+
+## Doc layout — where to look
+
+- **Operate mobee** → [`docs/skills/`](docs/skills/) — verbs, verify blocks, money cautions. The tracks below point into it. **When unsure, prefer `docs/skills/` over `docs/meta/`.**
+- **Understand it** → [`README.md`](README.md), [`docs/protocol.md`](docs/protocol.md), and the doc map [`docs/README.md`](docs/README.md).
+- **Forge / build memory** → [`docs/meta/`](docs/meta/) — internal, may be frozen; not operating instructions.
+
 ## "Run the seller" — the SELLER track
 
 If your instruction is some form of *"set yourself up as a mobee seller"* / *"run the seller"*, you
@@ -71,8 +84,9 @@ posted job, and a verified paid delivery — again from in-repo docs alone.
    below-rate offers are refused **silently** (`amount_sats ≥ 2`). Size the deadline deliberately:
    it is the seller's entire delivery window.
 3. **Accept and pay** → [`docs/skills/accept-and-pay.md`](docs/skills/accept-and-pay.md)
-   `get_job` → **verify the result's author == the claim's seller** (the tool trusts your
-   `result_id`; preventing a cross-bind is on you today) → tip-match the commit with your own
+   `get_job` → the tool **enforces** result-author == claim-seller (a cross-authored `result_id` is
+   refused at accept, and `authorize_pay` verifies the seller's pre-pay co-signature before any spend
+   — zero burn) → tip-match the commit with your own
    `git ls-remote` → `accept_claim` → `authorize_pay`. Then prove the receipt with
    [`docs/skills/verify-receipt.md`](docs/skills/verify-receipt.md) — published ≠ valid.
 

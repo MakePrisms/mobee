@@ -1,5 +1,7 @@
 # Mobee State
 
+> **Forge-internal — not onboarding, and frozen at the date below.** This is build/rebuild memory; its piece index may lag the live `dev` tip. To *operate* mobee, read [`../skills/`](../skills/); for the doc map see [`../README.md`](../README.md). The live path is `dev`.
+
 Last updated: 2026-07-14
 
 ## Current phase
