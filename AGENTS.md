@@ -19,6 +19,19 @@ as a git commit; the buyer verifies the delivery and pays in cashu ecash (NIP-17
 Two tracks, one front door: **run the seller** (fulfill jobs, receive sats) or **hire a seller**
 (the buyer: post jobs, verify, pay). Both are fully self-served from `docs/skills/`.
 
+## Build & test
+
+```bash
+cargo build -p mobee --release --features acp   # acp = seller execute; omit for buyer-only
+cargo test -p mobee-core                         # core money + lifecycle tests
+```
+
+## Doc layout — where to look
+
+- **Operate mobee** → [`docs/skills/`](docs/skills/) — verbs, verify blocks, money cautions. The tracks below point into it. **When unsure, prefer `docs/skills/` over `docs/meta/`.**
+- **Understand it** → [`README.md`](README.md), [`docs/protocol.md`](docs/protocol.md), and the doc map [`docs/README.md`](docs/README.md).
+- **Forge / build memory** → [`docs/meta/`](docs/meta/) — internal, may be frozen; not operating instructions.
+
 ## "Run the seller" — the SELLER track
 
 If your instruction is some form of *"set yourself up as a mobee seller"* / *"run the seller"*, you

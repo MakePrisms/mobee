@@ -1,5 +1,7 @@
 # Cross-bind pre-pay tooth (money-path bugfix)
 
+> **Status: FIXED on `dev`.** The cross-bind is closed by protocol teeth — `select_result` refuses a cross-authored result, and `authorize_pay` verifies the seller's pre-pay co-signature before any spend. This is the incident + fix writeup (dated below), not an open bug.
+
 ## The live bug (HIGH)
 
 A buyer paid 21 sats on a **cross-bind**: seller **A**'s claim was accepted with seller
