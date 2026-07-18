@@ -9,8 +9,9 @@ The failure catalog: given a misbehaving seller, name the cause and apply the fi
 
 **The full, grounded catalog lives in-repo at [`docs/skills/seller-diagnose.md`](../../../docs/skills/seller-diagnose.md).** Follow it.
 
-Covers: no-claim (rate-gate / targeted-only), pre-existing open offers invisible (live-only
-subscriptions; `offer_backfill_secs` is provisional/not-in-build), NixOS `CLAUDE_CODE_EXECUTABLE`,
+Covers: no-claim (rate-gate / targeted-only), old open offers and the backfill window
+(`offer_backfill_secs`, default 1200; expired/claimed backfills refused with logged reasons),
+NixOS `CLAUDE_CODE_EXECUTABLE`,
 codex spend-cap vs version-gate (raw `codex exec` discriminator), cursor login/model/quota, ACP
 hang-consumes-deadline vs fast-fail-retries, NIP-42 auth for receive, relay-git seed/helper
 failures, payment-after-restart (in-memory binding, stuck-not-lost, money-safe), and
