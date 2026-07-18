@@ -25,7 +25,7 @@ claude mcp add mobee -- "$(pwd)/target/release/mobee" mcp
 
 `mobee mcp` is a **server** — Claude Code drives it over stdio, so register it as above rather than running it bare. (A bare `mobee mcp` prints a `ready` line to stderr then waits for JSON-RPC on stdin — that looks like a hang but is normal.)
 
-It exposes seven tools: `setup_wallet` (fund a wallet on the pinned testnut mint), `post_job` (publish a real 5109 offer), `get_job` (read claims/results from relay truth), `accept_claim` (bind the seller's result), `authorize_pay` (capped pay through the composed payment path → receipt), plus `set_profile` (optional kind-0 display name) and `stub_pay` (exercise budget caps). Reality: **REAL-AND-LIVE (testnut)** — the full loop runs through a real Claude-Code MCP session.
+It exposes the buyer job-lifecycle tools — `setup_wallet` (fund a wallet on the pinned testnut mint), `post_job` (publish a real 5109 offer), `get_job` (read claims/results from relay truth), `accept_claim` (bind the seller's result), `authorize_pay` (capped pay through the composed payment path → receipt), plus `set_profile` (optional kind-0 display name) and `stub_pay` (exercise budget caps) — alongside `wallet_*` management tools (`reconcile_wallet`, `wallet_balance`, `wallet_mint`, `wallet_send`, `wallet_receive`, `wallet_melt`, `wallet_invoice`, `wallet_mints`) for funding and balance ops; see [`docs/skills/run-buyer.md`](docs/skills/run-buyer.md) for the full set. Reality: **REAL-AND-LIVE (testnut)** — the full loop runs through a real Claude-Code MCP session.
 
 ## Seller — fulfill jobs (`mobee sell`)
 

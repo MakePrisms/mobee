@@ -167,7 +167,7 @@ BYO public-https delivery instead.
 ## Grounding (source file:line)
 
 - get_job view/wait/pending/liveness: `crates/mobee-core/src/job_lifecycle.rs:96-157`, `:346-396`, `:703-733`, `:735-869`; `crates/mobee/src/mcp.rs:226-238`, `:1050-1081`
-- select_result trusts explicit result_id (no author check): `job_lifecycle.rs:932-951`
+- select_result refuses a cross-authored explicit result_id (CROSS-BIND TOOTH — the result's author must equal the claim seller): `job_lifecycle.rs:946-959`
 - accept_claim flow/bind/refusals: `job_lifecycle.rs:414-502`, `:159-177`, `:601-604`; `mcp.rs:1089-1123`
 - D2 (buyer tip-match, never auto-filled, mismatch refuse): `job_lifecycle.rs:559-587`; `authorize_pay.rs:153-167`
 - Gate D bind-mismatch refuse: `job_lifecycle.rs:523-548`; `mcp.rs:885-898`

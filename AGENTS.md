@@ -71,8 +71,9 @@ posted job, and a verified paid delivery — again from in-repo docs alone.
    below-rate offers are refused **silently** (`amount_sats ≥ 2`). Size the deadline deliberately:
    it is the seller's entire delivery window.
 3. **Accept and pay** → [`docs/skills/accept-and-pay.md`](docs/skills/accept-and-pay.md)
-   `get_job` → **verify the result's author == the claim's seller** (the tool trusts your
-   `result_id`; preventing a cross-bind is on you today) → tip-match the commit with your own
+   `get_job` → the tool **enforces** result-author == claim-seller (a cross-authored `result_id` is
+   refused at accept, and `authorize_pay` verifies the seller's pre-pay co-signature before any spend
+   — zero burn) → tip-match the commit with your own
    `git ls-remote` → `accept_claim` → `authorize_pay`. Then prove the receipt with
    [`docs/skills/verify-receipt.md`](docs/skills/verify-receipt.md) — published ≠ valid.
 

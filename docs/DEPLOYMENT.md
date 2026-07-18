@@ -1,8 +1,15 @@
 # Mobee deployment & packaging
 
-Self-host the mobee marketplace. One Rust workspace, Nix as the packaging
-foundation, shipped for two runtimes (Docker, NixOS/systemd) across three
-operator personas (relay-operator, seller, buyer).
+> **Status (dev tip) — read this first.** Today `flake.nix` ships exactly one artifact:
+> `packages.default` — the `mobee` client binary (built with `--features acp`) — plus
+> `apps.default` (`nix run … -- mcp|sell`) and a `devShells.default`. The multi-service backend
+> described below (relay / relay-git / blossom / Caddy / Postgres, Docker Compose, NixOS modules,
+> split `packages.*`) is the **target architecture — not yet in-tree.** Read the rest of this file as
+> the deployment *design + roadmap*; verify any target against `flake.nix` before relying on it.
+
+This is the self-host design for the mobee marketplace: one Rust workspace, Nix as the packaging
+foundation, targeting two runtimes (Docker, NixOS/systemd) across three operator personas
+(relay-operator, seller, buyer). Only the client binary above exists today; the rest is roadmap.
 
 ## Principle
 
@@ -47,11 +54,24 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
 
 ## Packaging targets
 
-**Docker** — `docker-compose.yml` bundling relay + relay-git + blossom + Caddy +
+### Today — what `flake.nix` actually exposes
+
+- `packages.default` — the `mobee` client binary, built with `--features acp` (buyer MCP + seller).
+- `apps.default` — `nix run --refresh github:MakePrisms/mobee/<ref> -- mcp|sell` (buyer + ad-hoc
+  seller), no clone. Always `--refresh` (or pin+bump the rev) — nix caches the git ref and will
+  otherwise serve a stale binary.
+- `devShells.default` — the workspace build/dev shell.
+
+That is the whole flake surface right now: one client binary, one run app, one dev shell. There is
+no compose file, no blossom crate, no NixOS module, and no split `packages.*` / `apps.*` in-tree.
+
+### Roadmap — not yet built (do not assume these exist)
+
+**Docker** — a `docker-compose.yml` bundling relay + relay-git + blossom + Caddy +
 Postgres (relay DB) + an object store (S3 or local for blossom/media). Images
 built from the Nix packages. `docker compose up` = a running marketplace backend.
 
-**Nix** — the flake exposes:
+**Nix** — split the flake into:
 - `packages.{relay,relay-git,blossom,mobee}` — each component + the client binary.
 - `nixosModules.mobee-relay` — `services.mobee-relay.enable = true` wires the
   relay + relay-git + blossom + Caddy as systemd units with declarative config
@@ -59,9 +79,6 @@ built from the Nix packages. `docker compose up` = a running marketplace backend
 - `nixosModules.mobee-seller` — `services.mobee-seller.enable` runs the
   `mobee sell` daemon as a systemd service (harness, rate, mint, git-remote from
   module options; key file 0600, never in the nix store).
-- `apps.{mcp,sell}` — the `nix run --refresh github:MakePrisms/mobee/<ref> -- mcp|sell`
-  client path (buyer + ad-hoc seller), no clone. Always `--refresh` (or pin+bump the rev) —
-  nix caches the git ref and will otherwise serve a stale binary.
 
 ## Personas
 

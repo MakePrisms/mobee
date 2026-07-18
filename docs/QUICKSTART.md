@@ -48,6 +48,11 @@ Buyer MCP tools on this tip:
 | `stub_pay` | Exercise budget caps over a mock pay (no piece-6 `run()`) |
 | `authorize_pay` | Real capped pay. **Documented default = job_id form** (see §4) |
 
+The same binary also exposes **wallet-management tools** — `reconcile_wallet`, `wallet_balance`,
+`wallet_mint` (testnut top-up), `wallet_send`, `wallet_receive`, `wallet_melt`, `wallet_invoice`,
+`wallet_mints` — for funding and balance ops outside the trade loop. This quickstart drives only the
+job-lifecycle tools above; see [`skills/run-buyer.md`](skills/run-buyer.md) for the full tool surface.
+
 Defaults written on first bootstrap (`~/.mobee/config.toml`):
 
 - mint: `https://testnut.cashudevkit.org` (hard-pinned; retarget refused)
@@ -107,7 +112,7 @@ Initialize once:
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 ```
 
-List tools (optional check — expect `setup_wallet`, `set_profile`, `post_job`, `get_job`, `accept_claim`, `stub_pay`, `authorize_pay`):
+List tools (optional check — the job-lifecycle tools are `setup_wallet`, `set_profile`, `post_job`, `get_job`, `accept_claim`, `stub_pay`, `authorize_pay`; the full list also includes the `wallet_*` management tools noted above, so don't treat these seven as the complete surface):
 
 ```json
 {"jsonrpc":"2.0","id":2,"method":"tools/list"}
@@ -160,7 +165,7 @@ Targeted seller is the documented default. Obtain a seller hex pubkey (seller da
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"post_job","arguments":{
   "task":"acceptance tip-match pay",
   "output":"text/plain",
-  "amount_sats":1,
+  "amount_sats":2,
   "seller_pubkey":"<seller 64-hex pubkey>",
   "repo":"https://github.com/bitcoin/bips.git",
   "branch":"master"
@@ -232,7 +237,7 @@ Plain https — no `insteadOf`, no SSH.
 ```json
 {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"authorize_pay","arguments":{
   "job_id":"<job_id>",
-  "amount_sats":1,
+  "amount_sats":2,
   "delivery_integrity_hash":"<BUYER_TIP from 3d>"
 }}}
 ```
@@ -262,7 +267,7 @@ Still accepted. If an accept-bind exists for `job_id`, seller/result/commit must
   "delivery_integrity_hash":"<buyer tip oid>",
   "job_hash":"<64 hex>",
   "seller_pubkey":"<seller pubkey>",
-  "amount_sats":1,
+  "amount_sats":2,
   "repo":"https://github.com/bitcoin/bips.git",
   "branch":"master",
   "commit_oid":"<same tip oid>"
@@ -308,7 +313,7 @@ Expect an error response containing a budget refuse (not a successful pay).
   "delivery_integrity_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "job_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "seller_pubkey":"<seller pubkey>",
-  "amount_sats":1,
+  "amount_sats":2,
   "repo":"ext::sh -c evil",
   "branch":"master",
   "commit_oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -322,7 +327,7 @@ Expect refuse (transport allowlist / `ext` / forbidden scheme). No successful pa
 With a valid accept-bind for `<job_id>` (§3c), call the job_id form with a hash ≠ accepted `commit_oid`:
 
 ```json
-{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"authorize_pay","arguments":{"job_id":"<job_id>","amount_sats":1,"delivery_integrity_hash":"<40-hex ≠ accepted commit_oid>"}}}
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"authorize_pay","arguments":{"job_id":"<job_id>","amount_sats":2,"delivery_integrity_hash":"<40-hex ≠ accepted commit_oid>"}}}
 ```
 
 Expect: refuse (buyer tip-match mismatch) AND `spent_total_sats` UNCHANGED from before the probe (zero burn — refuses in `authorize_request_from_bind` before budget is touched).
