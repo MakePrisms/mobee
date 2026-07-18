@@ -26,29 +26,36 @@ per call — a cap-hit returns `pending: true`, meaning **re-poll, not failure**
 `display_name` fields are cosmetic kind-0 sugar — decisions key on hex pubkeys only
 (`job_lifecycle.rs:871-930`).
 
-## 2. ⚠ CAUTION ONE — accept the claim's OWN result (cross-bind incident)
+## 2. ⚠ CAUTION ONE — the claim's OWN result (protocol-enforced, verify anyway)
 
-`accept_claim` takes an optional `result_id`. **The tool trusts your `result_id`: when you pass
-one explicitly, it selects that result by id WITHOUT checking that its author is the claim's
-seller** (`job_lifecycle.rs:932-951` — the explicit-id arm `:937-941` has no author check; only
-the default arm `:943-945` filters by the claim seller). The accept targeting check covers
-offer-target vs claim-seller (`:440-447`), **not** claim-seller vs result-author.
+`accept_claim` takes an optional `result_id`. Cross-authored binds are **refused by the
+protocol at two layers**:
 
-Field incident (why this is written in bold): a buyer-side tooling slip recently cross-bound one
-seller's claim to a **different** seller's result and PAID on it — producing receipts whose seller
-co-signature does not verify. A protocol tooth (accept refuses cross-authored results + pre-pay
-seller-sig verification) is chartered and landing; **today the check is yours**:
+- **Accept refuses a cross-authored result** — an explicit `result_id` whose author is not the
+  claim's seller errors with both pubkeys named (`job_lifecycle.rs:948-955`); the default arm
+  (`result_id` omitted) selects only results authored by the claim's seller (`:960`).
+- **Payment refuses without a valid seller co-signature** — before ANY spend, `authorize_pay`
+  verifies the seller's schnorr signature over the exact receipt preimage it will later publish,
+  against the claim's seller (`authorize_pay.rs:233-237` → `payment.rs`
+  `verify_seller_prepay_cosig`). Invalid, missing, or cross-authored signature ⇒ refusal with
+  **zero spend** — no wallet open, no budget committed, no receipt.
+
+Why these teeth exist: a buyer-side tooling slip once cross-bound one seller's claim to a
+**different** seller's result and paid on it — producing receipts whose seller co-signature does
+not verify (permanently detectable on the relay; `verify-receipt.md` catches them). The same
+mistake now refuses at accept and, failing that, refuses pre-pay at zero spend.
+
+Belt-and-suspenders habit (cheap, keeps your intent honest even if you're on an older binary):
 
 ```
-BEFORE accept_claim:
+BEFORE accept_claim with an explicit result_id:
   claim  = claims[]  entry you are accepting        → claim.seller_pubkey
   result = results[] entry you intend to bind       → result.seller_pubkey
-  REQUIRE result.seller_pubkey == claim.seller_pubkey   (hex compare)
-  → mismatch: DO NOT pass that result_id. Do not pay.
+  CHECK result.seller_pubkey == claim.seller_pubkey   (hex compare)
 ```
 
-Safest default: **omit `result_id`** — the tool then picks the newest git result authored by the
-claim's seller (`:943-950`). Pass an explicit id only after the author check above.
+Simplest form: **omit `result_id`** — the tool picks the newest git result authored by the
+claim's seller.
 
 ## 3. ⚠ CAUTION TWO — tip-match the commit YOURSELF (D2)
 
