@@ -883,11 +883,11 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
             seller_signature: seller_signature_arg.clone(),
             contribution: None,
         };
-        if let Some(bind) = job_lifecycle::load_accepted_bind(&state.home, &job_id)
-            .map_err(|error| error.to_string())?
-        {
+        let accept_bind = job_lifecycle::load_accepted_bind(&state.home, &job_id)
+            .map_err(|error| error.to_string())?;
+        if let Some(bind) = &accept_bind {
             job_lifecycle::assert_authorize_matches_bind(
-                &bind,
+                bind,
                 &request.seller_pubkey,
                 &request.result_id,
                 &request.commit_oid,
@@ -908,6 +908,18 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
                         tuple_signature: c.tuple_signature.clone(),
                     });
             }
+        }
+        // GAP-1 money-gate: with NO accept-bind, the paid offer's job-class was never resolved
+        // locally, so an explicit-form pay for a `job-class=contribution` offer would reach
+        // authorize_pay with `contribution: None` and SKIP all four contribution gates + the
+        // authorship-tuple seam (a non-descendant / empty / out-of-scope commit would be payable).
+        // Re-derive the offer class from the relay and REFUSE fail-closed for a contribution offer
+        // (or when the class cannot be determined). An accept-bind already resolved the class at
+        // accept time (contribution binds threaded above for a contribution offer, or proven
+        // from-scratch), so the accept-first path is untouched — no fetch, no new refusal.
+        if accept_bind.is_none() {
+            let job_class = derive_offer_job_class(&state.home, &job_id).await?;
+            guard_explicit_contribution_pay(&job_id, job_class.as_deref())?;
         }
         request
     } else {
@@ -960,6 +972,54 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
         "verifier": "PayPathDeliveryVerifier",
     });
     Ok(tool_ok(body))
+}
+
+/// GAP-1: re-derive a paid job's OFFER `job-class` from the relay, reusing the job-view machinery
+/// (no bespoke fetch). `Ok(Some("contribution"))` ⇒ a contribution offer; `Ok(Some(other))` /
+/// `Ok(None)` ⇒ a non-contribution (from-scratch) offer was found. `Err(..)` ⇒ the class could
+/// NOT be determined (relay read failed, or no offer on the relay) — the caller MUST fail closed
+/// (never treat an undeterminable class as from-scratch).
+#[cfg(feature = "wallet")]
+async fn derive_offer_job_class(home: &MobeeHome, job_id: &str) -> Result<Option<String>, String> {
+    let view = job_lifecycle::get_job_async(
+        home,
+        GetJobRequest {
+            job_id: job_id.to_owned(),
+            wait_for: None,
+            timeout_secs: None,
+        },
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "authorize_pay refused: cannot determine job-class for job {job_id} — relay read failed \
+             ({error}); refusing contribution-less explicit pay fail-closed (accept_claim first, or \
+             retry when the relay is reachable)"
+        )
+    })?;
+    let offer = view.offer.ok_or_else(|| {
+        format!(
+            "authorize_pay refused: cannot determine job-class for job {job_id} — no offer found on \
+             the relay; refusing contribution-less explicit pay fail-closed (accept_claim first)"
+        )
+    })?;
+    Ok(offer.job_class)
+}
+
+/// GAP-1 pure decision: an explicit-form pay carrying NO contribution binds must be refused when
+/// its offer is `job-class=contribution` — otherwise authorize_pay skips the four contribution
+/// gates + the authorship-tuple seam and a non-descendant / empty / out-of-scope commit is payable.
+/// Non-contribution classes (incl. `None` from-scratch) proceed unchanged.
+#[cfg(feature = "wallet")]
+fn guard_explicit_contribution_pay(job_id: &str, job_class: Option<&str>) -> Result<(), String> {
+    if job_class == Some(mobee_core::contribution::JOB_CLASS_CONTRIBUTION) {
+        return Err(format!(
+            "authorize_pay refused: job {job_id} is job-class=contribution but the explicit pay form \
+             carries no contribution binds — accept_claim this job first so the contribution gates \
+             (base-from-pin, descendant, content-policy, authorship-tuple) run before any spend"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "wallet")]
@@ -1704,5 +1764,156 @@ mod tests {
             reloaded.gate.lock().expect("lock").remaining(),
             reloaded.home.config.total_budget_sats - 7
         );
+    }
+
+    // --- GAP-1: explicit-form contribution money-gate ------------------------------------
+    // The explicit 9-field pay form must NOT let a `job-class=contribution` offer be paid with
+    // `contribution: None` — that would SKIP the four contribution gates + the authorship-tuple
+    // seam in authorize_pay (a non-descendant / empty / out-of-scope commit would be payable).
+    // The offer class is re-derived from the relay; the load-bearing decision is asserted here.
+
+    // THE GUARD: a contribution offer paid via the explicit form with no threaded binds refuses,
+    // naming the accept_claim remedy. Red-on-revert anchor: neutering the refuse flips this to
+    // an unexpected Ok (rc101).
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn gap1_contribution_offer_without_binds_is_refused() {
+        let err = guard_explicit_contribution_pay("job-contrib", Some("contribution"))
+            .expect_err("contribution offer paid contribution-less must refuse");
+        assert!(err.contains("job-class=contribution"), "err={err}");
+        assert!(err.contains("accept_claim"), "remedy must be named: {err}");
+        assert!(err.contains("no contribution binds"), "err={err}");
+    }
+
+    // From-scratch (no job-class tag) and any non-`contribution` class proceed unchanged — the
+    // guard gates ONLY `job-class=contribution`.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn gap1_from_scratch_and_other_classes_pass() {
+        guard_explicit_contribution_pay("job-scratch", None).expect("from-scratch must pass");
+        guard_explicit_contribution_pay("job-other", Some("bounty"))
+            .expect("non-contribution class passes");
+    }
+
+    // Class-derivation failure is FAIL-CLOSED with a distinct reason (never fail-open to
+    // from-scratch). A non-hex job_id makes the offer un-fetchable (EventId parse fails before any
+    // relay I/O), so the explicit contribution-less pay refuses at the class guard.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn gap1_explicit_pay_fails_closed_when_class_underivable() {
+        let root = temp_home("gap1-failclosed");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = state_at(&root);
+        let secret = home::read_secret_key_hex(&state.home).expect("secret");
+        let seller = home::public_key_hex(&state.home).expect("pubkey");
+        let response = dispatch(
+            &state,
+            &McpRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(51)),
+                method: "tools/call".into(),
+                params: json!({
+                    "name": "authorize_pay",
+                    "arguments": {
+                        "job_id": "contribution-job-not-on-relay",
+                        "result_id": "result",
+                        "delivery_integrity_hash": "aa".repeat(20),
+                        "job_hash": "bb".repeat(32),
+                        "seller_pubkey": seller,
+                        "amount_sats": 2,
+                        "repo": "https://example.invalid/repo.git",
+                        "branch": "main",
+                        "commit_oid": "aa".repeat(20),
+                    }
+                }),
+            },
+        );
+        let rendered = response.to_string();
+        assert!(!rendered.contains(&secret), "secret leaked on fail-closed refuse");
+        assert_eq!(response["result"]["isError"], true);
+        let message = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(
+            message.contains("cannot determine job-class"),
+            "must be the fail-closed class-derivation refusal, got: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The accept-first path is UNTOUCHED: when an accept-bind exists (here from-scratch), the class
+    // was already resolved at accept time, so the explicit pay SKIPS the class guard entirely (no
+    // relay fetch, no guard refusal) and reaches today's core pre-pay path — proven by refusing at
+    // the seller co-signature tooth, NOT at the GAP-1 guard.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn gap1_accept_bind_present_skips_class_guard() {
+        let root = temp_home("gap1-acceptbind");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = state_at(&root);
+        let seller = home::public_key_hex(&state.home).expect("pubkey");
+        let job_id = "gap1-accept-skip";
+        let bind = job_lifecycle::AcceptedBind {
+            job_id: job_id.to_owned(),
+            claim_id: "claim-x".into(),
+            result_id: "result".into(),
+            seller_pubkey: seller.clone(),
+            commit_oid: "aa".repeat(20),
+            repo: "https://example.invalid/repo.git".into(),
+            branch: "main".into(),
+            job_hash: "bb".repeat(32),
+            amount_sats: 2,
+            accept_event_id: "accept-x".into(),
+            accepted_at: 0,
+            seller_signature: String::new(),
+            contribution: None,
+        };
+        let jobs_dir = state.home.root.join("jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs dir");
+        std::fs::write(
+            jobs_dir.join(format!("{job_id}.json")),
+            serde_json::to_string(&bind).expect("bind json"),
+        )
+        .expect("write bind");
+        let response = dispatch(
+            &state,
+            &McpRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(52)),
+                method: "tools/call".into(),
+                params: json!({
+                    "name": "authorize_pay",
+                    "arguments": {
+                        "job_id": job_id,
+                        "result_id": "result",
+                        "delivery_integrity_hash": "aa".repeat(20),
+                        "job_hash": "bb".repeat(32),
+                        "seller_pubkey": seller,
+                        "amount_sats": 2,
+                        "repo": "https://example.invalid/repo.git",
+                        "branch": "main",
+                        "commit_oid": "aa".repeat(20),
+                    }
+                }),
+            },
+        );
+        assert_eq!(response["result"]["isError"], true);
+        let message = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        // Reached today's core pre-pay path (guard skipped): the refusal is the seller-cosig tooth,
+        // NOT the GAP-1 class guard nor the fail-closed derivation error.
+        assert!(
+            message.contains("co-signature"),
+            "accept-bind path must reach the core cosig tooth, got: {message}"
+        );
+        assert!(
+            !message.contains("no contribution binds")
+                && !message.contains("cannot determine job-class"),
+            "accept-bind path must NOT hit the GAP-1 class guard, got: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
