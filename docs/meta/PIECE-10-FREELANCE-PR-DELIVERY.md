@@ -13,9 +13,24 @@ path.
 Technically this is a protocol/spec extension atop landed **piece-7** (git delivery) and **piece-6**
 (payment SM). It adds a **contribution** job class: the buyer's offer names a **target repo it owns** +
 a base commit, and the seller delivers a change *against that repo*. Two seller paths —
-**fork** (push to the seller's own relay-git namespace) or **NIP-34 patch** (kind-1617). **v1 ships
-fork-only**; patch is designed below and explicitly deferred.
+**fork** (push to the seller's own relay-git namespace) or **NIP-34 patch** (kind-1617), typed as the
+foundation's `Delivery::Commit` and `Delivery::Tree` variants
+([PIECE-12](PIECE-12-TYPED-DELIVERY-ABSTRACTION.md)). **v1 ships fork-only** (the `Commit` variant); patch
+(the additive `Tree` variant) is designed below and explicitly deferred.
 
+> **v5 — reworked onto the landed typed-delivery FOUNDATION ([PIECE-12](PIECE-12-TYPED-DELIVERY-ABSTRACTION.md), @ dev `a77cdeb`).**
+> The fork path now builds **on `Delivery::Commit`** — the foundation's only-live variant, a
+> behavior-preserving re-type of today's commit path; the fork tip **is** that variant's `commit_oid`, and
+> the contribution binds (`base_oid` / target / ancestry / custody / authorship) layer **on top of it**.
+> The **patch** path is the foundation's **additive `Delivery::Tree` variant** (designed, not built) —
+> **not a parallel money-path** (v4's "parallel typed money-path" cost is retired by the abstraction).
+> **The money-safety design is UNCHANGED from v4** (coordinator CLEAR-FOR-BUILD stands, 23133); v5 only
+> re-expresses delivery on the foundation and repoints scope/patch at PIECE-12. **Build decomposition:**
+> **Step 0** = the PIECE-12 abstraction + `Commit` re-type (coordinator behavior-equivalence sub-pass —
+> produced-byte equivalence + refuse-path parity + red-on-revert + suite green — gated *before* this) →
+> **Step 1+** = this fork contribution (the 6 MUSTs) on `Commit`, full money-gate. **NO self-FF on
+> pay-verify (either step).**
+>
 > **v4 — folds a codex-deep design review (compose → blinded adversarial (Opus) → codex, complete)**
 > into the strong v3 draft. **v3 is preserved; v4 SHARPENS MECHANISMS — it does not re-open the design.**
 > The refinements: the **authorship bind is re-centred on the seller's schnorr-signed kind-6109 result**
@@ -27,7 +42,7 @@ fork-only**; patch is designed below and explicitly deferred.
 > **empty / out-of-scope**, NOT worthless-in-scope — quality-judging stays deferred to the
 > payment-and-reputation chapter); **custody-retention** is added (the buyer fetches + retains the paid
 > object and merges by the local oid); and the new fields are enumerated as schema/state additions
-> **adjacent to** authorization (frozen money-core stays byte-scope).
+> **adjacent to** authorization (frozen money-core byte-scope in v4 — **v5's Step-0 re-type supersedes**, see the v5 note above).
 >
 > **Two items were flagged PROPOSED-PENDING-COORDINATOR and are now CONFIRMED at coordinator
 > shape-review** (folded below as RESOLVED, no longer pending): **(1)** the chapter-acceptance pay-bind
@@ -131,14 +146,16 @@ not the paid object).
 
 ---
 
-## Scope decision — v1 = FORK only; PATCH deferred (RULED)
+## Scope decision — v1 = `Commit` variant + FORK; PATCH = additive `Tree` variant, deferred (RULED)
 
-**RULED GO — v1 = fork-only** (hearth Q3 + gudnuf). **Path B (patch → tree-oid) cannot reuse the money
-path.** The path is commit-typed at three gates, fetches a branch tip, and peels `^{commit}`; a tree oid
-cannot flow through it. Supporting patch means a **parallel typed money-path** — a `Patch` variant across
-`AuthorizePayRequest`, `PaymentKey`, `DeliveryVerifier`, and the `== commit_oid` gates — a substantial
-build, not a branch of the existing one. **v1 ships FORK only; patch is a follow-up piece.** The patch
-design is specified below (§ Path B) but marked **NOT-v1**.
+**RULED GO — v1 = fork-only, built on the foundation's `Delivery::Commit` variant** (hearth Q3 + gudnuf).
+The typed-delivery foundation ([PIECE-12](PIECE-12-TYPED-DELIVERY-ABSTRACTION.md)) **retires v4's
+"parallel typed money-path" cost**: v4 held that supporting patch meant duplicating the commit-typed path
+(a `Patch` variant across `AuthorizePayRequest`, `PaymentKey`, `DeliveryVerifier`, and the `== commit_oid`
+gates); with the foundation, patch is instead an **additive `Delivery::Tree` variant** — a tree-oid variant
++ its verify arm added to the *one* abstraction, **not a parallel path**. **v1 ships the `Commit` variant +
+the fork contribution; the `Tree` / patch variant is designed (§ Path B, PIECE-12) and explicitly NOT
+built.**
 
 ---
 
@@ -149,8 +166,8 @@ relay-git namespace (`default_relay_git_remote`, `home.rs:95` — owner-scoped p
 write access to the buyer's `target_repo`). It announces the fork (kind-30617, `profile.rs:421`) and its
 kind-6109 **result advertises `{target_repo, base_oid, fork_ref, commit_oid}` inside the seller's schnorr
 signature** (`fork_ref` = fork repo + branch; `commit_oid` = the fork tip). **Binding:
-`delivery_integrity_hash = commit_oid`** (the fork tip) — the existing commit-oid tip-match
-(`delivery.rs:86` `from_fetched_tip`), so v1 reuses the money path unchanged. Ordering is the ONE state
+`delivery_integrity_hash = commit_oid`** (the fork tip) — the foundation's `Delivery::Commit` variant
+(`delivery.rs:86` `from_fetched_tip` tip-match; PIECE-12), so v1 reuses the money path unchanged. Ordering is the ONE state
 machine (**`verify → pay → merge`**): after the buyer binds payment to the fork-tip `commit_oid`, it
 **merges the custodied `commit_oid` into `target_repo`** ("accept the PR", **FF-preferred**) — a
 buyer-custody action, **not** what payment binds.
@@ -203,11 +220,13 @@ buyer-custody action, **not** what payment binds.
    fork branch name — so a seller who **deletes or moves the fork after pay cannot strand the buyer**.
    (No-force-push covers tip-move; custody-retention covers deletion too.)
 
-## Path B — NIP-34 patch (kind-1617) — DEFERRED (design only, NOT v1)
+## Path B — NIP-34 patch (kind-1617) — the additive `Delivery::Tree` variant (DESIGNED, NOT v1)
 
 Seller publishes a kind-1617 patch against `base_oid`; **binding = the resulting TREE oid**
-(content-deterministic — a commit oid can't work, patch application yields a per-applier commit).
-Requires the parallel typed money-path (above) plus:
+(content-deterministic — a commit oid can't work, patch application yields a per-applier commit). This is
+the foundation's **additive `Delivery::Tree` variant** ([PIECE-12](PIECE-12-TYPED-DELIVERY-ABSTRACTION.md))
+— **not a parallel money-path** (the v4 framing is superseded). Adding it = the `Tree` variant + its verify
+arm on the one abstraction, plus:
 
 - **Determinism pinned (money bind):** apply with filters disabled (no autocrlf/ident/clean-smudge),
   a fixed file-mode policy, and a pinned object-format (sha1/sha256) shared seller↔buyer — else honest
@@ -312,22 +331,26 @@ offer); **authority is the buyer's signed offer** — the buyer resolves `base_o
 The contribution verify-path (base-ancestry + fork-fetch + pay-bind) touches **`PayPathDeliveryVerifier`**
 and the `authorize_pay` gates → it is subject to the **coordinator's money bar** before **any** FF that
 touches the pay-verify path: **independent full-suite re-run on the frozen candidate + live fixtures +
-dual-review (both frames).** The **frozen money-core** (`payment_wallet.rs` / `authorize_pay.rs` /
-`payment.rs`) stays **byte-scope** — unchanged unless the build genuinely requires it, and any such need
-is **flagged explicitly** for the coordinator (the new binds add threading + a verifier gate; they should
-not need to rewrite the frozen wallet/authorize/payment core).
+dual-review (both frames).** **Frozen-core (post-foundation):** the typed-delivery re-type threads `Delivery` through
+`authorize_pay` / `payment` / `delivery` in **Step 0** ([PIECE-12](PIECE-12-TYPED-DELIVERY-ABSTRACTION.md))
+— gudnuf-authorized, **behavior-preserving only**, gated by the Step-0 behavior-equivalence sub-pass
+(produced-byte equivalence + refuse-path parity + red-on-revert + suite green) **before** this chapter
+builds on it. `payment_wallet.rs` stays **byte-frozen** (no wallet/spend logic change); `receipt.rs` stays
+**as landed**. **Step 1+ (this chapter)** adds **threading + a verifier gate** on the `Commit` variant —
+not wallet/authorize/payment logic rewrites.
 
 **Fields threaded (schema/state additions ADJACENT to authorization — NOT wallet/payment rewrites):** the
 accept-bind + `authorize_request` gain `base_oid`, the pinned `target_repo` (`naddr`), `fork_ref`, and the
-**buyer-custody local ref**. These sit next to the existing `commit_oid` bind; the **frozen money-core**
-(`payment_wallet.rs` / `authorize_pay.rs` / `payment.rs`) stays **byte-scope**. The **receipt is not
+**buyer-custody local ref**. These sit next to the existing `commit_oid` bind; **`payment_wallet.rs` stays byte-frozen**, and
+the `authorize_pay` / `payment` changes are the Step-0 behavior-preserving re-type (PIECE-12) plus this
+chapter's threading — no wallet/spend logic rewrite. The **receipt is not
 extended** by this chapter (RESOLVED — see § Receipt binding): contribution-context rides the signed
 kind-6109 + the buyer accept-bind/journal, so no kind-3400 re-lock is warranted.
 
 ## Findings — RESOLVED
 
-1. **v1 scope = fork-only — GO.** Patch deferred (needs a parallel typed money-path). Ruled by hearth
-   (Q3) + gudnuf.
+1. **v1 scope = fork-only — GO.** Patch deferred as the additive `Delivery::Tree` variant (PIECE-12; not a
+   parallel money-path). Ruled by hearth (Q3) + gudnuf.
 2. **Receipt binding — RESOLVED via option (a).** piece-9 re-locked to attest `delivery_integrity_hash`
    + `delivery_kind` in the kind-3400 schema **and** its co-signed preimage; **landed in piece-9 v3 @
    `4190a15`** (code present at dev tip — see § Receipt binding). The receipt **does** attest the
@@ -351,8 +374,9 @@ kind-6109 + the buyer accept-bind/journal, so no kind-3400 re-lock is warranted.
 *(the bar for THIS doc; the chapter bar is below and distinct)*
 
 - Offer fields (contribution) specified + differ from from-scratch.
-- **Fork path (v1)** fully specified incl. the six MUSTs; patch path designed + explicitly deferred with
-  the reason (money-path retyping).
+- **Fork path (v1)** fully specified incl. the six MUSTs, built on the foundation's
+  `Delivery::Commit` variant (PIECE-12); patch path designed + deferred as the additive `Delivery::Tree`
+  variant (no parallel money-path).
 - **Delivery is ONE state machine — `verify → pay → merge`** (FF-preferred, buyer-custody) — stated
   identically in the intro, § Delivery model, Path A, and both acceptance bars.
 - Pay binding per path stated (fork = the delivered **FORK-TIP `commit_oid`** tip-match reused, **never a
@@ -405,10 +429,11 @@ acceptance (chapter):
 
 **SPEC-DRAFT (design).** No code lands here. Reality: from-scratch delivery **PROVEN** (c/c2), and the
 collect leg is **REAL-AND-LIVE**; contribution is **NOT BUILT** — fork-path v1 is buildable on the
-existing commit-typed money path (receipt binding already landed) **plus** the new gates (base_oid
-threading + base-from-pin, descendant, authorship via the seller-signed kind-6109 tuple, target_repo
-equality-check, content gate + policy hook, and buyer-custody retention); patch path needs a parallel
-typed money-path (deferred).
+foundation's `Delivery::Commit` variant ([PIECE-12](PIECE-12-TYPED-DELIVERY-ABSTRACTION.md); the
+behavior-preserving re-type of the commit path, receipt binding already landed) **plus** the new gates
+(base_oid threading + base-from-pin, descendant, authorship via the seller-signed kind-6109 tuple,
+target_repo equality-check, content gate + policy hook, and buyer-custody retention); the patch path is
+the additive `Delivery::Tree` variant (designed, not built).
 
 ## Reference
 
@@ -427,5 +452,8 @@ typed money-path (deferred).
   `:95` `default_relay_git_remote`, `:102` `relay_git_repo_id`.
 - **Greenfield gates:** `verify_git_descendant` / `merge-base --is-ancestor` / `ensure_repo_job_protection`
   / `base_oid` — **0 hits in `crates/*/src`** (docs-only: PIECE-7, REBUILD-SEAM).
-- Composes onto [PIECE-7-GIT-DELIVERY.md](PIECE-7-GIT-DELIVERY.md); receipt binding per
-  [PIECE-9-RECEIPT-AND-EXEC-METADATA.md](PIECE-9-RECEIPT-AND-EXEC-METADATA.md) (D4, @ `4190a15`).
+- Built on the typed-delivery foundation
+  [PIECE-12-TYPED-DELIVERY-ABSTRACTION.md](PIECE-12-TYPED-DELIVERY-ABSTRACTION.md) (fork = `Delivery::Commit`;
+  patch = the additive `Delivery::Tree`). Composes onto [PIECE-7-GIT-DELIVERY.md](PIECE-7-GIT-DELIVERY.md);
+  receipt binding per [PIECE-9-RECEIPT-AND-EXEC-METADATA.md](PIECE-9-RECEIPT-AND-EXEC-METADATA.md) (D4, @
+  `4190a15`).
