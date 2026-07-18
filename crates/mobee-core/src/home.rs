@@ -94,6 +94,17 @@ pub struct SellerConfig {
     /// both paths.
     #[serde(default = "default_offer_backfill_secs")]
     pub offer_backfill_secs: u64,
+    /// Opt-in to the piece-10 contribution (freelance-PR fork) path. Default **true**. When
+    /// **false** the daemon behaves as a seller WITHOUT contribution support: it kind-7000
+    /// `status=error`s a `job-class=contribution` offer instead of running it as from-scratch
+    /// (interop courtesy — NOT a security control; buyer refusal is the boundary).
+    #[serde(default = "default_contribution_enabled")]
+    pub contribution_enabled: bool,
+}
+
+/// Default for [`SellerConfig::contribution_enabled`] — contribution support ON.
+pub fn default_contribution_enabled() -> bool {
+    true
 }
 
 /// serde default for [`SellerConfig::offer_backfill_secs`]: 1200s (20 min). A `[seller]` block
@@ -193,6 +204,27 @@ pub struct MobeeConfig {
     /// Optional `[seller]` daemon config. Absent until `mobee sell` setup writes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seller: Option<SellerConfig>,
+    /// Optional buyer-side piece-10 contribution content policy (the MUST-5 policy hook). Absent
+    /// ⇒ the FLOOR (refuse only empty diffs). Present ⇒ tighten pre-pay with a path allowlist /
+    /// forbidden paths / max diff size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contribution: Option<ContributionPolicyConfig>,
+}
+
+/// Buyer-side content policy for piece-10 contribution verify (the MUST-5 policy hook). Maps 1:1
+/// to `contribution::ContentPolicy`; kept as a plain config type so `home` need not depend on the
+/// git-delivery feature. All fields default to the floor (allow all, forbid none, no cap).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ContributionPolicyConfig {
+    /// Non-empty ⇒ every changed path MUST lie under one of these prefixes (out-of-scope refuse).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_paths: Vec<String>,
+    /// A changed path under any of these prefixes is refused (checked before the allowlist).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbidden_paths: Vec<String>,
+    /// Refuse when summed churn exceeds this many units. `None` ⇒ no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_diff_bytes: Option<u64>,
 }
 
 impl Default for MobeeConfig {
@@ -205,6 +237,7 @@ impl Default for MobeeConfig {
             extra_mints: Vec::new(),
             profile: None,
             seller: None,
+            contribution: None,
         }
     }
 }

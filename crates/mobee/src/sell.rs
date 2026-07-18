@@ -336,6 +336,9 @@ fn ensure_seller_config(
         agent,
         claim_open_pool,
         offer_backfill_secs,
+        // Piece-10: contribution (freelance-PR fork) support ON by default for CLI-configured
+        // sellers. Operators disable it by editing `[seller] contribution_enabled = false`.
+        contribution_enabled: true,
     };
     home.config.seller = Some(seller);
     home::save_config(home).map_err(|error| {

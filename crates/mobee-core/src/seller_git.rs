@@ -135,6 +135,141 @@ pub fn init_empty_delivery_workdir(
     Ok(())
 }
 
+/// Contribution (piece-10) fork-from-base: initialise `workdir` as a working clone of the PINNED
+/// target `base_clone_url` at `base_oid`, on a per-job unique `branch` carrying the FULL job_id
+/// (MUST-6). The agent then commits its work on top; the daemon pushes `branch` to the seller's OWN
+/// relay-git namespace. Transport-allowlisted (https + relay-git; `ext::`/file/ssh refused) and
+/// scrubbed exactly like every other seller git child.
+///
+/// FULL-depth fetch (no `--depth`) so the fork carries `base_oid` + ancestry — a shallow fork would
+/// make the BUYER's `merge-base --is-ancestor` descendant gate false-refuse an honest contribution.
+/// The base history is foreign (the target's authors); only the commits ADDED on top are the
+/// seller's, so the daemon scopes its authorship gate to `base_oid..HEAD` (see
+/// [`require_agent_authored_contribution`]).
+pub fn init_contribution_workdir(
+    workdir: &Path,
+    seller_home: &Path,
+    identity: &DeliveryAgentIdentity,
+    base_clone_url: &str,
+    base_branch: &str,
+    base_oid: &str,
+    branch: &str,
+) -> Result<(), SellerGitError> {
+    crate::delivery_transport::assert_allowed_repo_locator(base_clone_url)?;
+    if !workdir.exists() {
+        std::fs::create_dir_all(workdir).map_err(|error| SellerGitError::Io(error.to_string()))?;
+    }
+    run_ok(
+        "init",
+        scrubbed_git(workdir, seller_home, ["init", "--initial-branch=main"])?,
+    )?;
+    run_ok(
+        "config-user-name",
+        scrubbed_git(workdir, seller_home, ["config", "user.name", &identity.name])?,
+    )?;
+    run_ok(
+        "config-user-email",
+        scrubbed_git(workdir, seller_home, ["config", "user.email", &identity.email])?,
+    )?;
+    // Full-depth fetch of the base branch from the pinned target into a local ref.
+    let refspec = format!("+refs/heads/{base_branch}:refs/mobee/base");
+    run_ok(
+        "fetch-base",
+        scrubbed_git(
+            workdir,
+            seller_home,
+            [
+                "fetch",
+                "--no-tags",
+                "--force",
+                "--end-of-options",
+                base_clone_url,
+                &refspec,
+            ],
+        )?,
+    )?;
+    // Check out base_oid onto the per-job unique branch (the fork tip the agent extends).
+    run_ok(
+        "checkout-base",
+        scrubbed_git(
+            workdir,
+            seller_home,
+            ["checkout", "-B", branch, "--", base_oid],
+        )?,
+    )
+}
+
+/// Contribution authorship gate (piece-10): deliver IFF every commit in `base_oid..HEAD` is
+/// agent-authored, HEAD advanced past `base_oid`, and the HEAD tree is non-empty. Scopes the
+/// empty-base authorship stamp to the commits ADDED on top of the (foreign) base — the base history
+/// is legitimately not agent-authored. Returns the HEAD oid on success.
+pub fn require_agent_authored_contribution(
+    workdir: &Path,
+    seller_home: &Path,
+    identity: &DeliveryAgentIdentity,
+    base_oid: &str,
+    after: Option<&str>,
+) -> Result<String, SellerGitError> {
+    let after = after.ok_or_else(|| {
+        SellerGitError::Io("contribution refused: agent left no commit (HEAD missing)".into())
+    })?;
+    if after == base_oid {
+        return Err(SellerGitError::Io(
+            "contribution refused: HEAD did not advance past base_oid (no agent work)".into(),
+        ));
+    }
+    require_range_agent_authored(workdir, seller_home, identity, base_oid, after)?;
+    require_head_tree_nonempty(workdir, seller_home, after)?;
+    Ok(after.to_owned())
+}
+
+fn require_range_agent_authored(
+    workdir: &Path,
+    seller_home: &Path,
+    identity: &DeliveryAgentIdentity,
+    base_oid: &str,
+    after: &str,
+) -> Result<(), SellerGitError> {
+    let range = format!("{base_oid}..{after}");
+    let out = scrubbed_git(
+        workdir,
+        seller_home,
+        ["log", "--format=%an%x1f%ae%x1f%cn%x1f%ce%x1e", &range],
+    )?;
+    if !out.status.success() {
+        return Err(SellerGitError::Io(
+            "contribution refused: cannot read commit authors — fail-closed".into(),
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut saw_commit = false;
+    for record in text.split('\u{1e}') {
+        let record = record.trim();
+        if record.is_empty() {
+            continue;
+        }
+        saw_commit = true;
+        let mut fields = record.split('\u{1f}');
+        let an = fields.next().unwrap_or("");
+        let ae = fields.next().unwrap_or("");
+        let cn = fields.next().unwrap_or("");
+        let ce = fields.next().unwrap_or("");
+        if an != identity.name || ae != identity.email || cn != identity.name || ce != identity.email
+        {
+            return Err(SellerGitError::Io(format!(
+                "contribution refused: commit on top of base not agent-authored (author={an} <{ae}>) — expected {} <{}>",
+                identity.name, identity.email
+            )));
+        }
+    }
+    if !saw_commit {
+        return Err(SellerGitError::Io(
+            "contribution refused: no agent commits on top of base_oid".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Gate #10 (empty-base): deliver IFF HEAD is agent-authored + substantive.
 ///
 /// - `after` missing → refuse (no harness fallback)
@@ -894,6 +1029,74 @@ mod tests {
             "expected protocol.ssh deny in stderr, got:\n{stderr}"
         );
 
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    // ── Piece-10 fork-from-base: allowlist + range-scoped authorship gate ──────────────────────
+    fn commit_as(dir: &Path, name: &str, email: &str, path: &str, content: &str, msg: &str) -> String {
+        let full = dir.join(path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).expect("mkdir parent");
+        }
+        fs::write(&full, content).expect("write");
+        assert!(Command::new("git").args(["add", "-A"]).current_dir(dir).status().unwrap().success());
+        assert!(Command::new("git")
+            .args(["commit", "-m", msg])
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", name)
+            .env("GIT_AUTHOR_EMAIL", email)
+            .env("GIT_COMMITTER_NAME", name)
+            .env("GIT_COMMITTER_EMAIL", email)
+            .status()
+            .unwrap()
+            .success());
+        let out = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn init_contribution_workdir_refuses_ext_base() {
+        let root = temp("contrib-ext");
+        let home = temp("contrib-ext-home");
+        let identity = DeliveryAgentIdentity::for_seller(&"aa".repeat(32));
+        let err = init_contribution_workdir(
+            &root,
+            &home,
+            &identity,
+            "ext::sh -c evil",
+            "main",
+            &"a".repeat(40),
+            "mobee/contribution/job",
+        )
+        .expect_err("ext base must be refused by the transport allowlist");
+        assert!(matches!(err, SellerGitError::Transport(_)), "got {err}");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn require_agent_authored_contribution_scopes_gate_to_range() {
+        let root = temp("contrib-range");
+        let home = temp("contrib-range-home");
+        let identity = DeliveryAgentIdentity::for_seller(&"bb".repeat(32));
+        init_repo(&root); // base commit authored by "Mobee Seller Test" (foreign to the stamp)
+        let base_oid = {
+            let out = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&root).output().unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        // Agent commit ON TOP of base, authored by the STAMPED identity.
+        let after = commit_as(&root, &identity.name, &identity.email, "src/x.rs", "work\n", "agent work");
+        // Range gate passes (base is foreign, but base_oid..HEAD is all agent-authored).
+        require_agent_authored_contribution(&root, &home, &identity, &base_oid, Some(&after))
+            .expect("agent-authored range must pass despite foreign base");
+
+        // A foreign commit on top of base ⇒ refuse.
+        let foreign = commit_as(&root, "Stranger", "x@evil.invalid", "src/y.rs", "sneaky\n", "foreign");
+        assert!(require_agent_authored_contribution(&root, &home, &identity, &base_oid, Some(&foreign)).is_err());
+
+        // HEAD == base (no advancement) ⇒ refuse.
+        assert!(require_agent_authored_contribution(&root, &home, &identity, &base_oid, Some(&base_oid)).is_err());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&home);
     }

@@ -183,6 +183,20 @@ pub enum DeliveryError {
         actual: CommitOid,
     },
     MissingCommitObject,
+    /// Contribution (piece-10): `base_oid` is not present in the PINNED target (base-from-pin
+    /// fetch produced no such object). Fail-closed — the buyer never bases against a value it
+    /// could not resolve from its own signed offer's target.
+    MissingBaseObject,
+    /// Contribution: the delivered `commit_oid` does NOT descend from `base_oid`
+    /// (`git merge-base --is-ancestor` refused). Closes unrelated-history / swapped-base.
+    NotDescendant {
+        base_oid: String,
+        commit_oid: String,
+    },
+    /// Contribution: the content gate refused (empty / out-of-scope / forbidden / too-large).
+    ContentRefused(String),
+    /// Contribution: merging the custodied local `commit_oid` into the target failed.
+    MergeFailed(&'static str),
 }
 
 impl fmt::Display for DeliveryError {
@@ -210,6 +224,20 @@ impl fmt::Display for DeliveryError {
             }
             Self::MissingCommitObject => {
                 formatter.write_str("fetched commit object is not in buyer custody")
+            }
+            Self::MissingBaseObject => {
+                formatter.write_str("base_oid is not present in the pinned target repo (base-from-pin)")
+            }
+            Self::NotDescendant {
+                base_oid,
+                commit_oid,
+            } => write!(
+                formatter,
+                "delivered commit {commit_oid} does not descend from base {base_oid}"
+            ),
+            Self::ContentRefused(reason) => write!(formatter, "content gate refused: {reason}"),
+            Self::MergeFailed(operation) => {
+                write!(formatter, "custodied merge {operation} failed")
             }
         }
     }

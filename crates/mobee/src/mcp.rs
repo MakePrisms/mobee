@@ -881,6 +881,7 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
             branch: require_str("branch")?,
             commit_oid: require_str("commit_oid")?,
             seller_signature: seller_signature_arg.clone(),
+            contribution: None,
         };
         if let Some(bind) = job_lifecycle::load_accepted_bind(&state.home, &job_id)
             .map_err(|error| error.to_string())?
@@ -894,6 +895,18 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
             .map_err(|error| error.to_string())?;
             if request.seller_signature.is_empty() {
                 request.seller_signature = bind.seller_signature.clone();
+            }
+            // Piece-10: thread contribution binds from the accept-bind so the explicit form still
+            // runs the contribution verify-path + authorship seam.
+            if request.contribution.is_none() {
+                request.contribution =
+                    bind.contribution.as_ref().map(|c| authorize_pay::ContributionPayBinds {
+                        target_owner_pubkey: c.target_owner_pubkey.clone(),
+                        target_clone_url: c.target_clone_url.clone(),
+                        base_branch: c.base_branch.clone(),
+                        base_oid: c.base_oid.clone(),
+                        tuple_signature: c.tuple_signature.clone(),
+                    });
             }
         }
         request
@@ -921,6 +934,7 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
             branch: require_str("branch")?,
             commit_oid: require_str("commit_oid")?,
             seller_signature: seller_signature_arg.clone(),
+            contribution: None,
         }
     };
 

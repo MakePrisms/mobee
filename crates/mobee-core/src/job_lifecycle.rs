@@ -126,6 +126,36 @@ pub struct OfferView {
     pub targeted: bool,
     pub repo: Option<String>,
     pub branch: Option<String>,
+    /// Raw `job-class` tag value (piece-10). `Some("contribution")` ⇒ a contribution offer; absent
+    /// ⇒ from-scratch. Carried raw so a `contribution`-class offer whose pins failed to parse is
+    /// visible as `job_class=Some, contribution=None` and REFUSED at accept (never run from-scratch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_class: Option<String>,
+    /// Parsed, well-formed contribution pins (target + base + accepts). `None` when not a
+    /// contribution OR when a `contribution`-class offer's pins were malformed (fail-closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contribution: Option<ContributionOfferView>,
+}
+
+/// Serializable view of a well-formed contribution offer's pins (piece-10).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ContributionOfferView {
+    pub target_owner_pubkey: String,
+    pub target_clone_url: String,
+    pub base_branch: String,
+    pub base_oid: String,
+    pub accepts: Vec<String>,
+}
+
+/// Serializable view of a seller result's contribution echo + authorship signature (piece-10).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ContributionResultView {
+    pub target_owner_pubkey: String,
+    pub target_clone_url: String,
+    pub base_branch: String,
+    pub base_oid: String,
+    /// Seller schnorr signature (hex) over the signed-6109 authorship tuple (`sig/seller-contribution`).
+    pub tuple_signature: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -154,6 +184,10 @@ pub struct ResultView {
     /// Seller schnorr signature (hex) from the result's `["sig","seller",..]` tag — the
     /// buyer counter-signs the same piece-9 receipt preimage to co-sign the kind-3400.
     pub seller_signature: Option<String>,
+    /// Piece-10 contribution echo + authorship signature. `Some` iff the result carries a
+    /// well-formed `job-class=contribution` echo AND a `sig/seller-contribution` tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contribution: Option<ContributionResultView>,
 }
 
 /// Local accept-bind recorded by [`accept_claim`] for authorize_pay Gate D / D2.
@@ -174,6 +208,25 @@ pub struct AcceptedBind {
     /// accepted result's `sig/seller` tag (piece-9). Empty for legacy/pre-piece-9 results.
     #[serde(default)]
     pub seller_signature: String,
+    /// Piece-10 contribution binds, recorded at accept when the OFFER is a contribution (authority
+    /// = the buyer's signed offer; the result echo is equality-checked, never trusted). Absent ⇒
+    /// from-scratch (EXACTLY today's path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contribution: Option<AcceptedContribution>,
+}
+
+/// Contribution binds captured in the accept-bind (piece-10). `target_*` / `base_*` come from the
+/// buyer's SIGNED offer (authority); `tuple_signature` is the seller's signed-6109 authorship sig
+/// from the accepted result; `custody_local_ref` is the buyer-controlled ref the fork tip is
+/// retained under (MUST-6 custody-retention; merge uses THIS, never the live fork branch).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedContribution {
+    pub target_owner_pubkey: String,
+    pub target_clone_url: String,
+    pub base_branch: String,
+    pub base_oid: String,
+    pub tuple_signature: String,
+    pub custody_local_ref: String,
 }
 
 /// Inputs for accepting a seller claim (and binding the matching result).
@@ -465,6 +518,11 @@ pub async fn accept_claim_async(
         .ok_or_else(|| JobLifecycleError::Input("result missing job-hash".into()))?;
     let amount_sats = result.amount_sats.unwrap_or(offer.amount_sats);
 
+    // Piece-10: resolve contribution binds from the buyer's SIGNED OFFER (authority), refusing a
+    // malformed contribution offer and equality-checking the seller echo (MUST-4) — never trusting
+    // the echo. From-scratch offers (no `job-class=contribution`) leave `contribution = None`.
+    let contribution = resolve_accepted_contribution(offer, result, &commit_oid)?;
+
     let buyer_pubkey = keys.public_key().to_hex();
     let draft = accept_draft(
         &request.job_id,
@@ -492,6 +550,7 @@ pub async fn accept_claim_async(
         accepted_at,
         // Capture sig/seller so authorize_pay can co-sign the receipt preimage (piece-9).
         seller_signature: result.seller_signature.clone().unwrap_or_default(),
+        contribution,
     };
     write_accepted_bind(home, &bind)?;
 
@@ -499,6 +558,77 @@ pub async fn accept_claim_async(
         accept_event_id,
         bind,
     })
+}
+
+/// Piece-10 accept-time contribution resolution (MUST-4). Authority is the buyer's SIGNED OFFER:
+/// - not a contribution offer (`job_class != contribution`) ⇒ `Ok(None)` (from-scratch);
+/// - a `contribution`-class offer whose pins failed to parse ⇒ REFUSE (fail-closed — never
+///   silently run from-scratch);
+/// - a contribution offer whose accepted result carries no valid echo+sig ⇒ REFUSE;
+/// - the seller-echoed `{target_repo, base_oid}` are EQUALITY-CHECKED against the offer (a
+///   cross-check input, never authority) — a mismatch REFUSES.
+///
+/// The recorded binds (`target_*`, `base_*`) come from the OFFER; the fork is the result's
+/// repo/branch; `custody_local_ref` is derived from the fork-tip `commit_oid`.
+fn resolve_accepted_contribution(
+    offer: &OfferView,
+    result: &ResultView,
+    commit_oid: &str,
+) -> Result<Option<AcceptedContribution>, JobLifecycleError> {
+    use crate::contribution::JOB_CLASS_CONTRIBUTION;
+    let offer_contribution = match &offer.contribution {
+        Some(c) => c,
+        None => {
+            // Fail-closed: a contribution-class offer whose pins didn't parse must NOT run as
+            // from-scratch. Only a genuinely non-contribution offer resolves to None.
+            if offer.job_class.as_deref() == Some(JOB_CLASS_CONTRIBUTION) {
+                return Err(JobLifecycleError::Input(
+                    "offer is job-class=contribution but its target-repo/base pins are malformed — \
+                     refused (a malformed contribution offer is never run as from-scratch)"
+                        .into(),
+                ));
+            }
+            return Ok(None);
+        }
+    };
+    let echo = result.contribution.as_ref().ok_or_else(|| {
+        JobLifecycleError::Input(
+            "contribution offer requires a contribution result (job-class echo + \
+             sig/seller-contribution); the accepted result carries none — refused"
+                .into(),
+        )
+    })?;
+    // MUST-4 equality-check: seller-echoed target/base MUST equal the buyer's signed offer.
+    if echo.target_owner_pubkey != offer_contribution.target_owner_pubkey
+        || echo.target_clone_url != offer_contribution.target_clone_url
+    {
+        return Err(JobLifecycleError::Targeting(format!(
+            "contribution result echoes target-repo (owner {}, {}) but the signed offer pins \
+             (owner {}, {}) — echo mismatch refused (base/target resolved from the PIN, never the echo)",
+            echo.target_owner_pubkey,
+            echo.target_clone_url,
+            offer_contribution.target_owner_pubkey,
+            offer_contribution.target_clone_url
+        )));
+    }
+    if echo.base_branch != offer_contribution.base_branch
+        || echo.base_oid != offer_contribution.base_oid
+    {
+        return Err(JobLifecycleError::Targeting(format!(
+            "contribution result echoes base ({}, {}) but the signed offer pins ({}, {}) — echo \
+             mismatch refused",
+            echo.base_branch, echo.base_oid, offer_contribution.base_branch, offer_contribution.base_oid
+        )));
+    }
+    Ok(Some(AcceptedContribution {
+        // Authority = the OFFER (buyer-signed), never the echo.
+        target_owner_pubkey: offer_contribution.target_owner_pubkey.clone(),
+        target_clone_url: offer_contribution.target_clone_url.clone(),
+        base_branch: offer_contribution.base_branch.clone(),
+        base_oid: offer_contribution.base_oid.clone(),
+        tuple_signature: echo.tuple_signature.clone(),
+        custody_local_ref: crate::delivery_git::PayPathDeliveryVerifier::custody_ref_for(commit_oid),
+    }))
 }
 
 /// Load the local accept-bind for a job, if any.
@@ -583,6 +713,17 @@ pub fn authorize_request_from_bind(
         branch: bind.branch.clone(),
         commit_oid: bind.commit_oid.clone(),
         seller_signature: bind.seller_signature.clone(),
+        // Piece-10: thread the contribution binds so authorize_pay runs the contribution
+        // verify-path + authorship seam. `None` ⇒ from-scratch (today's path).
+        contribution: bind.contribution.as_ref().map(|c| {
+            crate::authorize_pay::ContributionPayBinds {
+                target_owner_pubkey: c.target_owner_pubkey.clone(),
+                target_clone_url: c.target_clone_url.clone(),
+                base_branch: c.base_branch.clone(),
+                base_oid: c.base_oid.clone(),
+                tuple_signature: c.tuple_signature.clone(),
+            }
+        }),
     })
 }
 
@@ -805,6 +946,12 @@ pub(crate) async fn fetch_job_view_async(
             targeted: parsed.as_ref().map(|p| p.is_targeted()).unwrap_or(false),
             repo: first_tag_value(&draft.tags, "repo").map(str::to_owned),
             branch: first_tag_value(&draft.tags, "branch").map(str::to_owned),
+            // Piece-10: raw job-class + parsed pins. A malformed contribution offer parses to
+            // `contribution=None` while `job_class=Some("contribution")` — accept refuses it
+            // (fail-closed; never silently from-scratch).
+            job_class: first_tag_value(&draft.tags, crate::contribution::TAG_JOB_CLASS)
+                .map(str::to_owned),
+            contribution: contribution_offer_view(&draft.tags),
         }
     });
 
@@ -853,6 +1000,7 @@ pub(crate) async fn fetch_job_view_async(
                 .map(|d| d.commit_oid().as_str().to_owned()),
             amount_sats,
             seller_signature: sig_seller_value(&draft.tags),
+            contribution: contribution_result_view(&draft.tags),
         });
     }
     results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -988,6 +1136,36 @@ fn first_tag_value<'a>(tags: &'a [TagSpec], name: &str) -> Option<&'a str> {
     first_tag(tags, name).and_then(TagSpec::value)
 }
 
+/// Parse a well-formed contribution offer's pins into a serializable view. A malformed
+/// `contribution`-class offer yields `None` (surfaced as `job_class=Some, contribution=None`, which
+/// accept refuses — fail-closed, never run from-scratch).
+fn contribution_offer_view(tags: &[TagSpec]) -> Option<ContributionOfferView> {
+    match crate::contribution::parse_contribution_offer(tags) {
+        Ok(Some(offer)) => Some(ContributionOfferView {
+            target_owner_pubkey: offer.target.owner_pubkey().to_owned(),
+            target_clone_url: offer.target.clone_url().to_owned(),
+            base_branch: offer.base.branch().to_owned(),
+            base_oid: offer.base.oid().to_owned(),
+            accepts: offer.accepts,
+        }),
+        _ => None,
+    }
+}
+
+/// Parse a seller result's contribution echo + authorship signature into a serializable view.
+fn contribution_result_view(tags: &[TagSpec]) -> Option<ContributionResultView> {
+    match crate::contribution::parse_contribution_result_echo(tags) {
+        Ok(Some((echo, tuple_signature))) => Some(ContributionResultView {
+            target_owner_pubkey: echo.target.owner_pubkey().to_owned(),
+            target_clone_url: echo.target.clone_url().to_owned(),
+            base_branch: echo.base.branch().to_owned(),
+            base_oid: echo.base.oid().to_owned(),
+            tuple_signature,
+        }),
+        _ => None,
+    }
+}
+
 /// Value of the `["sig","seller",<hex>]` tag, if present (piece-9 co-signature capture).
 fn sig_seller_value(tags: &[TagSpec]) -> Option<String> {
     tags.iter()
@@ -1029,6 +1207,7 @@ mod tests {
             accept_event_id: "11".repeat(32),
             accepted_at: 1,
             seller_signature: "ab".repeat(32),
+            contribution: None,
         };
         write_accepted_bind(&home, &bind).expect("write");
         let loaded = load_accepted_bind(&home, &bind.job_id)
@@ -1053,6 +1232,7 @@ mod tests {
             accept_event_id: "11".repeat(32),
             accepted_at: 1,
             seller_signature: "ab".repeat(32),
+            contribution: None,
         };
         let err = authorize_request_from_bind(&bind, 1, String::new()).expect_err("empty hash");
         assert!(err.to_string().contains("delivery_integrity_hash"));
@@ -1087,6 +1267,7 @@ mod tests {
             accept_event_id: "11".repeat(32),
             accepted_at: 1,
             seller_signature: "ab".repeat(32),
+            contribution: None,
         };
         let bad_seller = "00".repeat(32);
         let err = assert_authorize_matches_bind(&bind, &bad_seller, &bind.result_id, &bind.commit_oid)
@@ -1106,6 +1287,7 @@ mod tests {
             commit_oid: Some("ee".repeat(20)),
             amount_sats: Some(1),
             seller_signature: Some("ab".repeat(64)),
+            contribution: None,
         }
     }
 
@@ -1356,5 +1538,182 @@ mod tests {
             "op name missing: {err}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Piece-10 accept-path: contribution resolution (MUST-4 echo-equality + fail-closed) ─────
+    fn offer_view_contribution(owner: &str, url: &str, base_branch: &str, base_oid: &str) -> OfferView {
+        OfferView {
+            event_id: "of".repeat(16),
+            created_at: 1,
+            author_pubkey: "aa".repeat(32),
+            author_display_name: None,
+            task: "t".into(),
+            output: "o".into(),
+            amount_sats: 1,
+            deadline_unix: 10,
+            mint_url: "https://testnut.cashudevkit.org".into(),
+            seller_pubkey: None,
+            seller_display_name: None,
+            targeted: false,
+            repo: None,
+            branch: None,
+            job_class: Some(crate::contribution::JOB_CLASS_CONTRIBUTION.to_owned()),
+            contribution: Some(ContributionOfferView {
+                target_owner_pubkey: owner.to_owned(),
+                target_clone_url: url.to_owned(),
+                base_branch: base_branch.to_owned(),
+                base_oid: base_oid.to_owned(),
+                accepts: vec!["fork".into()],
+            }),
+        }
+    }
+
+    fn result_view_contribution(owner: &str, url: &str, base_branch: &str, base_oid: &str, sig: &str) -> ResultView {
+        let mut r = result_view(&"cc".repeat(32), &"dd".repeat(32));
+        r.contribution = Some(ContributionResultView {
+            target_owner_pubkey: owner.to_owned(),
+            target_clone_url: url.to_owned(),
+            base_branch: base_branch.to_owned(),
+            base_oid: base_oid.to_owned(),
+            tuple_signature: sig.to_owned(),
+        });
+        r
+    }
+
+    #[test]
+    fn accept_contribution_records_offer_authority_and_custody_ref() {
+        let owner = "aa".repeat(32);
+        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let base_oid = "77".repeat(20);
+        let offer = offer_view_contribution(&owner, url, "main", &base_oid);
+        let result = result_view_contribution(&owner, url, "main", &base_oid, "sigbytes");
+        let bind = resolve_accepted_contribution(&offer, &result, &"ee".repeat(20))
+            .expect("resolve ok")
+            .expect("is contribution");
+        // Authority = the OFFER, not the echo.
+        assert_eq!(bind.target_owner_pubkey, owner);
+        assert_eq!(bind.base_oid, base_oid);
+        assert_eq!(bind.tuple_signature, "sigbytes");
+        assert_eq!(
+            bind.custody_local_ref,
+            crate::delivery_git::PayPathDeliveryVerifier::custody_ref_for(&"ee".repeat(20))
+        );
+    }
+
+    #[test]
+    fn accept_contribution_refuses_echo_target_mismatch() {
+        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let base_oid = "77".repeat(20);
+        let offer = offer_view_contribution(&"aa".repeat(32), url, "main", &base_oid);
+        // Result echoes a DIFFERENT target owner — MUST-4 equality-check refuses.
+        let result = result_view_contribution(&"bb".repeat(32), url, "main", &base_oid, "s");
+        let err = resolve_accepted_contribution(&offer, &result, &"ee".repeat(20))
+            .expect_err("echo target mismatch must refuse");
+        assert!(err.to_string().contains("echo mismatch"), "got {err}");
+    }
+
+    #[test]
+    fn accept_contribution_refuses_echo_base_mismatch() {
+        let owner = "aa".repeat(32);
+        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let offer = offer_view_contribution(&owner, url, "main", &"77".repeat(20));
+        // Result echoes a DIFFERENT base_oid.
+        let result = result_view_contribution(&owner, url, "main", &"88".repeat(20), "s");
+        let err = resolve_accepted_contribution(&offer, &result, &"ee".repeat(20))
+            .expect_err("echo base mismatch must refuse");
+        assert!(err.to_string().contains("echo mismatch"), "got {err}");
+    }
+
+    #[test]
+    fn accept_malformed_contribution_offer_fails_closed_not_from_scratch() {
+        // job_class=contribution but pins failed to parse (contribution=None) ⇒ REFUSE.
+        let mut offer = offer_view_contribution(&"aa".repeat(32), "https://x/r.git", "main", &"77".repeat(20));
+        offer.contribution = None; // simulate a malformed contribution offer
+        let result = result_view(&"cc".repeat(32), &"dd".repeat(32));
+        let err = resolve_accepted_contribution(&offer, &result, &"ee".repeat(20))
+            .expect_err("malformed contribution offer must refuse (fail-closed)");
+        assert!(err.to_string().contains("malformed"), "got {err}");
+    }
+
+    #[test]
+    fn accept_contribution_requires_a_contribution_result() {
+        let owner = "aa".repeat(32);
+        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
+        let offer = offer_view_contribution(&owner, url, "main", &"77".repeat(20));
+        // A from-scratch result (no contribution echo) against a contribution offer ⇒ refuse.
+        let result = result_view(&"cc".repeat(32), &"dd".repeat(32));
+        assert!(resolve_accepted_contribution(&offer, &result, &"ee".repeat(20)).is_err());
+    }
+
+    #[test]
+    fn from_scratch_offer_resolves_to_no_contribution() {
+        let mut offer = offer_view_contribution(&"aa".repeat(32), "https://x/r.git", "main", &"77".repeat(20));
+        offer.job_class = None;
+        offer.contribution = None;
+        let result = result_view(&"cc".repeat(32), &"dd".repeat(32));
+        assert_eq!(
+            resolve_accepted_contribution(&offer, &result, &"ee".repeat(20)).expect("ok"),
+            None
+        );
+    }
+
+    #[test]
+    fn authorize_request_from_bind_threads_contribution() {
+        let mut bind = AcceptedBind {
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "cc".repeat(32),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://mobee-relay.orveth.dev/git/seller/fork.git".into(),
+            branch: "mobee/contribution/x".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 1,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: "ab".repeat(32),
+            contribution: Some(AcceptedContribution {
+                target_owner_pubkey: "aa".repeat(32),
+                target_clone_url: "https://mobee-relay.orveth.dev/git/owner/repo.git".into(),
+                base_branch: "main".into(),
+                base_oid: "77".repeat(20),
+                tuple_signature: "cafe".into(),
+                custody_local_ref: "refs/mobee/deliveries/eeee".into(),
+            }),
+        };
+        let req = authorize_request_from_bind(&bind, 1, bind.commit_oid.clone()).expect("ok");
+        let c = req.contribution.expect("threaded");
+        assert_eq!(c.target_owner_pubkey, "aa".repeat(32));
+        assert_eq!(c.base_oid, "77".repeat(20));
+        assert_eq!(c.tuple_signature, "cafe");
+        // From-scratch bind ⇒ None threaded.
+        bind.contribution = None;
+        let req2 = authorize_request_from_bind(&bind, 1, bind.commit_oid.clone()).expect("ok");
+        assert!(req2.contribution.is_none());
+    }
+
+    #[test]
+    fn contribution_offer_view_parses_pins_and_malformed_is_none() {
+        // A well-formed contribution offer's tags parse into the view.
+        let offer = crate::contribution::ContributionOffer {
+            target: crate::contribution::TargetRepoPin::new(
+                "aa".repeat(32),
+                "https://mobee-relay.orveth.dev/git/owner/repo.git",
+            )
+            .unwrap(),
+            base: crate::contribution::ContributionBase::new("main", "77".repeat(20)).unwrap(),
+            accepts: vec!["fork".into()],
+        };
+        let tags = crate::contribution::contribution_offer_tags(&offer);
+        let view = contribution_offer_view(&tags).expect("parsed");
+        assert_eq!(view.target_owner_pubkey, "aa".repeat(32));
+        assert_eq!(view.base_oid, "77".repeat(20));
+        // A contribution offer missing the base tag ⇒ view None (surfaced as job_class-present +
+        // contribution-None, which accept refuses).
+        let malformed = vec![crate::gateway::TagSpec::new([
+            crate::contribution::TAG_JOB_CLASS,
+            crate::contribution::JOB_CLASS_CONTRIBUTION,
+        ])];
+        assert!(contribution_offer_view(&malformed).is_none());
     }
 }

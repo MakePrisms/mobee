@@ -44,6 +44,29 @@ pub struct AuthorizePayRequest {
     /// accepted result's `sig/seller` tag. Empty ⇒ the buyer cannot co-sign a valid
     /// receipt (the receipt authority fails closed at publish).
     pub seller_signature: String,
+    /// Piece-10 contribution binds. `None` ⇒ from-scratch job — EXACTLY today's path (no new
+    /// verify, byte-identical produced artifacts). `Some(..)` ⇒ the fork contribution verify-path
+    /// (custody fetch + base-from-pin + descendant + content) + the authorship tuple seam run
+    /// pre-pay, all against these buyer-controlled binds.
+    pub contribution: Option<ContributionPayBinds>,
+}
+
+/// Buyer-controlled contribution binds threaded from the signed offer / accept-bind into the pay
+/// path. `repo`/`branch`/`commit_oid` on the enclosing request ARE the fork (`fork_ref` + fork tip);
+/// these add the pinned target + base + the seller's authorship signature. All authority is the
+/// buyer's signed offer — never a seller echo (MUST-4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContributionPayBinds {
+    /// Pinned target owner pubkey (hex) — from the buyer's signed offer.
+    pub target_owner_pubkey: String,
+    /// Pinned target clone URL — base_oid is fetched from HERE (MUST-2), never the seller echo.
+    pub target_clone_url: String,
+    /// Base branch the exact `base_oid` lives on in the pinned target.
+    pub base_branch: String,
+    /// The exact commit the delivery must descend from (from the buyer's signed offer).
+    pub base_oid: String,
+    /// Seller schnorr signature (hex) over the signed-6109 authorship tuple (`sig/seller-contribution`).
+    pub tuple_signature: String,
 }
 
 /// Successful composed pay outcome (state + attempt id + spent accounting).
@@ -222,18 +245,72 @@ pub async fn authorize_pay_async(
     let seller_hex = seller_nostr.to_hex();
     let seller_signature = request.seller_signature.clone();
 
+    // Buyer-owned custody verifier (no wallet dependency; created before the pre-pay seam so the
+    // contribution verify runs against custody BEFORE any spend). The payment-journal is created
+    // LATER (after the pre-pay seam) so a pre-pay refusal leaves NO journal on disk.
+    let custody = home.root.join("custody");
+    let mut verifier = PayPathDeliveryVerifier::new(custody);
+
+    // Piece-10 contribution verify-path — ALL PRE-PAY (before the budget gate ⇒ zero spend on any
+    // refusal), ALL against BUYER-CONTROLLED binds. The fork (`delivery`) is custody-fetched +
+    // tip-matched, `base_oid` is fetched from the PINNED target (never the seller echo), the
+    // delivery must DESCEND from base, and the content gate + buyer policy hook must pass. The
+    // authorship tuple sig is then verified at the ONE pre-pay seam below (extending the receipt
+    // cosig). From-scratch jobs skip this block entirely (`contribution == None`).
+    let contribution_cosig = if let Some(binds) = request.contribution.as_ref() {
+        let base_oid = CommitOid::parse(binds.base_oid.clone())
+            .map_err(|error| AuthorizePayError::Input(format!("contribution base_oid: {error}")))?;
+        let Delivery::Commit(fork) = &delivery;
+        let fork = fork.clone();
+        let policy = contribution_policy(home);
+        verifier
+            .verify_contribution(
+                &fork,
+                &binds.target_clone_url,
+                &binds.base_branch,
+                &base_oid,
+                &policy,
+            )
+            .map_err(AuthorizePayError::Delivery)?;
+        // Reconstruct the exact tuple the seller signed (from BUYER-controlled binds) and carry its
+        // digest + the seller's signature to the pre-pay seam. A tuple field tampered post-signing
+        // (or a sig over a different commit_oid) fails there with ZERO spend.
+        let tuple = crate::contribution::AuthorshipTuple {
+            job_id: request.job_id.clone(),
+            seller_pubkey: seller_hex.clone(),
+            target: crate::contribution::TargetRepoPin::new(
+                binds.target_owner_pubkey.clone(),
+                binds.target_clone_url.clone(),
+            )
+            .map_err(|error| AuthorizePayError::Input(error.to_string()))?,
+            base_oid: binds.base_oid.clone(),
+            fork: crate::contribution::ForkRef::new(fork.repo(), fork.branch())
+                .map_err(|error| AuthorizePayError::Input(error.to_string()))?,
+            commit_oid: fork.commit_oid().as_str().to_owned(),
+        };
+        Some((tuple.digest_bytes(), binds.tuple_signature.clone()))
+    } else {
+        None
+    };
+
     // THE LOAD-BEARING PRE-PAY TOOTH (cross-bind / forged-cosig). Rebuild the EXACT receipt
     // preimage the pay path will co-sign and publish (same `receipt_preimage_for` constructor
     // as `build_and_publish_receipt`, so the verified bytes cannot drift from the published
     // bytes) and verify the seller's `sig/seller` over it against the claim-seller anchor —
-    // BEFORE the budget gate commits spent and BEFORE the wallet opens. Fail-closed here ⇒
-    // ZERO spend: no `authorize_then_attempt`, no lock/mint/send, no receipt, no journal
-    // record. This is the single seam piece-10's signed-6109 tuple bind extends (see
-    // `ReceiptAuthority::verify_seller_prepay_cosig`).
+    // BEFORE the budget gate commits spent and BEFORE the wallet opens. For a contribution the
+    // SAME seam ALSO verifies the seller's signed-6109 authorship tuple (one seam, more binds).
+    // Fail-closed here ⇒ ZERO spend: no `authorize_then_attempt`, no lock/mint/send, no receipt,
+    // no journal record.
     let prepay_preimage =
         receipt_preimage_for(&key, &buyer_nostr.to_hex(), &seller_hex, delivery_kind);
+    let contribution_bind = contribution_cosig
+        .as_ref()
+        .map(|(digest, sig)| crate::payment::ContributionCosig {
+            tuple_digest: *digest,
+            tuple_signature_hex: sig.as_str(),
+        });
     authority
-        .verify_seller_prepay_cosig(&prepay_preimage, &request.seller_signature)
+        .verify_seller_prepay_cosig(&prepay_preimage, &request.seller_signature, contribution_bind)
         .map_err(AuthorizePayError::Payment)?;
 
     let wallet = buyer_fund::open_testnut_wallet_async(home).await?;
@@ -259,12 +336,12 @@ pub async fn authorize_pay_async(
     )
     .map_err(|error| AuthorizePayError::Effects(error.to_string()))?;
 
+    // Payment journal — created only AFTER the pre-pay seam passed (a pre-pay refusal leaves no
+    // journal on disk, preserving the zero-spend / no-record invariant).
     let journal_dir = home.root.join("payment-journal");
     std::fs::create_dir_all(&journal_dir)
         .map_err(|error| AuthorizePayError::Home(format!("payment journal dir: {error}")))?;
     let journal = FsPaymentJournal::new(journal_dir.join(format!("{}.jsonl", attempt_id.as_str())));
-    let custody = home.root.join("custody");
-    let mut verifier = PayPathDeliveryVerifier::new(custody);
 
     let amount = request.amount_sats;
     let state = gate.authorize_then_attempt(attempt_id.as_str(), amount, || {
@@ -285,6 +362,19 @@ pub async fn authorize_pay_async(
         spent_total_sats: gate.spent(),
         remaining_sats: gate.remaining(),
     })
+}
+
+/// Resolve the buyer's piece-10 content policy hook (MUST-5) from `[contribution]` config, or the
+/// FLOOR (refuse only empty diffs) when unconfigured. Buyer-side; never seller-influenced.
+fn contribution_policy(home: &MobeeHome) -> crate::contribution::ContentPolicy {
+    match &home.config.contribution {
+        Some(cfg) => crate::contribution::ContentPolicy {
+            allowed_paths: cfg.allowed_paths.clone(),
+            forbidden_paths: cfg.forbidden_paths.clone(),
+            max_diff_bytes: cfg.max_diff_bytes,
+        },
+        None => crate::contribution::ContentPolicy::floor(),
+    }
 }
 
 fn cashu_compressed_from_nostr(key: &NostrPublicKey) -> Result<CashuPublicKey, AuthorizePayError> {
@@ -580,6 +670,7 @@ mod tests {
             branch: "master".into(),
             commit_oid: "aa".repeat(20),
             seller_signature: String::new(),
+            contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, request).expect_err("must refuse nested block_on");
         let message = err.to_string();
@@ -616,6 +707,7 @@ mod tests {
             // Even if commit_oid is set, empty buyer hash must refuse (no auto-fill).
             commit_oid: "aa".repeat(20),
             seller_signature: String::new(),
+            contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, request).expect_err("D2 empty");
         let message = err.to_string();
@@ -651,6 +743,7 @@ mod tests {
             branch: "master".into(),
             commit_oid: "cc".repeat(20),
             seller_signature: String::new(),
+            contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, request).expect_err("D2 mismatch");
         let message = err.to_string();
@@ -698,6 +791,7 @@ mod tests {
             branch: "main".into(),
             commit_oid: "aa".repeat(20),
             seller_signature: valid_sig,
+            contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, request.clone()).expect_err("ext refused");
         let message = err.to_string();
@@ -801,6 +895,7 @@ mod tests {
             branch: "main".into(),
             commit_oid: oid,
             seller_signature: forged_sig,
+            contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, request).expect_err("forged sig refused pre-pay");
         assert!(
@@ -853,6 +948,7 @@ mod tests {
             branch: "main".into(),
             commit_oid: honest_oid.clone(),
             seller_signature: sig_over_2,
+            contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, tampered_amount).expect_err("tampered amount");
         assert!(
@@ -879,6 +975,7 @@ mod tests {
             branch: "main".into(),
             commit_oid: tampered_oid,
             seller_signature: sig_over_aa,
+            contribution: None,
         };
         let err2 = authorize_pay(&home, &mut gate2, tampered_delivery).expect_err("tampered oid");
         assert!(

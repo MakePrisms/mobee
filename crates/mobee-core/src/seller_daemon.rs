@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::buyer_fund::{self, FundError};
+use crate::contribution::ContributionOffer;
 use crate::driver::UsageMetadata;
 use crate::gateway::{
     self, claim_draft, error_draft, git_result_draft, parse_offer, EventDraft, ParsedOffer,
@@ -167,6 +168,9 @@ pub struct ActiveJob {
     pub result_id: Option<String>,
     pub deadline_unix: u64,
     pub workdir: PathBuf,
+    /// Piece-10: the parsed contribution offer (target pin + base + accepts) when this is a
+    /// contribution job; `None` ⇒ from-scratch (empty-base delivery).
+    pub contribution: Option<ContributionOffer>,
 }
 
 /// What [`SellerDaemon::classify_offer`] decided to do with an offer event.
@@ -185,6 +189,8 @@ pub struct ClaimIntent {
     pub buyer_pubkey: String,
     pub offer: ParsedOffer,
     pub deadline_unix: u64,
+    /// Piece-10 parsed contribution offer, threaded into the active job.
+    pub contribution: Option<ContributionOffer>,
 }
 
 /// Enumerated reasons an offer is not claimed. Every variant maps to a logged reason —
@@ -212,6 +218,13 @@ pub enum OfferSkip {
     ProcessingBusy { job_id: String },
     /// Too many delivered-but-unpaid jobs pending payment (bounded-memory back-pressure).
     AwaitingPaymentFull { capacity: usize },
+    /// Piece-10: a `job-class=contribution` offer arrived but this seller has contribution support
+    /// disabled (`contribution_enabled=false`). Emits a kind-7000 error (interop courtesy) instead
+    /// of running it as from-scratch.
+    ContributionUnsupported,
+    /// Piece-10: a `job-class=contribution` offer whose target-repo/base pins are malformed —
+    /// refused (fail-closed; never run as from-scratch). Emits a kind-7000 error.
+    ContributionMalformed { reason: String },
 }
 
 impl OfferSkip {
@@ -231,6 +244,12 @@ impl OfferSkip {
             }
             Self::AwaitingPaymentFull { capacity } => {
                 format!("awaiting-payment backlog full (cap {capacity}); back-pressuring new claims")
+            }
+            Self::ContributionUnsupported => {
+                "contribution offer refused: seller contribution support is disabled (kind-7000 interop courtesy)".to_string()
+            }
+            Self::ContributionMalformed { reason } => {
+                format!("contribution offer refused (malformed pins, fail-closed): {reason}")
             }
         }
     }
@@ -334,6 +353,20 @@ impl SellerDaemon {
                 if matches!(skip, OfferSkip::RateGate { .. }) {
                     self.publish_under_rate_error_if_targeted(event).await;
                 }
+                // Piece-10 interop courtesy: a seller that cannot/​will not handle a contribution
+                // offer emits a kind-7000 `status=error` so the buyer does not wait on a delivery
+                // that will never come. NOT a security control — buyer refusal is the boundary.
+                if matches!(
+                    skip,
+                    OfferSkip::ContributionUnsupported | OfferSkip::ContributionMalformed { .. }
+                ) {
+                    let draft = error_draft(
+                        &event.id.to_hex(),
+                        &event.pubkey.to_hex(),
+                        &self.seller_pubkey,
+                    );
+                    let _ = publish_draft(&self.home, &self.keys, &draft).await;
+                }
                 return Ok(None);
             }
             OfferDisposition::Claim(intent) => intent,
@@ -382,6 +415,7 @@ impl SellerDaemon {
             result_id: None,
             deadline_unix: intent.deadline_unix,
             workdir,
+            contribution: intent.contribution,
         });
         Ok(self.active.as_ref())
     }
@@ -429,6 +463,20 @@ impl SellerDaemon {
             }));
         }
         let seller_cfg = require_seller_config(&self.home)?;
+        // Piece-10: parse the contribution class. A malformed contribution offer is REFUSED
+        // (fail-closed, never run from-scratch); a contribution offer to a seller with support
+        // disabled is refused as an interop courtesy. Both emit a kind-7000 in `on_offer_event`.
+        let contribution = match crate::contribution::parse_contribution_offer(&draft.tags) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(OfferDisposition::Skip(OfferSkip::ContributionMalformed {
+                    reason: error.to_string(),
+                }));
+            }
+        };
+        if contribution.is_some() && !seller_cfg.contribution_enabled {
+            return Ok(OfferDisposition::Skip(OfferSkip::ContributionUnsupported));
+        }
         if let Err(error) = rate_gate_allows(
             &offer,
             &self.seller_pubkey,
@@ -461,6 +509,7 @@ impl SellerDaemon {
             buyer_pubkey: event.pubkey.to_hex(),
             offer,
             deadline_unix,
+            contribution,
         }))
     }
 
@@ -735,9 +784,27 @@ impl SellerDaemon {
         // harness commit). Deliver only if every commit is agent-authored + non-empty tree.
         // Do NOT capture before-OID on empty / require advancement — dogfood is agent-from-empty.
         let identity = seller_git::DeliveryAgentIdentity::for_seller(&self.seller_pubkey);
-        if let Err(error) =
-            seller_git::init_empty_delivery_workdir(&active.workdir, &self.home.root, &identity)
-        {
+        // Piece-10: a contribution job forks the PINNED target at base_oid onto a per-job unique
+        // branch carrying the FULL job_id (MUST-6); a from-scratch job uses the empty-base workdir.
+        let branch = match &active.contribution {
+            Some(_) => crate::contribution::ForkRef::unique_branch(&active.job_id),
+            None => format!("mobee/{}", &active.job_id[..8.min(active.job_id.len())]),
+        };
+        let init_result = match &active.contribution {
+            Some(contribution) => seller_git::init_contribution_workdir(
+                &active.workdir,
+                &self.home.root,
+                &identity,
+                contribution.target.clone_url(),
+                contribution.base.branch(),
+                contribution.base.oid(),
+                &branch,
+            ),
+            None => {
+                seller_git::init_empty_delivery_workdir(&active.workdir, &self.home.root, &identity)
+            }
+        };
+        if let Err(error) = init_result {
             self.fail_active(&error.to_string()).await?;
             return Err(error.into());
         }
@@ -777,25 +844,36 @@ impl SellerDaemon {
             }
         };
         let after_oid = seller_git::try_head_oid(&active.workdir, &self.home.root);
-        let _advanced = match seller_git::require_agent_authored_delivery(
-            &active.workdir,
-            &self.home.root,
-            &identity,
-            after_oid.as_deref(),
-        ) {
-            Ok(oid) => oid,
-            Err(error) => {
-                self.fail_active(&error.to_string()).await?;
-                return Err(error.into());
-            }
+        // Contribution scopes the agent-authorship gate to `base_oid..HEAD` (the base history is the
+        // target's, not agent-authored); from-scratch requires the whole history agent-authored.
+        let gate_result = match &active.contribution {
+            Some(contribution) => seller_git::require_agent_authored_contribution(
+                &active.workdir,
+                &self.home.root,
+                &identity,
+                contribution.base.oid(),
+                after_oid.as_deref(),
+            ),
+            None => seller_git::require_agent_authored_delivery(
+                &active.workdir,
+                &self.home.root,
+                &identity,
+                after_oid.as_deref(),
+            ),
         };
+        if let Err(error) = gate_result {
+            self.fail_active(&error.to_string()).await?;
+            return Err(error.into());
+        }
 
-        let branch = format!("mobee/{}", &active.job_id[..8.min(active.job_id.len())]);
-        // Ensure we're on a branch named for the job (best-effort).
-        let _ = std::process::Command::new("git")
-            .args(["checkout", "-B", &branch])
-            .current_dir(&active.workdir)
-            .status();
+        // From-scratch: name the empty-base commits onto the job branch (best-effort). Contribution
+        // is ALREADY on `branch` (set by init_contribution_workdir at base_oid), so skip the reset.
+        if active.contribution.is_none() {
+            let _ = std::process::Command::new("git")
+                .args(["checkout", "-B", &branch])
+                .current_dir(&active.workdir)
+                .status();
+        }
 
         // NIP-98: key from 0600 file → git child env only (never argv / never logged).
         let push_secret = home::read_secret_key_hex(&self.home)?;
@@ -848,7 +926,7 @@ impl SellerDaemon {
             wall_time_ms,
             usage.as_ref(),
         );
-        let draft = git_result_draft(
+        let mut draft = git_result_draft(
             &active.job_id,
             &active.buyer_pubkey,
             &seller_cfg.git_remote,
@@ -860,6 +938,33 @@ impl SellerDaemon {
             format!("delivery commit {commit}"),
             &exec_metadata,
         );
+        // Piece-10: on a contribution, echo the pinned target + base + accepts and append the
+        // seller's schnorr signature over the authorship tuple {job_id, seller_pubkey, target_repo,
+        // base_oid, fork_ref, commit_oid} (MUST-3). The fork_ref is (this seller's git_remote, the
+        // per-job unique branch); the fork tip is `commit`. The buyer verifies this sig at the
+        // pre-pay seam and equality-checks the echo against its signed offer.
+        if let Some(contribution) = &active.contribution {
+            match crate::contribution::ForkRef::new(&seller_cfg.git_remote, &branch) {
+                Ok(fork) => {
+                    let tuple = crate::contribution::AuthorshipTuple {
+                        job_id: active.job_id.clone(),
+                        seller_pubkey: self.seller_pubkey.clone(),
+                        target: contribution.target.clone(),
+                        base_oid: contribution.base.oid().to_owned(),
+                        fork,
+                        commit_oid: commit.clone(),
+                    };
+                    let tuple_sig = crate::contribution::sign_authorship_tuple(&self.keys, &tuple);
+                    draft
+                        .tags
+                        .extend(crate::contribution::contribution_result_tags(contribution, &tuple_sig));
+                }
+                Err(error) => {
+                    self.fail_active(&error.to_string()).await?;
+                    return Err(DaemonError::Seller(SellerError::Io(error.to_string())));
+                }
+            }
+        }
         let result_id = match publish_draft(&self.home, &self.keys, &draft).await {
             Ok(id) => id,
             Err(error) => {
@@ -1810,6 +1915,7 @@ mod tests {
             agent: None,
             claim_open_pool: false,
             offer_backfill_secs: 0,
+            contribution_enabled: true,
         });
         home::save_config(&home).expect("save");
         let err = match SellerDaemon::open(home) {
@@ -2381,6 +2487,7 @@ mod tests {
             result_id: result_id.map(str::to_owned),
             deadline_unix: deadline,
             workdir: root.join(job_id),
+            contribution: None,
         }
     }
 
@@ -2397,6 +2504,7 @@ mod tests {
             agent: None,
             claim_open_pool: false,
             offer_backfill_secs: 0,
+            contribution_enabled: true,
         });
         home::save_config(&home).expect("save");
         let keys = nostr_sdk::Keys::generate();
@@ -2431,6 +2539,93 @@ mod tests {
         let draft = offer.to_event_draft();
         let builder = gateway::nostr::event_builder(&draft).expect("event builder");
         builder.sign_with_keys(buyer).expect("sign offer")
+    }
+
+    fn contribution_offer_event(
+        buyer: &nostr_sdk::Keys,
+        seller_pubkey: &str,
+        deadline: u64,
+        extra_tags: Vec<TagSpec>,
+    ) -> nostr_sdk::Event {
+        let offer =
+            crate::gateway::OfferDraft::new("do a task", "text/plain", 5, deadline, DEFAULT_MINT_URL, seller_pubkey);
+        let mut draft = offer.to_event_draft();
+        draft.tags.extend(extra_tags);
+        let builder = gateway::nostr::event_builder(&draft).expect("event builder");
+        builder.sign_with_keys(buyer).expect("sign offer")
+    }
+
+    fn sample_contribution_tags() -> Vec<TagSpec> {
+        let c = ContributionOffer {
+            target: crate::contribution::TargetRepoPin::new(
+                "aa".repeat(32),
+                "https://mobee-relay.orveth.dev/git/owner/repo.git",
+            )
+            .unwrap(),
+            base: crate::contribution::ContributionBase::new("main", "77".repeat(20)).unwrap(),
+            accepts: vec!["fork".into()],
+        };
+        crate::contribution::contribution_offer_tags(&c)
+    }
+
+    // Piece-10: the daemon RECOGNISES a contribution offer, threads the pins into the claim intent.
+    #[test]
+    fn classify_admits_contribution_offer_and_threads_pins() {
+        let (root, daemon) = test_daemon("contrib-admit");
+        let seller_pk = daemon.seller_pubkey().to_owned();
+        let buyer = nostr_sdk::Keys::generate();
+        let now = 1_000_000u64;
+        let ev = contribution_offer_event(&buyer, &seller_pk, now + 3600, sample_contribution_tags());
+        match daemon.classify_offer(&ev, now).expect("classify") {
+            OfferDisposition::Claim(intent) => {
+                let c = intent.contribution.expect("contribution threaded into claim intent");
+                assert_eq!(c.target.owner_pubkey(), "aa".repeat(32));
+                assert_eq!(c.base.oid(), "77".repeat(20));
+                assert!(c.accepts_fork());
+            }
+            other => panic!("must admit a contribution offer, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Piece-10: a seller with contribution support DISABLED refuses (interop kind-7000 skip).
+    #[test]
+    fn classify_refuses_contribution_when_disabled() {
+        let (root, mut daemon) = test_daemon("contrib-disabled");
+        if let Some(seller) = daemon.home.config.seller.as_mut() {
+            seller.contribution_enabled = false;
+        }
+        let seller_pk = daemon.seller_pubkey().to_owned();
+        let buyer = nostr_sdk::Keys::generate();
+        let now = 1_000_000u64;
+        let ev = contribution_offer_event(&buyer, &seller_pk, now + 3600, sample_contribution_tags());
+        assert!(matches!(
+            daemon.classify_offer(&ev, now).expect("classify"),
+            OfferDisposition::Skip(OfferSkip::ContributionUnsupported)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Piece-10: a malformed contribution offer is REFUSED (fail-closed) — never run from-scratch.
+    #[test]
+    fn classify_refuses_malformed_contribution_offer() {
+        let (root, daemon) = test_daemon("contrib-malformed");
+        let seller_pk = daemon.seller_pubkey().to_owned();
+        let buyer = nostr_sdk::Keys::generate();
+        let now = 1_000_000u64;
+        // job-class=contribution but a broken base oid.
+        let bad = vec![
+            TagSpec::new([crate::contribution::TAG_JOB_CLASS, crate::contribution::JOB_CLASS_CONTRIBUTION]),
+            TagSpec::new([crate::contribution::TAG_TARGET_REPO, &"aa".repeat(32), "https://x/git/o/r.git"]),
+            TagSpec::new([crate::contribution::TAG_BASE, "main", "not-an-oid"]),
+            TagSpec::new([crate::contribution::TAG_ACCEPTS, "fork"]),
+        ];
+        let ev = contribution_offer_event(&buyer, &seller_pk, now + 3600, bad);
+        assert!(matches!(
+            daemon.classify_offer(&ev, now).expect("classify"),
+            OfferDisposition::Skip(OfferSkip::ContributionMalformed { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // Behavior 1 (#15): a delivered-but-unpaid job MUST NOT block claiming a new offer;
@@ -2692,6 +2887,7 @@ mod local_relay_it {
             agent: None,
             claim_open_pool,
             offer_backfill_secs,
+            contribution_enabled: true,
         });
         h
     }
@@ -3219,6 +3415,91 @@ mod local_relay_it {
             "must NOT claim an offer already live-claimed by another seller (no stomping) e={offer_id}"
         );
 
+        relay.shutdown();
+    }
+
+    /// Publish a TARGETED piece-10 contribution offer (job-class + target-repo pin + base + accepts)
+    /// signed by `buyer`, returning its event id.
+    async fn publish_contribution_offer(
+        client: &Client,
+        buyer: &Keys,
+        seller_hex: &str,
+    ) -> nostr_sdk::EventId {
+        let offer = OfferDraft::new(
+            "improve the forge repo",
+            "text/plain",
+            10,
+            now_unix() + 3_600,
+            DEFAULT_MINT_URL,
+            seller_hex,
+        );
+        let mut draft = offer.to_event_draft();
+        let contribution = crate::contribution::ContributionOffer {
+            target: crate::contribution::TargetRepoPin::new(
+                "aa".repeat(32),
+                "https://mobee-relay.orveth.dev/git/forge/repo.git",
+            )
+            .unwrap(),
+            base: crate::contribution::ContributionBase::new("main", "77".repeat(20)).unwrap(),
+            accepts: vec!["fork".into()],
+        };
+        draft
+            .tags
+            .extend(crate::contribution::contribution_offer_tags(&contribution));
+        let event = gateway::nostr::event_builder(&draft)
+            .expect("contribution offer builder")
+            .sign_with_keys(buyer)
+            .expect("sign contribution offer");
+        let id = event.id;
+        client.send_event(&event).await.expect("publish contribution offer");
+        id
+    }
+
+    // ── Piece-10: a CONTRIBUTION offer round-trips over a real relay and the seller recognises it,
+    //    claiming it (kind-7000 processing) — the offer→claim leg of the ONE state machine live. ──
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn contribution_offer_round_trips_to_claim_over_local_relay() {
+        let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        SellerDaemon::end_flight();
+
+        let (relay, relay_url) = start_relay(RelayBuilder::default()).await;
+        let home = seller_home(&unique_root("contrib"), &relay_url, false, 0);
+        let daemon = SellerDaemon::open(home).expect("open seller daemon");
+        let seller_pk = PublicKey::parse(daemon.seller_pubkey()).expect("seller pubkey");
+        let seller_hex = daemon.seller_pubkey().to_string();
+
+        let observer = connect_client(&relay_url).await;
+        observer
+            .subscribe(
+                Filter::new()
+                    .kind(Kind::Custom(gateway::JOB_FEEDBACK_KIND))
+                    .author(seller_pk),
+                None,
+            )
+            .await
+            .expect("observer subscribe");
+        let claims = spawn_claim_collector(&observer, seller_pk);
+
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _daemon = spawn_daemon_thread(daemon, ready_tx);
+        let ready = tokio::time::timeout(Duration::from_secs(10), ready_rx.recv()).await;
+        assert!(matches!(ready, Ok(Some(()))), "daemon must reach READY (got {ready:?})");
+
+        // Post a TARGETED contribution offer; the seller must recognise the class + pins and CLAIM
+        // it (kind-7000 processing) — proving the additive offer round-trips over a live relay.
+        let buyer = Keys::generate();
+        let seeder = connect_client(&relay_url).await;
+        let offer_id = publish_contribution_offer(&seeder, &buyer, &seller_hex).await.to_hex();
+        let claimed = wait_until(Duration::from_secs(10), || {
+            claims_contain(&claims, &offer_id, "processing")
+        })
+        .await;
+        assert!(
+            claimed,
+            "seller must CLAIM a fresh contribution offer (kind-7000 processing e={offer_id}) within 10s"
+        );
+
+        wait_until(Duration::from_secs(8), || !SellerDaemon::in_flight()).await;
         relay.shutdown();
     }
 }

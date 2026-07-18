@@ -5,6 +5,7 @@ pub mod budget;
 pub mod job_lifecycle;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 pub mod profile;
+pub mod contribution;
 pub mod delivery;
 #[cfg(feature = "git-delivery")]
 pub mod delivery_git;

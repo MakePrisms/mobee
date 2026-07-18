@@ -586,6 +586,7 @@ offer_backfill_secs = {backfill}
             agent: None,
             claim_open_pool: false,
             offer_backfill_secs: 0,
+            contribution_enabled: true,
         });
         home::save_config(&home).expect("save");
 

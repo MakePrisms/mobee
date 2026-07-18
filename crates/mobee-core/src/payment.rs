@@ -542,15 +542,17 @@ impl ReceiptAuthority {
     /// does at the `Sent → ReceiptPublished` transition (detection, not prevention).
     ///
     /// SHARED SEAM — do NOT inline this at call sites. It is the single pre-pay point at which
-    /// every seller bind is checked. Only the receipt (job-hash) preimage signature is checked
-    /// today; piece-10 Step-1 (freelance-PR fork, `docs/meta/PIECE-10-FREELANCE-PR-DELIVERY.md`)
-    /// EXTENDS THIS POINT with a valid seller signature over its signed-6109 tuple bind
-    /// `{job_id, seller_pubkey, target_repo, base_oid, fork_ref, commit_oid}` — an additional
-    /// checked seller bind here, never a parallel pre-pay gate.
+    /// every seller bind is checked. The receipt (job-hash) preimage signature is checked always;
+    /// piece-10 Step-1 (freelance-PR fork, `docs/meta/PIECE-10-FREELANCE-PR-DELIVERY.md`) EXTENDS
+    /// THIS POINT — for a `contribution` result, an ADDITIONAL seller signature over its signed-6109
+    /// tuple bind `{job_id, seller_pubkey, target_repo, base_oid, fork_ref, commit_oid}` is verified
+    /// against the SAME claim-seller anchor. One seam, more binds — never a parallel pre-pay gate.
+    /// From-scratch trades pass `contribution = None` ⇒ byte-identical to the single-bind behavior.
     pub fn verify_seller_prepay_cosig(
         &self,
         preimage: &ReceiptPreimage,
         seller_signature_hex: &str,
+        contribution: Option<ContributionCosig<'_>>,
     ) -> Result<(), PaymentError> {
         let message = Message::from_digest(preimage.digest_bytes());
         verify_schnorr_hex(seller_signature_hex, &message, &self.seller).map_err(|_| {
@@ -560,8 +562,36 @@ impl ReceiptAuthority {
                  before payment)",
                 self.seller.to_hex()
             ))
-        })
+        })?;
+        if let Some(contribution) = contribution {
+            // MUST-3: the seller's own schnorr signature ties `seller_pubkey → this job_id → this
+            // exact commit_oid` (against the pinned target + base + fork). A commit signed over a
+            // DIFFERENT tuple (any field tampered post-signing) fails here ⇒ zero-spend refusal.
+            let tuple_message = Message::from_digest(contribution.tuple_digest);
+            verify_schnorr_hex(contribution.tuple_signature_hex, &tuple_message, &self.seller)
+                .map_err(|_| {
+                    PaymentError::Refused(format!(
+                        "pre-pay contribution authorship invalid: the accepted result's signed-6109 \
+                         tuple sig does not verify over {{job_id, seller_pubkey, target_repo, \
+                         base_oid, fork_ref, commit_oid}} against claim seller {} (zero spend; \
+                         refused before payment)",
+                        self.seller.to_hex()
+                    ))
+                })?;
+        }
+        Ok(())
     }
+}
+
+/// Additional pre-pay seller bind for a piece-10 contribution: the seller's schnorr signature over
+/// the authorship tuple digest (`contribution::AuthorshipTuple::digest_bytes`). Verified at the ONE
+/// pre-pay seam [`ReceiptAuthority::verify_seller_prepay_cosig`] alongside the receipt cosig.
+#[derive(Clone, Copy, Debug)]
+pub struct ContributionCosig<'a> {
+    /// SHA-256 digest of the seller's signed-6109 authorship tuple (buyer-reconstructed).
+    pub tuple_digest: [u8; 32],
+    /// The seller's schnorr signature (hex) over `tuple_digest`, read from the accepted result.
+    pub tuple_signature_hex: &'a str,
 }
 
 /// Verify one schnorr signature (hex) over `message` against a nostr x-only anchor.
@@ -1931,6 +1961,117 @@ mod tests {
 
     fn sign_hex(keys: &nostr_sdk::Keys, digest: [u8; 32]) -> String {
         keys.sign_schnorr(&Message::from_digest(digest)).to_string()
+    }
+
+    // ── Piece-10 MUST-3: the pre-pay seam ALSO binds the seller-signed authorship tuple ────────
+    // The SAME seam that verifies the receipt cosig now verifies an additional seller signature
+    // over {job_id, seller_pubkey, target_repo, base_oid, fork_ref, commit_oid} — one seam, more
+    // binds. A valid pair passes; a sig over a DIFFERENT commit_oid or a tampered field refuses.
+    fn authorship_tuple(commit_oid: &str) -> crate::contribution::AuthorshipTuple {
+        crate::contribution::AuthorshipTuple {
+            job_id: "job".into(),
+            seller_pubkey: seller_keys().public_key().to_hex(),
+            target: crate::contribution::TargetRepoPin::new(
+                "aa".repeat(32),
+                "https://mobee-relay.orveth.dev/git/owner/repo.git",
+            )
+            .unwrap(),
+            base_oid: "77".repeat(20),
+            fork: crate::contribution::ForkRef::new(
+                "https://mobee-relay.orveth.dev/git/seller/fork.git",
+                "mobee/contribution/job",
+            )
+            .unwrap(),
+            commit_oid: commit_oid.to_owned(),
+        }
+    }
+
+    #[test]
+    fn prepay_seam_accepts_valid_receipt_and_authorship_tuple() {
+        let key = git_key();
+        let preimage = receipt_preimage(&key);
+        let receipt_sig = sign_hex(&seller_keys(), preimage.digest_bytes());
+        // Buyer reconstructs the tuple over the PAID commit; the seller signed exactly that tuple.
+        let tuple = authorship_tuple(key.delivery_integrity_hash.as_str());
+        let tuple_sig = sign_hex(&seller_keys(), tuple.digest_bytes());
+        authority()
+            .verify_seller_prepay_cosig(
+                &preimage,
+                &receipt_sig,
+                Some(ContributionCosig {
+                    tuple_digest: tuple.digest_bytes(),
+                    tuple_signature_hex: &tuple_sig,
+                }),
+            )
+            .expect("valid receipt + tuple cosig must pass");
+    }
+
+    #[test]
+    fn prepay_seam_refuses_tuple_signed_over_a_different_commit_oid() {
+        let key = git_key();
+        let preimage = receipt_preimage(&key);
+        let receipt_sig = sign_hex(&seller_keys(), preimage.digest_bytes());
+        // Seller signed a tuple for a DIFFERENT commit; buyer reconstructs over the paid commit.
+        let signed_tuple = authorship_tuple(&"ab".repeat(20));
+        let tuple_sig = sign_hex(&seller_keys(), signed_tuple.digest_bytes());
+        let buyer_tuple = authorship_tuple(key.delivery_integrity_hash.as_str());
+        let err = authority()
+            .verify_seller_prepay_cosig(
+                &preimage,
+                &receipt_sig,
+                Some(ContributionCosig {
+                    tuple_digest: buyer_tuple.digest_bytes(),
+                    tuple_signature_hex: &tuple_sig,
+                }),
+            )
+            .expect_err("a tuple sig over a different commit_oid must refuse");
+        assert!(
+            err.to_string().contains("contribution authorship invalid"),
+            "must be the authorship refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn prepay_seam_refuses_tampered_tuple_field() {
+        let key = git_key();
+        let preimage = receipt_preimage(&key);
+        let receipt_sig = sign_hex(&seller_keys(), preimage.digest_bytes());
+        // Seller signed the honest tuple; buyer reconstructs one with a TAMPERED base_oid.
+        let honest = authorship_tuple(key.delivery_integrity_hash.as_str());
+        let tuple_sig = sign_hex(&seller_keys(), honest.digest_bytes());
+        let mut tampered = honest.clone();
+        tampered.base_oid = "cd".repeat(20);
+        assert!(authority()
+            .verify_seller_prepay_cosig(
+                &preimage,
+                &receipt_sig,
+                Some(ContributionCosig {
+                    tuple_digest: tampered.digest_bytes(),
+                    tuple_signature_hex: &tuple_sig,
+                }),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn prepay_seam_refuses_tuple_signed_by_a_non_seller_key() {
+        // A tuple signed by an unrelated key (not the claim seller) must refuse — the authorship
+        // anchor is the claim seller, so a third party cannot be paid for its own commit.
+        let key = git_key();
+        let preimage = receipt_preimage(&key);
+        let receipt_sig = sign_hex(&seller_keys(), preimage.digest_bytes());
+        let tuple = authorship_tuple(key.delivery_integrity_hash.as_str());
+        let attacker_sig = sign_hex(&attacker_keys(), tuple.digest_bytes());
+        assert!(authority()
+            .verify_seller_prepay_cosig(
+                &preimage,
+                &receipt_sig,
+                Some(ContributionCosig {
+                    tuple_digest: tuple.digest_bytes(),
+                    tuple_signature_hex: &attacker_sig,
+                }),
+            )
+            .is_err());
     }
 
     /// A valid, real co-signed receipt over the trade's preimage.
