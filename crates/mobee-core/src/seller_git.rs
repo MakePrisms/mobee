@@ -154,6 +154,7 @@ pub fn init_contribution_workdir(
     base_branch: &str,
     base_oid: &str,
     branch: &str,
+    auth: Option<&PushAuth>,
 ) -> Result<(), SellerGitError> {
     crate::delivery_transport::assert_allowed_repo_locator(base_clone_url)?;
     if !workdir.exists() {
@@ -171,11 +172,13 @@ pub fn init_contribution_workdir(
         "config-user-email",
         scrubbed_git(workdir, seller_home, ["config", "user.email", &identity.email])?,
     )?;
-    // Full-depth fetch of the base branch from the pinned target into a local ref.
+    // Full-depth fetch of the base branch from the pinned target into a local ref. mobee
+    // relay-git requires NIP-98 auth for READS, so wire the seller credential helper for
+    // relay-git bases; public/anonymous https bases fetch without it (see fetch_base_auth).
     let refspec = format!("+refs/heads/{base_branch}:refs/mobee/base");
     run_ok(
         "fetch-base",
-        scrubbed_git(
+        scrubbed_git_auth(
             workdir,
             seller_home,
             [
@@ -186,16 +189,38 @@ pub fn init_contribution_workdir(
                 base_clone_url,
                 &refspec,
             ],
+            fetch_base_auth(auth, base_clone_url),
         )?,
     )?;
     // Check out base_oid onto the per-job unique branch (the fork tip the agent extends).
+    checkout_base_branch(workdir, seller_home, branch, base_oid)
+}
+
+/// NIP-98 auth to present on the base fetch. `Some` only for relay-git targets (which require
+/// auth for reads) — mirrors [`push_branch_with_auth`]'s `is_relay_git_locator` gate. Public /
+/// anonymous https bases return `None` so they keep fetching without a credential helper.
+fn fetch_base_auth<'a>(auth: Option<&'a PushAuth>, base_clone_url: &str) -> Option<&'a PushAuth> {
+    if auth.is_some() && crate::delivery_transport::is_relay_git_locator(base_clone_url) {
+        auth
+    } else {
+        None
+    }
+}
+
+/// `git checkout -B <branch> <base_oid>` — the fork tip the agent extends.
+///
+/// No `--` before `base_oid`: that would make git parse it as a pathspec (checkout fails
+/// "not a commit and a branch cannot be created from it"). `base_oid` is validated as
+/// 40/64-hex upstream, so it can never be an option string that needs `--` protection.
+fn checkout_base_branch(
+    workdir: &Path,
+    seller_home: &Path,
+    branch: &str,
+    base_oid: &str,
+) -> Result<(), SellerGitError> {
     run_ok(
         "checkout-base",
-        scrubbed_git(
-            workdir,
-            seller_home,
-            ["checkout", "-B", branch, "--", base_oid],
-        )?,
+        scrubbed_git(workdir, seller_home, ["checkout", "-B", branch, base_oid])?,
     )
 }
 
@@ -543,6 +568,54 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    scrubbed_git_command(workdir, seller_home, args, auth)?
+        .output()
+        .map_err(|_| SellerGitError::Unavailable)
+}
+
+/// Build (but do not run) the scrubbed git child. Resolves the NIP-98 credential helper up
+/// front and fails closed when `auth` is set but the helper is missing (so an authenticated
+/// call can never silently degrade to an anonymous one).
+fn scrubbed_git_command<I, S>(
+    workdir: &Path,
+    seller_home: &Path,
+    args: I,
+    auth: Option<&PushAuth>,
+) -> Result<Command, SellerGitError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let helper = resolve_git_credential_nostr();
+    if auth.is_some() && helper.is_none() {
+        return Err(SellerGitError::AuthFailed(
+            "git-credential-nostr not found (set MOBEE_GIT_CREDENTIAL_NOSTR or install helper)"
+                .into(),
+        ));
+    }
+    Ok(build_scrubbed_command(
+        workdir,
+        seller_home,
+        args,
+        auth,
+        helper.as_deref(),
+    ))
+}
+
+/// Pure Command builder — no resolution, no I/O — so the credential-helper wiring is
+/// unit-inspectable. `helper` is the resolved `git-credential-nostr` path (or `None`); the
+/// NIP-98 `credential.helper` config is added only when BOTH `auth` and `helper` are present.
+fn build_scrubbed_command<I, S>(
+    workdir: &Path,
+    seller_home: &Path,
+    args: I,
+    auth: Option<&PushAuth>,
+    helper: Option<&Path>,
+) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut cmd = Command::new("git");
     // `-c` flags must precede the subcommand and beat local `.git/config` insteadOf
     // rewrites (agent-planted url.*.insteadOf → ssh/file/ext). Keep https + relay-git.
@@ -557,16 +630,10 @@ where
         ]);
 
     // Keep credential.helper string alive for the Command borrow.
-    let mut helper_cfg: Option<String> = None;
-    if auth.is_some() {
-        let helper = resolve_git_credential_nostr().ok_or_else(|| {
-            SellerGitError::AuthFailed(
-                "git-credential-nostr not found (set MOBEE_GIT_CREDENTIAL_NOSTR or install helper)"
-                    .into(),
-            )
-        })?;
-        helper_cfg = Some(format!("credential.helper={}", helper.to_string_lossy()));
-    }
+    let helper_cfg = match (auth, helper) {
+        (Some(_), Some(path)) => Some(format!("credential.helper={}", path.to_string_lossy())),
+        _ => None,
+    };
     if let Some(cfg) = helper_cfg.as_deref() {
         cmd.args(["-c", cfg, "-c", "credential.useHttpPath=true"]);
     }
@@ -616,23 +683,21 @@ where
     }
 
     // Ensure helper binary is discoverable when referenced by basename.
-    if let Some(helper) = resolve_git_credential_nostr() {
-        if let Some(dir) = helper.parent() {
-            let mut path = std::env::var_os("PATH").unwrap_or_default();
-            let prefix = dir.as_os_str();
-            if !path.is_empty() {
-                let mut combined = prefix.to_os_string();
-                combined.push(":");
-                combined.push(&path);
-                path = combined;
-            } else {
-                path = prefix.to_os_string();
-            }
-            cmd.env("PATH", path);
+    if let Some(dir) = helper.and_then(Path::parent) {
+        let mut path = std::env::var_os("PATH").unwrap_or_default();
+        let prefix = dir.as_os_str();
+        if !path.is_empty() {
+            let mut combined = prefix.to_os_string();
+            combined.push(":");
+            combined.push(&path);
+            path = combined;
+        } else {
+            path = prefix.to_os_string();
         }
+        cmd.env("PATH", path);
     }
 
-    cmd.output().map_err(|_| SellerGitError::Unavailable)
+    cmd
 }
 
 fn run_ok(op: &'static str, output: Output) -> Result<(), SellerGitError> {
@@ -1068,6 +1133,7 @@ mod tests {
             "main",
             &"a".repeat(40),
             "mobee/contribution/job",
+            None,
         )
         .expect_err("ext base must be refused by the transport allowlist");
         assert!(matches!(err, SellerGitError::Transport(_)), "got {err}");
@@ -1099,5 +1165,119 @@ mod tests {
         assert!(require_agent_authored_contribution(&root, &home, &identity, &base_oid, Some(&base_oid)).is_err());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn checkout_base_branch_from_oid_creates_fork_tip() {
+        // Bug-1 regression: `git checkout -B <branch> <oid>` must NOT pass `--` before the
+        // oid (that turns the oid into a pathspec → "not a commit ... cannot be created").
+        // RED at 8253b70 (with the `--`); GREEN after removal.
+        let root = temp("checkout-base");
+        let home = temp("checkout-base-home");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("home");
+        init_repo(&root); // leaves a commit whose oid is present in root's object db
+        let base_oid = {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+
+        checkout_base_branch(&root, &home, "mobee/contribution/job", &base_oid)
+            .expect("checkout of a valid base_oid onto the fork branch must succeed");
+
+        // Now on the per-job branch, pointing at base_oid.
+        let branch = Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(branch.stdout).unwrap().trim(),
+            "mobee/contribution/job"
+        );
+        let head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(head.stdout).unwrap().trim(), base_oid);
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// Args (after the program) of a built git Command, as owned Strings.
+    fn cmd_args(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// True when `NOSTR_PRIVATE_KEY` is being SET (not removed) on the child.
+    fn sets_nostr_key(cmd: &Command) -> bool {
+        cmd.get_envs()
+            .any(|(k, v)| k == std::ffi::OsStr::new("NOSTR_PRIVATE_KEY") && v.is_some())
+    }
+
+    #[test]
+    fn fetch_base_wires_nip98_helper_for_relay_git_only() {
+        // Bug-2 regression: the base fetch must present the seller NIP-98 credential helper
+        // for relay-git targets (mobee relay requires auth for reads), and NOT for public /
+        // anonymous https targets (which would otherwise break). Construction-level: inspect
+        // the git Command the fetch path builds. RED if fetch_base_auth stops gating (drops
+        // the auth), since the relay-git branch then wires no credential helper.
+        let td = std::env::temp_dir();
+        let auth = PushAuth {
+            secret_key_hex: "ab".repeat(32),
+        };
+        let helper = Path::new("/opt/mobee/git-credential-nostr"); // injected — no resolution/env
+        let relay_base = "https://relay.example/git/\
+            abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789/job.git";
+        let public_base = "https://example.invalid/repo.git";
+
+        // (1) relay-git base → auth applied → credential helper + key wired on the fetch child.
+        let eff = fetch_base_auth(Some(&auth), relay_base);
+        assert!(eff.is_some(), "relay-git base must present NIP-98 auth");
+        let relay_helper = eff.and(Some(helper));
+        let cmd = build_scrubbed_command(&td, &td, ["fetch", relay_base], eff, relay_helper);
+        let args = cmd_args(&cmd);
+        assert!(
+            args.iter().any(|a| a.starts_with("credential.helper=")),
+            "relay-git fetch must wire credential.helper, got args: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "credential.useHttpPath=true"),
+            "relay-git fetch must set credential.useHttpPath=true, got: {args:?}"
+        );
+        assert!(
+            sets_nostr_key(&cmd),
+            "relay-git fetch must inject NOSTR_PRIVATE_KEY on the child"
+        );
+
+        // (2) public https base → anonymous: no credential helper, no key on the fetch child.
+        let eff_pub = fetch_base_auth(Some(&auth), public_base);
+        assert!(eff_pub.is_none(), "public base must stay anonymous");
+        let cmd_pub =
+            build_scrubbed_command(&td, &td, ["fetch", public_base], eff_pub, eff_pub.and(Some(helper)));
+        let args_pub = cmd_args(&cmd_pub);
+        assert!(
+            !args_pub.iter().any(|a| a.starts_with("credential.helper=")),
+            "public fetch must NOT wire a credential helper, got: {args_pub:?}"
+        );
+        assert!(
+            !sets_nostr_key(&cmd_pub),
+            "public fetch must NOT inject NOSTR_PRIVATE_KEY"
+        );
+
+        // (3) no seller auth available → anonymous even for a relay-git base (never fail hard).
+        assert!(
+            fetch_base_auth(None, relay_base).is_none(),
+            "absent seller auth must fall back to anonymous fetch"
+        );
     }
 }

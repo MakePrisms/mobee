@@ -791,15 +791,24 @@ impl SellerDaemon {
             None => format!("mobee/{}", &active.job_id[..8.min(active.job_id.len())]),
         };
         let init_result = match &active.contribution {
-            Some(contribution) => seller_git::init_contribution_workdir(
-                &active.workdir,
-                &self.home.root,
-                &identity,
-                contribution.target.clone_url(),
-                contribution.base.branch(),
-                contribution.base.oid(),
-                &branch,
-            ),
+            Some(contribution) => {
+                // Fork base fetch needs NIP-98 auth for relay-git reads — same seller key the
+                // push path reads below (:879). Kept local to this arm so the anonymous
+                // empty-base path is untouched; fetch itself gates auth to relay-git targets.
+                let fork_auth = seller_git::PushAuth {
+                    secret_key_hex: home::read_secret_key_hex(&self.home)?,
+                };
+                seller_git::init_contribution_workdir(
+                    &active.workdir,
+                    &self.home.root,
+                    &identity,
+                    contribution.target.clone_url(),
+                    contribution.base.branch(),
+                    contribution.base.oid(),
+                    &branch,
+                    Some(&fork_auth),
+                )
+            }
             None => {
                 seller_git::init_empty_delivery_workdir(&active.workdir, &self.home.root, &identity)
             }
