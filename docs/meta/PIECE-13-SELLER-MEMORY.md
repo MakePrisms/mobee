@@ -11,9 +11,11 @@ rebuildable from the capture layer, so the memory system can be re-distilled wit
 models later without ever losing history — "backwards-improving" by construction.
 
 > **Status: design proposal, DOC-ONLY.** This document proposes **no** protocol changes and specifies no
-> wire events. It adds two **local, on-disk** capture/derivation layers under `MOBEE_HOME` and one extra
-> agent turn; nothing new goes on the relay. Where a field the design wants is not something the daemon
-> knows at capture time today, it is named **needs-new-plumbing** inline (§ Layer 0) rather than assumed.
+> wire events. It adds two **local, on-disk** capture/derivation layers under `MOBEE_HOME`, one extra
+> agent turn, an **operator-authorable** memory dir (§ Human input), and **config-pointed plugin seams**
+> over sensible in-repo defaults (§ Defaults + plugin ecosystem); nothing new goes on the relay. Where a
+> field the design wants is not something the daemon knows at capture time today, it is named
+> **needs-new-plumbing** inline (§ Layer 0) rather than assumed.
 >
 > **Anchored to:** `dev@868bb09`. All `file:line` references are to that tree.
 >
@@ -200,6 +202,65 @@ from** `memory_enabled` (the read path is cheap; the retro turn costs a model ca
 off independently for cost control). The retro turn is best-effort: a failed or timed-out retro logs and
 is skipped — it must never affect the trade's money path or block the daemon.
 
+## Human input — the operator writes memory too
+
+Layer 1 is plain markdown in a plain directory **by design** precisely so the operator is a first-class
+author, not just a reader. The seller's human can open `MOBEE_HOME/memory/`, read what the agent has
+learned, correct it, and add their own durable guidance (house rules, buyers to avoid, task shapes to
+prefer) — the same files, the same `[[wikilink]]` shape. The model is **defaults + human override**: the
+agent supplies a working memory out of the box; the operator refines it.
+
+For this to be safe, two things need a convention: telling agent-written from human-written content
+apart, and making sure a re-distillation (§ Evolvability — which regenerates the agent's memory) never
+clobbers what the human wrote.
+
+**Provenance convention (v1: file-level ownership).** Every topic file carries a minimal YAML frontmatter
+`author: agent | operator` (and `updated_at`). The distiller stamps `author: agent` on everything it
+writes; the operator's files are stamped `author: operator`. A distinguished `operator-notes.md` topic
+file is always operator-owned by convention and seeded (empty, `author: operator`) when the memory dir is
+created, so there is an obvious place for human guidance from day one. `MEMORY.md` (the index) lists both
+kinds and marks each entry's author.
+
+**Merge-not-clobber rule.** Re-distillation regenerates **only** files stamped `author: agent`.
+Files stamped `author: operator` (including `operator-notes.md`) are **never** regenerated or overwritten
+— they are read as input to the distiller (so the human's guidance informs the rebuild) and passed
+through untouched. If the operator wants to lock an agent-written topic against future regeneration, they
+flip its frontmatter to `author: operator` — that single edit takes ownership. Whole-file ownership keeps
+v1 simple and unambiguous; **block-level** provenance (preserving human-marked spans inside an
+agent-owned file) is named as a **future** refinement, not built in v1. The read-on-start path
+(§ Layer 1) inlines the index and exposes the dir regardless of authorship, so human-written topics reach
+the agent's context exactly like agent-written ones.
+
+## Defaults + plugin ecosystem
+
+The design ships **sensible defaults in-repo** and makes each behavior-defining seam **overridable via
+config** — the same "batteries included, everything swappable" shape as Claude Code's own
+**skills/hooks** pattern (ship defaults; let the operator drop in files that override or extend them).
+The precedent is deliberate: memory behavior should be operator-tunable without a fork of mobee.
+
+Three seams are override points in v1, each a **file path in `[seller.memory]` config** that falls back to
+an in-repo default when unset:
+
+1. **The retro/distiller prompt** — `retro_prompt_path`. The template the retro turn (§ Layer 1) runs.
+   Default shipped in-repo; an operator points this at their own template to change what the agent
+   distills and how. This is the highest-value seam — it is where memory *policy* actually lives.
+2. **The read-on-start injection** — `read_on_start_template_path`. The template that frames how
+   `MEMORY.md` is inlined into `compose_agent_prompt` (`seller_daemon.rs:1216`). Default in-repo; override
+   to change how memory is presented to the agent at job start.
+3. **The claim-policy hook** — the **sibling seam, already specced** in the business-manager design
+   (`business-manager-design.md` § V1 — the claim-policy hook): a swappable pre-claim decision function
+   that reads the same local state and writes `seller-decisions.jsonl`. Named here as the economic-brain
+   counterpart to these memory seams — the two ecosystems share the "defaults + override" frame and the
+   same local capture substrate.
+
+**v1 is deliberately light: config points at files, nothing more.** There is **no plugin registry, no
+marketplace, no discovery/versioning machinery, and no dynamic code loading** — a "plugin" in v1 is just
+an operator-supplied prompt template or (for the claim hook) a swapped function behind config. A richer
+ecosystem — a drop-in `MOBEE_HOME/plugins/` convention with auto-discovery, packaged/versioned plugins,
+or a shared registry — is named as **future** and explicitly out of scope for v1 (§ Non-goals). The v1
+seams are chosen so that future machinery is additive: a registry would just be another way to populate
+the same config paths.
+
 ## Evolvability guarantees
 
 This is the point of the whole design.
@@ -254,6 +315,9 @@ convenience/economic asset, not evidence. Two hard rules:
 - No buzz integration and no new relay events — nothing leaves the box.
 - No transcript rotation/GC — keep everything (rotation named as future-optional).
 - No kind-3400 receipt observation by the seller — out of scope (needs-new-plumbing, named above).
+- No plugin registry / marketplace / auto-discovery / dynamic code loading — v1 seams are config
+  file-paths only (§ Defaults + plugin ecosystem); richer machinery is future.
+- No block-level memory provenance — v1 is whole-file ownership (§ Human input); span-level is future.
 
 ## V1 build plan
 
@@ -274,17 +338,22 @@ claimed **and** refused paths. Includes the small plumbing: durable refusal capt
   - Red-on-revert: reverting the writer drops the episode line (asserted by hash/line-count delta).
 
 ### Piece B — memory dir + read-on-start
-Create `MOBEE_HOME/memory/` on demand; inline `MEMORY.md` into `compose_agent_prompt` behind
-`memory_enabled`.
+Create `MOBEE_HOME/memory/` on demand (seeding an empty `operator-notes.md`, `author: operator`); inline
+`MEMORY.md` into `compose_agent_prompt` behind `memory_enabled`, framed by the `read_on_start_template_path`
+seam (in-repo default when unset).
 - **Acceptance:**
   - With `memory_enabled=true` and a non-empty `MEMORY.md`, the composed prompt string contains the
     index text and the absolute memory path (unit-assertable on `compose_agent_prompt`).
   - With `memory_enabled=false`, the composed prompt is byte-identical to the pre-piece output (golden
     test).
+  - On first creation the dir contains `operator-notes.md` stamped `author: operator`.
+  - When `read_on_start_template_path` points at an operator file, the composed prompt reflects that
+    template, not the default (unit test); unset falls back to the in-repo default.
 
-### Piece C — retro write-back
+### Piece C — retro write-back (with provenance + prompt seam)
 After a delivered-paid (and optionally refused) terminal transition, run one retro agent turn against the
-memory dir behind `retro_enabled`; best-effort, non-blocking.
+memory dir behind `retro_enabled`, using the `retro_prompt_path` template seam (in-repo default when
+unset); best-effort, non-blocking. The distiller stamps `author: agent` and honors merge-not-clobber.
 - **Acceptance:**
   - With `retro_enabled=true`, a completed job triggers exactly one extra agent turn whose session cwd
     grants write to `MOBEE_HOME/memory/`, and a `MEMORY.md` exists afterward (integration test with the
@@ -292,6 +361,10 @@ memory dir behind `retro_enabled`; best-effort, non-blocking.
   - A retro that errors or times out is logged and does **not** change the journal or the trade outcome
     (fault-injection test: money path green with retro forced to fail).
   - With `retro_enabled=false`, no extra turn is issued.
+  - Files written by the retro are stamped `author: agent`; a pre-existing `author: operator` file
+    (and `operator-notes.md`) is byte-unchanged across a retro run (merge-not-clobber test).
+  - When `retro_prompt_path` points at an operator template, the retro turn uses it, not the default
+    (assertable on the composed retro prompt).
 
 ## Open questions (for the human owner)
 
@@ -309,3 +382,11 @@ memory dir behind `retro_enabled`; best-effort, non-blocking.
    turn is clean but must be re-fed the transcript. *Recommendation:* a **fresh** turn seeded with the
    episode + `transcript_ref` — it keeps delivery and retro independently gateable and failable (the
    money path never waits on retro), at the cost of re-reading the transcript.
+4. **Plugin seams — explicit config file-paths, or a drop-in `MOBEE_HOME/plugins/` convention?** v1 as
+   specced uses explicit `[seller.memory]` paths (`retro_prompt_path`, `read_on_start_template_path`). A
+   more Claude-Code-like alternative is auto-discovery: drop a template into a well-known dir and it takes
+   effect without editing config. This is a genuine fork — the first is simpler and fully explicit, the
+   second is friendlier to a future ecosystem but adds discovery/precedence rules. *Recommendation:*
+   ship **explicit config paths in v1** (no discovery surface, trivial to reason about) and revisit a
+   drop-in convention when a real second plugin exists to justify it — the config paths remain the
+   underlying mechanism either way, so a drop-in layer is purely additive later.
