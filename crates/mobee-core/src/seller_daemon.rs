@@ -1624,12 +1624,15 @@ fn harness_and_transport(
     agent_preset: Option<&str>,
 ) -> (String, &'static str) {
     // Preset label is authoritative — resolve from the adapter identity, never argv0.
+    // A non-built-in label is a config-defined `[agents]` preset: the preset name IS the
+    // harness identity (conservative `side-channel` transport — nothing is known about it).
     if let Some(preset) = agent_preset {
         match preset.trim().to_ascii_lowercase().as_str() {
             "claude" => return ("claude-agent-acp".to_owned(), "side-channel"),
             "codex" => return ("codex-acp-ng".to_owned(), "acp-native"),
             "cursor" => return ("cursor-agent".to_owned(), "side-channel"),
-            _ => {}
+            "" => {}
+            _ => return (preset.trim().to_owned(), "side-channel"),
         }
     }
     // Hatch fallback: scan the FULL argv (adapter identity), not just argv0.
@@ -2779,6 +2782,26 @@ mod tests {
             harness_family(&value(&hatch, "harness").expect("harness")),
             "claude"
         );
+    }
+
+    #[test]
+    fn custom_preset_label_is_the_reported_harness_identity() {
+        let value = |tags: &[TagSpec], name: &str| -> Option<String> {
+            tags.iter()
+                .find(|tag| tag.first() == Some(name))
+                .and_then(|tag| tag.value().map(str::to_owned))
+        };
+
+        // A config-defined `[agents]` preset (non-built-in label): the preset name IS the
+        // harness id — never argv0, never a family guess from the launch command.
+        let argv = vec!["/opt/adapters/grok-acp".to_string(), "stdio".to_string()];
+        let tags = seller_exec_metadata(&argv, Some("grok"), 42, None);
+        assert_eq!(value(&tags, "harness").as_deref(), Some("grok"));
+        assert_eq!(value(&tags, "usage_transport").as_deref(), Some("side-channel"));
+
+        // Built-in labels keep their adapter identities (custom seam must not regress them).
+        let builtin = seller_exec_metadata(&argv, Some("codex"), 42, None);
+        assert_eq!(value(&builtin, "harness").as_deref(), Some("codex-acp-ng"));
     }
 
     #[test]

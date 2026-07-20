@@ -212,8 +212,9 @@ fn ensure_seller_config(
         && options.git_remote.is_none();
 
     // Agent: preset | argv hatch | persisted config. Never re-prompt argv in steady state.
+    let custom_agents = home.config.agents.clone();
     let (mut agent_label, mut agent_command) =
-        resolve_agent(options, existing.as_ref(), out, err)?;
+        resolve_agent(options, existing.as_ref(), &custom_agents, out, err)?;
 
     let mut rate_sats = options
         .rate_sats
@@ -270,7 +271,7 @@ fn ensure_seller_config(
                 "mobee sell missing required field(s): {}",
                 missing.join(", ")
             );
-            let available = agent_presets::detect_available_agents();
+            let available = agent_presets::detect_available_agents(&custom_agents);
             if !available.is_empty() {
                 let _ = writeln!(err, "agents detected on PATH: {}", available.join(", "));
             }
@@ -278,8 +279,8 @@ fn ensure_seller_config(
         }
     } else if interactive {
         if agent_command.is_empty() {
-            let available = agent_presets::detect_available_agents();
-            let suggestion = available.first().copied().unwrap_or("claude");
+            let available = agent_presets::detect_available_agents(&custom_agents);
+            let suggestion = available.first().map(String::as_str).unwrap_or("claude");
             let detected = if available.is_empty() {
                 "none".to_owned()
             } else {
@@ -287,13 +288,15 @@ fn ensure_seller_config(
             };
             let _ = writeln!(
                 out,
-                "Pick an agent preset (claude|cursor|codex). Detected: {detected}"
+                "Pick an agent preset ({}). Detected: {detected}",
+                agent_presets::preset_choices(&custom_agents)
             );
             let picked = prompt_line(out, err, "Agent", suggestion)?;
-            let (label, argv) = agent_presets::resolve_agent_preset(&picked).map_err(|message| {
-                let _ = writeln!(err, "{message}");
-                USAGE_ERROR
-            })?;
+            let (label, argv) = agent_presets::resolve_agent_preset(&picked, &custom_agents)
+                .map_err(|message| {
+                    let _ = writeln!(err, "{message}");
+                    USAGE_ERROR
+                })?;
             agent_command = argv;
             agent_label = Some(label.clone());
             let _ = writeln!(err, "agent preset={label} argv0={}", agent_command[0]);
@@ -316,10 +319,10 @@ fn ensure_seller_config(
         return Err(USAGE_ERROR);
     }
 
-    let agent = options
-        .agent
-        .clone()
-        .or(agent_label)
+    // Prefer the resolved preset label (the configured/normalized name) — it is the harness
+    // identity reported in results.
+    let agent = agent_label
+        .or_else(|| options.agent.clone())
         .or(existing_agent);
 
     let seller = SellerConfig {
@@ -357,6 +360,7 @@ fn ensure_seller_config(
 fn resolve_agent(
     options: &SellOptions,
     existing: Option<&SellerConfig>,
+    custom_agents: &std::collections::BTreeMap<String, home::AgentPresetConfig>,
     _out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<(Option<String>, Vec<String>), i32> {
@@ -368,10 +372,11 @@ fn resolve_agent(
         return Ok((None, options.agent_argv.clone()));
     }
     if let Some(name) = options.agent.as_ref() {
-        let (label, argv) = agent_presets::resolve_agent_preset(name).map_err(|message| {
-            let _ = writeln!(err, "{message}");
-            USAGE_ERROR
-        })?;
+        let (label, argv) =
+            agent_presets::resolve_agent_preset(name, custom_agents).map_err(|message| {
+                let _ = writeln!(err, "{message}");
+                USAGE_ERROR
+            })?;
         let _ = writeln!(err, "agent preset={label} argv0={}", argv[0]);
         return Ok((Some(label), argv));
     }

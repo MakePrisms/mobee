@@ -3,6 +3,7 @@
 //! First-run bootstrap writes working defaults: testnut mint, mobee-relay, budget caps,
 //! autogen key (`0600`), and an empty `wallet/` dir. The secret key is never returned.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -304,6 +305,14 @@ where
     deserializer.deserialize_any(ArgvVisitor)
 }
 
+/// One custom agent preset (`[agents.<name>] argv = [...]`). The argv is a launch command
+/// for the seller ACP driver — same no-shell argv-array rule as `agent_command`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPresetConfig {
+    #[serde(deserialize_with = "deserialize_agent_command_argv")]
+    pub argv: Vec<String>,
+}
+
 /// Buyer-facing packaged config (`~/.mobee/config.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobeeConfig {
@@ -321,6 +330,10 @@ pub struct MobeeConfig {
     /// Optional `[seller]` daemon config. Absent until `mobee sell` setup writes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seller: Option<SellerConfig>,
+    /// Optional `[agents]` table of custom presets: name -> `{ argv = [...] }`. A custom
+    /// entry named after a built-in preset (claude|cursor|codex) OVERRIDES that built-in.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, AgentPresetConfig>,
     /// Piece-13 `[seller_memory]` config (read-on-start + retro seams). Defaults when absent.
     #[serde(default, skip_serializing_if = "SellerMemoryConfig::is_default")]
     pub seller_memory: SellerMemoryConfig,
@@ -360,6 +373,7 @@ impl Default for MobeeConfig {
             extra_mints: Vec::new(),
             profile: None,
             seller: None,
+            agents: BTreeMap::new(),
             seller_memory: SellerMemoryConfig::default(),
             seller_announce: SellerAnnounceConfig::default(),
             contribution: None,
@@ -596,6 +610,36 @@ mod tests {
             "mobee-home-{label}-{}-{id}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn agents_table_parses_round_trips_and_refuses_string_argv() {
+        let raw = "relay_url = 'r'\nmint_url = 'm'\n\
+                   per_job_budget_sats = 1\ntotal_budget_sats = 2\n\
+                   [agents.grok]\nargv = ['grok', 'agent', 'stdio']\n";
+        let config: MobeeConfig = toml::from_str(raw).expect("parse [agents]");
+        assert_eq!(
+            config.agents.get("grok").map(|p| p.argv.clone()),
+            Some(vec!["grok".into(), "agent".into(), "stdio".into()])
+        );
+
+        let serialized = toml::to_string_pretty(&config).expect("serialize");
+        let reloaded: MobeeConfig = toml::from_str(&serialized).expect("reparse");
+        assert_eq!(reloaded, config);
+
+        // Same no-shell rule as `agent_command`: a string argv is refused at parse.
+        let shelly = "relay_url = 'r'\nmint_url = 'm'\n\
+                      per_job_budget_sats = 1\ntotal_budget_sats = 2\n\
+                      [agents.grok]\nargv = 'grok agent stdio'\n";
+        assert!(toml::from_str::<MobeeConfig>(shelly).is_err());
+
+        // Absent table stays absent (config.toml stays clean).
+        let bare: MobeeConfig = toml::from_str(
+            "relay_url = 'r'\nmint_url = 'm'\nper_job_budget_sats = 1\ntotal_budget_sats = 2\n",
+        )
+        .expect("parse bare");
+        assert!(bare.agents.is_empty());
+        assert!(!toml::to_string_pretty(&bare).expect("ser").contains("[agents"));
     }
 
     #[test]
