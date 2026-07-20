@@ -868,7 +868,14 @@ impl SellerDaemon {
         let run_started = std::time::Instant::now();
         // Item #16(e): the daemon OWNS delivery — append explicit, secret-free instructions so
         // the agent commits its deliverable to git (the daemon pushes it) instead of guessing.
-        let prompt = compose_agent_prompt(&active.offer.task, &seller_cfg.git_remote);
+        // Piece-13 read-on-start: inline the MEMORY.md index when memory is enabled (byte-identical
+        // prompt when disabled).
+        let memory_section = self.read_on_start_section();
+        let prompt = compose_agent_prompt(
+            &active.offer.task,
+            &seller_cfg.git_remote,
+            memory_section.as_deref(),
+        );
         // Item #16(c): retry a transient agent error while the deadline still has room. The
         // kind-7000 error (fail_active, below) is published only after the attempt budget or
         // the deadline is spent — a transient failure never burns the claim early.
@@ -1062,6 +1069,32 @@ impl SellerDaemon {
         }
         Self::end_flight();
         Ok(())
+    }
+
+    /// Piece-13 read-on-start: the rendered `MEMORY.md` section to inline into the job prompt, or
+    /// `None` when memory is disabled or there is no non-empty index. Ensures the memory dir on
+    /// first use (seeding operator-notes.md + a non-empty index). Best-effort: any error degrades
+    /// to `None` (no memory), never blocks the job.
+    fn read_on_start_section(&self) -> Option<String> {
+        let cfg = &self.home.config.seller_memory;
+        if !cfg.memory_enabled {
+            return None;
+        }
+        let dir = crate::seller_memory::memory_dir(&self.home.root);
+        if let Err(error) = crate::seller_memory::ensure_memory_dir(&dir) {
+            eprintln!("seller memory: ensure dir failed (skipping read-on-start): {error}");
+            return None;
+        }
+        match crate::seller_memory::read_on_start_section(
+            &dir,
+            cfg.read_on_start_template_path.as_deref(),
+        ) {
+            Ok(section) => section,
+            Err(error) => {
+                eprintln!("seller memory: read-on-start failed (skipping): {error}");
+                None
+            }
+        }
     }
 
     /// Best-effort episode append — diagnostic, NEVER fails a trade. Logs on error, swallows it.
@@ -1476,8 +1509,8 @@ where
 /// The daemon performs the authenticated push of the committed branch to the bound remote
 /// (NIP-98; the agent is never handed a key), so this text carries NO secret — it is public
 /// prompt text built only from the task and the (public) remote URL.
-fn compose_agent_prompt(task: &str, git_remote: &str) -> String {
-    format!(
+fn compose_agent_prompt(task: &str, git_remote: &str, memory_section: Option<&str>) -> String {
+    let base = format!(
         "{task}\n\n\
          ---\n\
          DELIVERY (required). Deliver your work by committing it with git in your current \
@@ -1487,7 +1520,14 @@ fn compose_agent_prompt(task: &str, git_remote: &str) -> String {
          - You do NOT need to push and you are NOT handed any credentials: the daemon pushes \
          your committed branch to the bound git remote ({git_remote}) on your behalf.\n\
          Anything not committed to git will not be delivered."
-    )
+    );
+    // Piece-13 read-on-start: when memory is enabled the rendered index section is appended.
+    // When `None` (memory_enabled=false, or no non-empty index) the output is byte-IDENTICAL to
+    // the pre-piece-13 prompt (golden invariant).
+    match memory_section {
+        Some(section) => format!("{base}\n\n{section}"),
+        None => base,
+    }
 }
 
 async fn publish_draft(
@@ -2300,7 +2340,7 @@ mod tests {
     #[test]
     fn composed_prompt_carries_task_and_daemon_owned_delivery_instructions() {
         let remote = "https://relay.example/git/abc.git";
-        let prompt = compose_agent_prompt("build a widget", remote);
+        let prompt = compose_agent_prompt("build a widget", remote, None);
         // The original task stays up front.
         assert!(prompt.starts_with("build a widget"), "task preserved: {prompt}");
         // Explicit, daemon-owned delivery instructions are appended.
@@ -3197,6 +3237,84 @@ mod tests {
             "seller-journal.jsonl must be byte-unchanged by episode capture"
         );
         daemon.journal.entries().expect("journal still parses green");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Piece-13 Layer-1 read-on-start ──────────────────────────────────────────────────────
+
+    /// Acceptance (piece B): with memory DISABLED the composed prompt is byte-identical to the
+    /// pre-piece-13 output. The expected string is a hardcoded literal (NOT recomputed from the
+    /// function under test), so any drift in the disabled path fails this golden.
+    #[test]
+    fn composed_prompt_disabled_memory_is_byte_identical_golden() {
+        let remote = "https://relay.example/git/abc.git";
+        let expected = "build a widget\n\n\
+---\n\
+DELIVERY (required). Deliver your work by committing it with git in your current working directory:\n\
+- Make one or more non-empty commits authored by you. Do not leave the deliverable uncommitted and do not only print it to the console.\n\
+- You do NOT need to push and you are NOT handed any credentials: the daemon pushes your committed branch to the bound git remote (https://relay.example/git/abc.git) on your behalf.\n\
+Anything not committed to git will not be delivered.";
+        assert_eq!(
+            compose_agent_prompt("build a widget", remote, None),
+            expected,
+            "disabled-memory prompt must be byte-identical to the pre-piece-13 golden"
+        );
+    }
+
+    /// Acceptance (piece B): memory_enabled=false ⇒ the daemon produces NO read-on-start section
+    /// and does not even create the memory dir.
+    #[tokio::test]
+    async fn disabled_memory_yields_no_section_and_no_dir() {
+        let (root, mut daemon) = test_daemon("mem-disabled");
+        daemon.home.config.seller_memory.memory_enabled = false;
+        assert!(daemon.read_on_start_section().is_none(), "no section when disabled");
+        assert!(
+            !crate::seller_memory::memory_dir(&daemon.home().root).exists(),
+            "disabled memory must not create the memory dir"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Acceptance (piece B): with memory enabled and a non-empty index, the composed prompt
+    /// contains the index text and the absolute memory path; and first use seeds operator-notes.md
+    /// stamped author: operator.
+    #[tokio::test]
+    async fn enabled_memory_inlines_index_and_seeds_operator_notes() {
+        let (root, daemon) = test_daemon("mem-enabled");
+        // default config ⇒ memory_enabled = true.
+        let section = daemon.read_on_start_section().expect("section present");
+        let dir = crate::seller_memory::memory_dir(&daemon.home().root);
+        assert!(section.contains("Seller memory index"), "index text inlined: {section}");
+        assert!(
+            section.contains(&dir.display().to_string()),
+            "absolute memory path named: {section}"
+        );
+        // The full composed prompt is a superset of the disabled output.
+        let prompt = compose_agent_prompt("t", "https://r/git/x.git", Some(&section));
+        assert!(prompt.contains("Seller memory index"));
+        assert!(prompt.starts_with("t\n\n---\nDELIVERY"), "delivery block preserved");
+
+        // On first creation the dir carries operator-notes.md stamped author: operator.
+        let notes = dir.join(crate::seller_memory::OPERATOR_NOTES_FILE);
+        assert!(notes.is_file(), "operator-notes.md seeded on first read-on-start");
+        let author = crate::seller_memory::frontmatter_author(
+            &std::fs::read_to_string(&notes).expect("read notes"),
+        );
+        assert_eq!(author.as_deref(), Some(crate::seller_memory::AUTHOR_OPERATOR));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Acceptance (piece B): the read-on-start template seam overrides the in-repo default when
+    /// `read_on_start_template_path` is set (daemon path).
+    #[tokio::test]
+    async fn read_on_start_template_seam_used_by_daemon() {
+        let (root, mut daemon) = test_daemon("mem-seam");
+        let template = daemon.home().root.join("my-read.tmpl");
+        std::fs::write(&template, "CUSTOM-FRAME {memory_index}").expect("write template");
+        daemon.home.config.seller_memory.read_on_start_template_path = Some(template);
+        let section = daemon.read_on_start_section().expect("section");
+        assert!(section.starts_with("CUSTOM-FRAME"), "operator template used: {section}");
+        assert!(!section.contains("SELLER MEMORY"), "default framing not used");
         let _ = std::fs::remove_dir_all(&root);
     }
 

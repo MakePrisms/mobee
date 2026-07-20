@@ -32,6 +32,7 @@ pub mod runtime_guard;
 pub mod seller;
 #[cfg(feature = "wallet")]
 pub mod seller_daemon;
+pub mod seller_memory;
 #[cfg(feature = "git-delivery")]
 pub mod seller_git;
 #[cfg(feature = "wallet")]
