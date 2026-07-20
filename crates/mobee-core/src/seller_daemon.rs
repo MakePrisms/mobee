@@ -2130,6 +2130,78 @@ pub fn run_forever_blocking(daemon: SellerDaemon) -> Result<(), DaemonError> {
     runtime.block_on(run_forever(daemon))
 }
 
+/// Env override for the boot push-preflight (see [`boot_preflight_enabled`]).
+const BOOT_PUSH_PREFLIGHT_ENV: &str = "MOBEE_SELLER_BOOT_PUSH_PREFLIGHT";
+
+/// Boot push-preflight gate: probe iff the `[seller_preflight]` knob is on AND the env override does
+/// not disable it. An env value of `0/false/no/off` disables (the tests-off switch); the env can
+/// never force the probe on when the config knob is off. Pure over (config, env) → unit-testable.
+fn boot_preflight_enabled(config: &crate::home::MobeeConfig, env_override: Option<&str>) -> bool {
+    if let Some(value) = env_override {
+        let v = value.trim().to_ascii_lowercase();
+        if matches!(v.as_str(), "0" | "false" | "no" | "off") {
+            return false;
+        }
+    }
+    config.seller_preflight.boot_push_preflight
+}
+
+/// Format the boot-preflight outcome into ONE log line. NEVER returns an error — a failed probe is
+/// advisory: the daemon names the git-version cause + fix and keeps running (reads/claims still work;
+/// per-job deliveries fail-close per job as today). Pure over the probe result, so the probe seam is
+/// mockable in tests without git or a relay.
+fn boot_preflight_outcome(result: Result<(), crate::seller_git::SellerGitError>) -> String {
+    match result {
+        Ok(()) => "seller boot push preflight OK (write-auth path reachable)".to_owned(),
+        Err(error) => format!(
+            "seller WARN: boot push preflight FAILED ({error}). Most likely cause: git < 2.54 \
+             silently drops the Authorization credential on the git-receive-pack POST (reads work, \
+             pushes 401) — run `git version` and upgrade to 2.54+ (or run `mobee doctor`). \
+             Continuing to run: reads and claims still work; deliveries will fail-close per job \
+             until this is fixed."
+        ),
+    }
+}
+
+/// Run the boot push-preflight through a mockable probe seam. Returns the log line to emit, or
+/// `None` when the preflight is disabled. Never blocks boot and never errors.
+fn run_boot_push_preflight<P>(enabled: bool, probe: P) -> Option<String>
+where
+    P: FnOnce() -> Result<(), crate::seller_git::SellerGitError>,
+{
+    if !enabled {
+        return None;
+    }
+    Some(boot_preflight_outcome(probe()))
+}
+
+/// Wire the real probe seam from a live daemon and emit the outcome to stderr. Only probes when a
+/// relay-git canonical delivery repo is configured — public/BYO https deliveries push to the
+/// seller's own remote, outside the relay NIP-98 write-auth surface this guards. Best-effort: a
+/// missing seller key or config just skips the probe. Never blocks boot.
+fn run_boot_push_preflight_for_daemon(daemon: &SellerDaemon) {
+    let enabled = boot_preflight_enabled(
+        &daemon.home.config,
+        std::env::var(BOOT_PUSH_PREFLIGHT_ENV).ok().as_deref(),
+    );
+    let Some(seller) = daemon.home.config.seller.clone() else {
+        return;
+    };
+    if !crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
+        return;
+    }
+    let home_root = daemon.home.root.clone();
+    let auth = crate::home::read_secret_key_hex(&daemon.home)
+        .ok()
+        .map(|secret_key_hex| crate::seller_git::PushAuth { secret_key_hex });
+    let outcome = run_boot_push_preflight(enabled, || {
+        crate::seller_git::preflight_push_probe(&home_root, &seller.git_remote, auth.as_ref())
+    });
+    if let Some(line) = outcome {
+        eprintln!("{line}");
+    }
+}
+
 /// Outcome of [`wait_for_nip42_auth`].
 enum AuthWait {
     /// The relay issued a NIP-42 challenge and `automatic_authentication` completed it.
@@ -2505,6 +2577,10 @@ pub(crate) async fn run_forever_hooked(
         let _ = ready.send(());
     }
 
+    // Boot push preflight: surface WRITE-auth/git-version breakage now, not at job-delivery time.
+    // Advisory only — logs-and-continues; never refuses boot (see run_boot_push_preflight).
+    run_boot_push_preflight_for_daemon(&daemon);
+
     // Both 5109 filters ride ONE subscription, so the relay delivers each offer once even when
     // a targeted offer matches both filters. Keep an event-id dedup as defense-in-depth (e.g.
     // reconnect re-delivery) so each offer id reaches `on_offer_event` at most once. Bounded to
@@ -2733,6 +2809,63 @@ mod tests {
         };
         assert!(err.to_string().contains("seller") || err.to_string().contains("agent_command"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn boot_preflight_enabled_defaults_on_and_env_disables() {
+        let mut config = crate::home::MobeeConfig::default();
+        assert!(boot_preflight_enabled(&config, None), "default must be on");
+        for off in ["0", "false", "no", "OFF", " false "] {
+            assert!(
+                !boot_preflight_enabled(&config, Some(off)),
+                "env {off:?} must disable"
+            );
+        }
+        assert!(
+            boot_preflight_enabled(&config, Some("1")),
+            "a non-disabling env value keeps it on"
+        );
+        config.seller_preflight.boot_push_preflight = false;
+        assert!(
+            !boot_preflight_enabled(&config, None),
+            "config-off wins with no env"
+        );
+        assert!(
+            !boot_preflight_enabled(&config, Some("1")),
+            "env cannot force a config-off preflight on"
+        );
+    }
+
+    #[test]
+    fn boot_preflight_failure_logs_and_continues() {
+        // Mock the probe seam: a FAILING probe must still yield a (Some) advisory line naming the
+        // git-version cause + fix — never an error, never a panic. The daemon logs it and keeps
+        // running (this fn returning Some, not the probe's Err, IS the logs-and-continues contract).
+        let line = run_boot_push_preflight(true, || {
+            Err(crate::seller_git::SellerGitError::AuthFailed("mock 401".into()))
+        })
+        .expect("enabled preflight must yield a log line");
+        assert!(line.contains("FAILED"), "{line}");
+        assert!(line.contains("2.54"), "{line}");
+        assert!(line.to_lowercase().contains("continuing"), "{line}");
+    }
+
+    #[test]
+    fn boot_preflight_success_reports_ok() {
+        let line =
+            run_boot_push_preflight(true, || Ok(())).expect("enabled preflight yields a line");
+        assert!(line.contains("OK"), "{line}");
+    }
+
+    #[test]
+    fn boot_preflight_disabled_skips_probe_seam() {
+        let mut probe_ran = false;
+        let out = run_boot_push_preflight(false, || {
+            probe_ran = true;
+            Ok(())
+        });
+        assert!(out.is_none(), "disabled preflight must produce no line");
+        assert!(!probe_ran, "disabled preflight must not invoke the probe seam");
     }
 
     #[test]
