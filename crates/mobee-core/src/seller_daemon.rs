@@ -1097,6 +1097,87 @@ impl SellerDaemon {
         }
     }
 
+    /// Piece-13 retro: resolve the plan for a delivered-PAID job, or `None` to skip. `None` when
+    /// retro is disabled, the memory dir can't be prepared, or no `delivered_paid` episode exists
+    /// for `job_id` (retro fires on delivered-paid ONLY — refusals/errors never reach here).
+    /// Driver-free so it is testable without the `acp` feature.
+    fn retro_context(&self, job_id: &str) -> Option<RetroPlan> {
+        let cfg = &self.home.config.seller_memory;
+        if !cfg.retro_enabled {
+            return None;
+        }
+        let memory_dir = crate::seller_memory::memory_dir(&self.home.root);
+        if let Err(error) = crate::seller_memory::ensure_memory_dir(&memory_dir) {
+            eprintln!("seller retro: ensure memory dir failed (skip): {error}");
+            return None;
+        }
+        let episode = match EpisodeLog::open(&self.home.root).last_delivered_paid(job_id) {
+            Ok(Some(episode)) => episode,
+            Ok(None) => return None,
+            Err(error) => {
+                eprintln!("seller retro: episode read failed (skip): {error}");
+                return None;
+            }
+        };
+        // Seed the retro with the episode + the ABSOLUTE transcript path (§ Retro: fresh turn
+        // seeded with episode + transcript_ref; the transcript is a pointer, never copied).
+        let episode_json = serde_json::to_string_pretty(&episode).unwrap_or_default();
+        let transcript_abs = episode
+            .transcript_ref
+            .as_ref()
+            .map(|rel| self.home.root.join(rel).display().to_string())
+            .unwrap_or_else(|| "(no transcript recorded for this job)".to_owned());
+        let prompt = crate::seller_memory::retro_prompt(
+            &memory_dir,
+            &episode_json,
+            &transcript_abs,
+            cfg.retro_prompt_path.as_deref(),
+        );
+        let seller_cfg = require_seller_config(&self.home).ok()?;
+        let log_path = job_workdir(&self.home, job_id).join("seller-retro.jsonl");
+        Some(RetroPlan {
+            memory_dir,
+            prompt,
+            log_path,
+            agent_command: seller_cfg.agent_command.clone(),
+        })
+    }
+
+    /// Piece-13 retro trigger: after a delivered-PAID receipt, run ONE best-effort agent turn to
+    /// update memory. Never blocks or affects the trade — any failure is logged and swallowed. A
+    /// no-op without the `acp` feature (no agent to run), exactly like [`run_agent_job`].
+    #[cfg(feature = "acp")]
+    async fn maybe_run_retro(&mut self, job_id: &str) {
+        let Some(plan) = self.retro_context(job_id) else {
+            return;
+        };
+        if plan.agent_command.is_empty() {
+            return;
+        }
+        if let Some(parent) = plan.log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let timeout = Duration::from_secs(crate::seller::DEFAULT_JOB_TIMEOUT_SECS);
+        let mut driver = crate::driver::AcpDriver::new(
+            crate::driver::AgentCommand::new(
+                plan.agent_command[0].clone(),
+                plan.agent_command[1..].to_vec(),
+            ),
+            crate::driver::PermissionOutcome::Allow,
+            timeout,
+        );
+        if let Err(error) =
+            run_retro_turn(&mut driver, &plan.memory_dir, &plan.prompt, &plan.log_path).await
+        {
+            eprintln!(
+                "seller retro: best-effort turn failed (money path unaffected) job_id={job_id}: {error}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "acp"))]
+    async fn maybe_run_retro(&mut self, _job_id: &str) {}
+
     /// Best-effort episode append — diagnostic, NEVER fails a trade. Logs on error, swallows it.
     /// Episodes carry ids/amounts/mint/task-text/self-reported-usage only; no token/key material.
     fn write_episode(&self, episode: &Episode) {
@@ -1631,6 +1712,67 @@ fn short_hash(input: &str) -> String {
     hex::encode(&digest[..8])
 }
 
+/// Piece-13: everything a retro turn needs, resolved WITHOUT a driver so it is testable and works
+/// under `--no-default-features` (no `acp`). `None` from [`SellerDaemon::retro_context`] means "do
+/// not run a retro" (disabled, or no paid episode to distill).
+#[derive(Debug, Clone)]
+struct RetroPlan {
+    memory_dir: PathBuf,
+    prompt: String,
+    log_path: PathBuf,
+    agent_command: Vec<String>,
+}
+
+/// Piece-13 retro write-back: run ONE best-effort agent turn whose session cwd is the memory dir
+/// (so the agent can read/write `MEMORY.md` and topic files by relative path), seeded with the
+/// retro prompt. Merge-not-clobber is enforced at RUNTIME here, not by prompt prose: operator-owned
+/// files are snapshotted before the turn and byte-restored after — regardless of what the agent
+/// did. Generic over [`Driver`] so it is exercised with the mock driver in tests and an
+/// `AcpDriver` in production.
+///
+/// The money path NEVER waits on this: the caller invokes it only after the receipt is journaled,
+/// and swallows any error it returns.
+async fn run_retro_turn<D: crate::driver::Driver>(
+    driver: &mut D,
+    memory_dir: &Path,
+    prompt: &str,
+    log_path: &Path,
+) -> Result<(), DaemonError> {
+    use crate::driver::{ContentBlock, PromptTurn, SessionConfig};
+    use crate::engine::{run_job, RunParams};
+    use crate::event::{JobExecutionStatus, JobId};
+    use crate::log::EventLog;
+
+    // Merge-not-clobber (runtime): capture operator files BEFORE the turn.
+    let snapshot = crate::seller_memory::snapshot_operator_files(memory_dir)
+        .map_err(|error| DaemonError::Agent(format!("retro snapshot: {error}")))?;
+    let mut log =
+        EventLog::open(log_path).map_err(|error| DaemonError::Agent(error.to_string()))?;
+    let params = RunParams {
+        session_config: SessionConfig {
+            // cwd = memory dir ⇒ the retro turn's writes land in `memory/` by relative path.
+            cwd: memory_dir.to_path_buf(),
+            mcp_servers: Vec::new(),
+            env: Vec::new(),
+        },
+        prompt: PromptTurn {
+            input: vec![ContentBlock::Text {
+                text: prompt.to_owned(),
+            }],
+        },
+    };
+    let outcome = run_job(driver, &mut log, &JobId("seller-retro".to_owned()), params, &mut |_| {})
+        .await;
+    // Restore operator files whatever the turn did (success, failure, or clobber attempt).
+    let restore = crate::seller_memory::restore_snapshot(&snapshot);
+    let outcome = outcome.map_err(|error| DaemonError::Agent(error.to_string()))?;
+    restore.map_err(|error| DaemonError::Agent(format!("retro restore: {error}")))?;
+    match outcome.terminal {
+        JobExecutionStatus::Completed => Ok(()),
+        other => Err(DaemonError::Agent(format!("retro terminal {other:?}"))),
+    }
+}
+
 /// Handle one gift-wrap: unwrap (one site), then apply or buffer.
 pub async fn ingest_gift_wrap(
     daemon: &mut SellerDaemon,
@@ -2066,6 +2208,8 @@ pub(crate) async fn run_forever_hooked(
                                 "seller receipt job_id={} result_id={} amount_received={}",
                                 receipt.job_id, receipt.result_id, receipt.amount_received
                             );
+                            // Piece-13: delivered-PAID ⇒ best-effort retro (never blocks the trade).
+                            daemon.maybe_run_retro(&receipt.job_id).await;
                         }
                         Ok(None) => {}
                         // Idempotent re-see (info, not error): the sats already landed.
@@ -2101,10 +2245,14 @@ pub(crate) async fn run_forever_hooked(
                                     // be claimed while this job awaits payment (#15).
                                     daemon.mark_delivered();
                                     match reconcile_after_result(&mut daemon).await {
-                                        Ok(Some(receipt)) => eprintln!(
-                                            "seller receipt (reconcile) job_id={} amount_received={}",
-                                            receipt.job_id, receipt.amount_received
-                                        ),
+                                        Ok(Some(receipt)) => {
+                                            eprintln!(
+                                                "seller receipt (reconcile) job_id={} amount_received={}",
+                                                receipt.job_id, receipt.amount_received
+                                            );
+                                            // Piece-13: delivered-PAID ⇒ best-effort retro.
+                                            daemon.maybe_run_retro(&receipt.job_id).await;
+                                        }
                                         Ok(None) => {}
                                         // Idempotent re-see (info, not error): sats already landed.
                                         Err(error) if is_idempotent_already_redeemed(&error) => eprintln!(
@@ -3327,6 +3475,234 @@ Anything not committed to git will not be delivered.";
         daemon.record_refused_episode(&event, &OfferSkip::AlreadyProcessed);
         let log = crate::episode::EpisodeLog::open(&daemon.home().root);
         assert!(log.entries().expect("entries").is_empty(), "no episode for non-job skips");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Piece-13 retro write-back ───────────────────────────────────────────────────────────
+
+    /// A test Driver that simulates a misbehaving retro agent: on the prompt turn it CLOBBERS a
+    /// target (operator) file, then completes. Proves merge-not-clobber is enforced at runtime
+    /// (not by prompt prose): `run_retro_turn` must byte-revert the file afterward.
+    struct ClobberingDriver {
+        target: PathBuf,
+        clobber_with: Vec<u8>,
+    }
+
+    impl crate::driver::Driver for ClobberingDriver {
+        fn id(&self) -> crate::event::RuntimeId {
+            crate::event::RuntimeId("clobber".into())
+        }
+        async fn ready(&mut self) -> Result<crate::driver::Readiness, crate::driver::DriverError> {
+            Ok(crate::driver::Readiness {
+                runtime_id: self.id(),
+                protocol_version: crate::driver::acp::PROTOCOL_VERSION,
+            })
+        }
+        async fn start_session(
+            &mut self,
+            _cfg: crate::driver::SessionConfig,
+        ) -> Result<crate::driver::SessionId, crate::driver::DriverError> {
+            Ok("clobber-session".into())
+        }
+        async fn prompt(
+            &mut self,
+            _session_id: &crate::driver::SessionId,
+            _turn: crate::driver::PromptTurn,
+        ) -> Result<crate::driver::UpdateStream, crate::driver::DriverError> {
+            std::fs::write(&self.target, &self.clobber_with).expect("clobber write");
+            Ok(crate::driver::UpdateStream::new(
+                vec![crate::driver::SessionUpdate::TurnEnded(
+                    crate::driver::StopReason::Completed,
+                )],
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ))
+        }
+        async fn on_permission(
+            &mut self,
+            _req: crate::driver::PermissionRequest,
+        ) -> crate::driver::PermissionOutcome {
+            crate::driver::PermissionOutcome::Allow
+        }
+        async fn artifacts(
+            &self,
+            _session_id: &crate::driver::SessionId,
+        ) -> Result<Vec<crate::driver::Artifact>, crate::driver::DriverError> {
+            Ok(Vec::new())
+        }
+        async fn cancel(
+            &mut self,
+            _session_id: &crate::driver::SessionId,
+        ) -> Result<(), crate::driver::DriverError> {
+            Ok(())
+        }
+        async fn shutdown(&mut self) -> Result<(), crate::driver::DriverError> {
+            Ok(())
+        }
+    }
+
+    fn write_paid_episode(daemon: &SellerDaemon, job_id: &str) {
+        let mut episode = Episode::new(
+            EpisodeKind::Claimed,
+            EpisodeOutcome::DeliveredPaid,
+            7,
+            daemon.seller_pubkey(),
+            job_id,
+        );
+        episode.result_id = Some(format!("res-{job_id}"));
+        episode.transcript_ref = Some(format!("seller-jobs/{job_id}/seller-run.jsonl"));
+        crate::episode::EpisodeLog::open(&daemon.home().root)
+            .append(&episode)
+            .expect("append paid episode");
+    }
+
+    /// Acceptance (piece C): a completed job triggers exactly ONE extra agent turn (carrying the
+    /// retro prompt) and `MEMORY.md` exists afterward. The turn's session cwd is the memory dir
+    /// (set by `run_retro_turn`; the merge-not-clobber test below depends on that cwd's writes).
+    #[tokio::test]
+    async fn retro_turn_issues_exactly_one_turn_and_memory_index_exists() {
+        use crate::driver::{MockDriver, ScriptedSession, SessionUpdate, StopReason};
+        use crate::event::RuntimeId;
+        let root = temp("retro-one");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let dir = crate::seller_memory::memory_dir(&root);
+        crate::seller_memory::ensure_memory_dir(&dir).expect("ensure");
+
+        let script = ScriptedSession {
+            session_id: "retro-1".into(),
+            updates: vec![SessionUpdate::TurnEnded(StopReason::Completed)],
+            artifacts: Vec::new(),
+        };
+        let mut driver = MockDriver::new(RuntimeId("mock".into()), vec![script]);
+        let log_path = root.join("seller-retro.jsonl");
+        run_retro_turn(&mut driver, &dir, "distill this job", &log_path)
+            .await
+            .expect("retro turn ok");
+
+        assert_eq!(driver.prompt_history().len(), 1, "exactly one extra agent turn");
+        let (_sid, turn) = &driver.prompt_history()[0];
+        assert!(
+            matches!(&turn.input[0], crate::driver::ContentBlock::Text { text } if text == "distill this job"),
+            "the extra turn carried the retro prompt"
+        );
+        assert!(dir.join("MEMORY.md").is_file(), "MEMORY.md exists after retro");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Acceptance (piece C): with retro_enabled=false no retro is planned (no extra turn issued).
+    #[test]
+    fn retro_disabled_plans_nothing() {
+        let (root, mut daemon) = test_daemon("retro-off");
+        write_paid_episode(&daemon, "jd");
+        daemon.home.config.seller_memory.retro_enabled = false;
+        assert!(
+            daemon.retro_context("jd").is_none(),
+            "retro_enabled=false ⇒ no plan ⇒ no extra turn"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Acceptance (piece C): the retro plan is seeded with the episode (JSON) + the ABSOLUTE
+    /// transcript path, uses the default framing (which instructs `author: agent` + never touch
+    /// operator files), and honors the retro_prompt_path seam. No paid episode ⇒ no plan.
+    #[test]
+    fn retro_context_seeds_episode_and_honors_prompt_seam() {
+        let (root, mut daemon) = test_daemon("retro-ctx");
+        assert!(daemon.retro_context("absent").is_none(), "no paid episode ⇒ no plan");
+
+        write_paid_episode(&daemon, "jp");
+        let plan = daemon.retro_context("jp").expect("plan for paid job");
+        assert!(plan.prompt.contains("\"job_id\": \"jp\""), "episode json seeded: {}", plan.prompt);
+        assert!(plan.prompt.contains("DURABLE MEMORY"), "default retro framing");
+        assert!(
+            plan.prompt.contains("author: agent"),
+            "prompt instructs the agent to stamp author: agent"
+        );
+        let transcript_abs = daemon
+            .home()
+            .root
+            .join("seller-jobs/jp/seller-run.jsonl")
+            .display()
+            .to_string();
+        assert!(plan.prompt.contains(&transcript_abs), "absolute transcript path seeded");
+
+        // Seam override wins.
+        let template = daemon.home().root.join("retro.tmpl");
+        std::fs::write(&template, "SEAM DISTILLER for {episode_json}").expect("write template");
+        daemon.home.config.seller_memory.retro_prompt_path = Some(template);
+        let plan2 = daemon.retro_context("jp").expect("plan2");
+        assert!(plan2.prompt.starts_with("SEAM DISTILLER for"), "uses operator retro template");
+        assert!(!plan2.prompt.contains("DURABLE MEMORY"), "default framing not used");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Acceptance (piece C): a retro forced to fail surfaces an error the caller swallows, and the
+    /// MONEY path is green — the journal (a real claim+receipt) is byte-unchanged and still parses.
+    #[tokio::test]
+    async fn retro_failure_leaves_money_path_green() {
+        use crate::driver::MockDriver;
+        use crate::event::RuntimeId;
+        let (root, daemon) = test_daemon("retro-fail");
+        // Money state: a real journaled claim + receipt.
+        daemon.journal.append_claim("jf", "cf", "bf", 2_000_000_000).expect("claim");
+        daemon
+            .journal
+            .append_receipt("jf", "rf", "jf", "rf", 7, 7, DEFAULT_MINT_URL, "bf", true)
+            .expect("receipt");
+        let journal_before = std::fs::read(daemon.journal.path()).expect("read journal");
+
+        let dir = crate::seller_memory::memory_dir(&daemon.home().root);
+        crate::seller_memory::ensure_memory_dir(&dir).expect("ensure");
+        // Empty scripts ⇒ start_session ScriptExhausted ⇒ the retro turn FAILS.
+        let mut driver = MockDriver::new(RuntimeId("mock".into()), Vec::new());
+        let log_path = root.join("seller-retro.jsonl");
+        let result = run_retro_turn(&mut driver, &dir, "distill", &log_path).await;
+        assert!(result.is_err(), "forced retro failure surfaces Err (the caller swallows it)");
+
+        assert_eq!(
+            std::fs::read(daemon.journal.path()).expect("read"),
+            journal_before,
+            "money path GREEN: journal byte-unchanged across a failed retro"
+        );
+        daemon.journal.entries().expect("journal still parses green");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Acceptance (piece C): merge-not-clobber across a retro RUN. An agent that clobbers an
+    /// `author: operator` file mid-turn is byte-reverted by `run_retro_turn`. Reverting the
+    /// restore leaves the file HIJACKED — the piece-C red-on-revert target.
+    #[tokio::test]
+    async fn retro_run_reverts_operator_clobber() {
+        let root = temp("retro-merge");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let dir = crate::seller_memory::memory_dir(&root);
+        crate::seller_memory::ensure_memory_dir(&dir).expect("ensure");
+        let notes = dir.join(crate::seller_memory::OPERATOR_NOTES_FILE);
+        let notes_before = std::fs::read(&notes).expect("read notes");
+        // A pre-existing operator topic file too.
+        let house = dir.join("house-rules.md");
+        std::fs::write(&house, "---\nauthor: operator\n---\nORIGINAL").expect("write house");
+
+        let mut driver = ClobberingDriver {
+            target: notes.clone(),
+            clobber_with: b"HIJACKED BY AGENT".to_vec(),
+        };
+        let log_path = root.join("seller-retro.jsonl");
+        run_retro_turn(&mut driver, &dir, "distill", &log_path)
+            .await
+            .expect("retro ok");
+
+        assert_eq!(
+            std::fs::read(&notes).expect("read"),
+            notes_before,
+            "operator-notes.md byte-unchanged across the retro (merge-not-clobber)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&house).expect("read"),
+            "---\nauthor: operator\n---\nORIGINAL",
+            "operator topic file byte-unchanged across the retro"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
