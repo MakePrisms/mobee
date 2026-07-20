@@ -76,9 +76,9 @@ pub fn seed_from_secret_hex(secret_hex: &str) -> Result<[u8; 64], FundError> {
 }
 
 fn require_testnut_mint(home: &MobeeHome) -> Result<(), FundError> {
-    if home.config.mint_url != DEFAULT_MINT_URL {
+    if home.config.default_mint() != DEFAULT_MINT_URL {
         return Err(FundError::MintPinned {
-            configured: home.config.mint_url.clone(),
+            configured: home.config.default_mint().to_owned(),
         });
     }
     Ok(())
@@ -255,7 +255,7 @@ mod tests {
         let root = temp_home("pin");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap(&root).expect("bootstrap");
-        home.config.mint_url = "https://evil.example".into();
+        home.config.accepted_mints = vec!["https://evil.example".into()];
         let err = fund_testnut_wallet_blocking(&home, 1).expect_err("pin");
         assert!(matches!(err, FundError::MintPinned { .. }));
         assert!(err.to_string().contains(DEFAULT_MINT_URL));
@@ -295,7 +295,7 @@ mod tests {
         let root = temp_home("live");
         let _ = std::fs::remove_dir_all(&root);
         let home = bootstrap(&root).expect("bootstrap");
-        assert_eq!(home.config.mint_url, DEFAULT_MINT_URL);
+        assert_eq!(home.config.default_mint(), DEFAULT_MINT_URL);
         let outcome = fund_testnut_wallet_blocking(&home, DEFAULT_FUND_AMOUNT_SATS)
             .expect("live testnut fund");
         assert!(!outcome.already_funded);
@@ -312,6 +312,6 @@ mod tests {
 
     #[test]
     fn default_config_is_testnut() {
-        assert_eq!(MobeeConfig::default().mint_url, DEFAULT_MINT_URL);
+        assert_eq!(MobeeConfig::default().default_mint(), DEFAULT_MINT_URL);
     }
 }

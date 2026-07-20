@@ -89,8 +89,8 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
         home.config.relay_url = DEFAULT_RELAY_URL.to_owned();
         defaults_touched = true;
     }
-    if home.config.mint_url.trim().is_empty() {
-        home.config.mint_url = DEFAULT_MINT_URL.to_owned();
+    if home.config.accepted_mints.is_empty() {
+        home.config.accepted_mints = vec![DEFAULT_MINT_URL.to_owned()];
         defaults_touched = true;
     }
     if defaults_touched {
@@ -106,7 +106,7 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
         "mobee sell home={} key_present={} mint={} relay={}",
         home.root.display(),
         home::key_file_present(&home),
-        home.config.mint_url,
+        home.config.default_mint(),
         home.config.relay_url
     );
 

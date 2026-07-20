@@ -317,11 +317,20 @@ pub struct AgentPresetConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobeeConfig {
     pub relay_url: String,
-    pub mint_url: String,
+    /// Seller-side accept policy: the mints this seller will accept payment at. The first
+    /// entry is the mint the seller advertises first and also the buyer-side wallet default
+    /// mint (read via [`MobeeConfig::default_mint`]). Defaults to `[DEFAULT_MINT_URL]`.
+    ///
+    /// NOTE: distinct from `extra_mints`. `accepted_mints` is the SELLER accept-policy list;
+    /// `extra_mints` is the BUYER wallet's *additional allowed* mints. They are separate
+    /// fields with separate meanings and are never merged or repurposed for one another.
+    #[serde(default = "default_accepted_mints")]
+    pub accepted_mints: Vec<String>,
     pub per_job_budget_sats: u64,
     pub total_budget_sats: u64,
-    /// Opt-in additional mints (`mobee wallet mints add`). Default mint stays
-    /// [`DEFAULT_MINT_URL`] / `mint_url`; never invents spendable credit by itself.
+    /// Opt-in additional mints for the BUYER wallet (`mobee wallet mints add`). The buyer's
+    /// default mint stays the first `accepted_mints` entry ([`MobeeConfig::default_mint`]);
+    /// never invents spendable credit by itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_mints: Vec<String>,
     /// Optional `[profile] name / about`. Skipped when absent so fresh homes stay unnamed.
@@ -363,11 +372,30 @@ pub struct ContributionPolicyConfig {
     pub max_diff_bytes: Option<u64>,
 }
 
+/// Serde/default seed for [`MobeeConfig::accepted_mints`]: exactly the current testnut
+/// default, so an operator who configures nothing behaves identically to today.
+fn default_accepted_mints() -> Vec<String> {
+    vec![DEFAULT_MINT_URL.to_owned()]
+}
+
+impl MobeeConfig {
+    /// Buyer-side default mint: the first accepted mint. Falls back to [`DEFAULT_MINT_URL`]
+    /// only if the list is empty (boot validation refuses an empty list for sellers). Buyer
+    /// wallet ops read a single default mint through this accessor; the seller accept policy
+    /// is the full `accepted_mints` list.
+    pub fn default_mint(&self) -> &str {
+        self.accepted_mints
+            .first()
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_MINT_URL)
+    }
+}
+
 impl Default for MobeeConfig {
     fn default() -> Self {
         Self {
             relay_url: DEFAULT_RELAY_URL.to_owned(),
-            mint_url: DEFAULT_MINT_URL.to_owned(),
+            accepted_mints: default_accepted_mints(),
             per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,
             total_budget_sats: DEFAULT_TOTAL_BUDGET_SATS,
             extra_mints: Vec::new(),
@@ -449,15 +477,38 @@ pub fn bootstrap(root: impl AsRef<Path>) -> Result<MobeeHome, HomeError> {
     })
 }
 
-/// Rewrite dead `.cashu.space` testnut hosts to [`DEFAULT_MINT_URL`]. Returns true when changed.
+/// Rewrite dead `.cashu.space` testnut hosts to [`DEFAULT_MINT_URL`] across every
+/// `accepted_mints` entry. Returns true when any entry changed.
 pub fn migrate_dead_mint_url(config: &mut MobeeConfig) -> bool {
-    let lower = config.mint_url.to_ascii_lowercase();
-    if lower.contains(DEAD_TESTNUT_MINT_HOST) {
-        config.mint_url = DEFAULT_MINT_URL.to_owned();
-        true
-    } else {
-        false
+    let mut changed = false;
+    for mint in &mut config.accepted_mints {
+        if mint.to_ascii_lowercase().contains(DEAD_TESTNUT_MINT_HOST) {
+            *mint = DEFAULT_MINT_URL.to_owned();
+            changed = true;
+        }
     }
+    changed
+}
+
+/// Back-compat shim: a legacy config carrying only the single top-level `mint_url = "…"`
+/// (pre-`accepted_mints`) folds into `accepted_mints = ["<that value>"]` when the file does
+/// not already carry an `accepted_mints` key. Never silently drops a configured mint. A no-op
+/// once `accepted_mints` is present. Operates on the raw TOML because the removed `mint_url`
+/// field is otherwise ignored on deserialize.
+fn migrate_legacy_mint_url(raw: &str, config: &mut MobeeConfig) -> Result<(), HomeError> {
+    let doc: toml::Value =
+        toml::from_str(raw).map_err(|error| HomeError::Config(error.to_string()))?;
+    let table = match doc.as_table() {
+        Some(table) => table,
+        None => return Ok(()),
+    };
+    if table.contains_key("accepted_mints") {
+        return Ok(());
+    }
+    if let Some(legacy) = table.get("mint_url").and_then(|value| value.as_str()) {
+        config.accepted_mints = vec![legacy.to_owned()];
+    }
+    Ok(())
 }
 
 /// Hex-encode the secp256k1 x-only/public view is deferred; this returns the *public* key
@@ -491,7 +542,10 @@ pub fn public_key_hex(home: &MobeeHome) -> Result<String, HomeError> {
 
 fn load_config(path: &Path) -> Result<MobeeConfig, HomeError> {
     let raw = fs::read_to_string(path).map_err(|error| HomeError::Config(error.to_string()))?;
-    toml::from_str(&raw).map_err(|error| HomeError::Config(error.to_string()))
+    let mut config: MobeeConfig =
+        toml::from_str(&raw).map_err(|error| HomeError::Config(error.to_string()))?;
+    migrate_legacy_mint_url(&raw, &mut config)?;
+    Ok(config)
 }
 
 fn write_config(path: &Path, config: &MobeeConfig) -> Result<(), HomeError> {
@@ -725,14 +779,48 @@ mod tests {
         fs::create_dir_all(&root).expect("mkdir");
         let config_path = root.join(CONFIG_FILE);
         let stale = MobeeConfig {
-            mint_url: format!("https://{DEAD_TESTNUT_MINT_HOST}"),
+            accepted_mints: vec![format!("https://{DEAD_TESTNUT_MINT_HOST}")],
             ..MobeeConfig::default()
         };
         write_config(&config_path, &stale).expect("write stale");
         let home = bootstrap(&root).expect("bootstrap migrates");
-        assert_eq!(home.config.mint_url, DEFAULT_MINT_URL);
+        assert_eq!(home.config.accepted_mints, vec![DEFAULT_MINT_URL.to_owned()]);
         let reloaded = load_config(&config_path).expect("reload");
-        assert_eq!(reloaded.mint_url, DEFAULT_MINT_URL);
+        assert_eq!(reloaded.accepted_mints, vec![DEFAULT_MINT_URL.to_owned()]);
+    }
+
+    #[test]
+    fn accepted_mints_default() {
+        // A config that names no mint at all yields accepted_mints == [DEFAULT_MINT_URL].
+        let config: MobeeConfig = toml::from_str(
+            "relay_url = 'r'\nper_job_budget_sats = 1\ntotal_budget_sats = 2\n",
+        )
+        .expect("parse mint-less config");
+        assert_eq!(config.accepted_mints, vec![DEFAULT_MINT_URL.to_owned()]);
+        assert_eq!(
+            MobeeConfig::default().accepted_mints,
+            vec![DEFAULT_MINT_URL.to_owned()]
+        );
+    }
+
+    #[test]
+    fn legacy_mint_url_migrates() {
+        // A legacy config carrying only the single `mint_url` loads as accepted_mints=[value].
+        let root = temp_home("legacy-mint");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        let config_path = root.join(CONFIG_FILE);
+        fs::write(
+            &config_path,
+            "relay_url = 'r'\nmint_url = 'https://legacy.example'\n\
+             per_job_budget_sats = 1\ntotal_budget_sats = 2\n",
+        )
+        .expect("write legacy");
+        let config = load_config(&config_path).expect("load legacy");
+        assert_eq!(
+            config.accepted_mints,
+            vec!["https://legacy.example".to_owned()]
+        );
     }
 
     #[test]

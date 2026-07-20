@@ -176,9 +176,9 @@ pub async fn authorize_pay_async(
     gate: &mut BudgetGate,
     request: AuthorizePayRequest,
 ) -> Result<AuthorizePayOutcome, AuthorizePayError> {
-    if home.config.mint_url != DEFAULT_MINT_URL {
+    if home.config.default_mint() != DEFAULT_MINT_URL {
         return Err(FundError::MintPinned {
-            configured: home.config.mint_url.clone(),
+            configured: home.config.default_mint().to_owned(),
         }
         .into());
     }

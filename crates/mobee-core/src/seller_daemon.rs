@@ -252,8 +252,6 @@ pub enum OfferSkip {
     NotAnOffer { kind: u16 },
     /// Offer tags did not parse.
     Unparseable,
-    /// Offer mint is not the fail-closed testnut mint.
-    NonTestnutMint { mint_url: String },
     /// Offer's own deadline (`param deadline`, absolute unix) has already passed at `now`.
     /// Money-safety: a lapsed offer is REFUSED so a backfilled (stored) offer can never be
     /// resurrected with a fresh `now + timeout` deadline (the pre-backfill hazard in
@@ -284,7 +282,6 @@ impl OfferSkip {
         match self {
             Self::NotAnOffer { .. } => "NotAnOffer",
             Self::Unparseable => "Unparseable",
-            Self::NonTestnutMint { .. } => "NonTestnutMint",
             Self::DeadlineExpired { .. } => "DeadlineExpired",
             Self::RateGate { .. } => "RateGate",
             Self::AlreadyProcessed => "AlreadyProcessed",
@@ -300,7 +297,6 @@ impl OfferSkip {
         match self {
             Self::NotAnOffer { kind } => format!("not a kind-{JOB_OFFER_KIND} offer (kind {kind})"),
             Self::Unparseable => "offer tags did not parse".to_string(),
-            Self::NonTestnutMint { mint_url } => format!("non-testnut mint {mint_url}"),
             Self::DeadlineExpired { deadline_unix, now } => format!(
                 "offer deadline {deadline_unix} already passed at now={now} (expired; refused — a lapsed offer is never claimed or resurrected)"
             ),
@@ -353,14 +349,29 @@ pub struct SellerDaemon {
     awaiting_payment: Vec<ActiveJob>,
 }
 
+/// Fail-closed real-mint fence: an `accepted_mints` entry is admissible only if it is an
+/// allow-listed testnut/dev mint. Real-mint enablement is a separate, separately-gated change
+/// (PIECE-14 § Out of scope); this allow-list is the seam. Today the fleet's only testnut/dev
+/// mint is [`DEFAULT_MINT_URL`], so that is the whole allow-list.
+fn is_allowed_seller_mint(mint_url: &str) -> bool {
+    mint_url == DEFAULT_MINT_URL
+}
+
 impl SellerDaemon {
     pub fn open(home: MobeeHome) -> Result<Self, DaemonError> {
         require_seller_config(&home)?;
-        if home.config.mint_url != DEFAULT_MINT_URL {
-            return Err(DaemonError::Config(format!(
-                "seller mint fail-closed: configured mint_url must be {DEFAULT_MINT_URL}, got {}",
-                home.config.mint_url
-            )));
+        if home.config.accepted_mints.is_empty() {
+            return Err(DaemonError::Config(
+                "seller accepted_mints must be non-empty".to_owned(),
+            ));
+        }
+        for mint in &home.config.accepted_mints {
+            if !is_allowed_seller_mint(mint) {
+                return Err(DaemonError::Config(format!(
+                    "seller mint fail-closed: every accepted_mints entry must be an \
+                     allow-listed testnut/dev mint ({DEFAULT_MINT_URL}), got {mint}"
+                )));
+            }
         }
         let secret = home::read_secret_key_hex(&home)?;
         let keys = nostr_sdk::Keys::parse(&secret)
@@ -548,12 +559,10 @@ impl SellerDaemon {
             Ok(offer) => offer,
             Err(_) => return Ok(OfferDisposition::Skip(OfferSkip::Unparseable)),
         };
-        // Offer mint fail-closed to testnut (soft-skip so the daemon stays up).
-        if offer.mint_url != DEFAULT_MINT_URL {
-            return Ok(OfferDisposition::Skip(OfferSkip::NonTestnutMint {
-                mint_url: offer.mint_url.clone(),
-            }));
-        }
+        // PIECE-14 Job B: the offer no longer names a mint that the seller must match — the
+        // seller's `accepted_mints` are asserted later against the *paid* token (redeem guard),
+        // so there is nothing to gate here. (`offer.mint_url` stays present and readable until
+        // Jobs D/E re-point the remaining reads.)
         // Offer-freshness gate (money-safety, backfill guard #a) — a deliberate ALWAYS-ON
         // refusal on EVERY offer path (live, open-pool backfill, AND the targeted filter's
         // full-history backfill; classify-level, so no filter shape can bypass it). The offer
@@ -845,8 +854,11 @@ impl SellerDaemon {
             .clone()
             .expect("awaiting-payment job always carries a result_id");
         let expected_amount = job.offer.amount;
-        let mint = job.offer.mint_url.clone();
         let offer = job.offer.clone();
+        // PIECE-14 Job B (temporary): the mint recorded on the redeem log / journal receipt /
+        // announce is the seller's default accepted mint rather than `offer.mint_url`. Job E
+        // replaces this with the realized mint from the buyer's payment payload.
+        let mint = self.home.config.default_mint().to_owned();
 
         let payload_job = received.payload.job_id.clone();
         let payload_result = received.payload.result_id.clone();
@@ -859,7 +871,17 @@ impl SellerDaemon {
         }
 
         let buyer = received.buyer_pubkey.to_hex();
-        let policy = PaymentPolicy::new([mint_url(&mint)?]);
+        // PIECE-14 Job B (temporary): build the redeem allowlist from the seller's own
+        // `accepted_mints` rather than the offer's mint. `terms_for_offer` still reads
+        // `offer.mint_url` for now; Job E re-points that read onto the seller-authored creq.
+        let policy = PaymentPolicy::new(
+            self.home
+                .config
+                .accepted_mints
+                .iter()
+                .map(|entry| mint_url(entry))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
         let terms = policy.terms_for_offer(&offer, &self.seller_pubkey)?;
         // Amount in terms == offer.amount (NOT rate_sats).
         let secret = home::read_secret_key_hex(&self.home)?;
@@ -1398,6 +1420,7 @@ impl SellerDaemon {
             &offer,
             &event.pubkey.to_hex(),
             rate,
+            self.home.config.default_mint(),
             contribution.as_ref(),
         );
         episode.refusal_reason_code = Some(skip.code().to_owned());
@@ -1422,6 +1445,7 @@ impl SellerDaemon {
             &active.offer,
             &active.buyer_pubkey,
             rate,
+            self.home.config.default_mint(),
             active.contribution.as_ref(),
         );
         episode.claim_id = Some(active.claim_id.clone());
@@ -1450,6 +1474,7 @@ impl SellerDaemon {
             &job.offer,
             &job.buyer_pubkey,
             rate,
+            self.home.config.default_mint(),
             job.contribution.as_ref(),
         );
         episode.claim_id = Some(job.claim_id.clone());
@@ -1481,6 +1506,7 @@ impl SellerDaemon {
             &job.offer,
             &job.buyer_pubkey,
             rate,
+            self.home.config.default_mint(),
             job.contribution.as_ref(),
         );
         episode.claim_id = Some(job.claim_id.clone());
@@ -1531,13 +1557,17 @@ fn fill_offer_facts(
     offer: &ParsedOffer,
     buyer_pubkey: &str,
     rate_sats: u64,
+    // PIECE-14 Job B: episode.mint is sourced from the seller's default accepted mint rather
+    // than `offer.mint_url` (consumer re-pointed off the offer). Job E replaces this with the
+    // realized mint from the buyer's payment payload.
+    mint: &str,
     contribution: Option<&ContributionOffer>,
 ) {
     episode.offer_task = offer.task.clone();
     episode.output_type = offer.output.clone();
     episode.amount = offer.amount;
     episode.unit = offer.unit.clone();
-    episode.mint = offer.mint_url.clone();
+    episode.mint = mint.to_owned();
     episode.deadline_unix = offer.deadline_unix;
     episode.offer_target = offer.seller_pubkey.clone();
     episode.buyer_pubkey = buyer_pubkey.to_owned();
@@ -2490,14 +2520,14 @@ pub(crate) async fn run_forever_hooked(
         "seller daemon online pubkey={} relay={} mint={} nip42={nip42_label}",
         daemon.seller_pubkey(),
         daemon.home.config.relay_url,
-        daemon.home.config.mint_url
+        daemon.home.config.default_mint()
     );
     // ONLINE announce: subscribed + past the NIP-42 auth wait ⇒ reacting to live offers.
     daemon.announce(crate::announce::AnnounceEvent::online(
         now_unix(),
         daemon.seller_pubkey(),
         &daemon.home.config.relay_url,
-        &daemon.home.config.mint_url,
+        daemon.home.config.default_mint(),
         nip42_label,
     ));
     // Readiness hook: online + subscribed ⇒ ready to react to LIVE offers.
@@ -2702,7 +2732,7 @@ mod tests {
         let root = temp("mint");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = home::bootstrap(&root).expect("bootstrap");
-        home.config.mint_url = "https://real-mint.example".into();
+        home.config.accepted_mints = vec!["https://real-mint.example".into()];
         home.config.seller = Some(SellerConfig {
             agent_command: vec!["echo".into()],
             rate_sats: 1,
@@ -3312,7 +3342,7 @@ mod tests {
         let root = temp(label);
         let _ = std::fs::remove_dir_all(&root);
         let mut home = home::bootstrap(&root).expect("bootstrap");
-        home.config.mint_url = DEFAULT_MINT_URL.into();
+        home.config.accepted_mints = vec![DEFAULT_MINT_URL.into()];
         home.config.seller = Some(SellerConfig {
             agent_command: vec!["echo".into()],
             rate_sats: 1,
@@ -4399,7 +4429,8 @@ mod local_relay_it {
         let mut h = home::bootstrap(root).expect("bootstrap seller home");
         h.config.relay_url = relay_url.to_string();
         assert_eq!(
-            h.config.mint_url, DEFAULT_MINT_URL,
+            h.config.default_mint(),
+            DEFAULT_MINT_URL,
             "home mint must be the fail-closed testnut default"
         );
         h.config.seller = Some(SellerConfig {

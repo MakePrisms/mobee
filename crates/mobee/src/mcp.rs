@@ -58,7 +58,7 @@ pub fn run(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         "mobee mcp ready (home={}, key_created={}, mint={}, relay={}, tool_deadline_secs={})",
         state.home.root.display(),
         state.home.key_created,
-        state.home.config.mint_url,
+        state.home.config.default_mint(),
         state.home.config.relay_url,
         TOOL_DEADLINE_SECS
     );
@@ -765,7 +765,7 @@ async fn setup_wallet_fund_async(home: &MobeeHome) -> Result<Value, String> {
             "key_present": home::key_file_present(&home),
             "wallet_dir": home.wallet_dir.display().to_string(),
             "relay_url": home.config.relay_url,
-            "mint_url": home.config.mint_url,
+            "mint_url": home.config.default_mint(),
             "per_job_budget_sats": home.config.per_job_budget_sats,
             "total_budget_sats": home.config.total_budget_sats,
             "invoice": outcome.invoice,
