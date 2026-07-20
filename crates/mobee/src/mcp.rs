@@ -33,8 +33,6 @@ const SETUP_WALLET_DEADLINE_SECS: u64 = 45;
 
 #[derive(Debug, Deserialize)]
 struct McpRequest {
-    #[serde(default)]
-    jsonrpc: Option<String>,
     id: Option<Value>,
     method: String,
     #[serde(default)]
@@ -780,7 +778,7 @@ async fn setup_wallet_fund_async(home: &MobeeHome) -> Result<Value, String> {
                 "fund returned balance 0 — unexpected"
             }
         });
-        return Ok(tool_ok(body));
+        Ok(tool_ok(body))
     }
     #[cfg(not(feature = "wallet"))]
     {
@@ -1523,7 +1521,6 @@ mod tests {
         let response = dispatch(
             &state,
             &McpRequest {
-                jsonrpc: Some("2.0".into()),
                 id: Some(json!(77)),
                 method: "tools/call".into(),
                 params: json!({
@@ -1663,7 +1660,6 @@ mod tests {
         let response = dispatch(
             &state,
             &McpRequest {
-                jsonrpc: Some("2.0".into()),
                 id: Some(json!(1)),
                 method: "tools/call".into(),
                 params: json!({
@@ -1688,7 +1684,6 @@ mod tests {
         let response = dispatch(
             &state,
             &McpRequest {
-                jsonrpc: Some("2.0".into()),
                 id: Some(json!(9)),
                 method: "tools/call".into(),
                 params: json!({
@@ -1730,7 +1725,6 @@ mod tests {
         let response = dispatch(
             &state,
             &McpRequest {
-                jsonrpc: Some("2.0".into()),
                 id: Some(json!(41)),
                 method: "tools/call".into(),
                 params: json!({
@@ -1766,7 +1760,6 @@ mod tests {
         let response = dispatch(
             &state,
             &McpRequest {
-                jsonrpc: Some("2.0".into()),
                 id: Some(json!(42)),
                 method: "tools/call".into(),
                 params: json!({
@@ -1803,7 +1796,6 @@ mod tests {
         let response = dispatch(
             &state,
             &McpRequest {
-                jsonrpc: Some("2.0".into()),
                 id: Some(json!(42)),
                 method: "tools/call".into(),
                 params: json!({
@@ -1888,7 +1880,6 @@ mod tests {
         let response = dispatch(
             &state,
             &McpRequest {
-                jsonrpc: Some("2.0".into()),
                 id: Some(json!(51)),
                 method: "tools/call".into(),
                 params: json!({
@@ -1958,7 +1949,6 @@ mod tests {
         let response = dispatch(
             &state,
             &McpRequest {
-                jsonrpc: Some("2.0".into()),
                 id: Some(json!(52)),
                 method: "tools/call".into(),
                 params: json!({
