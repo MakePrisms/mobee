@@ -1144,39 +1144,57 @@ impl SellerDaemon {
     }
 
     /// Piece-13 retro trigger: after a delivered-PAID receipt, run ONE best-effort agent turn to
-    /// update memory. Never blocks or affects the trade — any failure is logged and swallowed. A
-    /// no-op without the `acp` feature (no agent to run), exactly like [`run_agent_job`].
+    /// update memory. **Fully detached** — it MUST NOT run in the seller event loop: a retro is a
+    /// whole agent turn (up to the job timeout, or a hang) and the loop is single-tasked, so an
+    /// inline retro would stop the daemon from collecting kind-1059 payments (the money path) and
+    /// from claiming offers until the retro finished (regression: "wraps parked, never collected").
+    /// So it runs on its OWN OS thread with its OWN runtime and this call returns immediately;
+    /// the money path never waits on retro (PIECE-13 § Retro). No-op without the `acp` feature.
     #[cfg(feature = "acp")]
-    async fn maybe_run_retro(&mut self, job_id: &str) {
+    fn maybe_run_retro(&self, job_id: &str) {
         let Some(plan) = self.retro_context(job_id) else {
             return;
         };
         if plan.agent_command.is_empty() {
             return;
         }
-        if let Some(parent) = plan.log_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let timeout = Duration::from_secs(crate::seller::DEFAULT_JOB_TIMEOUT_SECS);
-        let mut driver = crate::driver::AcpDriver::new(
-            crate::driver::AgentCommand::new(
-                plan.agent_command[0].clone(),
-                plan.agent_command[1..].to_vec(),
-            ),
-            crate::driver::PermissionOutcome::Allow,
-            timeout,
-        );
-        if let Err(error) =
-            run_retro_turn(&mut driver, &plan.memory_dir, &plan.prompt, &plan.log_path).await
-        {
-            eprintln!(
-                "seller retro: best-effort turn failed (money path unaffected) job_id={job_id}: {error}"
+        // AcpDriver is !Send, so it is BUILT inside the thread; `plan` is owned/Send.
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("seller retro: runtime build failed (skip): {error}");
+                    return;
+                }
+            };
+            if let Some(parent) = plan.log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let timeout = Duration::from_secs(crate::seller::DEFAULT_JOB_TIMEOUT_SECS);
+            let mut driver = crate::driver::AcpDriver::new(
+                crate::driver::AgentCommand::new(
+                    plan.agent_command[0].clone(),
+                    plan.agent_command[1..].to_vec(),
+                ),
+                crate::driver::PermissionOutcome::Allow,
+                timeout,
             );
-        }
+            if let Err(error) = runtime.block_on(run_retro_turn(
+                &mut driver,
+                &plan.memory_dir,
+                &plan.prompt,
+                &plan.log_path,
+            )) {
+                eprintln!("seller retro: best-effort turn failed (money path unaffected): {error}");
+            }
+        });
     }
 
     #[cfg(not(feature = "acp"))]
-    async fn maybe_run_retro(&mut self, _job_id: &str) {}
+    fn maybe_run_retro(&self, _job_id: &str) {}
 
     /// Best-effort episode append — diagnostic, NEVER fails a trade. Logs on error, swallows it.
     /// Episodes carry ids/amounts/mint/task-text/self-reported-usage only; no token/key material.
@@ -2076,6 +2094,26 @@ pub async fn run_forever(daemon: SellerDaemon) -> Result<(), DaemonError> {
     run_forever_hooked(daemon, RunHooks::default()).await
 }
 
+/// What the event loop does when `notifications.recv()` returns an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecvControl {
+    /// Stay alive and keep processing — a transient lag must NEVER permanently deafen the seller.
+    Continue,
+    /// The channel is closed (pool shut down) — end the loop.
+    Stop,
+}
+
+/// Classify a broadcast `recv()` error. A `Lagged` (the loop fell behind while blocked in a long
+/// agent turn) is RECOVERABLE: tokio drops the overflowed messages but keeps delivering new ones,
+/// so the seller continues rather than going silently deaf to all further offers AND kind-1059
+/// payments (the money-path regression: wraps parked, never collected). Only `Closed` stops it.
+fn classify_recv_error(error: &tokio::sync::broadcast::error::RecvError) -> RecvControl {
+    match error {
+        tokio::sync::broadcast::error::RecvError::Lagged(_) => RecvControl::Continue,
+        tokio::sync::broadcast::error::RecvError::Closed => RecvControl::Stop,
+    }
+}
+
 /// [`run_forever`] with test/observability hooks (see [`RunHooks`]).
 pub(crate) async fn run_forever_hooked(
     mut daemon: SellerDaemon,
@@ -2198,7 +2236,26 @@ pub(crate) async fn run_forever_hooked(
     // Loud-Closed fallback fires at most once (targeted-only is not itself broad-filtered).
     let mut offer_fallback_done = false;
     let mut notifications = client.notifications();
-    while let Ok(notification) = notifications.recv().await {
+    loop {
+        // Resilient recv: a broadcast LAG (the loop fell behind while blocked in a long agent
+        // turn) must NOT permanently deafen the daemon. tokio's broadcast drops the overflowed
+        // messages and keeps delivering NEW ones, so we LOG and CONTINUE; only a genuinely closed
+        // channel ends the loop. Before this a `Lagged` ended `while let Ok(..)` — the seller went
+        // silently deaf to all further offers AND kind-1059 payments (wraps parked, never
+        // collected) until restart. Missed stored events re-backfill on resubscribe/restart.
+        let notification = match notifications.recv().await {
+            Ok(notification) => notification,
+            Err(error) => match classify_recv_error(&error) {
+                RecvControl::Continue => {
+                    eprintln!(
+                        "seller WARN: notification stream {error}; continuing (NOT going deaf). \
+                         Missed stored offers/payments re-backfill on resubscribe."
+                    );
+                    continue;
+                }
+                RecvControl::Stop => break,
+            },
+        };
         match notification {
             RelayPoolNotification::Event { event, .. } => {
                 if event.kind == Kind::GiftWrap {
@@ -2208,8 +2265,9 @@ pub(crate) async fn run_forever_hooked(
                                 "seller receipt job_id={} result_id={} amount_received={}",
                                 receipt.job_id, receipt.result_id, receipt.amount_received
                             );
-                            // Piece-13: delivered-PAID ⇒ best-effort retro (never blocks the trade).
-                            daemon.maybe_run_retro(&receipt.job_id).await;
+                            // Piece-13: delivered-PAID ⇒ best-effort retro. Detached (own thread);
+                            // returns immediately so wrap collection is never blocked.
+                            daemon.maybe_run_retro(&receipt.job_id);
                         }
                         Ok(None) => {}
                         // Idempotent re-see (info, not error): the sats already landed.
@@ -2250,8 +2308,8 @@ pub(crate) async fn run_forever_hooked(
                                                 "seller receipt (reconcile) job_id={} amount_received={}",
                                                 receipt.job_id, receipt.amount_received
                                             );
-                                            // Piece-13: delivered-PAID ⇒ best-effort retro.
-                                            daemon.maybe_run_retro(&receipt.job_id).await;
+                                            // Piece-13: delivered-PAID ⇒ detached best-effort retro.
+                                            daemon.maybe_run_retro(&receipt.job_id);
                                         }
                                         Ok(None) => {}
                                         // Idempotent re-see (info, not error): sats already landed.
@@ -3702,6 +3760,124 @@ Anything not committed to git will not be delivered.";
             std::fs::read_to_string(&house).expect("read"),
             "---\nauthor: operator\n---\nORIGINAL",
             "operator topic file byte-unchanged across the retro"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── GATE-RED regression: the daemon must not go deaf to kind-1059 payments ────────────────
+
+    /// Root-cause guard #1 (deaf-daemon): a broadcast LAG must NOT terminate the event loop.
+    /// Before the fix, `while let Ok(..) = recv().await` ended the loop on `Lagged`, so a seller
+    /// that fell behind during a long agent turn went silently deaf to ALL further offers and
+    /// kind-1059 payments (wraps parked, never collected) until restart. Reverting the fix
+    /// (Lagged ⇒ Stop) fails this test.
+    #[test]
+    fn lagged_recv_keeps_daemon_alive_only_closed_stops() {
+        use tokio::sync::broadcast::error::RecvError;
+        assert_eq!(
+            classify_recv_error(&RecvError::Lagged(42)),
+            RecvControl::Continue,
+            "a broadcast lag must keep the daemon alive (never go deaf to payments)"
+        );
+        assert_eq!(
+            classify_recv_error(&RecvError::Closed),
+            RecvControl::Stop,
+            "only a closed channel ends the loop"
+        );
+    }
+
+    /// A Driver whose prompt turn BLOCKS (simulating a slow/hanging retro agent), then completes.
+    struct SlowDriver {
+        block: std::time::Duration,
+    }
+
+    impl crate::driver::Driver for SlowDriver {
+        fn id(&self) -> crate::event::RuntimeId {
+            crate::event::RuntimeId("slow".into())
+        }
+        async fn ready(&mut self) -> Result<crate::driver::Readiness, crate::driver::DriverError> {
+            Ok(crate::driver::Readiness {
+                runtime_id: self.id(),
+                protocol_version: crate::driver::acp::PROTOCOL_VERSION,
+            })
+        }
+        async fn start_session(
+            &mut self,
+            _cfg: crate::driver::SessionConfig,
+        ) -> Result<crate::driver::SessionId, crate::driver::DriverError> {
+            Ok("slow-session".into())
+        }
+        async fn prompt(
+            &mut self,
+            _session_id: &crate::driver::SessionId,
+            _turn: crate::driver::PromptTurn,
+        ) -> Result<crate::driver::UpdateStream, crate::driver::DriverError> {
+            std::thread::sleep(self.block); // a retro agent turn that takes real time
+            Ok(crate::driver::UpdateStream::new(
+                vec![crate::driver::SessionUpdate::TurnEnded(
+                    crate::driver::StopReason::Completed,
+                )],
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ))
+        }
+        async fn on_permission(
+            &mut self,
+            _req: crate::driver::PermissionRequest,
+        ) -> crate::driver::PermissionOutcome {
+            crate::driver::PermissionOutcome::Allow
+        }
+        async fn artifacts(
+            &self,
+            _session_id: &crate::driver::SessionId,
+        ) -> Result<Vec<crate::driver::Artifact>, crate::driver::DriverError> {
+            Ok(Vec::new())
+        }
+        async fn cancel(
+            &mut self,
+            _session_id: &crate::driver::SessionId,
+        ) -> Result<(), crate::driver::DriverError> {
+            Ok(())
+        }
+        async fn shutdown(&mut self) -> Result<(), crate::driver::DriverError> {
+            Ok(())
+        }
+    }
+
+    /// Root-cause guard #2 (retro must not block the loop): a retro turn runs to completion on a
+    /// DETACHED thread, so the caller (the event loop) is not blocked for the retro's duration.
+    /// This is exactly the pattern `maybe_run_retro` now uses (own thread + own runtime). Before
+    /// the fix the retro ran inline via `.await`, blocking wrap collection for the whole turn.
+    #[test]
+    fn retro_turn_runs_detached_without_blocking_caller() {
+        use std::time::{Duration, Instant};
+        let root = temp("retro-detach");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let dir = crate::seller_memory::memory_dir(&root);
+        crate::seller_memory::ensure_memory_dir(&dir).expect("ensure");
+        let log_path = root.join("seller-retro.jsonl");
+
+        let block = Duration::from_millis(800);
+        let started = Instant::now();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let mut driver = SlowDriver { block };
+            runtime.block_on(run_retro_turn(&mut driver, &dir, "distill", &log_path))
+        });
+        // The caller (loop) returns immediately — NOT blocked for the retro's ~800ms turn.
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "spawning the retro must not block the caller (elapsed {:?})",
+            started.elapsed()
+        );
+        let result = handle.join().expect("retro thread");
+        assert!(result.is_ok(), "detached retro completes: {result:?}");
+        assert!(
+            started.elapsed() >= block,
+            "the retro really did run in the background (took its full turn)"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
