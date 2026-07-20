@@ -12,6 +12,7 @@ pub mod delivery_git;
 pub mod delivery_transport;
 pub mod driver;
 pub mod engine;
+pub mod episode;
 pub mod event;
 pub mod format;
 pub mod gateway;

@@ -102,6 +102,69 @@ pub struct SellerConfig {
     pub contribution_enabled: bool,
 }
 
+/// Piece-13 persistent-seller-memory config (`[seller_memory]` section). The read-on-start +
+/// retro-write-back knobs and the two plugin seams (prompt template paths). Every field has a
+/// serde default so a config written before this section existed parses to the shipped defaults
+/// (back-compat).
+///
+/// NOTE (build judgment call): the PIECE-13 spec names this section `[seller.memory]` (nested in
+/// `[seller]`). Nesting it inside `SellerConfig` would force adding a required field to that
+/// struct, whose literal is constructed in `seller.rs` — a file the piece-13 build is forbidden
+/// to touch (money-path boundary; money-files diff must stay empty). Placing it top-level as
+/// `[seller_memory]` on `MobeeConfig` (built only via `Default`) delivers the identical knobs and
+/// seams without touching any money-path file. The nesting is cosmetic; behaviour is unchanged.
+///
+/// This is **diagnostic/economic** context only. Nothing here ever feeds the pay gate, the
+/// journal, or the receipt bind (see PIECE-13 § Threat & integrity).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SellerMemoryConfig {
+    /// Inline the distilled `MEMORY.md` index into the agent's job prompt at start. Default
+    /// **on**; when **false** the composed prompt is byte-identical to the pre-piece-13 output.
+    #[serde(default = "default_memory_enabled")]
+    pub memory_enabled: bool,
+    /// Run one best-effort retro agent turn after a delivered-**paid** job to update memory.
+    /// Default **on**; gated separately from `memory_enabled` (the read path is cheap, the retro
+    /// turn costs a model call). Never blocks or affects the money path.
+    #[serde(default = "default_retro_enabled")]
+    pub retro_enabled: bool,
+    /// Plugin seam: template for the retro/distiller prompt. Unset ⇒ the in-repo default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retro_prompt_path: Option<PathBuf>,
+    /// Plugin seam: template framing how `MEMORY.md` is inlined at job start. Unset ⇒ in-repo
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_on_start_template_path: Option<PathBuf>,
+}
+
+impl Default for SellerMemoryConfig {
+    fn default() -> Self {
+        Self {
+            memory_enabled: default_memory_enabled(),
+            retro_enabled: default_retro_enabled(),
+            retro_prompt_path: None,
+            read_on_start_template_path: None,
+        }
+    }
+}
+
+impl SellerMemoryConfig {
+    /// True when every field is at its shipped default (so config.toml stays clean — the section
+    /// is only serialized once an operator sets a non-default knob).
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// serde default for [`SellerMemoryConfig::memory_enabled`] — read-on-start ON.
+pub fn default_memory_enabled() -> bool {
+    true
+}
+
+/// serde default for [`SellerMemoryConfig::retro_enabled`] — retro write-back ON.
+pub fn default_retro_enabled() -> bool {
+    true
+}
+
 /// Default for [`SellerConfig::contribution_enabled`] — contribution support ON.
 pub fn default_contribution_enabled() -> bool {
     true
@@ -204,6 +267,9 @@ pub struct MobeeConfig {
     /// Optional `[seller]` daemon config. Absent until `mobee sell` setup writes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seller: Option<SellerConfig>,
+    /// Piece-13 `[seller_memory]` config (read-on-start + retro seams). Defaults when absent.
+    #[serde(default, skip_serializing_if = "SellerMemoryConfig::is_default")]
+    pub seller_memory: SellerMemoryConfig,
     /// Optional buyer-side piece-10 contribution content policy (the MUST-5 policy hook). Absent
     /// ⇒ the FLOOR (refuse only empty diffs). Present ⇒ tighten pre-pay with a path allowlist /
     /// forbidden paths / max diff size.
@@ -237,6 +303,7 @@ impl Default for MobeeConfig {
             extra_mints: Vec::new(),
             profile: None,
             seller: None,
+            seller_memory: SellerMemoryConfig::default(),
             contribution: None,
         }
     }

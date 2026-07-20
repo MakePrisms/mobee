@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use crate::buyer_fund::{self, FundError};
 use crate::contribution::ContributionOffer;
 use crate::driver::UsageMetadata;
+use crate::episode::{Episode, EpisodeKind, EpisodeLog, EpisodeOutcome, UsageRecord};
 use crate::gateway::{
     self, claim_draft, error_draft, git_result_draft, parse_offer, EventDraft, ParsedOffer,
     TagSpec, JOB_OFFER_KIND,
@@ -171,6 +172,27 @@ pub struct ActiveJob {
     /// Piece-10: the parsed contribution offer (target pin + base + accepts) when this is a
     /// contribution job; `None` ⇒ from-scratch (empty-base delivery).
     pub contribution: Option<ContributionOffer>,
+    /// Piece-13: delivery facts captured at successful kind-6109 publish, carried through
+    /// `mark_delivered` so the terminal episode (paid at receipt, or unpaid at eviction) is a
+    /// single complete append. `None` until the job delivers. Diagnostic only — never money state.
+    pub delivery: Option<DeliveryRecord>,
+}
+
+/// Piece-13: the delivery-time facts an [`Episode`] needs, captured once at kind-6109 publish.
+/// Stashed on the [`ActiveJob`] so the (possibly later) paid/unpaid terminal writes one complete
+/// episode without re-deriving anything on the money path.
+#[derive(Debug, Clone)]
+pub struct DeliveryRecord {
+    pub result_id: String,
+    pub commit_oid: String,
+    pub git_remote: String,
+    pub branch: String,
+    pub delivery_kind: String,
+    pub harness: String,
+    pub wall_time_ms: u64,
+    pub usage: Option<UsageMetadata>,
+    pub transcript_ref: String,
+    pub deliver_ts: u64,
 }
 
 /// What [`SellerDaemon::classify_offer`] decided to do with an offer event.
@@ -228,6 +250,22 @@ pub enum OfferSkip {
 }
 
 impl OfferSkip {
+    /// Machine-mappable variant name (piece-13 `refusal_reason_code`). Stable enumerated set.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotAnOffer { .. } => "NotAnOffer",
+            Self::Unparseable => "Unparseable",
+            Self::NonTestnutMint { .. } => "NonTestnutMint",
+            Self::DeadlineExpired { .. } => "DeadlineExpired",
+            Self::RateGate { .. } => "RateGate",
+            Self::AlreadyProcessed => "AlreadyProcessed",
+            Self::ProcessingBusy { .. } => "ProcessingBusy",
+            Self::AwaitingPaymentFull { .. } => "AwaitingPaymentFull",
+            Self::ContributionUnsupported => "ContributionUnsupported",
+            Self::ContributionMalformed { .. } => "ContributionMalformed",
+        }
+    }
+
     /// Human-readable skip reason for logging (never empty).
     pub fn reason(&self) -> String {
         match self {
@@ -347,6 +385,9 @@ impl SellerDaemon {
         let intent = match self.classify_offer(event, now)? {
             OfferDisposition::Skip(skip) => {
                 eprintln!("seller skip offer {}: {}", event.id.to_hex(), skip.reason());
+                // Piece-13: durable refusal capture (previously eprintln-only). Best-effort —
+                // an episode write never affects the skip decision or the money path.
+                self.record_refused_episode(event, &skip);
                 // Bundled buyer-visibility: a TARGETED-to-self under-rate refusal also emits a
                 // kind-7000 `status=error` so the buyer learns why. Open-pool under-rate stays
                 // log-only (spam guard). No-op for every other skip reason.
@@ -416,6 +457,7 @@ impl SellerDaemon {
             deadline_unix: intent.deadline_unix,
             workdir,
             contribution: intent.contribution,
+            delivery: None,
         });
         Ok(self.active.as_ref())
     }
@@ -617,6 +659,8 @@ impl SellerDaemon {
                     "seller drop awaiting-payment job_id={} (backlog cap {AWAITING_PAYMENT_CAP})",
                     dropped.job_id
                 );
+                // Piece-13: delivered-but-UNPAID terminal (backpressure eviction). Best-effort.
+                self.record_delivered_unpaid_episode(&dropped);
             }
         }
         Self::end_flight();
@@ -756,6 +800,10 @@ impl SellerDaemon {
             &buyer,
             true,
         )?;
+
+        // Piece-13: capture the delivered-PAID terminal episode. Best-effort — written AFTER the
+        // authoritative receipt above and can never fail or alter it. Seeds the retro (§ Retro).
+        self.record_paid_episode(&job, amount_received, expected_amount);
 
         let outcome = ReceiptOutcome {
             job_id: local_job,
@@ -983,17 +1031,172 @@ impl SellerDaemon {
         };
         if let Some(slot) = self.active.as_mut() {
             slot.result_id = Some(result_id.clone());
+            // Piece-13: stash the delivery facts so the terminal episode (paid at receipt, or
+            // unpaid at eviction) is one complete append. `transcript_ref` is a POINTER to the
+            // already-durable per-job transcript (`run_agent_job` wrote it); never a copy.
+            let (harness, _) =
+                harness_and_transport(&seller_cfg.agent_command, seller_cfg.agent.as_deref());
+            slot.delivery = Some(DeliveryRecord {
+                result_id: result_id.clone(),
+                commit_oid: commit.clone(),
+                git_remote: seller_cfg.git_remote.clone(),
+                branch: branch.clone(),
+                delivery_kind: delivery_kind.as_str().to_owned(),
+                harness,
+                wall_time_ms,
+                usage: usage.clone(),
+                transcript_ref: format!("seller-jobs/{}/seller-run.jsonl", active.job_id),
+                deliver_ts: now_unix(),
+            });
         }
         Ok(result_id)
     }
 
-    async fn fail_active(&mut self, _reason: &str) -> Result<(), DaemonError> {
+    async fn fail_active(&mut self, reason: &str) -> Result<(), DaemonError> {
         if let Some(active) = self.active.take() {
+            // Piece-13: capture the ERRORED terminal, threading `reason` (previously discarded)
+            // into `error_reason`. Best-effort; the kind-7000 below is the buyer-facing surface.
+            self.record_errored_episode(&active, reason);
             let draft = error_draft(&active.job_id, &active.buyer_pubkey, &self.seller_pubkey);
             let _ = publish_draft(&self.home, &self.keys, &draft).await;
         }
         Self::end_flight();
         Ok(())
+    }
+
+    /// Best-effort episode append — diagnostic, NEVER fails a trade. Logs on error, swallows it.
+    /// Episodes carry ids/amounts/mint/task-text/self-reported-usage only; no token/key material.
+    fn write_episode(&self, episode: &Episode) {
+        let log = EpisodeLog::open(&self.home.root);
+        if let Err(error) = log.append(episode) {
+            eprintln!(
+                "seller episode capture failed (non-fatal) job_id={}: {error}",
+                episode.job_id
+            );
+        }
+    }
+
+    /// Piece-13 refused terminal. Best-effort re-parse of the offer for its facts (classify does
+    /// not hand them back). No episode for a non-offer, a dedup re-see, or an unparseable event —
+    /// those are not freshly-classified jobs.
+    fn record_refused_episode(&self, event: &nostr_sdk::Event, skip: &OfferSkip) {
+        if matches!(skip, OfferSkip::NotAnOffer { .. } | OfferSkip::AlreadyProcessed) {
+            return;
+        }
+        let draft = event_to_draft(event);
+        let Ok(offer) = parse_offer(&draft) else {
+            return; // Unparseable ⇒ no offer facts to record.
+        };
+        let rate = require_seller_config(&self.home)
+            .map(|cfg| cfg.rate_sats)
+            .unwrap_or(0);
+        let contribution = crate::contribution::parse_contribution_offer(&draft.tags)
+            .ok()
+            .flatten();
+        let mut episode = Episode::new(
+            EpisodeKind::Refused,
+            EpisodeOutcome::Refused,
+            now_unix(),
+            &self.seller_pubkey,
+            event.id.to_hex(),
+        );
+        fill_offer_facts(
+            &mut episode,
+            &offer,
+            &event.pubkey.to_hex(),
+            rate,
+            contribution.as_ref(),
+        );
+        episode.refusal_reason_code = Some(skip.code().to_owned());
+        episode.refusal_reason = Some(skip.reason());
+        self.write_episode(&episode);
+    }
+
+    /// Piece-13 errored terminal (claimed job that failed before or during delivery).
+    fn record_errored_episode(&self, active: &ActiveJob, reason: &str) {
+        let rate = require_seller_config(&self.home)
+            .map(|cfg| cfg.rate_sats)
+            .unwrap_or(0);
+        let mut episode = Episode::new(
+            EpisodeKind::Claimed,
+            EpisodeOutcome::Errored,
+            now_unix(),
+            &self.seller_pubkey,
+            &active.job_id,
+        );
+        fill_offer_facts(
+            &mut episode,
+            &active.offer,
+            &active.buyer_pubkey,
+            rate,
+            active.contribution.as_ref(),
+        );
+        episode.claim_id = Some(active.claim_id.clone());
+        episode.resolved_deadline_unix = Some(active.deadline_unix);
+        episode.error_reason = Some(reason.to_owned());
+        if let Some(delivery) = &active.delivery {
+            fill_delivery_facts(&mut episode, delivery);
+        }
+        self.write_episode(&episode);
+    }
+
+    /// Piece-13 delivered-PAID terminal. Complete episode: offer + claim + delivery + payment.
+    fn record_paid_episode(&self, job: &ActiveJob, amount_received: u64, expected_amount: u64) {
+        let rate = require_seller_config(&self.home)
+            .map(|cfg| cfg.rate_sats)
+            .unwrap_or(0);
+        let mut episode = Episode::new(
+            EpisodeKind::Claimed,
+            EpisodeOutcome::DeliveredPaid,
+            now_unix(),
+            &self.seller_pubkey,
+            &job.job_id,
+        );
+        fill_offer_facts(
+            &mut episode,
+            &job.offer,
+            &job.buyer_pubkey,
+            rate,
+            job.contribution.as_ref(),
+        );
+        episode.claim_id = Some(job.claim_id.clone());
+        episode.resolved_deadline_unix = Some(job.deadline_unix);
+        if let Some(delivery) = &job.delivery {
+            fill_delivery_facts(&mut episode, delivery);
+        }
+        episode.amount_received = Some(amount_received);
+        episode.expected_amount = Some(expected_amount);
+        episode.swap_ok = Some(true);
+        episode.collect_ts = Some(now_unix());
+        self.write_episode(&episode);
+    }
+
+    /// Piece-13 delivered-but-UNPAID terminal (awaiting-payment backpressure eviction).
+    fn record_delivered_unpaid_episode(&self, job: &ActiveJob) {
+        let rate = require_seller_config(&self.home)
+            .map(|cfg| cfg.rate_sats)
+            .unwrap_or(0);
+        let mut episode = Episode::new(
+            EpisodeKind::Claimed,
+            EpisodeOutcome::DeliveredUnpaid,
+            now_unix(),
+            &self.seller_pubkey,
+            &job.job_id,
+        );
+        fill_offer_facts(
+            &mut episode,
+            &job.offer,
+            &job.buyer_pubkey,
+            rate,
+            job.contribution.as_ref(),
+        );
+        episode.claim_id = Some(job.claim_id.clone());
+        episode.resolved_deadline_unix = Some(job.deadline_unix);
+        if let Some(delivery) = &job.delivery {
+            fill_delivery_facts(&mut episode, delivery);
+        }
+        episode.expected_amount = Some(job.offer.amount);
+        self.write_episode(&episode);
     }
 }
 
@@ -1008,6 +1211,66 @@ fn mint_url(raw: &str) -> Result<cashu::MintUrl, DaemonError> {
     use std::str::FromStr;
     cashu::MintUrl::from_str(raw)
         .map_err(|error| DaemonError::Policy(format!("invalid mint url: {error}")))
+}
+
+/// Piece-13: opportunistic driver usage → serde-friendly episode mirror (absent-stays-absent;
+/// a field the harness did not surface stays `None`, never zero-filled).
+fn usage_record(usage: Option<&UsageMetadata>) -> UsageRecord {
+    let Some(usage) = usage else {
+        return UsageRecord::default();
+    };
+    UsageRecord {
+        model: usage.model.clone(),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        cost_amount: usage.cost.as_ref().map(|cost| cost.amount.clone()),
+        cost_basis: usage.cost.as_ref().map(|cost| cost.basis.clone()),
+        transport: usage.transport.map(|t| t.as_str().to_owned()),
+    }
+}
+
+/// Piece-13: fill the offer-facts group shared by every episode kind. Pure over its inputs.
+fn fill_offer_facts(
+    episode: &mut Episode,
+    offer: &ParsedOffer,
+    buyer_pubkey: &str,
+    rate_sats: u64,
+    contribution: Option<&ContributionOffer>,
+) {
+    episode.offer_task = offer.task.clone();
+    episode.output_type = offer.output.clone();
+    episode.amount = offer.amount;
+    episode.unit = offer.unit.clone();
+    episode.mint = offer.mint_url.clone();
+    episode.deadline_unix = offer.deadline_unix;
+    episode.offer_target = offer.seller_pubkey.clone();
+    episode.buyer_pubkey = buyer_pubkey.to_owned();
+    episode.configured_rate_sats = rate_sats;
+    match contribution {
+        Some(contribution) => {
+            episode.job_class = "contribution".to_owned();
+            episode.contribution_target = Some(contribution.target.clone_url().to_owned());
+            episode.contribution_base_oid = Some(contribution.base.oid().to_owned());
+        }
+        None => episode.job_class = "from_scratch".to_owned(),
+    }
+}
+
+/// Piece-13: fill the delivery-facts group from a captured [`DeliveryRecord`].
+fn fill_delivery_facts(episode: &mut Episode, delivery: &DeliveryRecord) {
+    episode.result_id = Some(delivery.result_id.clone());
+    episode.commit_oid = Some(delivery.commit_oid.clone());
+    episode.fork_git_remote = Some(delivery.git_remote.clone());
+    episode.fork_branch = Some(delivery.branch.clone());
+    episode.delivery_kind = Some(delivery.delivery_kind.clone());
+    episode.usage = usage_record(delivery.usage.as_ref());
+    episode.wall_time_ms = Some(delivery.wall_time_ms);
+    episode.harness = Some(delivery.harness.clone());
+    episode.transcript_ref = Some(delivery.transcript_ref.clone());
+    episode.deliver_ts = Some(delivery.deliver_ts);
 }
 
 /// Delivery discriminator for the seller's commit/fork delivery, derived from the SAME typed
@@ -2497,6 +2760,7 @@ mod tests {
             deadline_unix: deadline,
             workdir: root.join(job_id),
             contribution: None,
+            delivery: None,
         }
     }
 
@@ -2826,6 +3090,126 @@ mod tests {
         .expect_err("acp required");
         assert!(matches!(err, DaemonError::AcpRequired));
         assert!(err.to_string().contains("acp"));
+    }
+
+    // ── Piece-13 Layer-0 episode capture ────────────────────────────────────────────────────
+
+    /// Acceptance (piece A): a delivered→paid job appends exactly ONE episode line with
+    /// `outcome=delivered_paid`, populated `result_id`/`commit_oid`/`amount_received` and a
+    /// `transcript_ref` pointing at an on-disk `seller-run.jsonl`. `record_paid_episode` is the
+    /// exact writer `try_apply_payment` invokes after journaling the receipt — reverting its body
+    /// drops the line (line-count 1→0), which is the piece-A red-on-revert for the paid writer.
+    #[test]
+    fn paid_episode_writer_appends_one_complete_delivered_paid_line() {
+        let (root, daemon) = test_daemon("ep-paid");
+        // A real on-disk transcript at the pointed path (run_agent_job writes this in production).
+        let transcript_rel = "seller-jobs/jobpaid/seller-run.jsonl";
+        let transcript_abs = daemon.home().root.join(transcript_rel);
+        std::fs::create_dir_all(transcript_abs.parent().unwrap()).expect("mkdir jobdir");
+        std::fs::write(&transcript_abs, b"{\"event\":\"stub\"}\n").expect("write transcript");
+
+        let mut job = active_job(
+            "jobpaid",
+            daemon.seller_pubkey(),
+            Some("res-xyz"),
+            2_000_000_000,
+            &root,
+        );
+        job.delivery = Some(DeliveryRecord {
+            result_id: "res-xyz".into(),
+            commit_oid: "c".repeat(40),
+            git_remote: "https://example.invalid/repo.git".into(),
+            branch: "mobee/jobpaid".into(),
+            delivery_kind: "fork".into(),
+            harness: "claude-agent-acp".into(),
+            wall_time_ms: 4242,
+            usage: None,
+            transcript_ref: transcript_rel.into(),
+            deliver_ts: 111,
+        });
+
+        daemon.record_paid_episode(&job, 21, 21);
+
+        let log = crate::episode::EpisodeLog::open(&daemon.home().root);
+        let entries = log.entries().expect("entries");
+        assert_eq!(entries.len(), 1, "exactly one episode line for a paid job");
+        let episode = &entries[0];
+        assert_eq!(episode.outcome, EpisodeOutcome::DeliveredPaid);
+        assert_eq!(episode.episode_kind, EpisodeKind::Claimed);
+        assert_eq!(episode.result_id.as_deref(), Some("res-xyz"));
+        assert_eq!(episode.commit_oid.as_deref(), Some("c".repeat(40).as_str()));
+        assert_eq!(episode.amount_received, Some(21));
+        assert_eq!(episode.expected_amount, Some(21));
+        assert_eq!(episode.transcript_ref.as_deref(), Some(transcript_rel));
+        // The pointer resolves to a real file under MOBEE_HOME (pointer, never a copy).
+        assert!(
+            daemon.home().root.join(episode.transcript_ref.as_ref().unwrap()).is_file(),
+            "transcript_ref must point at an on-disk seller-run.jsonl"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Acceptance (piece A): a refused offer appends exactly one `episode_kind=refused` episode
+    /// with a non-empty `refusal_reason_code` matching the `OfferSkip` variant, AND the money-path
+    /// `seller-journal.jsonl` is byte-unchanged (episodes are a separate stream) and still parses
+    /// green. Drives the real daemon writer via `on_offer_event` → reverting the
+    /// `record_refused_episode` call drops the line (piece-A red-on-revert for the refused writer).
+    #[tokio::test]
+    async fn refused_offer_appends_one_refused_episode_and_leaves_journal_untouched() {
+        let (root, mut daemon) = test_daemon("ep-refused");
+        let journal_before = std::fs::read(daemon.journal.path()).unwrap_or_default();
+
+        // Untargeted offer + claim_open_pool=false ⇒ RateGate refusal on a NON-self target, so
+        // the skip path does no relay I/O (publish_under_rate_error_if_targeted early-returns).
+        let buyer = nostr_sdk::Keys::generate();
+        let draft = crate::gateway::OfferDraft::untargeted(
+            "do a task",
+            "text/plain",
+            10,
+            now_unix() + 3_600,
+            DEFAULT_MINT_URL,
+        )
+        .to_event_draft();
+        let event = gateway::nostr::event_builder(&draft)
+            .expect("event builder")
+            .sign_with_keys(&buyer)
+            .expect("sign offer");
+
+        let claimed = daemon.on_offer_event(&event).await.expect("skip is Ok");
+        assert!(claimed.is_none(), "untargeted offer must be refused, not claimed");
+
+        let log = crate::episode::EpisodeLog::open(&daemon.home().root);
+        let entries = log.entries().expect("entries");
+        assert_eq!(entries.len(), 1, "exactly one refused episode");
+        assert_eq!(entries[0].episode_kind, EpisodeKind::Refused);
+        assert_eq!(entries[0].outcome, EpisodeOutcome::Refused);
+        assert_eq!(entries[0].refusal_reason_code.as_deref(), Some("RateGate"));
+        assert!(
+            !entries[0].refusal_reason.as_deref().unwrap_or("").is_empty(),
+            "refusal_reason is never empty"
+        );
+        assert_eq!(entries[0].job_id, event.id.to_hex());
+
+        // Money-safety: the journal is a SEPARATE, untouched stream.
+        let journal_after = std::fs::read(daemon.journal.path()).unwrap_or_default();
+        assert_eq!(
+            journal_before, journal_after,
+            "seller-journal.jsonl must be byte-unchanged by episode capture"
+        );
+        daemon.journal.entries().expect("journal still parses green");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A not-an-offer / dedup re-see does not produce an episode (only freshly-classified jobs do).
+    #[test]
+    fn refused_episode_skips_non_offer_and_already_processed() {
+        let (root, daemon) = test_daemon("ep-refused-skip");
+        let event = offer_event(&nostr_sdk::Keys::generate(), daemon.seller_pubkey(), 5, now_unix() + 3_600);
+        daemon.record_refused_episode(&event, &OfferSkip::NotAnOffer { kind: 1 });
+        daemon.record_refused_episode(&event, &OfferSkip::AlreadyProcessed);
+        let log = crate::episode::EpisodeLog::open(&daemon.home().root);
+        assert!(log.entries().expect("entries").is_empty(), "no episode for non-job skips");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
