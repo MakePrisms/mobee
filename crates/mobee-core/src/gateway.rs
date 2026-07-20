@@ -482,17 +482,6 @@ pub fn error_draft(
     draft
 }
 
-/// Optional git bind on a kind-5109 offer (`delivery=git` + repo + branch).
-pub fn offer_git_target(event: &EventDraft) -> Option<(String, String)> {
-    let delivery = first_tag_value(&event.tags, "delivery")?;
-    if delivery != "git" {
-        return None;
-    }
-    let repo = first_tag_value(&event.tags, "repo")?.to_owned();
-    let branch = first_tag_value(&event.tags, "branch")?.to_owned();
-    Some((repo, branch))
-}
-
 /// Delivery binding (piece-9 D4) echoed into a kind-3400 receipt. Both fields are in the
 /// co-signed preimage, so the settled receipt attests which git object was paid for and
 /// its kind (commit vs tree) is not forgeable.

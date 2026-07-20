@@ -1160,7 +1160,7 @@ pub(crate) async fn fetch_job_view_async(
             live: false,
         });
     }
-    claims.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    claims.sort_by_key(|c| std::cmp::Reverse(c.created_at));
     // Liveness is DERIVED from `now` vs the offer deadline — a processing claim past its
     // deadline is EXPIRED and must not read live (piece-11 behavior 3; job 0867a213).
     let offer_deadline_unix = offer.as_ref().map(|o| o.deadline_unix);
@@ -1189,7 +1189,7 @@ pub(crate) async fn fetch_job_view_async(
             contribution: contribution_result_view(&draft.tags),
         });
     }
-    results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    results.sort_by_key(|r| std::cmp::Reverse(r.created_at));
 
     let accepted = load_accepted_bind(home, job_id)?;
 
