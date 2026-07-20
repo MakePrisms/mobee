@@ -1088,7 +1088,14 @@ async fn post_job_tool_async(state: &McpState, arguments: &Value) -> Result<Valu
         .get("seller_pubkey")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let deadline_unix = arguments.get("deadline_unix").and_then(Value::as_u64);
+    let deadline_unix = match arguments.get("deadline_unix") {
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| "post_job requires deadline_unix (integer >= 0)".to_owned())?,
+        ),
+        None => None,
+    };
     let repo = arguments
         .get("repo")
         .and_then(Value::as_str)
@@ -1747,6 +1754,43 @@ mod tests {
             message.contains("seller_pubkey") || message.contains("untargeted"),
             "message={message}"
         );
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn post_job_mcp_refuses_zero_deadline_before_publish() {
+        let root = temp_home("post-zero-deadline");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = state_at(&root);
+        let secret = home::read_secret_key_hex(&state.home).expect("secret");
+        let response = dispatch(
+            &state,
+            &McpRequest {
+                jsonrpc: Some("2.0".into()),
+                id: Some(json!(42)),
+                method: "tools/call".into(),
+                params: json!({
+                    "name": "post_job",
+                    "arguments": {
+                        "task": "deadline-gate",
+                        "output": "text/plain",
+                        "amount_sats": 1,
+                        "seller_pubkey": "aa".repeat(32),
+                        "deadline_unix": 0
+                    }
+                }),
+            },
+        );
+        let rendered = response.to_string();
+        assert!(!rendered.contains(&secret), "secret leaked on post_job error");
+        assert_eq!(response["result"]["isError"], true);
+        let message = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("");
+        assert!(message.contains("deadline_unix"), "message={message}");
+        assert!(message.contains("given=0"), "message={message}");
+        assert!(message.contains("current="), "message={message}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(feature = "wallet")]

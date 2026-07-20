@@ -333,6 +333,7 @@ pub async fn post_job_async(
     // Piece-10: validate the optional contribution params up front (fail-closed, before the wallet
     // opens). `None` ⇒ from-scratch (no additive tags). Emission happens in `build_offer_draft`.
     let contribution = contribution_offer_from_request(&request)?;
+    let deadline_unix = resolve_post_deadline(request.deadline_unix, now_unix_secs()?)?;
 
     // F2 buyer-fix: refuse a post whose amount exceeds the per-job budget cap AT POST — a job you
     // can post but can never pay (authorize_pay refuses at the SAME cap) is a UX trap. Read the
@@ -349,13 +350,6 @@ pub async fn post_job_async(
             .await
             .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
     }
-
-    let deadline_unix = request.deadline_unix.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() + DEFAULT_DEADLINE_SECS)
-            .unwrap_or(DEFAULT_DEADLINE_SECS)
-    });
 
     let draft = build_offer_draft(
         &request,
@@ -379,6 +373,26 @@ pub async fn post_job_async(
         task: request.task,
         output: request.output,
     })
+}
+
+fn now_unix_secs() -> Result<u64, JobLifecycleError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| JobLifecycleError::Input(format!("current unix time unavailable: {error}")))
+}
+
+fn resolve_post_deadline(
+    deadline_unix: Option<u64>,
+    now_unix: u64,
+) -> Result<u64, JobLifecycleError> {
+    match deadline_unix {
+        Some(given) if given <= now_unix => Err(JobLifecycleError::Input(format!(
+            "post_job refused: deadline_unix must be greater than current unix time; given={given}, current={now_unix}"
+        ))),
+        Some(given) => Ok(given),
+        None => Ok(now_unix.saturating_add(DEFAULT_DEADLINE_SECS)),
+    }
 }
 
 /// F2 buyer-fix: refuse a post whose `amount_sats` exceeds the per-job budget cap. Mirrors the
@@ -2145,6 +2159,43 @@ mod tests {
         assert!(assert_amount_within_budget_cap(21, 21).is_ok(), "at-cap must pass");
         // under-cap ⇒ passes, unchanged.
         assert!(assert_amount_within_budget_cap(20, 21).is_ok(), "under-cap must pass");
+    }
+
+    #[test]
+    fn post_job_deadline_past_refused_names_field_and_values() {
+        let err = resolve_post_deadline(Some(1_700_000_000), 1_700_000_001)
+            .expect_err("past deadline must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("deadline_unix"), "names the field: {msg}");
+        assert!(msg.contains("given=1700000000"), "shows given value: {msg}");
+        assert!(msg.contains("current=1700000001"), "shows current value: {msg}");
+    }
+
+    #[test]
+    fn post_job_deadline_zero_refused() {
+        let err = resolve_post_deadline(Some(0), 1_700_000_001)
+            .expect_err("zero deadline must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("deadline_unix"), "{msg}");
+        assert!(msg.contains("given=0"), "{msg}");
+        assert!(msg.contains("current=1700000001"), "{msg}");
+    }
+
+    #[test]
+    fn post_job_deadline_omitted_defaults_to_one_hour_from_now() {
+        assert_eq!(
+            resolve_post_deadline(None, 1_700_000_001).expect("omitted deadline defaults"),
+            1_700_003_601
+        );
+    }
+
+    #[test]
+    fn post_job_deadline_future_accepted() {
+        assert_eq!(
+            resolve_post_deadline(Some(1_700_000_002), 1_700_000_001)
+                .expect("future deadline accepted"),
+            1_700_000_002
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
