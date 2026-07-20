@@ -147,6 +147,60 @@ impl Default for SellerMemoryConfig {
     }
 }
 
+/// Seller lifecycle **announce** config (`[seller_announce]` section). Wires the daemon's
+/// structured lifecycle events (online/claimed/delivered/collected/refused/reconcile-released/
+/// job-failed) to a pluggable external sink command that receives one JSON event on stdin.
+///
+/// NOTE (same build judgment call as [`SellerMemoryConfig`]): the natural spelling would nest
+/// this under `[seller]`, but `SellerConfig`'s literal is constructed in `seller.rs` — a money-
+/// path file the gateway build must not touch. Placing it top-level as `[seller_announce]` on
+/// `MobeeConfig` (built only via `Default`) delivers the identical knob without touching any
+/// money file. Cosmetic nesting only; behavior is unchanged.
+///
+/// **Feature OFF by default**: an absent section (or an empty `command`) means the daemon emits
+/// nothing and spawns no process — byte-identical behavior to before the feature existed. This is
+/// diagnostic/observability context only; nothing here ever feeds the pay gate, journal, or
+/// receipt bind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SellerAnnounceConfig {
+    /// Sink command as an argv array (no-shell by construction, like `agent_command`). Empty ⇒
+    /// feature OFF. Each lifecycle event spawns this command with the event JSON on stdin.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Upper bound (ms) the daemon waits for one sink invocation before killing it. Emission is
+    /// always off the event loop (its own detached thread), so this bounds only that thread — the
+    /// seller loop is never blocked regardless. Default **2000**.
+    #[serde(default = "default_announce_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for SellerAnnounceConfig {
+    fn default() -> Self {
+        Self {
+            command: Vec::new(),
+            timeout_ms: default_announce_timeout_ms(),
+        }
+    }
+}
+
+impl SellerAnnounceConfig {
+    /// True when every field is at its shipped default (so config.toml stays clean — the section
+    /// only serializes once an operator sets a sink command or a non-default bound).
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// True when a sink command is configured (feature ON).
+    pub fn is_enabled(&self) -> bool {
+        !self.command.is_empty()
+    }
+}
+
+/// serde default for [`SellerAnnounceConfig::timeout_ms`] — a 2s bound on one sink invocation.
+pub fn default_announce_timeout_ms() -> u64 {
+    2000
+}
+
 impl SellerMemoryConfig {
     /// True when every field is at its shipped default (so config.toml stays clean — the section
     /// is only serialized once an operator sets a non-default knob).
@@ -270,6 +324,9 @@ pub struct MobeeConfig {
     /// Piece-13 `[seller_memory]` config (read-on-start + retro seams). Defaults when absent.
     #[serde(default, skip_serializing_if = "SellerMemoryConfig::is_default")]
     pub seller_memory: SellerMemoryConfig,
+    /// `[seller_announce]` lifecycle-event sink config. Defaults (feature OFF) when absent.
+    #[serde(default, skip_serializing_if = "SellerAnnounceConfig::is_default")]
+    pub seller_announce: SellerAnnounceConfig,
     /// Optional buyer-side piece-10 contribution content policy (the MUST-5 policy hook). Absent
     /// ⇒ the FLOOR (refuse only empty diffs). Present ⇒ tighten pre-pay with a path allowlist /
     /// forbidden paths / max diff size.
@@ -304,6 +361,7 @@ impl Default for MobeeConfig {
             profile: None,
             seller: None,
             seller_memory: SellerMemoryConfig::default(),
+            seller_announce: SellerAnnounceConfig::default(),
             contribution: None,
         }
     }

@@ -388,6 +388,21 @@ impl SellerDaemon {
                 // Piece-13: durable refusal capture (previously eprintln-only). Best-effort —
                 // an episode write never affects the skip decision or the money path.
                 self.record_refused_episode(event, &skip);
+                // Announce the refusal (with its machine-readable reason code). Skip the same two
+                // non-freshly-classified cases the episode capture skips — a non-offer and a dedup
+                // re-see are noise, not a seller decision. `amount` rides along when the offer
+                // parsed (unparseable ⇒ None).
+                if !matches!(skip, OfferSkip::NotAnOffer { .. } | OfferSkip::AlreadyProcessed) {
+                    let amount = parse_offer(&event_to_draft(event)).ok().map(|o| o.amount);
+                    self.announce(crate::announce::AnnounceEvent::refused(
+                        now_unix(),
+                        &self.seller_pubkey,
+                        &event.id.to_hex(),
+                        skip.code(),
+                        &skip.reason(),
+                        amount,
+                    ));
+                }
                 // Bundled buyer-visibility: a TARGETED-to-self under-rate refusal also emits a
                 // kind-7000 `status=error` so the buyer learns why. Open-pool under-rate stays
                 // log-only (spam guard). No-op for every other skip reason.
@@ -447,6 +462,24 @@ impl SellerDaemon {
             Self::end_flight();
             return Err(DaemonError::Seller(SellerError::Io(error.to_string())));
         }
+
+        // CLAIMED visibility: before this feature the daemon claimed an offer SILENTLY (the claim
+        // was journaled but emitted no log line and no observable event — the sidecar's earliest
+        // positive signal was `delivered`). Emit the first-ever claim signal on BOTH surfaces: a
+        // stderr line (for the log-tailing sidecar) and the structured announce event.
+        eprintln!(
+            "seller claimed offer job_id={} claim_id={claim_id} buyer={} amount={} deadline={}",
+            intent.job_id, intent.buyer_pubkey, intent.offer.amount, intent.deadline_unix
+        );
+        self.announce(crate::announce::AnnounceEvent::claimed(
+            now_unix(),
+            &self.seller_pubkey,
+            &intent.job_id,
+            &intent.buyer_pubkey,
+            intent.offer.amount,
+            &claim_id,
+            intent.deadline_unix,
+        ));
 
         self.active = Some(ActiveJob {
             job_id: intent.job_id,
@@ -694,6 +727,14 @@ impl SellerDaemon {
         let plan = self.reconcile_journal(now)?;
         for orphan in &plan {
             let reason = reconcile_reason(orphan.liveness);
+            // RECONCILE-RELEASED announce: an orphaned in-flight claim released on startup.
+            self.announce(crate::announce::AnnounceEvent::reconcile_released(
+                now_unix(),
+                &self.seller_pubkey,
+                &orphan.job_id,
+                &format!("{:?}", orphan.liveness),
+                reason,
+            ));
             let draft = error_draft(&orphan.job_id, &orphan.buyer_pubkey, &self.seller_pubkey);
             match publish_draft(&self.home, &self.keys, &draft).await {
                 Ok(id) => eprintln!(
@@ -804,6 +845,17 @@ impl SellerDaemon {
         // Piece-13: capture the delivered-PAID terminal episode. Best-effort — written AFTER the
         // authoritative receipt above and can never fail or alter it. Seeds the retro (§ Retro).
         self.record_paid_episode(&job, amount_received, expected_amount);
+        // COLLECTED announce: sats redeemed at the mint + receipt journaled. Emitted AFTER the
+        // authoritative receipt; a sink failure can never affect the money that already landed.
+        self.announce(crate::announce::AnnounceEvent::collected(
+            now_unix(),
+            &self.seller_pubkey,
+            &local_job,
+            &local_result,
+            amount_received,
+            expected_amount,
+            &mint,
+        ));
 
         let outcome = ReceiptOutcome {
             job_id: local_job,
@@ -1056,6 +1108,17 @@ impl SellerDaemon {
                 deliver_ts: now_unix(),
             });
         }
+        // DELIVERED announce: the kind-6109 result is published and pushed. Diagnostic only.
+        self.announce(crate::announce::AnnounceEvent::delivered(
+            now_unix(),
+            &self.seller_pubkey,
+            &active.job_id,
+            &result_id,
+            &commit,
+            &seller_cfg.git_remote,
+            &branch,
+            active.offer.amount,
+        ));
         Ok(result_id)
     }
 
@@ -1064,6 +1127,14 @@ impl SellerDaemon {
             // Piece-13: capture the ERRORED terminal, threading `reason` (previously discarded)
             // into `error_reason`. Best-effort; the kind-7000 below is the buyer-facing surface.
             self.record_errored_episode(&active, reason);
+            // JOB-FAILED announce (with the machine reason). Diagnostic; the kind-7000 stays the
+            // buyer-facing surface.
+            self.announce(crate::announce::AnnounceEvent::job_failed(
+                now_unix(),
+                &self.seller_pubkey,
+                &active.job_id,
+                reason,
+            ));
             let draft = error_draft(&active.job_id, &active.buyer_pubkey, &self.seller_pubkey);
             let _ = publish_draft(&self.home, &self.keys, &draft).await;
         }
@@ -1206,6 +1277,24 @@ impl SellerDaemon {
                 episode.job_id
             );
         }
+    }
+
+    /// Best-effort lifecycle announce — dispatch one JSON event to the configured
+    /// `[seller_announce]` sink command. NEVER blocks the event loop: [`crate::announce::dispatch`]
+    /// runs the whole spawn+write+bounded-wait on its OWN detached thread and returns immediately;
+    /// a missing/slow/hung/failing sink is logged once and swallowed. No-op when no sink is
+    /// configured (feature OFF ⇒ zero behavior change). Announce events carry only ids/amounts/
+    /// reasons already public on the relay or in the seller log — never a token/key/plaintext.
+    fn announce(&self, event: crate::announce::AnnounceEvent) {
+        let cfg = &self.home.config.seller_announce;
+        if !cfg.is_enabled() {
+            return;
+        }
+        crate::announce::dispatch(
+            &cfg.command,
+            Duration::from_millis(cfg.timeout_ms),
+            &event,
+        );
     }
 
     /// Piece-13 refused terminal. Best-effort re-parse of the offer for its facts (classify does
@@ -2222,6 +2311,14 @@ pub(crate) async fn run_forever_hooked(
         daemon.home.config.relay_url,
         daemon.home.config.mint_url
     );
+    // ONLINE announce: subscribed + past the NIP-42 auth wait ⇒ reacting to live offers.
+    daemon.announce(crate::announce::AnnounceEvent::online(
+        now_unix(),
+        daemon.seller_pubkey(),
+        &daemon.home.config.relay_url,
+        &daemon.home.config.mint_url,
+        nip42_label,
+    ));
     // Readiness hook: online + subscribed ⇒ ready to react to LIVE offers.
     if let Some(ready) = &hooks.ready {
         let _ = ready.send(());
