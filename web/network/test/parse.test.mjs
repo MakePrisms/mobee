@@ -162,6 +162,32 @@ assert.equal(handler.handler.version, "2026.07.09");
 store.ingest(handler);
 assert.equal(store.census()[0].harness_name, "cursor-agent");
 
+// Same d-tag from distinct pubkeys must not collapse (NIP-89 addressable key includes author).
+store.ingest(
+  ok({
+    id: "f0".repeat(32),
+    pubkey: "f1".repeat(32),
+    kind: 31990,
+    created_at: 301,
+    tags: [
+      ["d", "seller-a"],
+      ["k", "5109"],
+    ],
+    content: JSON.stringify({
+      harness_name: "other-agent",
+      version: "1.0.0",
+    }),
+  }),
+);
+{
+  const census = store.census();
+  assert.equal(census.length, 2);
+  const pubkeys = new Set(census.map((r) => r.pubkey));
+  assert.equal(pubkeys.size, 2);
+  assert.ok(pubkeys.has("6".repeat(64)));
+  assert.ok(pubkeys.has("f1".repeat(32)));
+}
+
 // ——— latency path ———
 store.ingest(
   ok({

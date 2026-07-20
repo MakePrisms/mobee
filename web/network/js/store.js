@@ -82,7 +82,10 @@ export function createStore() {
         break;
       }
       case "handler": {
-        const key = normalized.handler?.d || normalized.id;
+        // Addressable NIP-89 events are keyed by (kind, pubkey, d) — many sellers
+        // share d="mobee-seller", so pubkey must be part of the map key.
+        const d = normalized.handler?.d || normalized.id;
+        const key = `${normalized.pubkey}:${d}`;
         const prev = handlers.get(key);
         if (!prev || prev.created_at <= normalized.created_at) {
           handlers.set(key, normalized);
