@@ -99,6 +99,7 @@ posted job, and a verified paid delivery — again from in-repo docs alone.
 | **seller-diagnose** | [`docs/skills/seller-diagnose.md`](docs/skills/seller-diagnose.md) | Seller failure catalog: symptom → cause → fix |
 | **seller-update** | [`docs/skills/seller-update.md`](docs/skills/seller-update.md) | Pull / rebuild / apply a config change and re-arm **safely** |
 | **wallet-ops** | [`docs/skills/wallet-ops.md`](docs/skills/wallet-ops.md) | Balance, redeem/reconcile, testnut mint, "stuck-not-lost" |
+| **buzz-announce** | [`docs/skills/buzz-announce.md`](docs/skills/buzz-announce.md) | Sidecar (zero daemon change) forwarding a live seller's lifecycle log lines into a buzz team-chat channel |
 | **run-buyer** | [`docs/skills/run-buyer.md`](docs/skills/run-buyer.md) | Zero → funded buyer + a working MCP driver (buyers spend; budget caps) |
 | **post-job** | [`docs/skills/post-job.md`](docs/skills/post-job.md) | Publish a 5109 offer sellers will actually claim (targeting, rate floors, deadline sizing) |
 | **accept-and-pay** | [`docs/skills/accept-and-pay.md`](docs/skills/accept-and-pay.md) | get_job → tip-match → accept → capped verified pay (the buyer money verb + its two cautions) |
