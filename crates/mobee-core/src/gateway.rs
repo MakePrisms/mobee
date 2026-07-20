@@ -461,15 +461,25 @@ pub fn git_result_draft(
 }
 
 /// Kind-7000 `status=error` feedback (timeout / push-fail / refuse paths).
-pub fn error_draft(offer_id: &str, buyer_pubkey: &str, seller_pubkey: &str) -> EventDraft {
-    feedback_draft(
+///
+/// `content` carries a machine-readable reason when one is available (e.g. rate-gate
+/// refusal); empty string preserves the historical empty-content callers.
+pub fn error_draft(
+    offer_id: &str,
+    buyer_pubkey: &str,
+    seller_pubkey: &str,
+    content: impl Into<String>,
+) -> EventDraft {
+    let mut draft = feedback_draft(
         "error",
         vec![
             TagSpec::new(["e", offer_id]),
             TagSpec::new(["p", buyer_pubkey]),
             TagSpec::new(["p", seller_pubkey]),
         ],
-    )
+    );
+    draft.content = content.into();
+    draft
 }
 
 /// Optional git bind on a kind-5109 offer (`delivery=git` + repo + branch).

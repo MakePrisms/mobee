@@ -405,9 +405,11 @@ impl SellerDaemon {
                 }
                 // Bundled buyer-visibility: a TARGETED-to-self under-rate refusal also emits a
                 // kind-7000 `status=error` so the buyer learns why. Open-pool under-rate stays
-                // log-only (spam guard). No-op for every other skip reason.
-                if matches!(skip, OfferSkip::RateGate { .. }) {
-                    self.publish_under_rate_error_if_targeted(event).await;
+                // log-only (spam guard). No-op for every other skip reason. Content carries the
+                // same machine-readable rate-gate reason already logged here (buyers distinguish
+                // rate-refusal from a crash).
+                if let OfferSkip::RateGate { reason } = &skip {
+                    self.publish_under_rate_error_if_targeted(event, reason).await;
                 }
                 // Piece-10 interop courtesy: a seller that cannot/​will not handle a contribution
                 // offer emits a kind-7000 `status=error` so the buyer does not wait on a delivery
@@ -420,6 +422,7 @@ impl SellerDaemon {
                         &event.id.to_hex(),
                         &event.pubkey.to_hex(),
                         &self.seller_pubkey,
+                        "",
                     );
                     let _ = publish_draft(&self.home, &self.keys, &draft).await;
                 }
@@ -558,9 +561,14 @@ impl SellerDaemon {
             seller_cfg.rate_sats,
             seller_cfg.claim_open_pool,
         ) {
-            return Ok(OfferDisposition::Skip(OfferSkip::RateGate {
-                reason: error.to_string(),
-            }));
+            // Prefer the raw policy message (e.g. "offer amount 3 sat below seller rate_sats 5")
+            // over Display's "seller policy refused: …" prefix — that string is logged and
+            // plumbed into the kind-7000 content for targeted under-rate refusals.
+            let reason = match error {
+                SellerError::Policy(message) => message,
+                other => other.to_string(),
+            };
+            return Ok(OfferDisposition::Skip(OfferSkip::RateGate { reason }));
         }
         let job_id = event.id.to_hex();
         if self.journal.has_claim(&job_id)? {
@@ -651,8 +659,10 @@ impl SellerDaemon {
     /// being below the seller's rate floor, publish a kind-7000 `status=error` so the buyer
     /// learns WHY (in addition to the local skip log). OPEN-POOL / untargeted under-rate refusals
     /// stay LOG-ONLY (a fleet of rate-N sellers each 7000-ing every cheap open offer would spam
-    /// the relay). Publish failure is logged, never fatal. Called only on a `RateGate` skip.
-    async fn publish_under_rate_error_if_targeted(&self, event: &nostr_sdk::Event) {
+    /// the relay). `reason` is the machine-readable rate-gate string (same as the skip log) and
+    /// is written into the event content. Publish failure is logged, never fatal. Called only on
+    /// a `RateGate` skip.
+    async fn publish_under_rate_error_if_targeted(&self, event: &nostr_sdk::Event, reason: &str) {
         let draft = event_to_draft(event);
         let Ok(offer) = parse_offer(&draft) else {
             return;
@@ -664,10 +674,15 @@ impl SellerDaemon {
         if !(targeted_to_self && offer.amount < seller_cfg.rate_sats) {
             return; // open-pool / wrong-target / not-under-rate ⇒ log-only (handled by caller).
         }
-        let error = error_draft(&event.id.to_hex(), &event.pubkey.to_hex(), &self.seller_pubkey);
+        let error = under_rate_error_draft(
+            &event.id.to_hex(),
+            &event.pubkey.to_hex(),
+            &self.seller_pubkey,
+            reason,
+        );
         match publish_draft(&self.home, &self.keys, &error).await {
             Ok(id) => eprintln!(
-                "seller under-rate refusal surfaced: kind-7000 error={id} offer={} (amount {} < rate_sats {})",
+                "seller under-rate refusal surfaced: kind-7000 error={id} offer={} (amount {} < rate_sats {}) reason={reason}",
                 event.id.to_hex(),
                 offer.amount,
                 seller_cfg.rate_sats
@@ -735,7 +750,7 @@ impl SellerDaemon {
                 &format!("{:?}", orphan.liveness),
                 reason,
             ));
-            let draft = error_draft(&orphan.job_id, &orphan.buyer_pubkey, &self.seller_pubkey);
+            let draft = error_draft(&orphan.job_id, &orphan.buyer_pubkey, &self.seller_pubkey, "");
             match publish_draft(&self.home, &self.keys, &draft).await {
                 Ok(id) => eprintln!(
                     "seller reconcile: released orphaned claim job_id={} liveness={:?} kind7000={id} reason={reason}",
@@ -1135,7 +1150,7 @@ impl SellerDaemon {
                 &active.job_id,
                 reason,
             ));
-            let draft = error_draft(&active.job_id, &active.buyer_pubkey, &self.seller_pubkey);
+            let draft = error_draft(&active.job_id, &active.buyer_pubkey, &self.seller_pubkey, "");
             let _ = publish_draft(&self.home, &self.keys, &draft).await;
         }
         Self::end_flight();
@@ -1716,6 +1731,18 @@ fn compose_agent_prompt(task: &str, git_remote: &str, memory_section: Option<&st
         Some(section) => format!("{base}\n\n{section}"),
         None => base,
     }
+}
+
+/// Kind-7000 `status=error` draft for a targeted under-rate refusal. Content carries the
+/// machine-readable rate-gate reason (same string the skip log already has) so buyers can
+/// distinguish rate-refusal from a crash / empty-content failure.
+fn under_rate_error_draft(
+    offer_id: &str,
+    buyer_pubkey: &str,
+    seller_pubkey: &str,
+    reason: &str,
+) -> EventDraft {
+    error_draft(offer_id, buyer_pubkey, seller_pubkey, reason)
 }
 
 async fn publish_draft(
@@ -3366,6 +3393,68 @@ mod tests {
                 OfferDisposition::Claim(_)
             ),
             "a strictly-future deadline must be admitted"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Targeted under-rate refusal: the kind-7000 `status=error` draft CONTENT must carry the
+    // same machine-readable rate-gate reason the skip log already has (buyers distinguish
+    // rate-refusal from a crash / empty-content failure).
+    #[test]
+    fn under_rate_error_draft_content_carries_rate_gate_reason() {
+        let reason = "offer amount 3 sat below seller rate_sats 5";
+        let draft = under_rate_error_draft("offer-id", "buyer-pk", "seller-pk", reason);
+        assert_eq!(draft.kind, gateway::JOB_FEEDBACK_KIND);
+        assert_eq!(
+            draft.content, reason,
+            "kind-7000 content must carry the rate-gate reason, not stay empty"
+        );
+        assert!(
+            draft.tags.iter().any(|t| {
+                t.0.first().map(String::as_str) == Some("status")
+                    && t.0.get(1).map(String::as_str) == Some("error")
+            }),
+            "must be status=error: {:?}",
+            draft.tags
+        );
+        assert!(
+            draft.tags.iter().any(|t| {
+                t.0.first().map(String::as_str) == Some("e")
+                    && t.0.get(1).map(String::as_str) == Some("offer-id")
+            }),
+            "must e-tag the refused offer: {:?}",
+            draft.tags
+        );
+    }
+
+    // classify → RateGate reason is the clean policy string that under_rate_error_draft embeds.
+    #[test]
+    fn classify_under_rate_reason_is_plumbed_into_error_draft_content() {
+        let (root, mut daemon) = test_daemon("under-rate-content");
+        if let Some(seller) = daemon.home.config.seller.as_mut() {
+            seller.rate_sats = 5;
+        }
+        let seller_pk = daemon.seller_pubkey().to_owned();
+        let buyer = nostr_sdk::Keys::generate();
+        let now = 1_000_000u64;
+        let ev = offer_event(&buyer, &seller_pk, 3, now + 3600);
+        let reason = match daemon.classify_offer(&ev, now).expect("classify") {
+            OfferDisposition::Skip(OfferSkip::RateGate { reason }) => reason,
+            other => panic!("targeted under-rate must RateGate-skip, got {other:?}"),
+        };
+        assert_eq!(
+            reason, "offer amount 3 sat below seller rate_sats 5",
+            "classify must surface the machine-readable rate-gate reason"
+        );
+        let draft = under_rate_error_draft(
+            &ev.id.to_hex(),
+            &ev.pubkey.to_hex(),
+            &seller_pk,
+            &reason,
+        );
+        assert_eq!(
+            draft.content, reason,
+            "emitted kind-7000 content must equal the rate-gate reason"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
