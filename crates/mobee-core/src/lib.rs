@@ -10,6 +10,8 @@ pub mod contribution;
 pub mod delivery;
 #[cfg(feature = "git-delivery")]
 pub mod delivery_git;
+#[cfg(feature = "wallet")]
+pub mod doctor;
 pub mod delivery_transport;
 pub mod driver;
 pub mod engine;

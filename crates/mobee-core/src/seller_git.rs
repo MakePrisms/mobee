@@ -480,6 +480,133 @@ pub fn push_branch_with_auth(
     Ok(oid)
 }
 
+/// Boot-time WRITE-auth probe: stand up an ephemeral one-commit repo and `git push --dry-run` it
+/// to `remote_url`, exercising the receive-pack auth handshake WITHOUT mutating the remote (dry-run
+/// negotiates refs but sends no pack and updates nothing). Surfaces a broken write path — missing
+/// credential helper, unannounced/unreachable relay-git repo, or a write-scoped auth failure — at
+/// daemon boot instead of at job-delivery time.
+///
+/// Scope note: `--dry-run` performs the receive-pack ref ADVERTISEMENT (which mobee-relay NIP-98
+/// auth-gates) but stops before the pack POST, so it does not by itself reproduce the git < 2.54
+/// bug (that drops the Authorization credential specifically on the receive-pack POST — reads and
+/// the advertisement still succeed). `mobee doctor`'s git-version check is the definitive detector
+/// for that class; this probe catches the broader "can this seller authenticate a write at all"
+/// question cheaply and side-effect-free.
+///
+/// Allowlisted (https + relay-git; `ext::`/file/ssh refused) and scrubbed exactly like every other
+/// seller git child. Cleans up its temp workdir on the way out.
+pub fn preflight_push_probe(
+    seller_home: &Path,
+    remote_url: &str,
+    auth: Option<&PushAuth>,
+) -> Result<(), SellerGitError> {
+    assert_allowed_repo_locator(remote_url)?;
+
+    let workdir = std::env::temp_dir().join(format!(
+        "mobee-preflight-{}-{}",
+        std::process::id(),
+        preflight_probe_seq()
+    ));
+    let _ = std::fs::remove_dir_all(&workdir);
+    std::fs::create_dir_all(&workdir).map_err(|error| SellerGitError::Io(error.to_string()))?;
+
+    let result = preflight_push_probe_in(&workdir, seller_home, remote_url, auth);
+    let _ = std::fs::remove_dir_all(&workdir);
+    result
+}
+
+/// Monotonic per-process counter so concurrent probes never collide on a temp dir name.
+fn preflight_probe_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Body of [`preflight_push_probe`] with an explicit `workdir` so the caller owns cleanup.
+fn preflight_push_probe_in(
+    workdir: &Path,
+    seller_home: &Path,
+    remote_url: &str,
+    auth: Option<&PushAuth>,
+) -> Result<(), SellerGitError> {
+    run_ok(
+        "preflight-init",
+        scrubbed_git(workdir, seller_home, ["init", "--initial-branch=main"])?,
+    )?;
+    run_ok(
+        "preflight-config-name",
+        scrubbed_git(workdir, seller_home, ["config", "user.name", "mobee-preflight"])?,
+    )?;
+    run_ok(
+        "preflight-config-email",
+        scrubbed_git(
+            workdir,
+            seller_home,
+            ["config", "user.email", "preflight@seller.mobee.invalid"],
+        )?,
+    )?;
+    std::fs::write(workdir.join("preflight.txt"), b"mobee boot push preflight\n")
+        .map_err(|error| SellerGitError::Io(error.to_string()))?;
+    run_ok(
+        "preflight-add",
+        scrubbed_git(workdir, seller_home, ["add", "preflight.txt"])?,
+    )?;
+    run_ok(
+        "preflight-commit",
+        scrubbed_git(
+            workdir,
+            seller_home,
+            ["commit", "-m", "mobee boot push preflight"],
+        )?,
+    )?;
+
+    // Point origin at the allowlisted remote for this probe only.
+    let _ = scrubbed_git_auth(workdir, seller_home, ["remote", "remove", "origin"], None);
+    run_ok(
+        "preflight-remote-add",
+        scrubbed_git_auth(
+            workdir,
+            seller_home,
+            ["remote", "add", "origin", remote_url],
+            None,
+        )?,
+    )?;
+
+    // Push to a throwaway ref name (dry-run never creates it) so a real branch is never touched.
+    let use_nip98 = auth.is_some() && crate::delivery_transport::is_relay_git_locator(remote_url);
+    let push = scrubbed_git_auth(
+        workdir,
+        seller_home,
+        [
+            "push",
+            "--dry-run",
+            "origin",
+            "HEAD:refs/heads/mobee-preflight-probe",
+        ],
+        if use_nip98 { auth } else { None },
+    )?;
+    if push.status.success() {
+        return Ok(());
+    }
+    let stderr_raw = String::from_utf8_lossy(&push.stderr);
+    let stderr =
+        redact_secret(&stderr_raw, auth.map(|a| a.secret_key_hex.as_str())).to_lowercase();
+    if stderr.contains("authentication")
+        || stderr.contains("could not read username")
+        || stderr.contains("permission denied")
+        || stderr.contains("403")
+        || stderr.contains("401")
+        || stderr.contains("terminal prompts disabled")
+        || stderr.contains("repository not found")
+        || stderr.contains("forbidden")
+    {
+        return Err(SellerGitError::AuthFailed(
+            "boot push preflight: unauthenticated, unannounced, or prompt-required remote".into(),
+        ));
+    }
+    Err(SellerGitError::CommandFailed("preflight-push"))
+}
+
 fn redact_secret(text: &str, secret: Option<&str>) -> String {
     let Some(secret) = secret.filter(|s| s.len() >= 16) else {
         return text.to_owned();
@@ -801,6 +928,51 @@ mod tests {
         .expect_err("file refused");
         assert!(matches!(err, SellerGitError::Transport(_)));
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn preflight_push_probe_refuses_non_allowlisted_remote() {
+        let home = temp("preflight-refuse-home");
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("home");
+        for bad in [
+            "git@example.invalid:repo.git",
+            "ssh://example.invalid/repo.git",
+            "/tmp/local.git",
+            "ext::sh -c evil",
+        ] {
+            assert!(
+                matches!(
+                    preflight_push_probe(&home, bad, None),
+                    Err(SellerGitError::Transport(_))
+                ),
+                "expected transport refuse for {bad}"
+            );
+        }
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn preflight_push_probe_fails_closed_on_unreachable_https_remote() {
+        // No mutation, no hang: an allowlisted-but-unresolvable https remote must fail closed
+        // (GIT_TERMINAL_PROMPT=0) rather than block boot. Proves the probe reaches the push.
+        let home = temp("preflight-unreach-home");
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("home");
+        let err = preflight_push_probe(
+            &home,
+            "https://mobee-preflight.invalid/git/owner/repo.git",
+            None,
+        )
+        .expect_err("unreachable remote must fail closed");
+        assert!(
+            matches!(
+                err,
+                SellerGitError::AuthFailed(_) | SellerGitError::CommandFailed(_)
+            ),
+            "got {err:?}"
+        );
         let _ = fs::remove_dir_all(&home);
     }
 

@@ -202,6 +202,48 @@ pub fn default_announce_timeout_ms() -> u64 {
     2000
 }
 
+/// Boot-time push-preflight config (`[seller_preflight]` section). Gates the seller daemon's
+/// one-shot WRITE-auth probe at startup (a `git push --dry-run` against the seller's relay-git
+/// canonical repo) so environment breakage — most notably git < 2.54 silently dropping the
+/// Authorization credential on the git-receive-pack POST (reads work, pushes 401) — surfaces at
+/// BOOT instead of mid-job.
+///
+/// NOTE (same money-path build boundary as [`SellerMemoryConfig`] / [`SellerAnnounceConfig`]): the
+/// natural spelling would nest this under `[seller]`, but `SellerConfig`'s literal is constructed
+/// in `seller.rs` — a money-path file this change must not touch. A new required field there would
+/// force editing that literal. Placing it top-level as `[seller_preflight]` on `MobeeConfig` (built
+/// only via `Default`) delivers the identical knob without touching any money file. Cosmetic only;
+/// the probe is diagnostic — it NEVER feeds the pay gate, journal, or receipt bind, and NEVER
+/// refuses boot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SellerPreflightConfig {
+    /// Run the boot-time dry-run push probe. Default **true**. Set false (or the env override
+    /// `MOBEE_SELLER_BOOT_PUSH_PREFLIGHT=0`) to skip — e.g. tests, or air-gapped first boots.
+    #[serde(default = "default_boot_push_preflight")]
+    pub boot_push_preflight: bool,
+}
+
+impl Default for SellerPreflightConfig {
+    fn default() -> Self {
+        Self {
+            boot_push_preflight: default_boot_push_preflight(),
+        }
+    }
+}
+
+impl SellerPreflightConfig {
+    /// True when every field is at its shipped default (so config.toml stays clean — the section is
+    /// only serialized once an operator sets a non-default knob).
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// serde default for [`SellerPreflightConfig::boot_push_preflight`] — probe ON.
+pub fn default_boot_push_preflight() -> bool {
+    true
+}
+
 impl SellerMemoryConfig {
     /// True when every field is at its shipped default (so config.toml stays clean — the section
     /// is only serialized once an operator sets a non-default knob).
@@ -340,6 +382,9 @@ pub struct MobeeConfig {
     /// `[seller_announce]` lifecycle-event sink config. Defaults (feature OFF) when absent.
     #[serde(default, skip_serializing_if = "SellerAnnounceConfig::is_default")]
     pub seller_announce: SellerAnnounceConfig,
+    /// `[seller_preflight]` boot push-probe config. Defaults (probe ON) when absent.
+    #[serde(default, skip_serializing_if = "SellerPreflightConfig::is_default")]
+    pub seller_preflight: SellerPreflightConfig,
     /// Optional buyer-side piece-10 contribution content policy (the MUST-5 policy hook). Absent
     /// ⇒ the FLOOR (refuse only empty diffs). Present ⇒ tighten pre-pay with a path allowlist /
     /// forbidden paths / max diff size.
@@ -376,6 +421,7 @@ impl Default for MobeeConfig {
             agents: BTreeMap::new(),
             seller_memory: SellerMemoryConfig::default(),
             seller_announce: SellerAnnounceConfig::default(),
+            seller_preflight: SellerPreflightConfig::default(),
             contribution: None,
         }
     }
