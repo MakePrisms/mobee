@@ -353,7 +353,7 @@ pub async fn post_job_async(
 
     let draft = build_offer_draft(
         &request,
-        &home.config.mint_url,
+        home.config.default_mint(),
         deadline_unix,
         contribution.as_ref(),
     )?;

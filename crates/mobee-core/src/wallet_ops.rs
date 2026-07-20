@@ -137,7 +137,7 @@ fn is_autopay_mint(mint_url: &str) -> bool {
 /// Configured mints: default `mint_url` first, then opt-in `extra_mints` (deduped).
 pub fn configured_mints(home: &MobeeHome) -> Result<Vec<String>, WalletOpsError> {
     let mut out = Vec::new();
-    let default = normalize_mint_url(&home.config.mint_url)?;
+    let default = normalize_mint_url(home.config.default_mint())?;
     out.push(default.clone());
     for extra in &home.config.extra_mints {
         let normalized = normalize_mint_url(extra)?;
@@ -163,7 +163,7 @@ fn mint_is_allowed(home: &MobeeHome, mint_url: &str) -> Result<String, WalletOps
 fn resolve_mint(home: &MobeeHome, mint_override: Option<&str>) -> Result<String, WalletOpsError> {
     match mint_override {
         Some(url) => mint_is_allowed(home, url),
-        None => normalize_mint_url(&home.config.mint_url),
+        None => normalize_mint_url(home.config.default_mint()),
     }
 }
 
@@ -236,7 +236,7 @@ async fn poll_and_mint(
 
 /// Balance per configured mint (default + extras).
 pub async fn balances_async(home: &MobeeHome) -> Result<Vec<MintBalance>, WalletOpsError> {
-    let default = normalize_mint_url(&home.config.mint_url)?;
+    let default = normalize_mint_url(home.config.default_mint())?;
     let mut rows = Vec::new();
     for mint_url in configured_mints(home)? {
         let wallet = open_wallet_async(home, &mint_url).await?;
@@ -488,7 +488,7 @@ pub async fn melt_async(
 
 /// List configured mints (default first).
 pub fn list_mints(home: &MobeeHome) -> Result<Vec<MintBalance>, WalletOpsError> {
-    let default = normalize_mint_url(&home.config.mint_url)?;
+    let default = normalize_mint_url(home.config.default_mint())?;
     Ok(configured_mints(home)?
         .into_iter()
         .map(|mint_url| MintBalance {
@@ -502,7 +502,7 @@ pub fn list_mints(home: &MobeeHome) -> Result<Vec<MintBalance>, WalletOpsError> 
 /// Opt-in add of an extra mint URL (does not invent balance).
 pub fn add_mint(home: &mut MobeeHome, mint_url: &str) -> Result<String, WalletOpsError> {
     let normalized = normalize_mint_url(mint_url)?;
-    let default = normalize_mint_url(&home.config.mint_url)?;
+    let default = normalize_mint_url(home.config.default_mint())?;
     if normalized == default {
         return Ok(normalized);
     }
@@ -522,7 +522,7 @@ pub fn add_mint(home: &mut MobeeHome, mint_url: &str) -> Result<String, WalletOp
 /// Remove an opt-in extra mint. Default mint is pinned and cannot be removed.
 pub fn remove_mint(home: &mut MobeeHome, mint_url: &str) -> Result<(), WalletOpsError> {
     let normalized = normalize_mint_url(mint_url)?;
-    let default = normalize_mint_url(&home.config.mint_url)?;
+    let default = normalize_mint_url(home.config.default_mint())?;
     if normalized == default {
         return Err(WalletOpsError::MintPinnedDefault);
     }
@@ -652,7 +652,7 @@ mod tests {
         let root = temp_home("mints");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap(&root).expect("bootstrap");
-        assert_eq!(home.config.mint_url, DEFAULT_MINT_URL);
+        assert_eq!(home.config.default_mint(), DEFAULT_MINT_URL);
         let listed = list_mints(&home).expect("list");
         assert_eq!(listed.len(), 1);
         assert!(listed[0].is_default);
