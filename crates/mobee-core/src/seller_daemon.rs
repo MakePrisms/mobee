@@ -195,6 +195,35 @@ pub struct DeliveryRecord {
     pub deliver_ts: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorReasonCode {
+    AgentSpawnFailed,
+    AgentRunFailed,
+    AgentTimeout,
+    GitForkFailed,
+    GitPushFailed,
+    ContributionUnsupported,
+    ContributionMalformed,
+    ClaimReleased,
+    Internal,
+}
+
+impl ErrorReasonCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentSpawnFailed => "agent_spawn_failed",
+            Self::AgentRunFailed => "agent_run_failed",
+            Self::AgentTimeout => "agent_timeout",
+            Self::GitForkFailed => "git_fork_failed",
+            Self::GitPushFailed => "git_push_failed",
+            Self::ContributionUnsupported => "contribution_unsupported",
+            Self::ContributionMalformed => "contribution_malformed",
+            Self::ClaimReleased => "claim_released",
+            Self::Internal => "internal",
+        }
+    }
+}
+
 /// What [`SellerDaemon::classify_offer`] decided to do with an offer event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OfferDisposition {
@@ -418,11 +447,12 @@ impl SellerDaemon {
                     skip,
                     OfferSkip::ContributionUnsupported | OfferSkip::ContributionMalformed { .. }
                 ) {
+                    let content = contribution_refusal_error_content(&skip);
                     let draft = error_draft(
                         &event.id.to_hex(),
                         &event.pubkey.to_hex(),
                         &self.seller_pubkey,
-                        "",
+                        content,
                     );
                     let _ = publish_draft(&self.home, &self.keys, &draft).await;
                 }
@@ -750,7 +780,13 @@ impl SellerDaemon {
                 &format!("{:?}", orphan.liveness),
                 reason,
             ));
-            let draft = error_draft(&orphan.job_id, &orphan.buyer_pubkey, &self.seller_pubkey, "");
+            let content = reconcile_error_content(orphan.liveness);
+            let draft = error_draft(
+                &orphan.job_id,
+                &orphan.buyer_pubkey,
+                &self.seller_pubkey,
+                content,
+            );
             match publish_draft(&self.home, &self.keys, &draft).await {
                 Ok(id) => eprintln!(
                     "seller reconcile: released orphaned claim job_id={} liveness={:?} kind7000={id} reason={reason}",
@@ -890,7 +926,8 @@ impl SellerDaemon {
             .ok_or_else(|| DaemonError::Policy("no active job".into()))?
             .clone();
         if now_unix() > active.deadline_unix {
-            self.fail_active("job deadline exceeded").await?;
+            self.fail_active(ErrorReasonCode::AgentTimeout, "job deadline exceeded")
+                .await?;
             return Err(DaemonError::Policy("job deadline exceeded".into()));
         }
 
@@ -929,7 +966,12 @@ impl SellerDaemon {
             }
         };
         if let Err(error) = init_result {
-            self.fail_active(&error.to_string()).await?;
+            let code = if active.contribution.is_some() {
+                ErrorReasonCode::GitForkFailed
+            } else {
+                ErrorReasonCode::Internal
+            };
+            self.fail_active(code, &error.to_string()).await?;
             return Err(error.into());
         }
         let run_started = std::time::Instant::now();
@@ -970,7 +1012,8 @@ impl SellerDaemon {
         let usage = match run_result {
             Ok(usage) => usage,
             Err(error) => {
-                self.fail_active(&error.to_string()).await?;
+                self.fail_active(agent_error_reason_code(&error), &error.to_string())
+                    .await?;
                 return Err(error);
             }
         };
@@ -993,7 +1036,8 @@ impl SellerDaemon {
             ),
         };
         if let Err(error) = gate_result {
-            self.fail_active(&error.to_string()).await?;
+            self.fail_active(ErrorReasonCode::AgentRunFailed, &error.to_string())
+                .await?;
             return Err(error.into());
         }
 
@@ -1021,7 +1065,8 @@ impl SellerDaemon {
             Ok(oid) => oid,
             Err(error) => {
                 // Display path must not echo the secret (SellerGitError is scrubbed).
-                self.fail_active(&error.to_string()).await?;
+                self.fail_active(ErrorReasonCode::GitPushFailed, &error.to_string())
+                    .await?;
                 return Err(error.into());
             }
         };
@@ -1091,7 +1136,8 @@ impl SellerDaemon {
                         .extend(crate::contribution::contribution_result_tags(contribution, &tuple_sig));
                 }
                 Err(error) => {
-                    self.fail_active(&error.to_string()).await?;
+                    self.fail_active(ErrorReasonCode::Internal, &error.to_string())
+                        .await?;
                     return Err(DaemonError::Seller(SellerError::Io(error.to_string())));
                 }
             }
@@ -1099,7 +1145,8 @@ impl SellerDaemon {
         let result_id = match publish_draft(&self.home, &self.keys, &draft).await {
             Ok(id) => id,
             Err(error) => {
-                self.fail_active(&error.to_string()).await?;
+                self.fail_active(ErrorReasonCode::Internal, &error.to_string())
+                    .await?;
                 return Err(error);
             }
         };
@@ -1137,20 +1184,30 @@ impl SellerDaemon {
         Ok(result_id)
     }
 
-    async fn fail_active(&mut self, reason: &str) -> Result<(), DaemonError> {
+    async fn fail_active(
+        &mut self,
+        code: ErrorReasonCode,
+        human_reason: &str,
+    ) -> Result<(), DaemonError> {
         if let Some(active) = self.active.take() {
+            let reason = seller_error_content(code, human_reason);
             // Piece-13: capture the ERRORED terminal, threading `reason` (previously discarded)
             // into `error_reason`. Best-effort; the kind-7000 below is the buyer-facing surface.
-            self.record_errored_episode(&active, reason);
+            self.record_errored_episode(&active, &reason);
             // JOB-FAILED announce (with the machine reason). Diagnostic; the kind-7000 stays the
             // buyer-facing surface.
             self.announce(crate::announce::AnnounceEvent::job_failed(
                 now_unix(),
                 &self.seller_pubkey,
                 &active.job_id,
-                reason,
+                &reason,
             ));
-            let draft = error_draft(&active.job_id, &active.buyer_pubkey, &self.seller_pubkey, "");
+            let draft = error_draft(
+                &active.job_id,
+                &active.buyer_pubkey,
+                &self.seller_pubkey,
+                reason,
+            );
             let _ = publish_draft(&self.home, &self.keys, &draft).await;
         }
         Self::end_flight();
@@ -1746,6 +1803,100 @@ fn under_rate_error_draft(
     reason: &str,
 ) -> EventDraft {
     error_draft(offer_id, buyer_pubkey, seller_pubkey, reason)
+}
+
+fn seller_error_content(code: ErrorReasonCode, human: &str) -> String {
+    let sanitized = truncate_human_reason(&strip_absolute_paths(human), 300);
+    let human = if sanitized.trim().is_empty() {
+        "seller aborted the job without a detailed reason"
+    } else {
+        sanitized.trim()
+    };
+    format!("{}: {human}", code.as_str())
+}
+
+fn strip_absolute_paths(input: &str) -> String {
+    input
+        .split_whitespace()
+        .map(strip_absolute_path_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn strip_absolute_path_token(token: &str) -> String {
+    let mut first_path = None;
+    for (idx, ch) in token.char_indices() {
+        if ch == '/' {
+            first_path = Some(idx);
+            break;
+        }
+    }
+    let Some(start) = first_path else {
+        return token.to_owned();
+    };
+    if start > 0 && token[..start].ends_with(':') && token[start..].starts_with("//") {
+        return token.to_owned();
+    }
+    if start > 0 {
+        let prefix = &token[..start];
+        if prefix
+            .chars()
+            .last()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            return token.to_owned();
+        }
+    }
+
+    let suffix_start = token[start..]
+        .find(|ch: char| matches!(ch, ',' | ';' | ':' | ')' | ']' | '}'))
+        .map(|offset| start + offset)
+        .unwrap_or(token.len());
+    format!("{}<path>{}", &token[..start], &token[suffix_start..])
+}
+
+fn truncate_human_reason(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for ch in input.chars().take(max_chars) {
+        out.push(ch);
+    }
+    out
+}
+
+fn agent_error_reason_code(error: &DaemonError) -> ErrorReasonCode {
+    match error {
+        DaemonError::AcpRequired => ErrorReasonCode::AgentSpawnFailed,
+        DaemonError::Agent(message) => {
+            let lower = message.to_ascii_lowercase();
+            if lower.contains("failed to spawn") || lower.contains("no such file") {
+                ErrorReasonCode::AgentSpawnFailed
+            } else if lower.contains("timed out")
+                || lower.contains("timeout")
+                || lower.contains("deadline")
+            {
+                ErrorReasonCode::AgentTimeout
+            } else {
+                ErrorReasonCode::AgentRunFailed
+            }
+        }
+        _ => ErrorReasonCode::AgentRunFailed,
+    }
+}
+
+fn contribution_refusal_error_content(skip: &OfferSkip) -> String {
+    match skip {
+        OfferSkip::ContributionUnsupported => {
+            seller_error_content(ErrorReasonCode::ContributionUnsupported, &skip.reason())
+        }
+        OfferSkip::ContributionMalformed { .. } => {
+            seller_error_content(ErrorReasonCode::ContributionMalformed, &skip.reason())
+        }
+        _ => seller_error_content(ErrorReasonCode::Internal, &skip.reason()),
+    }
+}
+
+fn reconcile_error_content(liveness: ClaimLiveness) -> String {
+    seller_error_content(ErrorReasonCode::ClaimReleased, reconcile_reason(liveness))
 }
 
 async fn publish_draft(
@@ -3480,6 +3631,109 @@ mod tests {
             "emitted kind-7000 content must equal the rate-gate reason"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn assert_error_content_starts_with(code: &str, content: &str) {
+        assert!(!content.is_empty(), "error content must not be empty");
+        assert!(
+            content.starts_with(&format!("{code}: ")),
+            "error content must start with {code}:, got {content:?}"
+        );
+    }
+
+    #[test]
+    fn seller_error_content_is_machine_readable_truncated_and_path_scrubbed() {
+        let long = format!(
+            "failed in /Users/seller/private/job/worktree/file.rs while using https://relay.example/git/repo.git {}",
+            "x".repeat(400)
+        );
+        let content = seller_error_content(ErrorReasonCode::AgentRunFailed, &long);
+        assert_error_content_starts_with("agent_run_failed", &content);
+        let human = content
+            .strip_prefix("agent_run_failed: ")
+            .expect("prefix checked");
+        assert!(human.chars().count() <= 300, "human part is capped: {}", human.len());
+        assert!(!human.contains("/Users/seller/private"), "absolute path leaked: {human}");
+        assert!(human.contains("<path>"), "path redaction marker absent: {human}");
+        assert!(
+            human.contains("https://relay.example/git/repo.git"),
+            "URLs are public locators, not filesystem paths: {human}"
+        );
+    }
+
+    #[test]
+    fn agent_error_reason_code_covers_spawn_timeout_and_run_failure() {
+        assert_eq!(
+            agent_error_reason_code(&DaemonError::Agent("failed to spawn ACP agent: no such file".into()))
+                .as_str(),
+            "agent_spawn_failed"
+        );
+        assert_eq!(
+            agent_error_reason_code(&DaemonError::Agent(
+                "ACP request 3 timed out waiting for response".into()
+            ))
+            .as_str(),
+            "agent_timeout"
+        );
+        assert_eq!(
+            agent_error_reason_code(&DaemonError::Agent("agent terminal Failed".into())).as_str(),
+            "agent_run_failed"
+        );
+    }
+
+    #[test]
+    fn active_job_abort_error_drafts_carry_machine_readable_content() {
+        // These are the active-job fail_active publishers. Live publish itself is intentionally
+        // not exercised here: publish_draft hits the relay; the regression is the draft content
+        // passed to that publisher.
+        let cases = [
+            (
+                "agent_spawn_failed",
+                seller_error_content(ErrorReasonCode::AgentSpawnFailed, "failed to spawn ACP agent"),
+            ),
+            (
+                "agent_run_failed",
+                seller_error_content(ErrorReasonCode::AgentRunFailed, "agent terminal Failed"),
+            ),
+            (
+                "agent_timeout",
+                seller_error_content(ErrorReasonCode::AgentTimeout, "job deadline exceeded"),
+            ),
+            (
+                "git_fork_failed",
+                seller_error_content(ErrorReasonCode::GitForkFailed, "seller git fetch failed"),
+            ),
+            (
+                "git_push_failed",
+                seller_error_content(ErrorReasonCode::GitPushFailed, "seller git push failed"),
+            ),
+            (
+                "internal",
+                seller_error_content(ErrorReasonCode::Internal, "result publish failed"),
+            ),
+        ];
+        for (code, content) in cases {
+            let draft = error_draft("offer-id", "buyer-pk", "seller-pk", content);
+            assert_error_content_starts_with(code, &draft.content);
+        }
+    }
+
+    #[test]
+    fn contribution_refusal_error_drafts_carry_machine_readable_content() {
+        let unsupported = contribution_refusal_error_content(&OfferSkip::ContributionUnsupported);
+        assert_error_content_starts_with("contribution_unsupported", &unsupported);
+
+        let malformed = contribution_refusal_error_content(&OfferSkip::ContributionMalformed {
+            reason: "bad base oid".into(),
+        });
+        assert_error_content_starts_with("contribution_malformed", &malformed);
+    }
+
+    #[test]
+    fn reconcile_release_error_draft_carries_machine_readable_content() {
+        let content = reconcile_error_content(ClaimLiveness::Expired);
+        let draft = error_draft("orphan-job", "buyer-pk", "seller-pk", content);
+        assert_error_content_starts_with("claim_released", &draft.content);
     }
 
     // window == 0 reproduces the pre-backfill subscription shape byte-identically PER FILTER:
