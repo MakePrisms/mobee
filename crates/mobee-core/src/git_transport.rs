@@ -1,7 +1,7 @@
 //! Shared in-process libgit2 transport for every mobee relay-git leg — seller push, seller
 //! base-fetch, buyer verify-fetch, and ref-advertisement probes (ls-remote / boot preflight).
 //!
-//! No system `git` is used on any product path (issue #55). A rustls-backed smart-HTTP
+//! No system `git` is used on any product path. A rustls-backed smart-HTTP
 //! subtransport is registered for the `https` scheme; it injects a NIP-98 `Authorization`
 //! header on every request so write/read auth rides the wire regardless of the local git
 //! version (git ≤ 2.53 drops the header on the streamed POST retry). TLS is reqwest/rustls;
@@ -239,7 +239,7 @@ pub fn push_branch(
 /// long client (seller base fetch). Tags are never downloaded (mirrors `--no-tags`).
 ///
 /// The transport allowlist is NOT asserted here — fetch has legitimate LOCAL-path callers (the
-/// buyer's custody→working-clone merge, and test fixtures fetch from `file`/local bare repos). The
+/// buyer's store→working-clone merge, and test fixtures fetch from `file`/local bare repos). The
 /// allowlist is enforced at the caller's seam (`PayPathDeliveryVerifier` for the money path;
 /// `init_contribution_workdir` for the seller base). A local path routes through libgit2's built-in
 /// local transport (no header); only allowlisted `https` reaches the NIP-98 subtransport.

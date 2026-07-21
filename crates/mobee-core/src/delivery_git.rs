@@ -1,7 +1,7 @@
-//! Buyer-side delivery verification, in-process via libgit2 (issue #55 — NO system `git`).
+//! Buyer-side delivery verification, in-process via libgit2.
 //!
 //! The pay path fetches the seller's delivered fork tip (and the pinned base) into a buyer-owned
-//! custody object database, all through [`crate::git_transport`]'s rustls smart-HTTP subtransport
+//! local bare repository (the buyer store), all through [`crate::git_transport`]'s rustls smart-HTTP subtransport
 //! (NIP-98 auth for relay-git reads), then runs the contribution gates entirely in-process:
 //! tip-match, base-from-pin, descendant, and the content policy. A hung fetch fails CLOSED under a
 //! short per-leg HTTP timeout so `authorize_pay` never burns budget on a stalled verify.
@@ -53,14 +53,14 @@ impl GitDeliveryVerifier {
         self.buyer_secret_hex.as_deref()
     }
 
-    /// Open the custody object database (bare repo).
-    fn open_custody(&self) -> Result<Repository, DeliveryError> {
+    /// Open the buyer store (a buyer-owned local bare repository).
+    fn open_store(&self) -> Result<Repository, DeliveryError> {
         Repository::open_bare(&self.repository)
-            .map_err(|_| DeliveryError::GitCommandFailed("open-custody"))
+            .map_err(|_| DeliveryError::GitCommandFailed("open-store"))
     }
 
-    /// Ensure the custody repo exists. mobee sellers always emit sha1 objects (they `init` without
-    /// `--object-format`), so custody is sha1; a sha256 (64-hex) delivery is not reachable in the
+    /// Ensure the buyer store exists. mobee sellers always emit sha1 objects (they `init` without
+    /// `--object-format`), so the store is sha1; a sha256 (64-hex) delivery is not reachable in the
     /// mobee system and git2 0.19 cannot init a sha256 odb — so it fails CLOSED here rather than
     /// silently mishandling one.
     fn ensure_repository(&self, oid: &CommitOid) -> Result<(), DeliveryError> {
@@ -68,8 +68,8 @@ impl GitDeliveryVerifier {
             return Err(DeliveryError::GitCommandFailed("object-format"));
         }
         if self.repository.join("HEAD").is_file() {
-            // Already a git dir — confirm it opens; a corrupt custody fails closed.
-            self.open_custody()?;
+            // Already a git dir — confirm it opens; a corrupt store fails closed.
+            self.open_store()?;
             return Ok(());
         }
         if let Some(parent) = self.repository.parent() {
@@ -93,7 +93,7 @@ impl GitDeliveryVerifier {
     }
 
     fn fetch(&self, delivery: &GitDelivery) -> Result<CommitOid, DeliveryError> {
-        let repo = self.open_custody()?;
+        let repo = self.open_store()?;
         let fetched_ref = format!("refs/mobee/deliveries/{}", delivery.commit_oid().as_str());
         let refspec = format!("+refs/heads/{}:{fetched_ref}", delivery.branch());
         // short_timeout=true: a hung fetch must not own the MCP stdio loop past the client timeout,
@@ -110,7 +110,7 @@ impl GitDeliveryVerifier {
     }
 
     fn require_local_object(&self, oid: &CommitOid) -> Result<(), DeliveryError> {
-        let repo = self.open_custody()?;
+        let repo = self.open_store()?;
         let parsed = Self::parse_oid(oid)?;
         repo.find_commit(parsed)
             .map(|_| ())
@@ -118,10 +118,10 @@ impl GitDeliveryVerifier {
     }
 
     /// Contribution: fetch `base_oid` from the **pinned target** clone URL into the SAME
-    /// custody odb, then prove `base_oid` is present in that target — fail-closed if absent.
+    /// buyer store, then prove `base_oid` is present in that target — fail-closed if absent.
     ///
     /// FETCH DEPTH: this is a FULL fetch of the base branch (no depth limit), so
-    /// `base_oid` and the ancestry chain up to the fork tip are all in custody. A shallow / tip-only
+    /// `base_oid` and the ancestry chain up to the fork tip are all in the store. A shallow / tip-only
     /// fetch would make the later descendant gate FALSE-REFUSE an honest deep contribution.
     fn fetch_base(
         &self,
@@ -130,12 +130,12 @@ impl GitDeliveryVerifier {
         base_oid: &CommitOid,
     ) -> Result<(), DeliveryError> {
         self.check_branch(base_branch)?;
-        let repo = self.open_custody()?;
+        let repo = self.open_store()?;
         let fetched_ref = format!("refs/mobee/bases/{}", base_oid.as_str());
         let refspec = format!("+refs/heads/{base_branch}:{fetched_ref}");
         git_transport::fetch_refspecs(&repo, base_clone_url, &[&refspec], self.read_auth(), true)
             .map_err(|_| DeliveryError::GitCommandFailed("fetch-base"))?;
-        // The pinned target MUST actually contain base_oid — resolve it as a commit in custody.
+        // The pinned target MUST actually contain base_oid — resolve it as a commit in the store.
         let parsed = Self::parse_oid(base_oid)?;
         repo.find_commit(parsed)
             .map(|_| ())
@@ -144,13 +144,13 @@ impl GitDeliveryVerifier {
 
     /// Contribution: refuse unless `commit_oid` descends from `base_oid`, in-process via
     /// `graph_descendant_of`. Equal oids count as ancestor (parity with `merge-base --is-ancestor`,
-    /// exit 0) — the empty diff is then refused by the content gate. Both oids must be in custody.
+    /// exit 0) — the empty diff is then refused by the content gate. Both oids must be in the store.
     fn assert_descendant(
         &self,
         base_oid: &CommitOid,
         commit_oid: &CommitOid,
     ) -> Result<(), DeliveryError> {
-        let repo = self.open_custody()?;
+        let repo = self.open_store()?;
         let base = Self::parse_oid(base_oid)?;
         let commit = Self::parse_oid(commit_oid)?;
         if base == commit {
@@ -167,7 +167,7 @@ impl GitDeliveryVerifier {
     }
 
     /// Contribution: the changed paths of the fork-vs-base diff, computed by the BUYER in
-    /// custody (never trusted from the seller). `bytes` per path is the numstat churn
+    /// the store (never trusted from the seller). `bytes` per path is the numstat churn
     /// (added+deleted lines; binary files count as 1) — a deterministic size proxy for the policy
     /// cap. An empty result means an empty diff (the content-gate floor refuses it).
     fn changed_paths(
@@ -175,7 +175,7 @@ impl GitDeliveryVerifier {
         base_oid: &CommitOid,
         commit_oid: &CommitOid,
     ) -> Result<Vec<crate::contribution::ChangedPath>, DeliveryError> {
-        let repo = self.open_custody()?;
+        let repo = self.open_store()?;
         let base_tree = repo
             .find_commit(Self::parse_oid(base_oid)?)
             .and_then(|c| c.tree())
@@ -227,8 +227,8 @@ impl GitDeliveryVerifier {
 
     /// Contribution buyer verify-path orchestration (the ONE state machine, all pre-pay). Bare —
     /// the transport allowlist is applied by [`PayPathDeliveryVerifier::verify_contribution`] BEFORE
-    /// this runs. In order: custody-fetch the fork tip + tip-match, base-from-pin, descendant gate,
-    /// content gate. Returns the custody proof + local ref for the later merge.
+    /// this runs. In order: fetch the fork tip into the store + tip-match, base-from-pin, descendant gate,
+    /// content gate. Returns the store proof + local ref for the later merge.
     fn contribution_verify(
         &mut self,
         fork: &GitDelivery,
@@ -237,9 +237,9 @@ impl GitDeliveryVerifier {
         base_oid: &CommitOid,
         policy: &crate::contribution::ContentPolicy,
     ) -> Result<VerifiedContribution, DeliveryError> {
-        // 1. custody fetch fork tip + tip-match (retains the object under refs/mobee/deliveries/…).
+        // 1. fetch fork tip into the store + tip-match (retains the object under refs/mobee/deliveries/…).
         let verified = self.verify(fork)?;
-        // 2. base-from-pin into the same custody odb (fail-closed if absent from the pinned target).
+        // 2. base-from-pin into the same buyer store (fail-closed if absent from the pinned target).
         self.fetch_base(base_clone_url, base_branch, base_oid)?;
         // 3. descendant gate.
         self.assert_descendant(base_oid, verified.commit_oid())?;
@@ -249,7 +249,7 @@ impl GitDeliveryVerifier {
             .evaluate(&changed)
             .map_err(|refusal| DeliveryError::ContentRefused(refusal.to_string()))?;
         Ok(VerifiedContribution {
-            custody_local_ref: PayPathDeliveryVerifier::custody_ref_for(verified.commit_oid().as_str()),
+            store_ref: PayPathDeliveryVerifier::store_ref_for(verified.commit_oid().as_str()),
             verified,
             changed_paths: changed,
         })
@@ -263,13 +263,13 @@ fn Reference_is_valid_branch(branch: &str) -> bool {
     git2::Reference::is_valid_name(&format!("refs/heads/{branch}"))
 }
 
-/// Proof that a contribution fork tip is in buyer custody AND descends from the pinned base, with
-/// the content gate satisfied. Carries the LOCAL custody ref so the merge step operates on the
-/// custodied oid, never the live fork branch (custody-retention).
+/// Proof that a contribution fork tip is in the buyer store AND descends from the pinned base, with
+/// the content gate satisfied. Carries the LOCAL store ref so the merge step operates on the
+/// retained oid, never the live fork branch (retention).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedContribution {
     verified: VerifiedDelivery,
-    custody_local_ref: String,
+    store_ref: String,
     changed_paths: Vec<crate::contribution::ChangedPath>,
 }
 
@@ -279,13 +279,13 @@ impl VerifiedContribution {
         &self.verified
     }
 
-    /// The BUYER-CONTROLLED local ref holding the custodied fork tip (recorded in the accept-bind;
+    /// The BUYER-CONTROLLED local ref holding the retained fork tip (recorded in the accept-bind;
     /// merge uses THIS, never the live fork branch name).
-    pub fn custody_local_ref(&self) -> &str {
-        &self.custody_local_ref
+    pub fn store_ref(&self) -> &str {
+        &self.store_ref
     }
 
-    /// The changed paths the content gate evaluated (buyer-computed in custody).
+    /// The changed paths the content gate evaluated (buyer-computed in the store).
     pub fn changed_paths(&self) -> &[crate::contribution::ChangedPath] {
         &self.changed_paths
     }
@@ -327,20 +327,20 @@ impl PayPathDeliveryVerifier {
         self.inner.inner().repository()
     }
 
-    /// The buyer-controlled custody ref a fork tip is retained under (custody-retention).
-    pub fn custody_ref_for(commit_oid: &str) -> String {
+    /// The buyer-controlled store ref a fork tip is retained under (retention).
+    pub fn store_ref_for(commit_oid: &str) -> String {
         format!("refs/mobee/deliveries/{commit_oid}")
     }
 
     /// Contribution buyer verify-path — the ONE state machine, ALL pre-pay, ALL against
     /// BUYER-CONTROLLED inputs (`fork` = the delivered object; `base_*` come from the buyer's
     /// SIGNED offer pin, NEVER the seller echo). In order:
-    ///   1. custody fetch the fork tip + tip-match (allowlisted);
-    ///   2. base-from-pin: fetch `base_oid` from the PINNED target clone URL into the same custody
-    ///      odb (allowlisted) — fail-closed if absent from the pinned target;
+    ///   1. fetch the fork tip into the store + tip-match (allowlisted);
+    ///   2. base-from-pin: fetch `base_oid` from the PINNED target clone URL into the same buyer
+    ///      store (allowlisted) — fail-closed if absent from the pinned target;
     ///   3. descendant gate: `commit_oid` must descend from `base_oid`;
     ///   4. content gate + policy hook: refuse an empty / out-of-scope / forbidden / too-large diff.
-    /// Returns the custody proof + LOCAL custody ref for the later merge. Authorship (the seller's
+    /// Returns the store proof + LOCAL store ref for the later merge. Authorship (the seller's
     /// signed tuple) + echo-equality are checked by the caller at the pre-pay seam; pay then binds
     /// the fork-tip `commit_oid` via the unchanged money path.
     pub fn verify_contribution(
@@ -361,30 +361,30 @@ impl PayPathDeliveryVerifier {
             .contribution_verify(fork, base_clone_url, base_branch, base_oid, policy)
     }
 
-    /// Merge the CUSTODIED local `commit_oid` into a buyer-owned target working clone, FF-preferred
-    /// ("accept the PR"). Buyer-custody action (NOT what payment binds): it fetches the object from
-    /// the buyer's own custody odb by its LOCAL ref and fast-forwards to it — so a seller that
-    /// deletes or moves the fork AFTER pay cannot strand the buyer (custody-retention). No transport
-    /// allowlist applies: both custody and the target clone are buyer-owned LOCAL repos.
-    pub fn merge_custodied_commit(
+    /// Merge the RETAINED local `commit_oid` into a buyer-owned target working clone, FF-preferred
+    /// ("accept the PR"). Buyer-store action (NOT what payment binds): it fetches the object from
+    /// the buyer's own store by its LOCAL ref and fast-forwards to it — so a seller that
+    /// deletes or moves the fork AFTER pay cannot strand the buyer (retention). No transport
+    /// allowlist applies: both the store and the target clone are buyer-owned LOCAL repos.
+    pub fn merge_retained_commit(
         &self,
         target_workdir: &Path,
         commit_oid: &CommitOid,
     ) -> Result<(), DeliveryError> {
-        let custody = self.repository();
-        let custody_url = custody.to_string_lossy().into_owned();
-        let local_ref = Self::custody_ref_for(commit_oid.as_str());
+        let store = self.repository();
+        let store_url = store.to_string_lossy().into_owned();
+        let local_ref = Self::store_ref_for(commit_oid.as_str());
         let merge_ref = format!("refs/mobee/merge/{}", commit_oid.as_str());
         let fetch_spec = format!("+{local_ref}:{merge_ref}");
 
         let target = Repository::open(target_workdir)
             .map_err(|_| DeliveryError::GitCommandFailed("merge-open"))?;
-        // Local custody→target fetch (no network, no auth, no allowlist — both are buyer-owned).
-        git_transport::fetch_refspecs(&target, &custody_url, &[&fetch_spec], None, false)
-            .map_err(|_| DeliveryError::GitCommandFailed("fetch-from-custody"))?;
+        // Local store→target fetch (no network, no auth, no allowlist — both are buyer-owned).
+        git_transport::fetch_refspecs(&target, &store_url, &[&fetch_spec], None, false)
+            .map_err(|_| DeliveryError::GitCommandFailed("fetch-from-store"))?;
 
         let merged = GitDeliveryVerifier::parse_oid(commit_oid)?;
-        // Fast-forward-only: the custodied commit must be the current HEAD or a descendant of it.
+        // Fast-forward-only: the retained commit must be the current HEAD or a descendant of it.
         let annotated = target
             .find_annotated_commit(merged)
             .map_err(|_| DeliveryError::MergeFailed("ff-only"))?;
@@ -406,7 +406,7 @@ impl PayPathDeliveryVerifier {
         let mut head = target
             .head()
             .map_err(|_| DeliveryError::MergeFailed("ff-only"))?;
-        head.set_target(merged, "mobee ff-only merge of custodied delivery")
+        head.set_target(merged, "mobee ff-only merge of retained delivery")
             .map_err(|_| DeliveryError::MergeFailed("ff-only"))?;
         Ok(())
     }
@@ -431,7 +431,7 @@ mod tests {
         root: PathBuf,
         work: PathBuf,
         remote: PathBuf,
-        custody: PathBuf,
+        store: PathBuf,
     }
 
     impl Fixture {
@@ -441,7 +441,7 @@ mod tests {
                 std::env::temp_dir().join(format!("mobee-delivery-{}-{id}", std::process::id()));
             let work = root.join("work");
             let remote = root.join("remote.git");
-            let custody = root.join("custody.git");
+            let store = root.join("store.git");
             fs::create_dir_all(&work).expect("create fixture");
             run(["init", "--initial-branch=main"], Some(&work));
             run(["config", "user.name", "Mobee Test"], Some(&work));
@@ -470,7 +470,7 @@ mod tests {
                 root,
                 work,
                 remote,
-                custody,
+                store,
             }
         }
 
@@ -516,10 +516,10 @@ mod tests {
     }
 
     #[test]
-    fn fetch_tip_match_returns_custodied_commit() {
+    fn fetch_tip_match_returns_retained_commit() {
         let fixture = Fixture::new();
         let advertised = fixture.delivery(fixture.head());
-        let mut verifier = GitDeliveryVerifier::new(&fixture.custody);
+        let mut verifier = GitDeliveryVerifier::new(&fixture.store);
 
         let verified = verifier.verify(&advertised).expect("verify delivery");
 
@@ -528,13 +528,13 @@ mod tests {
         let status = Command::new("git")
             .args([
                 "-C",
-                fixture.custody.to_str().expect("custody path"),
+                fixture.store.to_str().expect("store path"),
                 "cat-file",
                 "-e",
                 &object,
             ])
             .status()
-            .expect("inspect custody");
+            .expect("inspect store");
         assert!(status.success());
     }
 
@@ -542,7 +542,7 @@ mod tests {
     fn moved_tip_refuses_the_stale_advertised_oid() {
         let fixture = Fixture::new();
         let advertised = fixture.delivery(fixture.head());
-        let mut verifier = GitDeliveryVerifier::new(&fixture.custody);
+        let mut verifier = GitDeliveryVerifier::new(&fixture.store);
         verifier
             .verify(&advertised)
             .expect("initial delivery verifies");
@@ -558,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_branch_refuses_before_creating_the_custody_repo() {
+    fn malformed_branch_refuses_before_creating_the_store_repo() {
         let fixture = Fixture::new();
         let delivery = GitDelivery::new(
             fixture.remote.to_str().expect("remote path"),
@@ -566,13 +566,13 @@ mod tests {
             fixture.head(),
         )
         .expect("delivery shape");
-        let mut verifier = GitDeliveryVerifier::new(&fixture.custody);
+        let mut verifier = GitDeliveryVerifier::new(&fixture.store);
 
         assert_eq!(
             verifier.verify(&delivery),
             Err(DeliveryError::InvalidBranch)
         );
-        assert!(!fixture.custody.exists());
+        assert!(!fixture.store.exists());
     }
 
     #[test]
@@ -586,13 +586,13 @@ mod tests {
             fixture.head(),
         )
         .expect("delivery shape");
-        let mut verifier = PayPathDeliveryVerifier::new(&fixture.custody, None);
+        let mut verifier = PayPathDeliveryVerifier::new(&fixture.store, None);
         let err = verifier.verify(&delivery).expect_err("refuse ext");
         assert!(matches!(
             err,
             DeliveryError::Transport(TransportRefuse::ForbiddenScheme(_))
         ));
-        assert!(!fixture.custody.exists());
+        assert!(!fixture.store.exists());
     }
 
     #[test]
@@ -601,7 +601,7 @@ mod tests {
         // Pay path must not be that type — factory always allowlists first.
         let fixture = Fixture::new();
         let advertised = fixture.delivery(fixture.head());
-        let mut pay_path = PayPathDeliveryVerifier::new(&fixture.custody, None);
+        let mut pay_path = PayPathDeliveryVerifier::new(&fixture.store, None);
         let err = pay_path.verify(&advertised).expect_err("local path refused");
         assert!(matches!(
             err,
@@ -609,8 +609,8 @@ mod tests {
         ));
     }
 
-    /// PATH-stripped proof (#55): build the delivery source repo with git2 ONLY (no `Command`), then
-    /// verify through the product path (git2 fetch + tip-match + custody retention). Run with `git`
+    /// PATH-stripped proof: build the delivery source repo with git2 ONLY (no `Command`), then
+    /// verify through the product path (git2 fetch + tip-match + store retention). Run with `git`
     /// absent from PATH to prove the buyer verify money path has no hidden shell-out.
     #[test]
     fn verify_delivery_without_system_git() {
@@ -618,7 +618,7 @@ mod tests {
         let id = NEXT_REPO.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("mobee-nogit-{}-{id}", std::process::id()));
         let src = root.join("src");
-        let custody = root.join("custody.git");
+        let store = root.join("store.git");
         fs::create_dir_all(&src).expect("mkdir src");
         let repo = Repository::init(&src).expect("git2 init source");
         fs::write(src.join("d.txt"), "one\n").expect("write");
@@ -637,15 +637,15 @@ mod tests {
             CommitOid::parse(oid.to_string()).expect("oid"),
         )
         .expect("delivery");
-        let mut verifier = GitDeliveryVerifier::new(&custody);
+        let mut verifier = GitDeliveryVerifier::new(&store);
         let verified = verifier.verify(&delivery).expect("git2 verify without system git");
         assert_eq!(verified.commit_oid().as_str(), oid.to_string());
-        let cust = Repository::open_bare(&custody).expect("open custody");
-        assert!(cust.find_commit(oid).is_ok(), "custody must retain the object");
+        let cust = Repository::open_bare(&store).expect("open store");
+        assert!(cust.find_commit(oid).is_ok(), "store must retain the object");
         let _ = fs::remove_dir_all(&root);
     }
 
-    // NOTE (#55): the old `hanging_remote_fetch_fails_closed_via_in_process_timeout` test drove the
+    // NOTE: the old `hanging_remote_fetch_fails_closed_via_in_process_timeout` test drove the
     // removed `git_output_timed` subprocess-kill helper against a `git://` hang server. The buyer
     // fetch is now in-process libgit2 over the rustls subtransport, and fail-closed on a hung remote
     // is enforced BY CONSTRUCTION via `git_transport::client_short`'s connect+read timeout (a read
@@ -701,7 +701,7 @@ mod contribution_tests {
         root: PathBuf,
         target_git: PathBuf,
         fork_git: PathBuf,
-        custody: PathBuf,
+        store: PathBuf,
         base_oid: CommitOid,
         fork_tip: CommitOid,
     }
@@ -720,7 +720,7 @@ mod contribution_tests {
         let target_git = root.join("target.git");
         let fork_work = root.join("fork_work");
         let fork_git = root.join("fork.git");
-        let custody = root.join("custody.git");
+        let store = root.join("store.git");
         fs::create_dir_all(&target_work).expect("mk");
         ok(["init", "--initial-branch=main"], &target_work);
         commit(&target_work, "README.md", "base one\n", "base one");
@@ -742,7 +742,7 @@ mod contribution_tests {
         ok(["remote", "add", "fork", fork_git.to_str().unwrap()], &fork_work);
         ok(["push", "fork", "contribution"], &fork_work);
 
-        Fx { root, target_git, fork_git, custody, base_oid, fork_tip }
+        Fx { root, target_git, fork_git, store, base_oid, fork_tip }
     }
 
     fn fork_delivery(fx: &Fx) -> GitDelivery {
@@ -751,11 +751,11 @@ mod contribution_tests {
     }
 
     // ── Descendant + tip-match + base-from-pin: a valid DEEP-history contribution passes (item i:
-    //    a full-depth custody fetch reaches base_oid, so the descendant gate never false-refuses). ──
+    //    a full-depth fetch into the store reaches base_oid, so the descendant gate never false-refuses). ──
     #[test]
     fn deep_history_contribution_verifies() {
         let fx = scenario(5, "src/feature.rs");
-        let mut v = GitDeliveryVerifier::new(&fx.custody);
+        let mut v = GitDeliveryVerifier::new(&fx.store);
         let verified = v
             .contribution_verify(
                 &fork_delivery(&fx),
@@ -766,7 +766,7 @@ mod contribution_tests {
             )
             .expect("deep-history contribution must verify");
         assert_eq!(verified.verified().commit_oid(), &fx.fork_tip);
-        assert_eq!(verified.custody_local_ref(), PayPathDeliveryVerifier::custody_ref_for(fx.fork_tip.as_str()));
+        assert_eq!(verified.store_ref(), PayPathDeliveryVerifier::store_ref_for(fx.fork_tip.as_str()));
         assert!(!verified.changed_paths().is_empty());
     }
 
@@ -780,14 +780,14 @@ mod contribution_tests {
         ok(["init", "--initial-branch=main"], &orphan_work);
         commit(&orphan_work, "x.txt", "orphan\n", "orphan");
         let orphan_oid = oid(&orphan_work, "HEAD");
-        // Put the orphan object into custody (as if a base fetch produced it) so the descendant
+        // Put the orphan object into the store (as if a base fetch produced it) so the descendant
         // check is the thing under test, not object-presence.
-        let mut v = GitDeliveryVerifier::new(&fx.custody);
+        let mut v = GitDeliveryVerifier::new(&fx.store);
         v.verify(&fork_delivery(&fx)).expect("fetch fork tip");
-        ok(["init", "--bare", fx.custody.join("dummy").to_str().unwrap_or("dummy")], &fx.root);
-        // fetch the orphan commit into custody directly
+        ok(["init", "--bare", fx.store.join("dummy").to_str().unwrap_or("dummy")], &fx.root);
+        // fetch the orphan commit into the store directly
         let spec = format!("+refs/heads/main:refs/mobee/bases/{}", orphan_oid.as_str());
-        ok(["-C", fx.custody.to_str().unwrap(), "fetch", orphan_work.to_str().unwrap(), &spec], &fx.root);
+        ok(["-C", fx.store.to_str().unwrap(), "fetch", orphan_work.to_str().unwrap(), &spec], &fx.root);
         assert!(matches!(
             v.assert_descendant(&orphan_oid, &fx.fork_tip),
             Err(DeliveryError::NotDescendant { .. })
@@ -804,10 +804,10 @@ mod contribution_tests {
         ok(["checkout", "-B", "sib", fx.base_oid.as_str()], &sib);
         commit(&sib, "src/b.rs", "sibling\n", "sibling");
         let sib_oid = oid(&sib, "HEAD");
-        let mut v = GitDeliveryVerifier::new(&fx.custody);
+        let mut v = GitDeliveryVerifier::new(&fx.store);
         v.verify(&fork_delivery(&fx)).expect("fetch fork tip");
         let spec = format!("+refs/heads/sib:refs/mobee/x/{}", sib_oid.as_str());
-        ok(["-C", fx.custody.to_str().unwrap(), "fetch", sib.to_str().unwrap(), &spec], &fx.root);
+        ok(["-C", fx.store.to_str().unwrap(), "fetch", sib.to_str().unwrap(), &spec], &fx.root);
         // The sibling is NOT an ancestor of the fork tip ⇒ swapped-base refuse.
         assert!(matches!(
             v.assert_descendant(&sib_oid, &fx.fork_tip),
@@ -820,13 +820,13 @@ mod contribution_tests {
     fn base_absent_from_pinned_target_fails_closed() {
         let fx = scenario(1, "src/feature.rs");
         // An ORPHAN base_oid — a commit that is NOT on the target's main branch AND not in the
-        // fork's history (so it is absent from custody after both the fork and the base fetch).
+        // fork's history (so it is absent from the store after both the fork and the base fetch).
         let orphan = fx.root.join("orphan_base");
         fs::create_dir_all(&orphan).unwrap();
         ok(["init", "--initial-branch=main"], &orphan);
         commit(&orphan, "z.txt", "orphan base\n", "orphan base");
         let bogus_base = oid(&orphan, "HEAD");
-        let mut v = GitDeliveryVerifier::new(&fx.custody);
+        let mut v = GitDeliveryVerifier::new(&fx.store);
         v.verify(&fork_delivery(&fx)).expect("fetch fork tip");
         // base-from-pin fetches the target's main (base + base_two) but the orphan is not there ⇒
         // fail-closed MissingBaseObject (the buyer never bases against an oid absent from the pin).
@@ -839,7 +839,7 @@ mod contribution_tests {
     #[test]
     fn base_from_pin_finds_ancestor_base() {
         let fx = scenario(2, "src/feature.rs");
-        let mut v = GitDeliveryVerifier::new(&fx.custody);
+        let mut v = GitDeliveryVerifier::new(&fx.store);
         v.verify(&fork_delivery(&fx)).expect("fetch fork tip");
         // base_oid is an ANCESTOR of the target's main tip — base-from-pin must resolve it.
         v.fetch_base(fx.target_git.to_str().unwrap(), "main", &fx.base_oid)
@@ -858,7 +858,7 @@ mod contribution_tests {
         let tg = root.join("t.git");
         let fw = root.join("fw");
         let fg = root.join("f.git");
-        let custody = root.join("c.git");
+        let store = root.join("c.git");
         fs::create_dir_all(&tw).unwrap();
         ok(["init", "--initial-branch=main"], &tw);
         commit(&tw, "README.md", "base\n", "base");
@@ -873,7 +873,7 @@ mod contribution_tests {
         ok(["init", "--bare", fg.to_str().unwrap()], &root);
         ok(["remote", "add", "fork", fg.to_str().unwrap()], &fw);
         ok(["push", "fork", "contribution"], &fw);
-        let mut v = GitDeliveryVerifier::new(&custody);
+        let mut v = GitDeliveryVerifier::new(&store);
         let err = v
             .contribution_verify(
                 &GitDelivery::new(fg.to_str().unwrap(), "contribution", fork_tip).unwrap(),
@@ -891,7 +891,7 @@ mod contribution_tests {
     fn content_gate_scope_out_of_scope_refuses_in_scope_passes() {
         // out-of-scope: change under "other/", policy allows only "src".
         let fx = scenario(1, "other/x.rs");
-        let mut v = GitDeliveryVerifier::new(&fx.custody);
+        let mut v = GitDeliveryVerifier::new(&fx.store);
         let policy = ContentPolicy { allowed_paths: vec!["src".into()], ..Default::default() };
         let err = v
             .contribution_verify(&fork_delivery(&fx), fx.target_git.to_str().unwrap(), "main", &fx.base_oid, &policy)
@@ -900,32 +900,32 @@ mod contribution_tests {
 
         // in-scope: change under "src/", same policy → pass.
         let fx2 = scenario(1, "src/ok.rs");
-        let mut v2 = GitDeliveryVerifier::new(&fx2.custody);
+        let mut v2 = GitDeliveryVerifier::new(&fx2.store);
         v2.contribution_verify(&fork_delivery(&fx2), fx2.target_git.to_str().unwrap(), "main", &fx2.base_oid, &policy)
             .expect("in-scope must pass");
     }
 
-    // ── Custody retention (the STRAND-PROOF): after verify, the object is in buyer custody; the
-    //    fork moving/deleting cannot strand the buyer — merge succeeds from the custodied local oid. ─
+    // ── Retention (the STRAND-PROOF): after verify, the object is in the buyer store; the
+    //    fork moving/deleting cannot strand the buyer — merge succeeds from the retained local oid. ─
     #[test]
-    fn custody_retention_survives_fork_deletion_and_merges_from_local_oid() {
+    fn retention_survives_fork_deletion_and_merges_from_local_oid() {
         let fx = scenario(1, "src/feature.rs");
-        let pay = PayPathDeliveryVerifier::new(&fx.custody, None);
-        // Custody-fetch via the bare verifier (local path; allowlist tested separately).
-        let mut bare = GitDeliveryVerifier::new(&fx.custody);
+        let pay = PayPathDeliveryVerifier::new(&fx.store, None);
+        // Fetch into the store via the bare verifier (local path; allowlist tested separately).
+        let mut bare = GitDeliveryVerifier::new(&fx.store);
         let verified = bare
             .contribution_verify(&fork_delivery(&fx), fx.target_git.to_str().unwrap(), "main", &fx.base_oid, &ContentPolicy::floor())
             .expect("verify");
         // Simulate the seller DELETING the fork remote after accept.
         fs::remove_dir_all(&fx.fork_git).expect("delete fork");
-        // The object is RETAINED in custody (a deleted fork cannot strand the buyer).
-        bare.require_local_object(&fx.fork_tip).expect("custodied object retained after fork deletion");
-        // Merge the CUSTODIED local oid into a target working clone, FF-preferred.
+        // The object is RETAINED in the store (a deleted fork cannot strand the buyer).
+        bare.require_local_object(&fx.fork_tip).expect("retained object survives fork deletion");
+        // Merge the RETAINED local oid into a target working clone, FF-preferred.
         let target_clone = fx.root.join("accept_pr");
         ok(["clone", fx.target_git.to_str().unwrap(), target_clone.to_str().unwrap()], &fx.root);
         ok(["checkout", fx.base_oid.as_str()], &target_clone);
-        pay.merge_custodied_commit(&target_clone, &fx.fork_tip)
-            .expect("merge from custody must succeed by LOCAL oid even after fork deletion");
+        pay.merge_retained_commit(&target_clone, &fx.fork_tip)
+            .expect("merge from the store must succeed by LOCAL oid even after fork deletion");
         assert_eq!(oid(&target_clone, "HEAD"), fx.fork_tip, "FF merge lands the paid fork-tip oid");
         assert_eq!(verified.verified().commit_oid(), &fx.fork_tip);
     }
@@ -935,7 +935,7 @@ mod contribution_tests {
     fn pay_path_contribution_verify_refuses_ext_transport() {
         use crate::delivery_transport::TransportRefuse;
         let fx = scenario(1, "src/feature.rs");
-        let mut pay = PayPathDeliveryVerifier::new(&fx.custody, None);
+        let mut pay = PayPathDeliveryVerifier::new(&fx.store, None);
         // ext:: fork repo refused before any fetch.
         let ext_fork = GitDelivery::new("ext::sh -c evil", "contribution", fx.fork_tip.clone()).unwrap();
         assert!(matches!(

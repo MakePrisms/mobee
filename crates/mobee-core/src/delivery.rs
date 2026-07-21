@@ -82,7 +82,7 @@ impl GitDelivery {
     }
 }
 
-/// Proof that the advertised branch tip was fetched into buyer custody.
+/// Proof that the advertised branch tip was fetched into the buyer store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedDelivery {
     commit_oid: CommitOid,
@@ -150,7 +150,7 @@ pub enum DeliveryError {
     },
     /// Contribution: the content gate refused (empty / out-of-scope / forbidden / too-large).
     ContentRefused(String),
-    /// Contribution: merging the custodied local `commit_oid` into the target failed.
+    /// Contribution: merging the retained local `commit_oid` into the target failed.
     MergeFailed(&'static str),
 }
 
@@ -178,7 +178,7 @@ impl fmt::Display for DeliveryError {
                 )
             }
             Self::MissingCommitObject => {
-                formatter.write_str("fetched commit object is not in buyer custody")
+                formatter.write_str("fetched commit object is not in the buyer store")
             }
             Self::MissingBaseObject => {
                 formatter.write_str("base_oid is not present in the pinned target repo (base-from-pin)")
@@ -192,7 +192,7 @@ impl fmt::Display for DeliveryError {
             ),
             Self::ContentRefused(reason) => write!(formatter, "content gate refused: {reason}"),
             Self::MergeFailed(operation) => {
-                write!(formatter, "custodied merge {operation} failed")
+                write!(formatter, "retained merge {operation} failed")
             }
         }
     }

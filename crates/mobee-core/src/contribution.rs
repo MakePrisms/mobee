@@ -4,13 +4,13 @@
 //! A **contribution** job targets a buyer-owned repo (pinned by owner pubkey + clone URL) at an
 //! exact `base_oid`; the seller forks that target, works, and delivers a fork tip that MUST
 //! **descend** from `base_oid`. The buyer verify-path (ALL pre-pay, ALL against buyer-controlled
-//! inputs) fetches the fork tip into custody, resolves `base_oid` **from the PIN** (never the
+//! inputs) fetches the fork tip into the buyer store, resolves `base_oid` **from the PIN** (never the
 //! seller echo), and asserts descendant + tip-match + **seller-signed tuple authorship** +
 //! content-gate + echo-equality *before* the existing fork-tip commit money bind pays the
-//! fork-tip `commit_oid`. Then the buyer merges the **custodied local oid** (custody-retention: a
+//! fork-tip `commit_oid`. Then the buyer merges the **retained local oid** (retention: a
 //! fork moved/deleted post-accept cannot strand the buyer).
 //!
-//! This module holds the pure types + wire helpers. The git gates (custody fetch, base-from-pin,
+//! This module holds the pure types + wire helpers. The git gates (fetch into the store, base-from-pin,
 //! descendant, content diff) live on the pay-path verifier in `delivery_git.rs`; the authorship
 //! tuple's schnorr verify EXTENDS the one pre-pay seam `ReceiptAuthority::verify_seller_prepay_cosig`
 //! (`payment.rs`) — one seam, more binds, never a parallel pre-pay gate.
@@ -154,7 +154,7 @@ impl ContributionBase {
 }
 
 /// The seller's fork **repo + branch** in the seller's own relay-git namespace (what the buyer
-/// custody-fetches and later merges). The fork tip `commit_oid` rides the existing result
+/// fetches into the store and later merges). The fork tip `commit_oid` rides the existing result
 /// `commit` tag.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForkRef {
@@ -186,7 +186,7 @@ impl ForkRef {
         &self.branch
     }
 
-    /// A per-job unique custody/push ref carrying the **FULL** `job_id`. The
+    /// A per-job unique store/push ref carrying the **FULL** `job_id`. The
     /// `mobee/<job_id[:8]>` prefix collides — a real field collision already occurred between two
     /// sellers sharing a remote — so the full id + owner-scoped namespaces is the shape.
     pub fn unique_branch(job_id: &str) -> String {
@@ -287,7 +287,7 @@ impl ContentPolicy {
 
     /// Evaluate a fork-vs-base diff against the policy. Fail-closed: empty / out-of-scope /
     /// forbidden / too-large ⇒ refuse. `changed` is the set of changed paths (never trusted from
-    /// the seller — computed by the buyer in custody).
+    /// the seller — computed by the buyer in the store).
     pub fn evaluate(&self, changed: &[ChangedPath]) -> Result<(), ContentRefusal> {
         if changed.is_empty() {
             return Err(ContentRefusal::Empty);
