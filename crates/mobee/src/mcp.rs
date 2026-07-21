@@ -915,31 +915,11 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
                 &request.commit_oid,
             )
             .map_err(|error| error.to_string())?;
-            if request.seller_signature.is_empty() {
-                request.seller_signature = bind.seller_signature.clone();
-            }
-            // Piece-14: bind the seller-authored creq hash recorded at accept, so the explicit
-            // form binds the same attempt + receipt as the accept-first path.
-            if request.creq_hash.is_none() {
-                request.creq_hash = bind.creq_hash.clone();
-            }
-            // Piece-14 Job E: thread the creq accepted-mint list so the explicit form picks the
-            // realized mint like the accept-first path.
-            if request.accepted_mints.is_empty() {
-                request.accepted_mints = bind.accepted_mints.clone();
-            }
-            // Piece-10: thread contribution binds from the accept-bind so the explicit form still
-            // runs the contribution verify-path + authorship seam.
-            if request.contribution.is_none() {
-                request.contribution =
-                    bind.contribution.as_ref().map(|c| authorize_pay::ContributionPayBinds {
-                        target_owner_pubkey: c.target_owner_pubkey.clone(),
-                        target_clone_url: c.target_clone_url.clone(),
-                        base_branch: c.base_branch.clone(),
-                        base_oid: c.base_oid.clone(),
-                        tuple_signature: c.tuple_signature.clone(),
-                    });
-            }
+            // Issue #53: fill the preimage-critical + auth fields from the bind so the explicit
+            // form builds the SAME co-signed receipt preimage as the accept-first path (job_hash is
+            // authoritative from the bind; seller_signature/creq_hash/accepted_mints/contribution
+            // fill when the caller left them empty).
+            job_lifecycle::fill_explicit_request_from_bind(&mut request, bind);
         }
         // GAP-1 money-gate: with NO accept-bind, the paid offer's job-class was never resolved
         // locally, so an explicit-form pay for a `job-class=contribution` offer would reach
