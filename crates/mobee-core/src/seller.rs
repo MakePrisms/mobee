@@ -616,7 +616,7 @@ mod tests {
     fn agent_command_string_refused_at_config_parse() {
         let raw = r#"
 relay_url = "wss://example.invalid"
-mint_url = "https://testnut.cashudevkit.org"
+accepted_mints = ["https://testnut.cashudevkit.org"]
 per_job_budget_sats = 21
 total_budget_sats = 100
 
@@ -636,7 +636,7 @@ git_remote = "https://example.invalid/repo.git"
     fn agent_command_argv_array_parses() {
         let raw = r#"
 relay_url = "wss://example.invalid"
-mint_url = "https://testnut.cashudevkit.org"
+accepted_mints = ["https://testnut.cashudevkit.org"]
 per_job_budget_sats = 21
 total_budget_sats = 100
 
@@ -662,7 +662,7 @@ git_remote = "https://example.invalid/repo.git"
             format!(
                 r#"
 relay_url = "wss://example.invalid"
-mint_url = "https://testnut.cashudevkit.org"
+accepted_mints = ["https://testnut.cashudevkit.org"]
 per_job_budget_sats = 21
 total_budget_sats = 100
 

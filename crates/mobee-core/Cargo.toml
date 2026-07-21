@@ -20,6 +20,7 @@ test-support = []
 [dependencies]
 base64 = { workspace = true, optional = true }
 cashu = { version = "=0.17.2", optional = true }
+config.workspace = true
 git2 = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 cdk = { version = "=0.17.2", default-features = false, features = ["wallet"], optional = true }
