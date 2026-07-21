@@ -1,4 +1,5 @@
-import { HISTORY_LIMIT, RELAY_URL, SUBSCRIBE_KINDS } from "../config.js";
+import { HISTORY_LIMIT, RELAY_URL } from "../config.js";
+import { PROFILE, SUBSCRIBE_KINDS } from "./kinds.js";
 
 /**
  * Single-owner NIP-01 websocket client.
@@ -120,7 +121,7 @@ export function createRelayClient(hooks) {
     profileSubId = `mobee-net-p-${subSeq}`;
     // Cap authors per REQ to keep filter sane; remainder wait for next flush.
     const batch = authors.slice(0, 100);
-    safeSend(socket, ["REQ", profileSubId, { kinds: [0], authors: batch }]);
+    safeSend(socket, ["REQ", profileSubId, { kinds: [PROFILE], authors: batch }]);
   }
 
   /**
