@@ -47,6 +47,13 @@ pub struct RetireReport {
     pub retired: usize,
     /// Mapped `Send(TokenCreated)` pending claims left alone (not a wedge).
     pub mapped_token_created: usize,
+    /// Stranded Swap sagas rolled back after mint-truth said the reserved inputs
+    /// were all UNSPENT — the swap never executed (issue #63).
+    pub swap_rolled_back: usize,
+    /// Stranded Swap sagas completed after mint-truth said the reserved inputs
+    /// were all SPENT — the swap executed; inputs marked spent and outputs
+    /// re-derived from the wallet seed via NUT-13 `Wallet::restore` (issue #63).
+    pub swap_recovered: usize,
 }
 
 #[derive(Debug)]
@@ -638,6 +645,14 @@ pub async fn retire_eligible_incomplete_sagas(
             {
                 report.mapped_token_created += 1;
             }
+            // Swap-family sagas (proofs_reserved / swap_requested): resolve on mint
+            // truth (issue #63). A mid-swap mint outage otherwise strands these
+            // forever — retire never handled them and recover_unmapped_sagas refused
+            // them via its `other` arm. Resolve deletes resolvable sagas; a
+            // mixed/pending/unreachable answer returns Err (fail-closed).
+            WalletSagaState::Swap(_) => {
+                resolve_one_swap_saga(wallet, &saga, &mut report).await?;
+            }
             // TokenCreated without confirmed tx, RollingBack, other kinds: leave
             // in place for recover_unmapped_sagas to refuse. Do not retire here.
             _ => {}
@@ -769,9 +784,24 @@ async fn retire_one_proofs_reserved(
     let states = nut07_check_state_non_mutating(wallet, ys.clone()).await?;
     refuse_if_not_all_unspent(&ys, &states)?;
 
-    // Match CDK compensate_send: PendingSpent → Reserved locally, then revert
-    // Reserved/Pending → Unspent and clear used_by_operation, then delete saga.
-    // TOCTOU: any failure here aborts with error — never report retire success.
+    revert_reserved_and_delete_saga(wallet, saga).await
+}
+
+/// Revert a saga's reserved proofs to spendable and delete the saga, matching CDK
+/// `compensate_send`: PendingSpent → Reserved locally, then Reserved/Pending →
+/// Unspent (clearing `used_by_operation`), then delete the saga. TOCTOU: any
+/// failure aborts with an error — never report success (leave wedged-safer-than-
+/// double-spend). Callers MUST first prove the reserved proofs are all Unspent at
+/// the mint immediately before invoking this.
+async fn revert_reserved_and_delete_saga(
+    wallet: &Wallet,
+    saga: &cdk::wallet::types::WalletSaga,
+) -> Result<(), PaymentWalletError> {
+    let reserved = wallet
+        .localstore
+        .get_reserved_proofs(&saga.id)
+        .await
+        .map_err(wallet_error)?;
     let mut pending_spent: Vec<_> = reserved
         .iter()
         .filter(|proof| proof.state == State::PendingSpent)
@@ -823,6 +853,201 @@ async fn retire_one_proofs_reserved(
         .map_err(|error| {
             PaymentWalletError::Reconcile(format!(
                 "retire cancel failed deleting saga (leave wedged-safer-than-double-spend): {error}"
+            ))
+        })?;
+    Ok(())
+}
+
+/// Mint-truth outcome for a stranded Swap saga's reserved INPUT proofs (issue #63).
+enum SwapInputTruth {
+    /// Every reserved input is UNSPENT at the mint — the swap never executed.
+    AllUnspent,
+    /// Every reserved input is SPENT at the mint — the swap executed.
+    AllSpent,
+}
+
+/// Classify a Swap saga's reserved inputs from a NUT-07 answer. Requires a
+/// complete answer (response Y-set == requested ys); empty/partial/wrong-y refuses
+/// exactly like [`refuse_if_not_all_unspent`]. Any mix of Spent/Unspent, or any
+/// Pending, refuses fail-closed — only a unanimous answer is actionable.
+fn classify_swap_inputs(
+    requested_ys: &[CashuPublicKey],
+    states: &[cashu::ProofState],
+) -> Result<SwapInputTruth, PaymentWalletError> {
+    let requested: HashSet<_> = requested_ys.iter().copied().collect();
+    let reported: HashSet<_> = states.iter().map(|proof_state| proof_state.y).collect();
+    if requested.is_empty() || requested != reported {
+        return Err(PaymentWalletError::Reconcile(
+            "swap-saga resolve refused: NUT-07 response Y set incomplete or mismatched (empty/partial/wrong-y; per-saga fail-closed)"
+                .into(),
+        ));
+    }
+    if states
+        .iter()
+        .all(|proof_state| proof_state.state == State::Unspent)
+    {
+        Ok(SwapInputTruth::AllUnspent)
+    } else if states
+        .iter()
+        .all(|proof_state| proof_state.state == State::Spent)
+    {
+        Ok(SwapInputTruth::AllSpent)
+    } else {
+        Err(PaymentWalletError::Reconcile(
+            "swap-saga resolve refused: reserved inputs neither all-unspent nor all-spent (mixed/pending; per-saga fail-closed)"
+                .into(),
+        ))
+    }
+}
+
+/// Mint-truth resolution for a stranded Swap-family saga (issue #63).
+///
+/// A mid-swap mint outage can leave a `swap_requested` (or `proofs_reserved`) Swap
+/// saga that `retire_eligible_incomplete_sagas` never handled and that
+/// `recover_unmapped_sagas` refused forever, wedging every subsequent pay. Once
+/// the mint is reachable we resolve on mint truth over the reserved INPUT proofs:
+///   * all UNSPENT ⇒ the swap never executed ⇒ roll the inputs back to spendable
+///     and drop the saga (via [`revert_reserved_and_delete_saga`]).
+///   * all SPENT   ⇒ the swap executed ⇒ re-derive the outputs from the wallet
+///     seed (NUT-13 `Wallet::restore`), then mark the inputs spent and drop the
+///     saga (via [`complete_spent_swap_saga`]).
+///   * mixed/pending, incomplete NUT-07, empty reservation, or an unreachable mint
+///     ⇒ keep refusing fail-closed.
+async fn resolve_one_swap_saga(
+    wallet: &Wallet,
+    saga: &cdk::wallet::types::WalletSaga,
+    report: &mut RetireReport,
+) -> Result<(), PaymentWalletError> {
+    let reserved = wallet
+        .localstore
+        .get_reserved_proofs(&saga.id)
+        .await
+        .map_err(wallet_error)?;
+    // Migration-safe fail-closed: an empty reservation is ambiguous (never-bound
+    // orphan vs Spent-then-deleted under old check_proofs_spent) — same posture as
+    // the Send path. Refuse rather than guess.
+    if reserved.is_empty() {
+        return Err(PaymentWalletError::Reconcile(
+            "swap-saga resolve refused: empty reserved set (migration-safe fail-closed; leave wedged-safer-than-double-spend)"
+                .into(),
+        ));
+    }
+    let ys = reserved.iter().map(|info| info.y).collect::<Vec<_>>();
+    // Non-mutating NUT-07 — never check_proofs_spent (it deletes Spent ys from
+    // localstore). A dead mint surfaces as a Reconcile error here and propagates as
+    // a fail-closed refuse.
+    let states = nut07_check_state_non_mutating(wallet, ys.clone()).await?;
+    match classify_swap_inputs(&ys, &states)? {
+        SwapInputTruth::AllUnspent => {
+            rollback_swap_saga(wallet, saga).await?;
+            report.swap_rolled_back += 1;
+        }
+        SwapInputTruth::AllSpent => {
+            complete_spent_swap_saga(wallet, saga).await?;
+            report.swap_recovered += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Roll back a Swap saga whose inputs are all UNSPENT at the mint (issue #63): the
+/// swap never executed, so restore the reserved inputs to spendable and drop the
+/// saga. TOCTOU: re-fetch and re-prove (still a Swap saga, reservation non-empty,
+/// still all-unspent at the mint) immediately before mutating.
+async fn rollback_swap_saga(
+    wallet: &Wallet,
+    saga: &cdk::wallet::types::WalletSaga,
+) -> Result<(), PaymentWalletError> {
+    let fresh = wallet
+        .localstore
+        .get_saga(&saga.id)
+        .await
+        .map_err(wallet_error)?
+        .ok_or_else(|| {
+            PaymentWalletError::Reconcile(
+                "swap-saga rollback refused: saga disappeared before mutate (leave wedged-safer)"
+                    .into(),
+            )
+        })?;
+    if !matches!(fresh.state, WalletSagaState::Swap(_)) {
+        return Err(PaymentWalletError::Reconcile(
+            "swap-saga rollback refused: saga no longer a Swap saga before mutate (TOCTOU)".into(),
+        ));
+    }
+    let reserved = wallet
+        .localstore
+        .get_reserved_proofs(&saga.id)
+        .await
+        .map_err(wallet_error)?;
+    if reserved.is_empty() {
+        return Err(PaymentWalletError::Reconcile(
+            "swap-saga rollback refused: reserved emptied before mutate (TOCTOU / migration-safe fail-closed)"
+                .into(),
+        ));
+    }
+    let ys = reserved.iter().map(|info| info.y).collect::<Vec<_>>();
+    let states = nut07_check_state_non_mutating(wallet, ys.clone()).await?;
+    if !matches!(
+        classify_swap_inputs(&ys, &states)?,
+        SwapInputTruth::AllUnspent
+    ) {
+        return Err(PaymentWalletError::Reconcile(
+            "swap-saga rollback refused: inputs no longer all-unspent before mutate (TOCTOU)".into(),
+        ));
+    }
+    revert_reserved_and_delete_saga(wallet, saga).await
+}
+
+/// Complete a Swap saga whose inputs are all SPENT at the mint (issue #63): the
+/// swap executed. Re-derive the outputs from the wallet seed via NUT-13
+/// `Wallet::restore` — the only output-recovery path cdk 0.17.2 exposes publicly
+/// (the saga-scoped `restore_outputs` is crate-private) — then mark the spent
+/// inputs Spent and drop the saga. Restore runs FIRST so a restore-unreachable
+/// mint aborts before any local mutation (fail-closed; the saga stays wedged for a
+/// later retry rather than losing the outputs).
+async fn complete_spent_swap_saga(
+    wallet: &Wallet,
+    saga: &cdk::wallet::types::WalletSaga,
+) -> Result<(), PaymentWalletError> {
+    // Re-derive the swap outputs from seed+counter (NUT-13). Idempotent: a re-run
+    // rebuilds the same proofs. Any error aborts before we touch local state.
+    wallet.restore().await.map_err(|error| {
+        PaymentWalletError::Reconcile(format!(
+            "swap-saga restore refused (leave wedged for a later retry): {error}"
+        ))
+    })?;
+
+    // The inputs are confirmed Spent at the mint — record that truthfully (no
+    // phantom credit) and clear their operation binding. `restore` may already have
+    // swept some inputs via its own state check, so tolerate a shrunk reservation.
+    let reserved = wallet
+        .localstore
+        .get_reserved_proofs(&saga.id)
+        .await
+        .map_err(wallet_error)?;
+    if !reserved.is_empty() {
+        let mut spent = reserved;
+        for proof in spent.iter_mut() {
+            proof.state = State::Spent;
+            proof.used_by_operation = None;
+        }
+        wallet
+            .localstore
+            .update_proofs(spent, vec![])
+            .await
+            .map_err(|error| {
+                PaymentWalletError::Reconcile(format!(
+                    "swap-saga complete failed marking inputs spent: {error}"
+                ))
+            })?;
+    }
+    wallet
+        .localstore
+        .delete_saga(&saga.id)
+        .await
+        .map_err(|error| {
+            PaymentWalletError::Reconcile(format!(
+                "swap-saga complete failed deleting saga: {error}"
             ))
         })?;
     Ok(())
@@ -3232,5 +3457,293 @@ mod tests {
                 0,
             ))
         }
+    }
+
+    /// Fake mint for stranded-Swap-saga resolution (issue #63). Answers NUT-07
+    /// `/v1/checkstate` with configured input states and NUT-13 `/v1/restore` with
+    /// an empty batch (no output signatures) — the existing scaffolding does not
+    /// simulate a signing mint, so the AllSpent branch exercises the completion
+    /// path (mark inputs Spent + drop saga) with a no-op output re-derivation.
+    #[derive(Clone, Debug, Default)]
+    struct SwapReconcileTransport {
+        checkstate: serde_json::Value,
+    }
+
+    impl SwapReconcileTransport {
+        fn new(states: Vec<ProofState>) -> Self {
+            Self {
+                checkstate: serde_json::to_value(cashu::CheckStateResponse { states }).unwrap(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HttpTransport for SwapReconcileTransport {
+        fn with_proxy(
+            &mut self,
+            _proxy: Url,
+            _host_matcher: Option<&str>,
+            _accept_invalid_certs: bool,
+        ) -> Result<(), cdk::Error> {
+            Ok(())
+        }
+
+        async fn http_get<R>(
+            &self,
+            _url: Url,
+            _auth: Option<cashu::nuts::AuthToken>,
+        ) -> Result<R, cdk::Error>
+        where
+            R: DeserializeOwned,
+        {
+            Err(cdk::Error::Custom("unexpected GET".into()))
+        }
+
+        async fn http_post<P, R>(
+            &self,
+            url: Url,
+            _auth: Option<cashu::nuts::AuthToken>,
+            _payload: &P,
+        ) -> Result<R, cdk::Error>
+        where
+            P: Serialize + ?Sized + Send + Sync,
+            R: DeserializeOwned,
+        {
+            if url.path().ends_with("/v1/checkstate") {
+                return serde_json::from_value(self.checkstate.clone())
+                    .map_err(|error| cdk::Error::Custom(error.to_string()));
+            }
+            if url.path().ends_with("/v1/restore") {
+                let empty = cashu::nuts::nut09::RestoreResponse {
+                    outputs: vec![],
+                    signatures: vec![],
+                };
+                return serde_json::from_value(serde_json::to_value(empty).unwrap())
+                    .map_err(|error| cdk::Error::Custom(error.to_string()));
+            }
+            Err(cdk::Error::Custom("unexpected POST".into()))
+        }
+    }
+
+    /// Build a wallet holding a single stranded Swap saga in `SwapRequested` state
+    /// with `proofs` reserved under it, keysets seeded so NUT-13 restore stays
+    /// local, and a [`SwapReconcileTransport`] reporting `states` for the inputs.
+    async fn swap_saga_wallet(
+        seed: u8,
+        proofs: Vec<Proof>,
+        states: Vec<ProofState>,
+    ) -> (Wallet, uuid::Uuid, Vec<CashuPublicKey>) {
+        let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        store
+            .add_mint(mint(MINT), Some(MintInfo::new()))
+            .await
+            .unwrap();
+        let keyset = test_keyset();
+        store
+            .add_mint_keysets(
+                mint(MINT),
+                vec![KeySetInfo {
+                    id: keyset.id,
+                    unit: keyset.unit.clone(),
+                    active: true,
+                    input_fee_ppk: keyset.input_fee_ppk,
+                    final_expiry: keyset.final_expiry,
+                }],
+            )
+            .await
+            .unwrap();
+        store.add_keys(keyset).await.unwrap();
+
+        let ys = proofs
+            .iter()
+            .map(|proof| proof.y().unwrap())
+            .collect::<Vec<_>>();
+        let infos = proofs
+            .iter()
+            .map(|proof| {
+                ProofInfo::new(proof.clone(), mint(MINT), State::Unspent, CurrencyUnit::Sat)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        store.update_proofs(infos, vec![]).await.unwrap();
+        let saga_id = uuid::Uuid::now_v7();
+        store.reserve_proofs(ys.clone(), &saga_id).await.unwrap();
+        let total: u64 = proofs.iter().map(|proof| proof.amount.to_u64()).sum();
+        let saga = WalletSaga::new(
+            saga_id,
+            cdk::wallet::types::WalletSagaState::Swap(
+                cdk::wallet::types::SwapSagaState::SwapRequested,
+            ),
+            Amount::from(total),
+            mint(MINT),
+            CurrencyUnit::Sat,
+            cdk::wallet::types::OperationData::Swap(cdk::wallet::types::SwapOperationData {
+                input_amount: Amount::from(total),
+                output_amount: Amount::from(total),
+                counter_start: Some(0),
+                counter_end: Some(1),
+                blinded_messages: None,
+            }),
+        );
+        store.add_saga(saga).await.unwrap();
+
+        let connector = Arc::new(BaseHttpClient::with_transport(
+            mint(MINT),
+            SwapReconcileTransport::new(states),
+            None,
+        ));
+        let wallet = WalletBuilder::new()
+            .mint_url(mint(MINT))
+            .unit(CurrencyUnit::Sat)
+            .localstore(store)
+            .seed([seed; 64])
+            .shared_client(connector)
+            .build()
+            .unwrap();
+        (wallet, saga_id, ys)
+    }
+
+    #[tokio::test]
+    async fn swap_saga_all_inputs_unspent_rolls_back() {
+        // Issue #63: a stranded swap_requested saga whose reserved inputs are all
+        // UNSPENT at the mint never executed — roll it back to spendable.
+        let seller = secret_key(1).public_key();
+        let proof = p2pk_proof(7, seller);
+        let proof_y = proof.y().unwrap();
+        let (wallet, saga_id, ys) = swap_saga_wallet(
+            40,
+            vec![proof],
+            vec![ProofState::from((proof_y, State::Unspent))],
+        )
+        .await;
+
+        let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+        assert_eq!(report.swap_rolled_back, 1, "unspent inputs must roll back");
+        assert_eq!(report.swap_recovered, 0);
+        assert!(
+            wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .is_empty(),
+            "saga must be dropped after rollback"
+        );
+        assert!(
+            wallet
+                .localstore
+                .get_reserved_proofs(&saga_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "inputs must be unreserved after rollback"
+        );
+        let unspent = wallet
+            .localstore
+            .get_proofs(None, None, Some(vec![State::Unspent]), None)
+            .await
+            .unwrap();
+        assert!(
+            ys.iter()
+                .all(|y| unspent.iter().any(|info| info.y == *y)),
+            "rolled-back inputs must be spendable (Unspent) again"
+        );
+    }
+
+    #[tokio::test]
+    async fn swap_saga_all_inputs_spent_recovers_via_restore() {
+        // Issue #63: a stranded swap_requested saga whose reserved inputs are all
+        // SPENT at the mint executed — complete it: re-derive outputs via NUT-13
+        // restore (no-op against the fake), mark inputs Spent, drop the saga.
+        let seller = secret_key(1).public_key();
+        let proof = p2pk_proof(7, seller);
+        let proof_y = proof.y().unwrap();
+        let (wallet, saga_id, _ys) = swap_saga_wallet(
+            41,
+            vec![proof],
+            vec![ProofState::from((proof_y, State::Spent))],
+        )
+        .await;
+
+        let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
+        assert_eq!(report.swap_recovered, 1, "spent inputs must complete via restore");
+        assert_eq!(report.swap_rolled_back, 0);
+        assert!(
+            wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .is_empty(),
+            "saga must be dropped after completion"
+        );
+        assert!(
+            wallet
+                .localstore
+                .get_reserved_proofs(&saga_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "inputs must be released from the saga after completion"
+        );
+        // Truthful: spent inputs must NOT reappear as spendable (no phantom credit).
+        let unspent = wallet
+            .localstore
+            .get_proofs(None, None, Some(vec![State::Unspent]), None)
+            .await
+            .unwrap();
+        assert!(
+            unspent.iter().all(|info| info.y != proof_y),
+            "spent inputs must never be credited back as Unspent"
+        );
+    }
+
+    #[tokio::test]
+    async fn swap_saga_mixed_input_states_refuses() {
+        // Issue #63: a partial/mixed answer (one input Spent, one Unspent) is
+        // inconsistent — keep refusing fail-closed, leave the saga wedged.
+        let seller = secret_key(1).public_key();
+        let proof_a = p2pk_proof(4, seller);
+        let proof_b = p2pk_proof(3, seller);
+        let y_a = proof_a.y().unwrap();
+        let y_b = proof_b.y().unwrap();
+        let (wallet, saga_id, _ys) = swap_saga_wallet(
+            42,
+            vec![proof_a, proof_b],
+            vec![
+                ProofState::from((y_a, State::Spent)),
+                ProofState::from((y_b, State::Unspent)),
+            ],
+        )
+        .await;
+
+        let err = retire_eligible_incomplete_sagas(&wallet)
+            .await
+            .expect_err("mixed input states must refuse");
+        match &err {
+            PaymentWalletError::Reconcile(message)
+                if message.contains("neither all-unspent nor all-spent") => {}
+            other => panic!("expected mixed-state refuse, got: {other}"),
+        }
+        assert_eq!(
+            wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "saga must remain wedged on a mixed answer"
+        );
+        assert_eq!(
+            wallet
+                .localstore
+                .get_reserved_proofs(&saga_id)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "reserved inputs must remain untouched on refuse"
+        );
     }
 }
