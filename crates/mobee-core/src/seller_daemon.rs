@@ -2633,43 +2633,6 @@ pub(crate) async fn run_forever_hooked(
         .await
         .map_err(|error| DaemonError::Relay(format!("subscribe 1059: {error}")))?;
 
-    // #57 boot backfill: the live 1059 subscription does not reliably replay stored gift-wraps
-    // across a restart on a p-gated DM relay, so a payment that landed while this seller was
-    // offline would be stranded (real sats P2PK-locked, unredeemed — no log line, no recovery).
-    // Explicitly fetch stored wraps p-tagged to us since the last journaled receipt and run each
-    // through the SAME redeem path. Idempotent: the journal pay-once guard makes an already-redeemed
-    // wrap a no-op, so this can never double-spend. Fetch failure is non-fatal (the live sub stays).
-    let backfill_since = daemon.journal.last_receipt_ts().unwrap_or(None).unwrap_or(0);
-    match client
-        .fetch_events(
-            wrap_filter.since(Timestamp::from(backfill_since)),
-            Duration::from_secs(15),
-        )
-        .await
-    {
-        Ok(events) => {
-            eprintln!(
-                "seller wrap backfill: {} stored kind-1059(s) since ts={backfill_since}",
-                events.len()
-            );
-            for event in events {
-                match ingest_gift_wrap(&mut daemon, &event).await {
-                    Ok(Some(receipt)) => eprintln!(
-                        "seller receipt (backfill) job_id={} result_id={} amount_received={}",
-                        receipt.job_id, receipt.result_id, receipt.amount_received
-                    ),
-                    Ok(None) => {}
-                    Err(error) if is_idempotent_already_redeemed(&error) => eprintln!(
-                        "seller pay: kind-1059 already redeemed (backfill idempotent re-see): {error}"
-                    ),
-                    Err(error) => eprintln!("seller pay path (backfill): {error}"),
-                }
-            }
-        }
-        Err(error) => eprintln!(
-            "seller WARN: wrap backfill fetch failed (continuing; live 1059 subscription active): {error}"
-        ),
-    }
 
     // Status line: never echo secrets.
     eprintln!(
@@ -2689,6 +2652,63 @@ pub(crate) async fn run_forever_hooked(
     // Readiness hook: online + subscribed ⇒ ready to react to LIVE offers.
     if let Some(ready) = &hooks.ready {
         let _ = ready.send(());
+    }
+
+    // #57 boot backfill (recovery) — runs AFTER online/readiness so the daemon reports up promptly
+    // and the backfill can never hide behind a hang. kind-1059 is auth-gated on mobee-relay (dark
+    // kind): a REQ sent before NIP-42 completes is CLOSED `restricted:` and dropped, so the stored
+    // wrap is never served (the #57 live-acceptance failure). Confirm auth FIRST, then fetch stored
+    // wraps p-tagged to us since the last journaled receipt and run each through the SAME redeem
+    // path — idempotent via the journal pay-once guard, so it can never double-spend. A live offer
+    // posted during this window is buffered in `notifications` and drained when the loop starts.
+    let backfill_authed = nip42_label == "authenticated"
+        || matches!(
+            // If the connect-time challenge already authenticated us this returns immediately; if
+            // the relay defers to the REQ, the subscribes above triggered the challenge and this
+            // catches the completion. Short + non-fatal so it never wedges boot.
+            wait_for_nip42_auth(&mut relay_notifications, Duration::from_secs(3)).await,
+            Ok(AuthWait::Authenticated)
+        );
+    let backfill_since = daemon.journal.last_receipt_ts().unwrap_or(None).unwrap_or(0);
+    // Log the ATTEMPT unconditionally, BEFORE the fetch — silence must never read as "no wraps".
+    eprintln!(
+        "seller wrap backfill: fetching stored kind-1059(s) since ts={backfill_since} (nip42_authed={backfill_authed})"
+    );
+    // Hard-cap the fetch so an auth-gated relay that never EOSEs cannot wedge boot.
+    match tokio::time::timeout(
+        Duration::from_secs(15),
+        client.fetch_events(
+            wrap_filter.since(Timestamp::from(backfill_since)),
+            Duration::from_secs(12),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(events)) => {
+            eprintln!(
+                "seller wrap backfill: {} stored kind-1059(s) returned since ts={backfill_since}",
+                events.len()
+            );
+            for event in events {
+                match ingest_gift_wrap(&mut daemon, &event).await {
+                    Ok(Some(receipt)) => eprintln!(
+                        "seller receipt (backfill) job_id={} result_id={} amount_received={}",
+                        receipt.job_id, receipt.result_id, receipt.amount_received
+                    ),
+                    Ok(None) => {}
+                    Err(error) if is_idempotent_already_redeemed(&error) => eprintln!(
+                        "seller pay: kind-1059 already redeemed (backfill idempotent re-see): {error}"
+                    ),
+                    Err(error) => eprintln!("seller pay path (backfill): {error}"),
+                }
+            }
+        }
+        Ok(Err(error)) => eprintln!(
+            "seller WARN: wrap backfill fetch failed (continuing; live 1059 subscription active): {error}"
+        ),
+        Err(_) => eprintln!(
+            "seller WARN: wrap backfill fetch timed out after 15s (continuing; live 1059 subscription active)"
+        ),
     }
 
     // Both offer filters ride ONE subscription, so the relay delivers each offer once even when
@@ -4914,6 +4934,83 @@ mod local_relay_it {
         );
 
         // Quiesce: let execution finish so single-flight is released before the guard drops.
+        wait_until(Duration::from_secs(8), || !SellerDaemon::in_flight()).await;
+        relay.shutdown();
+    }
+
+    // ── #57: boot backfill retrieves a stored kind-1059 without wedging the daemon ───────────
+    // A stored gift-wrap p-tagged to the seller (the stranded-payment shape) is seeded BEFORE boot.
+    // The reordered boot backfill (after online/readiness, auth-confirmed, hard-capped) must fetch
+    // and ingest it, reach READY, and keep processing LIVE offers. Proves the recovery path runs
+    // end-to-end over a real stored 1059 without hanging boot. (The auth-gate itself is exercised by
+    // the live relay on deploy; here the local relay serves 1059 without NIP-42.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn boot_backfill_over_stored_wrap_stays_healthy() {
+        use nostr_sdk::prelude::{EventBuilder, Tag};
+
+        let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        SellerDaemon::end_flight();
+
+        let (relay, relay_url) = start_relay(RelayBuilder::default()).await;
+
+        // Open the seller (to learn its pubkey), then seed a stored 1059 gift-wrap p-tagged to it.
+        let home = seller_home(&unique_root("backfill-wrap"), &relay_url, true, 0);
+        let daemon = SellerDaemon::open(home).expect("open seller daemon");
+        let seller_pk = PublicKey::parse(daemon.seller_pubkey()).expect("seller pubkey");
+
+        let seeder = connect_client(&relay_url).await;
+        let past = Timestamp::from(Timestamp::now().as_secs().saturating_sub(120));
+        let stored_wrap = EventBuilder::new(Kind::GiftWrap, "opaque-stored-wrap")
+            .tag(Tag::public_key(seller_pk))
+            .custom_created_at(past)
+            .sign_with_keys(&Keys::generate())
+            .expect("sign stored wrap");
+        seeder
+            .send_event(&stored_wrap)
+            .await
+            .expect("seed stored wrap");
+
+        // Observer for the seller's claims (before boot, so none is missed).
+        let observer = connect_client(&relay_url).await;
+        observer
+            .subscribe(
+                Filter::new()
+                    .kinds([
+                        Kind::Custom(gateway::JOB_CLAIM_KIND),
+                        Kind::Custom(gateway::JOB_FEEDBACK_KIND),
+                    ])
+                    .author(seller_pk),
+                None,
+            )
+            .await
+            .expect("observer subscribe");
+        let claims = spawn_claim_collector(&observer, seller_pk);
+
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _daemon = spawn_daemon_thread(daemon, ready_tx);
+
+        // The boot backfill retrieves + ingests the stored 1059 (opaque ⇒ not a decodable
+        // own-payment wrap) WITHOUT wedging boot: readiness still fires.
+        let ready = tokio::time::timeout(Duration::from_secs(12), ready_rx.recv()).await;
+        assert!(
+            matches!(ready, Ok(Some(()))),
+            "daemon must reach READY despite a stored wrap in the boot backfill (got {ready:?})"
+        );
+
+        // And it still processes LIVE work after the backfill: a fresh targeted offer is claimed.
+        let buyer = Keys::generate();
+        let live_id = publish_offer(&seeder, &buyer, &offer_draft(Some(&seller_pk.to_hex())), None)
+            .await
+            .to_hex();
+        let claimed = wait_until(Duration::from_secs(12), || {
+            claims_contain(&claims, &live_id, "processing")
+        })
+        .await;
+        assert!(
+            claimed,
+            "seller must still CLAIM a live offer after boot-backfilling a stored wrap (e={live_id})"
+        );
+
         wait_until(Duration::from_secs(8), || !SellerDaemon::in_flight()).await;
         relay.shutdown();
     }
