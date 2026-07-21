@@ -18,7 +18,7 @@ use crate::buyer_fund::{self, FundError};
 use crate::delivery::{CommitOid, Delivery, DeliveryError, GitDelivery};
 use crate::delivery_git::PayPathDeliveryVerifier;
 use crate::gateway;
-use crate::home::{self, MobeeHome, DEFAULT_MINT_URL};
+use crate::home::{self, MobeeHome};
 use crate::payment::{
     DeliveryIntegrityHash, EffectError, FsPaymentJournal, JobHash, JobId, PaymentError, PaymentKey,
     PaymentService, PaymentState, PaymentTerms, ReceiptAuthority, ReceiptEvidence, ResultId,
@@ -188,13 +188,6 @@ pub async fn authorize_pay_async(
     gate: &mut BudgetGate,
     request: AuthorizePayRequest,
 ) -> Result<AuthorizePayOutcome, AuthorizePayError> {
-    if home.config.default_mint() != DEFAULT_MINT_URL {
-        return Err(FundError::MintPinned {
-            configured: home.config.default_mint().to_owned(),
-        }
-        .into());
-    }
-
     // D2 (both job_id and explicit forms): buyer tip-match hash is required and must
     // equal the seller-advertised commit_oid. Never derive/default the hash from the
     // claim/result oid — caller must supply it; mismatch refuses.
@@ -221,8 +214,10 @@ pub async fn authorize_pay_async(
     let seller_nostr = NostrPublicKey::parse(&request.seller_pubkey)
         .map_err(|error| AuthorizePayError::Input(format!("seller_pubkey: {error}")))?;
     let seller_p2pk = cashu_compressed_from_nostr(&seller_nostr)?;
-    // Piece-14 Job E: choose the realized mint the buyer pays at from the seller's `creq` `m` list.
-    let mint = resolve_realized_mint(&request.accepted_mints)?;
+    // Piece-14 Job E + issue #49: choose the realized mint the buyer pays at from the seller's
+    // `creq` `m` list, keyed off the buyer's CONFIGURED mint (same source `buyer_fund` opens the
+    // spending wallet at) — never a compile-time pin.
+    let mint = resolve_realized_mint(home.config.default_mint(), &request.accepted_mints)?;
     let terms = PaymentTerms::new(
         mint,
         Amount::from(request.amount_sats),
@@ -399,24 +394,26 @@ fn contribution_policy(home: &MobeeHome) -> crate::contribution::ContentPolicy {
     }
 }
 
-/// PIECE-14 Job E buyer mint selection (§ The Lightning bridge).
+/// PIECE-14 Job E buyer mint selection (§ The Lightning bridge), config-driven (issue #49).
 ///
-/// The buyer pays from a mint it holds balance at that the seller listed in its `creq` `m` array.
-/// The buyer wallet is hard-pinned to [`DEFAULT_MINT_URL`] (`buyer_fund`), so "holds balance at a
-/// listed mint" reduces to: is the default mint in the creq list?
+/// `buyer_mint_url` is the mint the buyer's wallet spends from — the home config's default mint
+/// ([`crate::home::MobeeConfig::default_mint`]), the SAME source `buyer_fund` opens the wallet at.
+/// The buyer pays from a mint it holds balance at that the seller listed in its `creq` `m` array;
+/// since the buyer wallet is single-mint, that reduces to: is the buyer's configured mint listed?
 ///
-/// - **v1 claim (no creq ⇒ empty list):** pay from the pinned default mint — byte-identical to
-///   before piece-14.
-/// - **v2, default mint listed:** pay directly from the default mint (the direct path).
-/// - **v2, default mint NOT listed:** the buyer would have to BRIDGE over Lightning
+/// - **empty creq list (v1 / no creq):** pay from the buyer's configured mint.
+/// - **configured mint listed:** pay directly from it (the direct path).
+/// - **configured mint NOT listed:** the buyer would have to BRIDGE over Lightning
 ///   ([`crate::payment_wallet::bridge_to_accepted_mint`]). That live cross-mint path is fail-closed
-///   in v2 — accepted mints are testnut-only and the buyer wallet is single-mint, so there is no
-///   second reachable mint to mint-quote/melt against, and it cannot be validated without live
-///   mints. It refuses `mint_unreachable_pay`; no funds move, no binding is committed. The bridge
-///   mechanism itself is implemented and unit-tested for a future multi-mint enablement.
-fn resolve_realized_mint(accepted_mints: &[String]) -> Result<MintUrl, AuthorizePayError> {
-    let buyer_mint = MintUrl::from_str(DEFAULT_MINT_URL)
-        .map_err(|error| AuthorizePayError::Input(format!("mint url: {error}")))?;
+///   (single-mint wallet — no second reachable mint to mint-quote/melt against), so it refuses
+///   `mint_unreachable_pay`; no funds move, no binding is committed. The bridge mechanism is
+///   implemented and unit-tested for a future multi-mint enablement.
+fn resolve_realized_mint(
+    buyer_mint_url: &str,
+    accepted_mints: &[String],
+) -> Result<MintUrl, AuthorizePayError> {
+    let buyer_mint = MintUrl::from_str(buyer_mint_url)
+        .map_err(|error| AuthorizePayError::Input(format!("buyer mint url: {error}")))?;
     if accepted_mints.is_empty() {
         return Ok(buyer_mint);
     }
@@ -431,8 +428,8 @@ fn resolve_realized_mint(accepted_mints: &[String]) -> Result<MintUrl, Authorize
         return Ok(buyer_mint);
     }
     Err(AuthorizePayError::Wallet(PaymentWalletError::Wallet(format!(
-        "mint_unreachable_pay: buyer holds no balance at any creq mint {listed:?}; the live \
-         cross-mint Lightning bridge is disabled in v2 (testnut-only, single-mint wallet)"
+        "mint_unreachable_pay: buyer mint {buyer_mint} is not in the creq mint list {listed:?}; \
+         the live cross-mint Lightning bridge is disabled (single-mint wallet)"
     ))))
 }
 
@@ -708,36 +705,53 @@ async fn wait_for_nip42_auth(
 mod tests {
     use super::*;
     use crate::budget::BudgetGate;
-    use crate::home;
+    use crate::home::{self, DEFAULT_MINT_URL};
 
-    // PIECE-14 Job E v1-compat: a claim WITHOUT a creq (empty accepted-mint list) resolves the
-    // realized mint to the pinned default mint — byte-identical to the pre-piece-14 pay path (this
-    // mirrors Job D's None-compat pattern).
+    // A mint the buyer is NOT the compile-time default — proves resolution is config-driven (#49).
+    const CONFIGURED_MINT: &str = "https://minibits.example";
+
+    // Empty creq list (v1 / no creq) → pay from the buyer's CONFIGURED mint (not a compile pin).
     #[test]
-    fn resolve_realized_mint_v1_no_creq_uses_default_mint() {
-        let mint = resolve_realized_mint(&[]).unwrap();
-        assert_eq!(mint, MintUrl::from_str(DEFAULT_MINT_URL).unwrap());
+    fn resolve_realized_mint_empty_creq_uses_configured_mint() {
+        let mint = resolve_realized_mint(CONFIGURED_MINT, &[]).unwrap();
+        assert_eq!(mint, MintUrl::from_str(CONFIGURED_MINT).unwrap());
     }
 
-    // Direct path: the buyer's default mint is one the seller listed → pay from it directly.
+    // Direct path: the buyer's configured mint is one the seller listed → pay from it directly.
+    // (Uses the default mint as the configured one to keep a default-config regression too.)
     #[test]
-    fn resolve_realized_mint_direct_when_default_mint_is_listed() {
-        let mint = resolve_realized_mint(&[
-            "https://other.example".to_string(),
-            DEFAULT_MINT_URL.to_string(),
-        ])
+    fn resolve_realized_mint_direct_when_configured_mint_is_listed() {
+        let mint = resolve_realized_mint(
+            DEFAULT_MINT_URL,
+            &[
+                "https://other.example".to_string(),
+                DEFAULT_MINT_URL.to_string(),
+            ],
+        )
         .unwrap();
         assert_eq!(mint, MintUrl::from_str(DEFAULT_MINT_URL).unwrap());
     }
 
-    // Bridge needed but disabled in v2: the buyer holds balance only at the default mint, which the
-    // seller did NOT list → refuse `mint_unreachable_pay` fail-closed (no spend).
+    // Configured mint NOT in the creq list → refuse `mint_unreachable_pay` fail-closed (no spend).
     #[test]
-    fn resolve_realized_mint_refuses_when_bridge_would_be_needed() {
+    fn resolve_realized_mint_refuses_when_configured_mint_not_listed() {
         let error =
-            resolve_realized_mint(&["https://other.example".to_string()]).unwrap_err();
+            resolve_realized_mint(CONFIGURED_MINT, &["https://other.example".to_string()])
+                .unwrap_err();
         assert!(matches!(error, AuthorizePayError::Wallet(_)));
         assert!(error.to_string().contains("mint_unreachable_pay"));
+    }
+
+    // Issue #49: a buyer configured at mint X pays at X when the creq lists X, and refuses when the
+    // creq lists only a DIFFERENT mint — the paying mint follows config, not the compile-time const.
+    #[test]
+    fn resolve_realized_mint_follows_configured_mint_x() {
+        let paid = resolve_realized_mint(CONFIGURED_MINT, &[CONFIGURED_MINT.to_string()]).unwrap();
+        assert_eq!(paid, MintUrl::from_str(CONFIGURED_MINT).unwrap());
+
+        let refused =
+            resolve_realized_mint(CONFIGURED_MINT, &[DEFAULT_MINT_URL.to_string()]).unwrap_err();
+        assert!(refused.to_string().contains("mint_unreachable_pay"));
     }
 
     #[tokio::test(flavor = "current_thread")]
