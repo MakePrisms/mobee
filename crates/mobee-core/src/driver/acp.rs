@@ -204,15 +204,14 @@ impl UpdateStream {
     }
 }
 
-use super::{UsageMetadata, UsageTransport};
+use super::UsageMetadata;
 
 /// Extract execution usage from an ACP `session/prompt` JSON-RPC result.
 ///
 /// The prompt result is the only ACP-native usage surface the driver has: whatever the harness
 /// reports under its `usage` object is captured here. **Absent-stays-absent** — a result with no
 /// recognizable usage returns `None` and nothing is emitted downstream, so a missing number is
-/// never rendered as a fabricated zero. When any field is found, `transport = acp-native`,
-/// because the value arrived over the ACP wire.
+/// never rendered as a fabricated zero.
 ///
 /// Token components are read only from a real `usage` object, never guessed off unrelated root
 /// fields.
@@ -256,15 +255,11 @@ pub fn parse_acp_usage(result: &Value) -> Option<UsageMetadata> {
         cache_read_tokens,
         cache_write_tokens,
         cost: None,
-        transport: None,
     };
     if meta.is_empty() {
         return None;
     }
-    Some(UsageMetadata {
-        transport: Some(UsageTransport::AcpNative),
-        ..meta
-    })
+    Some(meta)
 }
 
 fn first_u64(v: &Value, keys: &[&str]) -> Option<u64> {
@@ -318,7 +313,6 @@ mod usage_tests {
         assert_eq!(usage.cache_write_tokens, Some(512));
         // total = input + output (+ reasoning if present); cache siblings NEVER folded in.
         assert_eq!(usage.total_tokens(), Some(140));
-        assert_eq!(usage.transport, Some(UsageTransport::AcpNative));
         // Neither is carried on the ACP wire, so neither is fabricated.
         assert_eq!(usage.model, None);
         assert_eq!(usage.cost, None);
@@ -376,7 +370,6 @@ mod usage_tests {
         assert_eq!(usage.cache_write_tokens, Some(256));
         assert_eq!(usage.reasoning_tokens, None);
         assert_eq!(usage.total_tokens(), Some(1540));
-        assert_eq!(usage.transport, Some(UsageTransport::AcpNative));
         assert_eq!(usage.model, None);
         assert_eq!(usage.cost, None);
     }
@@ -402,7 +395,6 @@ mod usage_tests {
         assert_eq!(usage.cache_write_tokens, None);
         // total = input + output + reasoning (cache read is a sibling, never folded in).
         assert_eq!(usage.total_tokens(), Some(1174));
-        assert_eq!(usage.transport, Some(UsageTransport::AcpNative));
         assert_eq!(usage.model, None);
         assert_eq!(usage.cost, None);
     }
@@ -430,7 +422,6 @@ mod usage_tests {
         assert_eq!(usage.cache_read_tokens, Some(1024));
         assert_eq!(usage.cache_write_tokens, Some(128));
         assert_eq!(usage.total_tokens(), Some(77));
-        assert_eq!(usage.transport, Some(UsageTransport::AcpNative));
     }
 
     #[test]
@@ -445,6 +436,5 @@ mod usage_tests {
         assert_eq!(usage.input_tokens, Some(5));
         assert_eq!(usage.output_tokens, Some(3));
         assert_eq!(usage.total_tokens(), Some(8));
-        assert_eq!(usage.transport, Some(UsageTransport::AcpNative));
     }
 }

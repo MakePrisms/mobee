@@ -206,7 +206,7 @@ mod tests {
 
     use crate::driver::{
         Artifact, ContentBlock, MockDriver, ScriptedSession, SessionUpdate, StopReason,
-        UsageMetadata, UsageTransport,
+        UsageMetadata,
     };
     use crate::engine::{EngineError, RunEvent, RunOutcome, RunParams, run_job};
     use crate::event::{ArtifactId, Event, JobExecutionStatus, JobId, RuntimeId};
@@ -283,7 +283,6 @@ mod tests {
             model: Some("claude-opus-4-8".into()),
             input_tokens: Some(100),
             output_tokens: Some(40),
-            transport: Some(UsageTransport::AcpNative),
             ..UsageMetadata::default()
         };
         let script = ScriptedSession {

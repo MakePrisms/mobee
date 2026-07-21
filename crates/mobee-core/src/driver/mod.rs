@@ -23,23 +23,6 @@ pub struct Readiness {
     pub protocol_version: u32,
 }
 
-/// Where a run's usage numbers were actually captured (the `usage_transport` tag).
-/// This reflects reality — the surface the value came off — not a harness-declared guess.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UsageTransport {
-    /// Carried over the ACP wire (the `session/prompt` JSON-RPC result). The only transport a
-    /// driver produces today; [`crate::driver::acp::parse_acp_usage`] is its sole producer.
-    AcpNative,
-}
-
-impl UsageTransport {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::AcpNative => "acp-native",
-        }
-    }
-}
-
 /// A real monetary cost with its accounting basis (the `cost` tag).
 /// `amount` is the exact string as reported by the harness (kept as text so it is
 /// byte-exact and never zero/float-mangled); `basis` ∈ {harness-reported-usd,
@@ -69,7 +52,6 @@ pub struct UsageMetadata {
     /// Cache-write/creation sibling — evidence only, NEVER summed into the total.
     pub cache_write_tokens: Option<u64>,
     pub cost: Option<UsageCost>,
-    pub transport: Option<UsageTransport>,
 }
 
 impl UsageMetadata {
@@ -82,7 +64,6 @@ impl UsageMetadata {
             && self.cache_read_tokens.is_none()
             && self.cache_write_tokens.is_none()
             && self.cost.is_none()
-            && self.transport.is_none()
     }
 
     /// Derived `total_tokens = input + output + reasoning`. Returns `None` unless BOTH `input`

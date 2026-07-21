@@ -936,7 +936,6 @@ mod tests {
     fn receipt_draft_binds_delivery_and_echoes_exec_metadata() {
         let exec = vec![
             TagSpec::new(["harness", "claude-agent-acp"]),
-            TagSpec::new(["usage_transport", "acp-native"]),
             TagSpec::new(["metadata_trust", "seller-claimed"]),
             TagSpec::new(["wall_time", "1234", "ms"]),
         ];
@@ -978,7 +977,6 @@ mod tests {
     fn result_draft_carries_seller_claimed_exec_metadata_after_sig() {
         let exec = vec![
             TagSpec::new(["harness", "codex-acp-ng"]),
-            TagSpec::new(["usage_transport", "acp-native"]),
             TagSpec::new(["metadata_trust", "seller-claimed"]),
             TagSpec::new(["tokens", "3172", "total"]),
         ];
@@ -995,7 +993,6 @@ mod tests {
             &exec,
         );
         assert!(has_tag_value(&result.tags, "harness", "codex-acp-ng"));
-        assert!(has_tag_value(&result.tags, "usage_transport", "acp-native"));
         assert!(has_tag_value(&result.tags, "metadata_trust", "seller-claimed"));
         // exec-metadata sits after the seller signature, before the protocol markers.
         let sig_at = result
