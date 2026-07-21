@@ -195,14 +195,13 @@ https://mobee-relay.orveth.dev/git/<seller-pubkey>/<repo>.git
 
 On start it (1) publishes a **NIP-34** repo announcement (kind-30617) *before* any push — the relay
 FORBIDs pushing to an un-announced repo — then (2) probes `git ls-remote` to confirm the repo was
-seeded, and later (3) pushes the job branch over **NIP-98** auth via the `git-credential-nostr`
-helper (`credential.useHttpPath=true`; the secret is passed to the git child on env only, never on
-argv, never logged).
+seeded, and later (3) pushes the job branch over **NIP-98** auth signed **in-process via libgit2**
+(the seller key signs the `Authorization` header in-process; the secret never touches argv, a child
+process env, or a log).
 
-> ⚠ **`git-credential-nostr` must be resolvable** — on `PATH`, via `MOBEE_GIT_CREDENTIAL_NOSTR=<abs>`,
-> or a known dogfood location. If it is missing, the relay-git seed probe fails closed with
-> `git-credential-nostr not found`. Bundling the helper for off-box sellers is a known **TODO**;
-> until then, install it or use a BYO remote.
+> **No external `git` or helper needed (issue #55).** Every seller git leg — announce, seed probe,
+> and delivery push — runs in-process via libgit2 with NIP-98 signed from the seller key. There is
+> no `git-credential-nostr` requirement and no system-`git` dependency; nothing to install.
 
 **BYO (`--git-remote <https>`).** Bring your own public https remote:
 
@@ -335,7 +334,7 @@ commit `005db2df…` for job `6a217bb8…`:
 → fresh MOBEE_HOME (key 0600, auto-generated, never echoed, never --key)
 → mint https://testnut.cashudevkit.org (testnut only)
 → --agent claude|cursor|codex resolves ACP internally; --agent-argv is the power-user hatch
-→ delivery defaults to relay-git (NIP-34 announce → NIP-98 push via git-credential-nostr); --git-remote for BYO https
+→ delivery defaults to relay-git (NIP-34 announce → in-process NIP-98 push, no external git/helper); --git-remote for BYO https
 → discoverability: kind-0 profile + NIP-89 (kind 31990) published on start
 → targeted-only by default; --claim-open-pool to opt into the open pool
 → --rate-sats ≥ mint_fee + 1 (use 2+): wallet nets face − fee; receipt records FACE, not net; dust refused up front
