@@ -936,7 +936,7 @@ mod tests {
     fn receipt_draft_binds_delivery_and_echoes_exec_metadata() {
         let exec = vec![
             TagSpec::new(["harness", "claude-agent-acp"]),
-            TagSpec::new(["usage_transport", "side-channel"]),
+            TagSpec::new(["usage_transport", "acp-native"]),
             TagSpec::new(["metadata_trust", "seller-claimed"]),
             TagSpec::new(["wall_time", "1234", "ms"]),
         ];

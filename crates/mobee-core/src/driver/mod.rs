@@ -27,17 +27,15 @@ pub struct Readiness {
 /// This reflects reality — the surface the value came off — not a harness-declared guess.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UsageTransport {
-    /// Carried over the ACP wire (the `session/prompt` JSON-RPC result).
+    /// Carried over the ACP wire (the `session/prompt` JSON-RPC result). The only transport a
+    /// driver produces today; [`crate::driver::acp::parse_acp_usage`] is its sole producer.
     AcpNative,
-    /// Read off a non-ACP sibling surface (e.g. a `--print` stream).
-    SideChannel,
 }
 
 impl UsageTransport {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AcpNative => "acp-native",
-            Self::SideChannel => "side-channel",
         }
     }
 }
