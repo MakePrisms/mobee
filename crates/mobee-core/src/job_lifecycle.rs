@@ -965,6 +965,45 @@ pub fn authorize_request_from_bind(
     })
 }
 
+/// Fill an explicit-form [`AuthorizePayRequest`](crate::authorize_pay::AuthorizePayRequest) from
+/// the accept-bind so it builds the SAME co-signed receipt preimage as
+/// [`authorize_request_from_bind`] (issue #53). Call AFTER [`assert_authorize_matches_bind`].
+///
+/// `job_hash` feeds the receipt preimage and is taken from the bind unconditionally: it was
+/// recorded at accept from the seller's own result, so the bind is authoritative. Before this fix
+/// the explicit form kept the caller's `job_hash` arg (the only preimage field neither asserted
+/// against nor filled from the bind), so a caller whose `job_hash` diverged from the bind built a
+/// preimage the seller never co-signed and the pay refused "pre-pay seller co-signature invalid" —
+/// while the bind-first form (always using `bind.job_hash`) paid clean. `seller_signature`,
+/// `creq_hash`, `accepted_mints`, and the contribution binds fill from the bind only when the
+/// explicit caller left them empty/absent.
+pub fn fill_explicit_request_from_bind(
+    request: &mut crate::authorize_pay::AuthorizePayRequest,
+    bind: &AcceptedBind,
+) {
+    request.job_hash = bind.job_hash.clone();
+    if request.seller_signature.is_empty() {
+        request.seller_signature = bind.seller_signature.clone();
+    }
+    if request.creq_hash.is_none() {
+        request.creq_hash = bind.creq_hash.clone();
+    }
+    if request.accepted_mints.is_empty() {
+        request.accepted_mints = bind.accepted_mints.clone();
+    }
+    if request.contribution.is_none() {
+        request.contribution = bind.contribution.as_ref().map(|c| {
+            crate::authorize_pay::ContributionPayBinds {
+                target_owner_pubkey: c.target_owner_pubkey.clone(),
+                target_clone_url: c.target_clone_url.clone(),
+                base_branch: c.base_branch.clone(),
+                base_oid: c.base_oid.clone(),
+                tuple_signature: c.tuple_signature.clone(),
+            }
+        });
+    }
+}
+
 fn write_accepted_bind(home: &MobeeHome, bind: &AcceptedBind) -> Result<(), JobLifecycleError> {
     let dir = home.root.join(JOBS_DIR);
     fs::create_dir_all(&dir).map_err(|error| JobLifecycleError::Io(error.to_string()))?;
@@ -1457,6 +1496,114 @@ mod tests {
         assert!(
             error.to_string().contains("unparseable creq"),
             "unexpected error: {error}"
+        );
+    }
+
+    // Issue #53 (load-bearing): the explicit 9-field form (with bind-fill applied) and the
+    // bind-first form must build the IDENTICAL AuthorizePayRequest over the same accept-bind —
+    // identical requests ⇒ identical PaymentKey ⇒ identical co-signed receipt preimage/digest, so
+    // both forms pass the seller's pre-pay cosig. Fails on pre-fix v2 (the explicit form kept the
+    // caller's divergent job_hash); passes with fill_explicit_request_from_bind sourcing job_hash
+    // from the bind.
+    #[test]
+    fn explicit_and_bind_forms_build_identical_request() {
+        let bind = AcceptedBind {
+            job_id: "2a195bece5f6".into(),
+            claim_id: "0a8bbc5284e8".into(),
+            result_id: "058886d7b19e".into(),
+            seller_pubkey: "aa".repeat(32),
+            commit_oid: "bb".repeat(20),
+            repo: "https://example.invalid/repo.git".into(),
+            branch: "mobee/job".into(),
+            job_hash: "cc".repeat(32),
+            amount_sats: 5,
+            accept_event_id: "accept-x".into(),
+            accepted_at: 1,
+            seller_signature: "dd".repeat(64),
+            creq_hash: Some("2ad9b34cbf8c".to_string()),
+            accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
+            contribution: None,
+        };
+
+        // The bind-first request (always sources preimage fields from the bind).
+        let from_bind =
+            authorize_request_from_bind(&bind, 5, bind.commit_oid.clone()).expect("bind form");
+
+        // The explicit request as mcp.rs builds it, with a job_hash that DIVERGES from the bind
+        // (the real-trade failure) and creq_hash/accepted_mints/seller_signature left for the fill.
+        let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            job_id: bind.job_id.clone(),
+            result_id: bind.result_id.clone(),
+            delivery_integrity_hash: bind.commit_oid.clone(),
+            job_hash: "ff".repeat(32), // caller-supplied, DIFFERENT from bind.job_hash
+            seller_pubkey: bind.seller_pubkey.clone(),
+            amount_sats: 5,
+            repo: bind.repo.clone(),
+            branch: bind.branch.clone(),
+            commit_oid: bind.commit_oid.clone(),
+            seller_signature: String::new(),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            contribution: None,
+        };
+        fill_explicit_request_from_bind(&mut explicit, &bind);
+
+        assert_eq!(
+            explicit, from_bind,
+            "explicit-form and bind-form requests must be identical so both build the same \
+             co-signed receipt preimage (issue #53)"
+        );
+    }
+
+    // Issue #53 incident diagnosis: the LIVE failure had the explicit call's job_hash BYTE-EQUAL
+    // to the bind (per the failed-run logs). Reproduce that exact shape — ALL explicit fields
+    // byte-equal to the bind — and confirm the two constructed requests are identical EVEN without
+    // the job_hash fix mattering. If this passes, the incident's divergence was NOT in request
+    // construction (it points at the next layer: the bind on disk / re-accept rewrite / config).
+    #[test]
+    fn byte_equal_explicit_matches_bind_request() {
+        let bind = AcceptedBind {
+            job_id: "2a195bece5f6".into(),
+            claim_id: "0a8bbc5284e8".into(),
+            result_id: "058886d7b19e".into(),
+            seller_pubkey: "aa".repeat(32),
+            commit_oid: "5ce37eeb".repeat(5),
+            repo: "https://example.invalid/repo.git".into(),
+            branch: "mobee/job".into(),
+            job_hash: "699c9230".repeat(8),
+            amount_sats: 5,
+            accept_event_id: "accept-x".into(),
+            accepted_at: 1,
+            seller_signature: "dd".repeat(64),
+            creq_hash: Some("2ad9b34c".repeat(8)),
+            accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
+            contribution: None,
+        };
+        let from_bind =
+            authorize_request_from_bind(&bind, 5, bind.commit_oid.clone()).expect("bind form");
+
+        // Explicit form with EVERY field byte-equal to the bind (the incident's inputs).
+        let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            job_id: bind.job_id.clone(),
+            result_id: bind.result_id.clone(),
+            delivery_integrity_hash: bind.commit_oid.clone(),
+            job_hash: bind.job_hash.clone(), // byte-equal, as in the live failure
+            seller_pubkey: bind.seller_pubkey.clone(),
+            amount_sats: 5,
+            repo: bind.repo.clone(),
+            branch: bind.branch.clone(),
+            commit_oid: bind.commit_oid.clone(),
+            seller_signature: bind.seller_signature.clone(),
+            creq_hash: bind.creq_hash.clone(),
+            accepted_mints: bind.accepted_mints.clone(),
+            contribution: None,
+        };
+        fill_explicit_request_from_bind(&mut explicit, &bind);
+
+        assert_eq!(
+            explicit, from_bind,
+            "with byte-equal inputs the two forms already produce identical requests — the live \
+             incident was NOT request construction"
         );
     }
 
