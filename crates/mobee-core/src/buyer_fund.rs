@@ -1,7 +1,9 @@
-//! Buyer wallet fund path for packaged `~/.mobee` (testnut only).
+//! Buyer wallet fund path for packaged `~/.mobee`.
 //!
-//! Flow: mint quote → (testnut FakeWallet auto-marks paid) → mint.
-//! The wallet mint is the configured mint ([`crate::home::MobeeConfig::default_mint`]).
+//! Flow: mint quote → surface the bolt11 invoice → poll quote state until paid → mint. A testnut
+//! FakeWallet auto-marks the invoice paid, so the loop completes immediately; a real mint completes
+//! once the invoice is paid externally. The wallet mint is the configured mint
+//! ([`crate::home::MobeeConfig::default_mint`]).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -15,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::home::{self, HomeError, MobeeHome};
 
-/// Default fund amount for first-run setup (sats). Small; testnut only.
+/// Small default fund amount for first-run setup (sats).
 pub const DEFAULT_FUND_AMOUNT_SATS: u64 = 21;
 
 /// Result of a successful fund (or already-funded status read).
@@ -32,6 +34,10 @@ pub struct FundOutcome {
 pub enum FundError {
     Home(HomeError),
     Wallet(String),
+    /// The mint quote was still unpaid when the poll window elapsed. Fail-closed (no mint), but
+    /// the bolt11 `invoice` is reported so a slow external payment (real mint) is not lost — pay it
+    /// and re-run to complete the mint.
+    QuoteUnpaid { invoice: String, quote_id: String },
 }
 
 impl std::fmt::Display for FundError {
@@ -39,6 +45,10 @@ impl std::fmt::Display for FundError {
         match self {
             Self::Home(error) => write!(formatter, "{error}"),
             Self::Wallet(message) => write!(formatter, "wallet fund error: {message}"),
+            Self::QuoteUnpaid { invoice, quote_id } => write!(
+                formatter,
+                "mint quote {quote_id} still unpaid; pay the invoice and re-run to complete: {invoice}"
+            ),
         }
     }
 }
@@ -148,7 +158,8 @@ pub async fn fund_testnut_wallet(
     let quote_id = quote.id.clone();
 
     // Poll HTTP quote status — do not use wait_and_mint_quote (its WS stream can hang; polling is
-    // deterministic). FakeWallet marks bolt11 paid; poll until Paid/Issued.
+    // deterministic). A testnut FakeWallet marks the invoice paid immediately; a real mint's quote
+    // flips to Paid once the invoice is paid externally. Poll until Paid/Issued.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {
         let status = wallet
@@ -159,9 +170,12 @@ pub async fn fund_testnut_wallet(
             MintQuoteState::Paid | MintQuoteState::Issued => break,
             MintQuoteState::Unpaid => {
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(FundError::Wallet(format!(
-                        "timed out waiting for testnut mint quote {quote_id} to become paid"
-                    )));
+                    // Fail closed (no mint) but report the invoice so a slow external payment is
+                    // not lost — the caller can pay it and re-run to complete the mint.
+                    return Err(FundError::QuoteUnpaid {
+                        invoice: invoice.clone(),
+                        quote_id: quote_id.clone(),
+                    });
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }

@@ -101,25 +101,29 @@ pub async fn set_profile_async(
 ) -> Result<SetProfileOutcome, ProfileError> {
     home::reload_config(home)?;
 
-    if let Some(name) = &request.name {
-        let trimmed = clamp_field(name, PROFILE_NAME_MAX).ok_or_else(|| {
+    let name = match &request.name {
+        Some(name) => Some(clamp_field(name, PROFILE_NAME_MAX).ok_or_else(|| {
             ProfileError::Input("name must be a non-empty string (max 128 chars)".into())
-        })?;
-        profile_mut(home).name = Some(trimmed);
-    }
-    if let Some(about) = &request.about {
-        let trimmed = clamp_field(about, PROFILE_ABOUT_MAX).ok_or_else(|| {
+        })?),
+        None => None,
+    };
+    let about = match &request.about {
+        Some(about) => Some(clamp_field(about, PROFILE_ABOUT_MAX).ok_or_else(|| {
             ProfileError::Input("about must be a non-empty string (max 512 chars)".into())
-        })?;
-        profile_mut(home).about = Some(trimmed);
-    }
+        })?),
+        None => None,
+    };
 
-    // Ensure the section exists even when re-publishing empties (idempotent replace).
-    if home.config.profile.is_none() {
-        home.config.profile = Some(ProfileConfig::default());
-    }
-
-    home::save_config(home)?;
+    home::save_config(home, |config| {
+        // Ensure the section exists even when re-publishing empties (idempotent replace).
+        let profile = config.profile.get_or_insert_with(ProfileConfig::default);
+        if let Some(name) = name {
+            profile.name = Some(name);
+        }
+        if let Some(about) = about {
+            profile.about = Some(about);
+        }
+    })?;
 
     let profile = home.config.profile.clone().unwrap_or_default();
     let keys = buyer_keys(home)?;
@@ -175,8 +179,10 @@ pub async fn publish_seller_discoverability_async(
         .map(|n| n.trim().is_empty())
         .unwrap_or(true)
     {
-        profile_mut(home).name = Some(format!("mobee-seller-{short}"));
-        home::save_config(home)?;
+        let name = format!("mobee-seller-{short}");
+        home::save_config(home, |config| {
+            config.profile.get_or_insert_with(ProfileConfig::default).name = Some(name);
+        })?;
     }
     if home
         .config
@@ -186,10 +192,10 @@ pub async fn publish_seller_discoverability_async(
         .is_none()
     {
         let agent_label = agent.as_deref().unwrap_or("agent");
-        profile_mut(home).about = Some(format!(
-            "mobee seller · {agent_label} · {rate_sats} sat/job · testnut"
-        ));
-        home::save_config(home)?;
+        let about = format!("mobee seller · {agent_label} · {rate_sats} sat/job · testnut");
+        home::save_config(home, |config| {
+            config.profile.get_or_insert_with(ProfileConfig::default).about = Some(about);
+        })?;
     }
 
     let profile = home.config.profile.clone().unwrap_or_default();
@@ -236,12 +242,6 @@ pub fn resolve_display_names(
         Ok(map) => map,
         Err(_) => unique.into_iter().map(|k| (k, None)).collect(),
     }
-}
-
-fn profile_mut(home: &mut MobeeHome) -> &mut ProfileConfig {
-    home.config
-        .profile
-        .get_or_insert_with(ProfileConfig::default)
 }
 
 fn clamp_field(raw: &str, max: usize) -> Option<String> {
@@ -642,12 +642,14 @@ mod tests {
         let mut home = home::bootstrap(&root).expect("home");
         assert!(home.config.profile.is_none());
 
-        // Merge into config only (skip relay publish by testing profile_mut path via save).
-        home.config.profile = Some(ProfileConfig {
-            name: Some("buyer-x".into()),
-            about: Some("about-x".into()),
-        });
-        home::save_config(&home).expect("save");
+        // Persist a profile through the file-only edit view (skips relay publish).
+        home::save_config(&mut home, |config| {
+            config.profile = Some(ProfileConfig {
+                name: Some("buyer-x".into()),
+                about: Some("about-x".into()),
+            });
+        })
+        .expect("save");
         home::reload_config(&mut home).expect("reload");
         let profile = home.config.profile.expect("present");
         assert_eq!(profile.name.as_deref(), Some("buyer-x"));

@@ -152,30 +152,13 @@ impl From<PaymentWalletError> for AuthorizePayError {
     }
 }
 
-/// Authorize spend under [`BudgetGate`], then pay only through
-/// [`PaymentService::run`] with a [`PayPathDeliveryVerifier`].
+/// Authorize spend under [`BudgetGate`], then pay only through [`PaymentService::run`] with a
+/// [`PayPathDeliveryVerifier`]. Async — every caller is already on a Tokio runtime (MCP dispatch).
 ///
 /// Spent is keyed by stable `PaymentKey::attempt_id()`: first authorize persists
 /// spent **before** `run()` (write-before-mint); a reconciled retry does not
 /// re-count. `run()` delivery-verifies first and reconciles inside the saga.
-pub fn authorize_pay(
-    home: &MobeeHome,
-    gate: &mut BudgetGate,
-    request: AuthorizePayRequest,
-) -> Result<AuthorizePayOutcome, AuthorizePayError> {
-    crate::runtime_guard::refuse_nested_block_on("authorize_pay")
-        .map_err(AuthorizePayError::Effects)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| AuthorizePayError::Effects(error.to_string()))?;
-    runtime.block_on(authorize_pay_async(home, gate, request))
-}
-
-/// Async authorize_pay for callers already on a Tokio runtime (MCP dispatch).
-///
-/// LOGIC identical to the sync path — only wallet open is `await` (no nested
-/// `block_on`). Verify-fetch timeout still fails CLOSED (no pay / zero burn).
+/// Verify-fetch timeout fails CLOSED (no pay / zero burn).
 ///
 /// CALLER CONTRACT (contribution gating): this function trusts `request.contribution` —
 /// `None` is treated as a from-scratch job, so the four contribution gates + the
@@ -784,42 +767,19 @@ mod tests {
         assert!(refused.to_string().contains("mint_unreachable_pay"));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn authorize_pay_sync_refuses_inside_runtime() {
-        let root = std::env::temp_dir().join(format!(
-            "mobee-authorize-pay-nested-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = home::bootstrap(&root).expect("home");
-        let mut gate = BudgetGate::from_home(&home).expect("gate");
-        let request = AuthorizePayRequest {
-            job_id: "job-nested".into(),
-            result_id: "result-nested".into(),
-            delivery_integrity_hash: "aa".repeat(20),
-            job_hash: "bb".repeat(32),
-            seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
-            amount_sats: 1,
-            repo: "https://github.com/bitcoin/bips.git".into(),
-            branch: "master".into(),
-            commit_oid: "aa".repeat(20),
-            seller_signature: String::new(),
-            creq_hash: None,
-            accepted_mints: Vec::new(),
-            contribution: None,
-        };
-        let err = authorize_pay(&home, &mut gate, request).expect_err("must refuse nested block_on");
-        let message = err.to_string();
-        assert!(
-            message.contains("nested block_on refused"),
-            "unexpected error: {message}"
-        );
-        assert_eq!(gate.spent(), 0, "nested refuse must not burn spent");
-        let _ = std::fs::remove_dir_all(&root);
+    // Build a current-thread runtime and block on `authorize_pay_async` — the pattern the MCP
+    // dispatch's own runtime provides in production. Lets the sync `#[test]` cases drive the async
+    // authorize path directly.
+    fn authorize_pay_blocking(
+        home: &MobeeHome,
+        gate: &mut BudgetGate,
+        request: AuthorizePayRequest,
+    ) -> Result<AuthorizePayOutcome, AuthorizePayError> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime")
+            .block_on(authorize_pay_async(home, gate, request))
     }
 
     #[test]
@@ -851,7 +811,7 @@ mod tests {
             accepted_mints: Vec::new(),
             contribution: None,
         };
-        let err = authorize_pay(&home, &mut gate, request).expect_err("empty tip-match hash");
+        let err = authorize_pay_blocking(&home, &mut gate, request).expect_err("empty tip-match hash");
         let message = err.to_string();
         assert!(
             message.contains("delivery_integrity_hash is required"),
@@ -889,7 +849,7 @@ mod tests {
             accepted_mints: Vec::new(),
             contribution: None,
         };
-        let err = authorize_pay(&home, &mut gate, request).expect_err("tip-match mismatch");
+        let err = authorize_pay_blocking(&home, &mut gate, request).expect_err("tip-match mismatch");
         let message = err.to_string();
         assert!(
             message.contains("does not match seller-advertised commit_oid"),
@@ -939,7 +899,7 @@ mod tests {
             accepted_mints: Vec::new(),
             contribution: None,
         };
-        let err = authorize_pay(&home, &mut gate, request.clone()).expect_err("ext refused");
+        let err = authorize_pay_blocking(&home, &mut gate, request.clone()).expect_err("ext refused");
         let message = err.to_string();
         assert!(
             message.contains("ext") || message.contains("refused") || message.contains("transport"),
@@ -949,7 +909,7 @@ mod tests {
         assert_eq!(gate.spent(), 2);
 
         // Reconciled retry of the same PaymentKey attempt_id must not re-count spent.
-        let err2 = authorize_pay(&home, &mut gate, request).expect_err("retry still refuses");
+        let err2 = authorize_pay_blocking(&home, &mut gate, request).expect_err("retry still refuses");
         let message2 = err2.to_string();
         assert!(
             message2.contains("ext")
@@ -1046,7 +1006,7 @@ mod tests {
             accepted_mints: Vec::new(),
             contribution: None,
         };
-        let err = authorize_pay(&home, &mut gate, request).expect_err("forged sig refused pre-pay");
+        let err = authorize_pay_blocking(&home, &mut gate, request).expect_err("forged sig refused pre-pay");
         assert!(
             err.to_string().contains("pre-pay seller co-signature invalid"),
             "must be the pre-pay tooth refusal, got: {err}"
@@ -1102,7 +1062,7 @@ mod tests {
             contribution: None,
         };
         let seller_pubkey = home::public_key_hex(&home).expect("pubkey");
-        let msg = authorize_pay(&home, &mut gate, request)
+        let msg = authorize_pay_blocking(&home, &mut gate, request)
             .expect_err("forged sig refused")
             .to_string();
 
@@ -1173,7 +1133,7 @@ mod tests {
             accepted_mints: Vec::new(),
             contribution: None,
         };
-        let err = authorize_pay(&home, &mut gate, tampered_amount).expect_err("tampered amount");
+        let err = authorize_pay_blocking(&home, &mut gate, tampered_amount).expect_err("tampered amount");
         assert!(
             err.to_string().contains("pre-pay seller co-signature invalid"),
             "amount tamper must refuse at the pre-pay tooth, got: {err}"
@@ -1202,7 +1162,7 @@ mod tests {
             accepted_mints: Vec::new(),
             contribution: None,
         };
-        let err2 = authorize_pay(&home, &mut gate2, tampered_delivery).expect_err("tampered oid");
+        let err2 = authorize_pay_blocking(&home, &mut gate2, tampered_delivery).expect_err("tampered oid");
         assert!(
             err2.to_string().contains("pre-pay seller co-signature invalid"),
             "oid tamper must refuse at the pre-pay tooth, got: {err2}"

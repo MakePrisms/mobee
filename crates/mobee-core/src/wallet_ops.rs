@@ -614,8 +614,10 @@ pub fn add_mint(home: &mut MobeeHome, mint_url: &str) -> Result<String, WalletOp
     {
         return Ok(normalized);
     }
-    home.config.extra_mints.push(normalized.clone());
-    home::save_config(home)?;
+    let to_add = normalized.clone();
+    home::save_config(home, |config| {
+        config.extra_mints.push(to_add);
+    })?;
     Ok(normalized)
 }
 
@@ -626,19 +628,20 @@ pub fn remove_mint(home: &mut MobeeHome, mint_url: &str) -> Result<(), WalletOps
     if normalized == default {
         return Err(WalletOpsError::MintPinnedDefault);
     }
-    let before = home.config.extra_mints.len();
-    home.config.extra_mints.retain(|entry| {
-        normalize_mint_url(entry)
-            .ok()
-            .as_deref()
-            != Some(normalized.as_str())
+    let present = home.config.extra_mints.iter().any(|entry| {
+        normalize_mint_url(entry).ok().as_deref() == Some(normalized.as_str())
     });
-    if home.config.extra_mints.len() == before {
+    if !present {
         return Err(WalletOpsError::MintNotAllowed {
             mint_url: normalized,
         });
     }
-    home::save_config(home)?;
+    let to_remove = normalized.clone();
+    home::save_config(home, |config| {
+        config
+            .extra_mints
+            .retain(|entry| normalize_mint_url(entry).ok().as_deref() != Some(to_remove.as_str()));
+    })?;
     Ok(())
 }
 

@@ -50,17 +50,33 @@ pub struct PostJobRequest {
     /// Optional git delivery bind tags on the offer (repo + branch).
     pub repo: Option<String>,
     pub branch: Option<String>,
-    /// Contribution-offer params. OPTIONAL and **ALL-OR-NOTHING**: if any
-    /// of these is present this is a `job-class=contribution` offer and `target_repo_owner`,
-    /// `target_repo_url`, `base_branch`, `base_oid` are ALL required; absent entirely ⇒ from-scratch
-    /// (no additive tags, byte-identical to a non-contribution offer). See
-    /// [`contribution_offer_from_request`].
-    pub target_repo_owner: Option<String>,
-    pub target_repo_url: Option<String>,
-    pub base_branch: Option<String>,
-    pub base_oid: Option<String>,
-    /// Positional `accepts` values; defaults to `["fork"]` when contribution params are present.
-    /// Fork is the only supported delivery, so a supplied `accepts` MUST include `"fork"`.
+    /// Job class, explicit at the type level. `FromScratch` emits no contribution tags
+    /// (byte-identical to a non-contribution offer); `Contribution` carries the required target +
+    /// base pins. See [`JobKind`].
+    pub job: JobKind,
+}
+
+/// Job class of a posted offer. Making this an enum (rather than an all-or-nothing cluster of
+/// `Option`s) makes a partial contribution spec unrepresentable: the flat MCP tool args are
+/// validated into this at the tool layer, so the core never sees a half-specified contribution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobKind {
+    /// No contribution pins — a plain offer, byte-identical to a non-contribution offer.
+    FromScratch,
+    /// A `job-class=contribution` offer carrying the required target + base pins.
+    Contribution(ContributionSpec),
+}
+
+/// Required contribution-offer pins. The four target/base fields are REQUIRED (a partial set is
+/// unrepresentable); `accepts` is optional and defaults to `["fork"]` — fork is the only supported
+/// delivery, so a supplied `accepts` MUST include `"fork"`. The owner/branch/oid formats and the
+/// clone-URL transport allowlist are validated by [`contribution_offer_from_spec`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContributionSpec {
+    pub target_repo_owner: String,
+    pub target_repo_url: String,
+    pub base_branch: String,
+    pub base_oid: String,
     pub accepts: Option<Vec<String>>,
 }
 
@@ -343,9 +359,12 @@ pub async fn post_job_async(
         }
         _ => {}
     }
-    // Validate the optional contribution params up front (fail-closed, before the wallet
-    // opens). `None` ⇒ from-scratch (no additive tags). Emission happens in `build_offer_draft`.
-    let contribution = contribution_offer_from_request(&request)?;
+    // Validate the contribution spec up front (fail-closed, before the wallet opens). From-scratch
+    // ⇒ `None` (no additive tags). Emission happens in `build_offer_draft`.
+    let contribution = match &request.job {
+        JobKind::FromScratch => None,
+        JobKind::Contribution(spec) => Some(contribution_offer_from_spec(spec)?),
+    };
     let deadline_unix = resolve_post_deadline(request.deadline_unix, now_unix_secs()?)?;
 
     // Refuse a post whose amount exceeds the per-job budget cap AT POST — a job you
@@ -433,7 +452,7 @@ fn assert_amount_within_budget_cap(
 /// Build the offer-kind offer event draft. The optional git-delivery tags **and** the
 /// contribution tags are emitted HERE so the post path and its round-trip test share ONE
 /// tag-emission seam (pure — no publish, no wallet). `contribution` is the pre-validated canonical
-/// offer from [`contribution_offer_from_request`]; `None` ⇒ from-scratch, so NO additive
+/// offer from [`contribution_offer_from_spec`]; `None` ⇒ from-scratch, so NO additive
 /// contribution tags are emitted (byte-identical to a non-contribution offer).
 fn build_offer_draft(
     request: &PostJobRequest,
@@ -477,35 +496,25 @@ fn build_offer_draft(
     Ok(draft)
 }
 
-/// Validate the OPTIONAL contribution params on a [`PostJobRequest`] and build the
-/// canonical [`ContributionOffer`](crate::contribution::ContributionOffer).
+/// Validate a [`ContributionSpec`] and build the canonical
+/// [`ContributionOffer`](crate::contribution::ContributionOffer).
 ///
-/// - **Absent entirely** (no owner / url / branch / oid / accepts) ⇒ `Ok(None)` — from-scratch.
-/// - **ALL-OR-NOTHING:** if ANY contribution field is present, ALL required (owner, url, branch,
-///   oid) MUST be present; a partial set is REFUSED fail-closed, naming every missing field.
-/// - When present: owner (64-hex) + branch/oid are validated by the canonical constructors
-///   ([`TargetRepoPin`](crate::contribution::TargetRepoPin) /
-///   [`ContributionBase`](crate::contribution::ContributionBase)), and the clone URL additionally
-///   passes the SAME transport allowlist the pay path fetches under — `ext::`/file/ssh are refused
-///   at POST time so a buyer never publishes an offer nobody can safely verify. `accepts` defaults
-///   to `["fork"]` and MUST include `"fork"` (fork is the only supported delivery).
-fn contribution_offer_from_request(
-    request: &PostJobRequest,
-) -> Result<Option<crate::contribution::ContributionOffer>, JobLifecycleError> {
+/// owner (64-hex) + branch/oid are validated by the canonical constructors
+/// ([`TargetRepoPin`](crate::contribution::TargetRepoPin) /
+/// [`ContributionBase`](crate::contribution::ContributionBase)), and the clone URL additionally
+/// passes the SAME transport allowlist the pay path fetches under — `ext::`/file/ssh are refused
+/// at POST time so a buyer never publishes an offer nobody can safely verify. `accepts` defaults
+/// to `["fork"]` and MUST include `"fork"` (fork is the only supported delivery).
+fn contribution_offer_from_spec(
+    spec: &ContributionSpec,
+) -> Result<crate::contribution::ContributionOffer, JobLifecycleError> {
     use crate::contribution::{ContributionBase, ContributionOffer, TargetRepoPin, ACCEPTS_FORK};
 
-    let opt_trimmed = |value: &Option<String>| -> Option<String> {
-        value
-            .as_ref()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    };
-    let owner = opt_trimmed(&request.target_repo_owner);
-    let url = opt_trimmed(&request.target_repo_url);
-    let branch = opt_trimmed(&request.base_branch);
-    let oid = opt_trimmed(&request.base_oid);
-    let accepts: Vec<String> = request
+    let owner = spec.target_repo_owner.trim().to_owned();
+    let url = spec.target_repo_url.trim().to_owned();
+    let branch = spec.base_branch.trim().to_owned();
+    let oid = spec.base_oid.trim().to_owned();
+    let accepts: Vec<String> = spec
         .accepts
         .as_ref()
         .map(|values| {
@@ -516,37 +525,6 @@ fn contribution_offer_from_request(
                 .collect()
         })
         .unwrap_or_default();
-
-    // Absent entirely ⇒ from-scratch (byte-identical, no additive tags).
-    if owner.is_none() && url.is_none() && branch.is_none() && oid.is_none() && accepts.is_empty() {
-        return Ok(None);
-    }
-
-    // All-or-nothing: name EVERY missing required field so a partial set fails closed clearly.
-    let mut missing = Vec::new();
-    if owner.is_none() {
-        missing.push("target_repo_owner");
-    }
-    if url.is_none() {
-        missing.push("target_repo_url");
-    }
-    if branch.is_none() {
-        missing.push("base_branch");
-    }
-    if oid.is_none() {
-        missing.push("base_oid");
-    }
-    if !missing.is_empty() {
-        return Err(JobLifecycleError::Input(format!(
-            "contribution offer is all-or-nothing: missing required field(s) [{}] (required: \
-             target_repo_owner, target_repo_url, base_branch, base_oid)",
-            missing.join(", ")
-        )));
-    }
-    let owner = owner.expect("checked present");
-    let url = url.expect("checked present");
-    let branch = branch.expect("checked present");
-    let oid = oid.expect("checked present");
 
     // Transport allowlist at POST time (https + relay-git only; ext::/file/ssh/local refused) —
     // don't let a buyer publish an offer nobody can safely verify. The pay-path verifier re-checks
@@ -570,11 +548,11 @@ fn contribution_offer_from_request(
         )));
     }
 
-    Ok(Some(ContributionOffer {
+    Ok(ContributionOffer {
         target,
         base,
         accepts,
-    }))
+    })
 }
 
 /// Read offer / claims / results from the relay. Local accept-bind is attached if present.
@@ -1853,11 +1831,7 @@ mod tests {
                 deadline_unix: Some(1_800_000_000),
                 repo: None,
                 branch: None,
-                target_repo_owner: None,
-                target_repo_url: None,
-                base_branch: None,
-                base_oid: None,
-                accepts: None,
+                job: JobKind::FromScratch,
             },
         )
         .expect_err("seller required");
@@ -1893,11 +1867,7 @@ mod tests {
                 deadline_unix: Some(1_800_000_000),
                 repo: None,
                 branch: None,
-                target_repo_owner: None,
-                target_repo_url: None,
-                base_branch: None,
-                base_oid: None,
-                accepts: None,
+                job: JobKind::FromScratch,
             },
         )
         .expect_err("must refuse nested block_on");
@@ -2158,12 +2128,28 @@ mod tests {
         assert!(contribution_offer_view(&malformed).is_none());
     }
 
-    // ── Buyer POST-path: contribution offer params (all-or-nothing + tag emission) ─────
+    // ── Buyer POST-path: contribution offer spec (validation + tag emission) ─────
+    fn contribution_spec(
+        owner: &str,
+        url: &str,
+        branch: &str,
+        oid: &str,
+        accepts: Option<Vec<String>>,
+    ) -> ContributionSpec {
+        ContributionSpec {
+            target_repo_owner: owner.into(),
+            target_repo_url: url.into(),
+            base_branch: branch.into(),
+            base_oid: oid.into(),
+            accepts,
+        }
+    }
+
     fn contribution_post_request(
-        owner: Option<&str>,
-        url: Option<&str>,
-        branch: Option<&str>,
-        oid: Option<&str>,
+        owner: &str,
+        url: &str,
+        branch: &str,
+        oid: &str,
         accepts: Option<Vec<String>>,
     ) -> PostJobRequest {
         PostJobRequest {
@@ -2175,11 +2161,7 @@ mod tests {
             deadline_unix: Some(10),
             repo: None,
             branch: None,
-            target_repo_owner: owner.map(str::to_owned),
-            target_repo_url: url.map(str::to_owned),
-            base_branch: branch.map(str::to_owned),
-            base_oid: oid.map(str::to_owned),
-            accepts,
+            job: JobKind::Contribution(contribution_spec(owner, url, branch, oid, accepts)),
         }
     }
 
@@ -2191,12 +2173,14 @@ mod tests {
         let owner = "aa".repeat(32);
         let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
         let base_oid = "77".repeat(20);
-        let request =
-            contribution_post_request(Some(&owner), Some(url), Some("main"), Some(&base_oid), None);
+        let request = contribution_post_request(&owner, url, "main", &base_oid, None);
 
-        let contribution = contribution_offer_from_request(&request)
-            .expect("valid contribution params")
-            .expect("is a contribution offer");
+        let spec = match &request.job {
+            JobKind::Contribution(spec) => spec,
+            JobKind::FromScratch => panic!("built a contribution request"),
+        };
+        let contribution =
+            contribution_offer_from_spec(spec).expect("valid contribution params");
         let draft =
             build_offer_draft(&request, 10, Some(&contribution)).expect("draft built");
 
@@ -2242,14 +2226,13 @@ mod tests {
             deadline_unix: Some(10),
             repo: None,
             branch: None,
-            target_repo_owner: None,
-            target_repo_url: None,
-            base_branch: None,
-            base_oid: None,
-            accepts: None,
+            job: JobKind::FromScratch,
         };
-        let contribution = contribution_offer_from_request(&request).expect("ok");
-        assert!(contribution.is_none(), "no params ⇒ from-scratch");
+        let contribution: Option<crate::contribution::ContributionOffer> = match &request.job {
+            JobKind::FromScratch => None,
+            JobKind::Contribution(spec) => Some(contribution_offer_from_spec(spec).expect("ok")),
+        };
+        assert!(contribution.is_none(), "from-scratch ⇒ no contribution offer");
         let draft = build_offer_draft(
             &request,
             10,
@@ -2275,49 +2258,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn post_job_contribution_partial_params_refuse_naming_missing_fields() {
-        let owner = "aa".repeat(32);
-        let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
-        let base_oid = "77".repeat(20);
-        // owner alone ⇒ refuse, naming the three missing required fields.
-        let err = contribution_offer_from_request(&contribution_post_request(
-            Some(&owner),
-            None,
-            None,
-            None,
-            None,
-        ))
-        .expect_err("partial refused");
-        let msg = err.to_string();
-        assert!(msg.contains("target_repo_url"), "{msg}");
-        assert!(msg.contains("base_branch"), "{msg}");
-        assert!(msg.contains("base_oid"), "{msg}");
-        // missing only owner ⇒ names owner.
-        let err = contribution_offer_from_request(&contribution_post_request(
-            None,
-            Some(url),
-            Some("main"),
-            Some(&base_oid),
-            None,
-        ))
-        .expect_err("partial refused");
-        assert!(err.to_string().contains("target_repo_owner"), "{err}");
-        // accepts alone (no pins) is still a contribution param present ⇒ refuse, naming the pins.
-        let err = contribution_offer_from_request(&contribution_post_request(
-            None,
-            None,
-            None,
-            None,
-            Some(vec!["fork".into()]),
-        ))
-        .expect_err("accepts-only refused");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("target_repo_owner") && msg.contains("base_oid"),
-            "{msg}"
-        );
-    }
+    // Partial-param (all-or-nothing) refusal moved to the flat-args → `JobKind` mapping in the MCP
+    // tool layer: a partial contribution set is now unrepresentable in `PostJobRequest`, so the core
+    // no longer has a partial case to refuse (the type enforces it at compile time).
 
     #[test]
     fn post_job_contribution_bad_fields_refuse() {
@@ -2325,47 +2268,34 @@ mod tests {
         let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
         let oid = "77".repeat(20);
         // bad owner (not 64-hex)
-        assert!(contribution_offer_from_request(&contribution_post_request(
-            Some("nothex"),
-            Some(url),
-            Some("main"),
-            Some(&oid),
-            None
-        ))
-        .is_err());
+        assert!(
+            contribution_offer_from_spec(&contribution_spec("nothex", url, "main", &oid, None))
+                .is_err()
+        );
         // bad oid (not 40/64-hex)
-        assert!(contribution_offer_from_request(&contribution_post_request(
-            Some(&owner),
-            Some(url),
-            Some("main"),
-            Some("xyz"),
-            None
-        ))
-        .is_err());
+        assert!(
+            contribution_offer_from_spec(&contribution_spec(&owner, url, "main", "xyz", None))
+                .is_err()
+        );
         // bad base branch (leading dash)
-        assert!(contribution_offer_from_request(&contribution_post_request(
-            Some(&owner),
-            Some(url),
-            Some("-x"),
-            Some(&oid),
-            None
-        ))
-        .is_err());
+        assert!(
+            contribution_offer_from_spec(&contribution_spec(&owner, url, "-x", &oid, None)).is_err()
+        );
         // bad url (forbidden scheme via the transport allowlist)
-        assert!(contribution_offer_from_request(&contribution_post_request(
-            Some(&owner),
-            Some("file:///tmp/repo.git"),
-            Some("main"),
-            Some(&oid),
+        assert!(contribution_offer_from_spec(&contribution_spec(
+            &owner,
+            "file:///tmp/repo.git",
+            "main",
+            &oid,
             None
         ))
         .is_err());
         // accepts present but without "fork" (fork is the only supported delivery) ⇒ refuse.
-        assert!(contribution_offer_from_request(&contribution_post_request(
-            Some(&owner),
-            Some(url),
-            Some("main"),
-            Some(&oid),
+        assert!(contribution_offer_from_spec(&contribution_spec(
+            &owner,
+            url,
+            "main",
+            &oid,
             Some(vec!["patch".into()])
         ))
         .is_err());
@@ -2376,11 +2306,11 @@ mod tests {
         // ext:: clone URL refused at POST time — a buyer must not publish an unverifiable offer.
         let owner = "aa".repeat(32);
         let oid = "77".repeat(20);
-        let err = contribution_offer_from_request(&contribution_post_request(
-            Some(&owner),
-            Some("ext::sh -c evil"),
-            Some("main"),
-            Some(&oid),
+        let err = contribution_offer_from_spec(&contribution_spec(
+            &owner,
+            "ext::sh -c evil",
+            "main",
+            &oid,
             None,
         ))
         .expect_err("ext refused at post");
@@ -2457,11 +2387,7 @@ mod tests {
                 deadline_unix: Some(1_800_000_000),
                 repo: None,
                 branch: None,
-                target_repo_owner: None,
-                target_repo_url: None,
-                base_branch: None,
-                base_oid: None,
-                accepts: None,
+                job: JobKind::FromScratch,
             },
         )
         .await
