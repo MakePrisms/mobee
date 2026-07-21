@@ -7,7 +7,7 @@ use std::sync::{
 use crate::driver::acp::{PROTOCOL_VERSION, UpdateStream};
 use crate::driver::{
     Artifact, Driver, DriverError, PermissionOutcome, PermissionRequest, PromptTurn, Readiness,
-    RuntimeId, SessionConfig, SessionId, SessionUpdate,
+    RuntimeId, SessionConfig, SessionId, SessionUpdate, UsageMetadata,
 };
 
 #[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
@@ -34,6 +34,7 @@ pub struct MockDriver {
     permission_outcomes: VecDeque<PermissionOutcome>,
     permission_history: Vec<(PermissionRequest, PermissionOutcome)>,
     prompt_history: Vec<(SessionId, PromptTurn)>,
+    usage: Option<UsageMetadata>,
 }
 
 impl MockDriver {
@@ -46,11 +47,19 @@ impl MockDriver {
             permission_outcomes: VecDeque::new(),
             permission_history: Vec::new(),
             prompt_history: Vec::new(),
+            usage: None,
         }
     }
 
     pub fn with_permission_outcomes(mut self, outcomes: Vec<PermissionOutcome>) -> Self {
         self.permission_outcomes = outcomes.into();
+        self
+    }
+
+    /// Script the usage the driver reports so the engine→`RunOutcome` plumbing is exercisable
+    /// without a live ACP rig.
+    pub fn with_usage(mut self, usage: UsageMetadata) -> Self {
+        self.usage = Some(usage);
         self
     }
 
@@ -143,6 +152,10 @@ impl Driver for MockDriver {
             session.cancelled.store(true, Ordering::SeqCst);
         }
         Ok(())
+    }
+
+    fn usage(&self) -> Option<UsageMetadata> {
+        self.usage.clone()
     }
 }
 
@@ -262,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn scripted_driver_run_appends_piece1_events_to_log() {
+    fn scripted_driver_run_appends_events_to_log() {
         let artifact = Artifact {
             uri_or_path: "out/result.txt".into(),
             mime: Some("text/plain".into()),

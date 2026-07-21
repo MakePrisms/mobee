@@ -21,6 +21,13 @@
       }
     },
     {
+      "type": "agent.message",
+      "data": {
+        "job_id": "job-1",
+        "text": "partial progress"
+      }
+    },
+    {
       "type": "job.execution_changed",
       "data": {
         "job_id": "job-1",
