@@ -153,6 +153,29 @@ pub enum JournalEntry {
         reason: String,
         ts: u64,
     },
+    /// Delivered-but-unpaid (#57): the seller published a result and is awaiting the buyer's payment
+    /// wrap. Durable so a restart rebuilds the job into `awaiting_payment` — a backfilled/buffered
+    /// wrap can then bind and redeem. A matching `Receipt` supersedes it (paid); a matching
+    /// `Release` cancels it. Carries the money-critical fields the redeem path needs.
+    Delivery {
+        job_id: String,
+        result_id: String,
+        amount: u64,
+        unit: String,
+        buyer_pubkey: String,
+        ts: u64,
+    },
+}
+
+/// A delivered-but-unpaid job recovered from the journal at boot, enough to rebuild an
+/// awaiting-payment binding so a stored/buffered wrap can redeem (#57).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveredUnpaid {
+    pub job_id: String,
+    pub result_id: String,
+    pub amount: u64,
+    pub unit: String,
+    pub buyer_pubkey: String,
 }
 
 /// Whether an orphaned claim is past its deadline at reconcile time.
@@ -185,7 +208,11 @@ pub fn plan_orphaned_claims(entries: &[JournalEntry], now: u64) -> Vec<OrphanCla
     let mut terminal: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for entry in entries {
         match entry {
-            JournalEntry::Receipt { job_id, .. } | JournalEntry::Release { job_id, .. } => {
+            JournalEntry::Receipt { job_id, .. }
+            | JournalEntry::Release { job_id, .. }
+            // #57: a delivered job is NOT an orphaned in-flight claim — it published a result and is
+            // awaiting payment (rebuilt into awaiting_payment on boot), so it must never be released.
+            | JournalEntry::Delivery { job_id, .. } => {
                 terminal.insert(job_id.as_str());
             }
             JournalEntry::Claim { .. } => {}
@@ -264,6 +291,7 @@ impl SellerJournal {
             JournalEntry::Claim { job_id: id, .. } => id == job_id,
             JournalEntry::Receipt { job_id: id, .. } => id == job_id,
             JournalEntry::Release { job_id: id, .. } => id == job_id,
+            JournalEntry::Delivery { job_id: id, .. } => id == job_id,
         }))
     }
 
@@ -372,6 +400,74 @@ impl SellerJournal {
             swap_ok,
             ts: now_unix(),
         })
+    }
+
+    /// Journal a delivered-but-unpaid transition (#57) so a restart can rebuild the awaiting-payment
+    /// binding and a stored/buffered wrap can redeem. Idempotent-safe to call more than once.
+    pub fn append_delivery(
+        &self,
+        job_id: &str,
+        result_id: &str,
+        amount: u64,
+        unit: &str,
+        buyer_pubkey: &str,
+    ) -> Result<(), SellerError> {
+        self.append(JournalEntry::Delivery {
+            job_id: job_id.to_owned(),
+            result_id: result_id.to_owned(),
+            amount,
+            unit: unit.to_owned(),
+            buyer_pubkey: buyer_pubkey.to_owned(),
+            ts: now_unix(),
+        })
+    }
+
+    /// Delivered-but-unpaid jobs to rebuild into `awaiting_payment` at boot (#57): every `Delivery`
+    /// whose `job_id` has no `Receipt` (paid) and no `Release` (cancelled). Deduped by `job_id`
+    /// (latest Delivery wins).
+    pub fn deliveries_awaiting_receipt(&self) -> Result<Vec<DeliveredUnpaid>, SellerError> {
+        let entries = match self.entries() {
+            Ok(entries) => entries,
+            Err(SellerError::Io(_)) => return Ok(Vec::new()),
+            Err(other) => return Err(other),
+        };
+        let mut settled: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for entry in &entries {
+            match entry {
+                JournalEntry::Receipt { job_id, .. } | JournalEntry::Release { job_id, .. } => {
+                    settled.insert(job_id.as_str());
+                }
+                _ => {}
+            }
+        }
+        let mut by_job: std::collections::BTreeMap<String, DeliveredUnpaid> =
+            std::collections::BTreeMap::new();
+        for entry in &entries {
+            if let JournalEntry::Delivery {
+                job_id,
+                result_id,
+                amount,
+                unit,
+                buyer_pubkey,
+                ..
+            } = entry
+            {
+                if settled.contains(job_id.as_str()) {
+                    continue;
+                }
+                by_job.insert(
+                    job_id.clone(),
+                    DeliveredUnpaid {
+                        job_id: job_id.clone(),
+                        result_id: result_id.clone(),
+                        amount: *amount,
+                        unit: unit.clone(),
+                        buyer_pubkey: buyer_pubkey.clone(),
+                    },
+                );
+            }
+        }
+        Ok(by_job.into_values().collect())
     }
 
     fn append(&self, entry: JournalEntry) -> Result<(), SellerError> {
@@ -699,6 +795,39 @@ offer_backfill_secs = {backfill}
             .expect("receipt");
         let ts = journal.last_receipt_ts().expect("ts").expect("some after receipt");
         assert!(ts >= before, "receipt ts {ts} must be >= {before}");
+    }
+
+    // #57: a delivered-but-unpaid job (Claim + Delivery, no Receipt) is NOT an orphaned in-flight
+    // claim (never released, even past deadline) AND is recoverable for awaiting_payment rebuild.
+    #[test]
+    fn delivered_unpaid_is_recoverable_and_not_orphaned() {
+        let root = temp_home("delivered-unpaid");
+        let _ = fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("bootstrap");
+        let journal = SellerJournal::open(&home).expect("journal");
+        journal
+            .append_claim("job-d", "claim-d", "buyer-d", 10)
+            .expect("claim");
+        journal
+            .append_delivery("job-d", "result-d", 15, "sat", "buyer-d")
+            .expect("delivery");
+
+        // Recoverable: one delivered-but-unpaid job with the money-critical fields.
+        let unpaid = journal.deliveries_awaiting_receipt().expect("unpaid");
+        assert_eq!(unpaid.len(), 1);
+        assert_eq!(unpaid[0].job_id, "job-d");
+        assert_eq!(unpaid[0].result_id, "result-d");
+        assert_eq!(unpaid[0].amount, 15);
+        assert_eq!(unpaid[0].buyer_pubkey, "buyer-d");
+
+        // Not orphaned even long past the claim deadline (delivery resolves the claim).
+        assert!(plan_orphaned_claims(&journal.entries().unwrap(), 9_999_999_999).is_empty());
+
+        // Once receipted, it is no longer awaiting payment.
+        journal
+            .append_receipt("job-d", "result-d", "job-d", "result-d", 15, 15, "m", "buyer-d", true)
+            .expect("receipt");
+        assert!(journal.deliveries_awaiting_receipt().expect("unpaid2").is_empty());
     }
 
     #[test]
