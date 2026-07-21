@@ -120,37 +120,22 @@ An empty `seller_signature` in the bind (legacy result without `sig/seller`) fai
 closed — the money send is guarded by the same saga (`authorize_pay.rs:43-46`;
 `payment.rs:499-528`). After paying, run [`verify-receipt.md`](verify-receipt.md).
 
-## 6. Verify-fetch credentials for relay-git deliveries
+## 6. Verify-fetch of relay-git deliveries — in-process, no credentials to set up
 
-The pay-path `git fetch` child inherits the **MCP server process env** — mobee forces only
-`GIT_TERMINAL_PROMPT=0` / `GCM_INTERACTIVE=never` on it, so an auth-needing remote fails closed
-instead of prompting (`delivery_git.rs:183-197`, `:216-227`). A **BYO public https** repo
-(github etc.) therefore needs nothing. A **mobee relay-git** repo
-(`https://mobee-relay.orveth.dev/git/<seller>/<repo>.git`) authenticates via the
-`git-credential-nostr` helper — provide it through git's env-config, set **when launching the MCP
-server** (git reads `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`/`GIT_CONFIG_COUNT` as extra config):
+The pay-path delivery verification fetches the seller's advertised commit **in-process via libgit2**
+(issue #55 — no system `git`, no fetch subprocess). A **BYO public https** repo (github etc.) is
+fetched anonymously and needs nothing. A **mobee relay-git** repo
+(`https://mobee-relay.orveth.dev/git/<seller>/<repo>.git`) is authenticated by signing a **NIP-98**
+`Authorization` header **in-process from the buyer key** — there is no `git-credential-nostr` helper,
+no `GIT_CONFIG_*` recipe, and no `NOSTR_PRIVATE_KEY` to export. Nothing to set up either way.
 
-```bash
-export GIT_CONFIG_COUNT=2
-export GIT_CONFIG_KEY_0=credential.helper
-export GIT_CONFIG_VALUE_0=/abs/path/to/git-credential-nostr
-export GIT_CONFIG_KEY_1=credential.useHttpPath
-export GIT_CONFIG_VALUE_1=true
-export NOSTR_PRIVATE_KEY="$(cat "$MOBEE_HOME/key")"   # the helper's key source — see hygiene below
-"$MOBEE_BIN" mcp   # or launch your MCP client so the server inherits these
-```
+Grounds: buyer verify-fetch is in-process libgit2 with NIP-98 on relay-git reads
+(`crates/mobee-core/src/delivery_git.rs:1-5`, `:33-58`); the shared in-process transport
+(`crates/mobee-core/src/git_transport.rs`).
 
-`credential.helper` + `credential.useHttpPath=true` + `NOSTR_PRIVATE_KEY` is the same helper
-contract the seller push path uses (in-repo grounds for the helper interface:
-`crates/mobee-core/src/seller_git.rs:427-447` and the seed probe `crates/mobee/src/sell.rs:383-402`;
-helper resolution `seller_git.rs:331-351`).
-
-**Key hygiene (rule):** this puts the key in the server's process env — acceptable ONLY in the
-launch wrapper of that one process. Never export it in shell rc files, never echo/log it, never
-commit it. **NAMED GAP:** unlike the seller push (which injects the key onto the git child env
-itself, child-only), the buyer verify-fetch has no in-tree credential injection — the env recipe
-above is the operator-side workaround until it does. If you cannot meet the hygiene bar, require
-BYO public-https delivery instead.
+**Key hygiene (rule):** the buyer secret is used ONLY in-process to sign the NIP-98 event — never on
+argv, never in a child-process env, never logged, never committed. A relay-git fetch that still fails
+auth is a relay/permissions issue, not a missing credential recipe.
 
 ## Verify (acceptance predicate for this skill)
 

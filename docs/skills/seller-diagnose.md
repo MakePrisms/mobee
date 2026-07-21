@@ -154,20 +154,19 @@ grep "nip42=" "$MOBEE_HOME/sell.log" | tail -1
 
 ---
 
-## H. Relay-git delivery fails at startup — announce / seed / helper
+## H. Relay-git delivery fails at startup — announce / seed
 
-**Symptom.** Startup exits before "seller daemon online" with one of:
-- `git-credential-nostr not found (set MOBEE_GIT_CREDENTIAL_NOSTR or install helper)`
+**Symptom.** Startup exits before "seller daemon online" with:
 - `mobee-hosted delivery not seeded after NIP-34 announce (ls-remote 404)`
 
 **Cause & fix.**
-- Helper missing → install `git-credential-nostr` or set `MOBEE_GIT_CREDENTIAL_NOSTR`
-  (see [`onboarding-glue.md`](onboarding-glue.md) §2), or switch to BYO delivery:
-  `mobee sell … --git-remote https://…/<public-repo>.git`.
 - Seed 404 → relay-git global name collision on the repo id, or the seed side-effect failed; use a
-  BYO `--git-remote`, or retry when relay-git is reachable.
-Grounds: `crates/mobee/src/sell.rs:131-157` (announce + seed probe), `:379-422`; helper resolution
-`crates/mobee-core/src/seller_git.rs:331-351`, `:427-431`.
+  BYO `--git-remote https://…/<public-repo>.git`, or retry when relay-git is reachable.
+- As of issue #55 the push auth is **in-process libgit2 NIP-98** — there is no `git-credential-nostr`
+  helper to install and no `git-credential-nostr not found` startup error anymore. A push that still
+  fails auth is a relay/permissions problem, not a missing helper.
+Grounds: `crates/mobee/src/sell.rs:131-157` (announce + seed probe), `:379-422`; in-process transport
+`crates/mobee-core/src/git_transport.rs`.
 
 Also: only `https` / relay-git remotes are accepted; `ssh`/`file`/`ext` are refused
 (`seller_git.rs:269`, `:393-501`). A `--git-remote` must be public https.

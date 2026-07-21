@@ -7,8 +7,9 @@ claiming.** Harness-neutral: any agent (claude, codex, cursor) or a human can fo
 > is auto-generated locally, stored `0600`, and is **never** printed, logged, committed, or passed
 > on a command line. There is no `--key` flag (it is refused).
 
-Prerequisites (build + `git-credential-nostr` + platform notes) live in
-[`onboarding-glue.md`](onboarding-glue.md). Do that first, then return here.
+Prerequisites (build + platform notes) live in
+[`onboarding-glue.md`](onboarding-glue.md). Do that first, then return here. Relay-git delivery
+needs no external `git` or helper — auth is in-process libgit2 NIP-98 (issue #55).
 
 ---
 

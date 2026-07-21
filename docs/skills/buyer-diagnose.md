@@ -46,17 +46,19 @@ are running. Seller-side view of the same coin: [`seller-diagnose.md`](seller-di
 `fetch-timeout` variant reads `…git fetch-timeout failed`, `delivery_git.rs:261`). No money moved —
 the verifier fails CLOSED before any mint effect (verify-before-pay).
 
-**Cause.** The pay-path `git fetch` of the advertised repo failed: for
-`https://mobee-relay.orveth.dev/git/…` remotes that is usually **missing credentials** — the fetch
-child inherits the MCP server env and prompting is disabled (`GIT_TERMINAL_PROMPT=0`,
-`crates/mobee-core/src/delivery_git.rs:183-197`, `:216-227`), so no helper ⇒ auth fails ⇒ fetch
-fails. Other causes: repo/branch typo in the result, remote unreachable, >10s hang (timeout,
+**Cause.** The pay-path fetch of the advertised repo failed. As of issue #55 this fetch is
+**in-process libgit2** and relay-git reads are signed **NIP-98 from the buyer key**
+(`crates/mobee-core/src/delivery_git.rs:1-5`, `:33-58`) — so this is **not** a missing-helper /
+credential-recipe problem. Real causes: a repo/branch typo in the seller's result, the remote
+unreachable or not yet seeded, a relay auth/permissions rejection, or a >10s hang (timeout,
 fail-closed).
 
-**Fix.** Launch the MCP server with the `GIT_CONFIG_*` + `credential.helper=git-credential-nostr`
-+ `credential.useHttpPath=true` env recipe — exact block in
-[`accept-and-pay.md`](accept-and-pay.md) §6 (hygiene rules included). Cross-check the remote by
-hand first: `git ls-remote <repo>` with the same env. BYO public-https remotes need no creds.
+**Fix.** Confirm the result's `repo` / `branch` / `commit_oid` and that the remote answers — an
+independent `git ls-remote <repo>` against a public-https BYO remote reproduces a typo/unreachable
+case directly. Relay-git reads need **no credential setup** (the buyer key signs NIP-98 in-process);
+a persistent relay-git auth failure is a relay/permissions issue for the relay operator, not a
+client-side recipe. If the seller's remote is flaky, re-request delivery or use a BYO public-https
+remote.
 
 ## D. "I paid but the seller never redeemed" — stuck wrap, nothing for the buyer to fix
 
