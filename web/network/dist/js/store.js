@@ -1,4 +1,5 @@
 import { percentile } from "./parse.js";
+import { aggregateJobs, computePulse } from "./jobs.js";
 
 /** In-memory aggregator for observatory views. */
 export function createStore() {
@@ -276,8 +277,22 @@ export function createStore() {
     return profiles.get(pubkey) || null;
   }
 
-  function snapshot() {
+  /** Job-card feed: one card per offer chain, newest activity first. */
+  function jobs(now) {
+    return aggregateJobs([...byId.values()], profiles, now);
+  }
+
+  /** Pulse-strip numbers: sats settled today · open offers · active sellers. */
+  function pulse(now, jobsList) {
+    const js = jobsList || jobs(now);
+    return computePulse([...byId.values()], js, now);
+  }
+
+  function snapshot(now) {
+    const jobsList = jobs(now);
     return {
+      jobs: jobsList,
+      pulse: pulse(now, jobsList),
       funnel: funnel(),
       latency: latency(),
       economics: economics(),
@@ -286,7 +301,7 @@ export function createStore() {
     };
   }
 
-  return { ingest, snapshot, funnel, latency, economics, census, tail, getProfile };
+  return { ingest, snapshot, jobs, pulse, funnel, latency, economics, census, tail, getProfile };
 }
 
 function pushMap(map, key, value) {

@@ -3,6 +3,8 @@
  * One malformed / hostile event must never throw into the page.
  */
 
+import { CLAIM, HANDLER, OFFER, PROFILE, RECEIPT, RESULT } from "./kinds.js";
+
 /**
  * @param {unknown} raw
  * @returns {object | null}
@@ -31,12 +33,12 @@ export function parseEvent(raw) {
       contentJson: tryParseJson(content),
     };
 
-    if (kind === 0) return { ...base, role: "profile", profile: parseProfile(base) };
-    if (kind === 5109) return { ...base, role: "offer", offer: parseOffer(base) };
-    if (kind === 7000) return { ...base, role: "feedback", feedback: parseFeedback(base) };
-    if (kind === 6109) return { ...base, role: "result", result: parseResult(base) };
-    if (kind === 3400) return { ...base, role: "receipt", receipt: parseReceipt(base) };
-    if (kind === 31990) return { ...base, role: "handler", handler: parseHandler(base) };
+    if (kind === PROFILE) return { ...base, role: "profile", profile: parseProfile(base) };
+    if (kind === OFFER) return { ...base, role: "offer", offer: parseOffer(base) };
+    if (kind === CLAIM) return { ...base, role: "feedback", feedback: parseFeedback(base) };
+    if (kind === RESULT) return { ...base, role: "result", result: parseResult(base) };
+    if (kind === RECEIPT) return { ...base, role: "receipt", receipt: parseReceipt(base) };
+    if (kind === HANDLER) return { ...base, role: "handler", handler: parseHandler(base) };
     return { ...base, role: "other" };
   } catch {
     return null;
@@ -223,7 +225,11 @@ function parseOffer(base) {
     task: firstTagValue(base.tags, "i"),
     amount_sats: amountSatsFromTags(base.tags),
     mint: firstTagValue(base.tags, "mint"),
+    // A `p` tag on an offer = a targeted seller; absent = open-pool offer.
     seller: firstTagValue(base.tags, "p"),
+    // Sellers bind the deadline as ["param","deadline","<unix-seconds>"] (not NIP-40).
+    deadline: deadlineFromTags(base.tags),
+    job_class: firstTagValue(base.tags, "job-class"),
   };
 }
 
@@ -234,8 +240,21 @@ function parseFeedback(base) {
     status,
     isClaim: status === "processing",
     isAccept: status === "accepted",
+    // NIP-90 "error" = the job failed / was refused. Feed shows it as refused.
+    isRefusal: status === "error",
     offerId,
   };
+}
+
+/** Deadline unix-seconds from ["param","deadline","<n>"]; absent → null. */
+function deadlineFromTags(tags) {
+  for (const tag of tags) {
+    if (tag[0] === "param" && tag[1] === "deadline" && tag[2] != null) {
+      const n = Number(tag[2]);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
 }
 
 function parseResult(base) {
