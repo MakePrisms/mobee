@@ -231,6 +231,10 @@ pub struct AcceptedBind {
     /// for a v1 claim that carries no `creq` — binding then behaves byte-identically to before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creq_hash: Option<String>,
+    /// Piece-14 Job E: the accepted claim's `creq` accepted-mint list (`m`), recorded at accept so
+    /// the buyer pay path chooses the realized mint from it. Empty for a v1 claim with no `creq`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_mints: Vec<String>,
     /// Piece-10 contribution binds, recorded at accept when the OFFER is a contribution (authority
     /// = the buyer's signed offer; the result echo is equality-checked, never trusted). Absent ⇒
     /// from-scratch (EXACTLY today's path).
@@ -751,6 +755,15 @@ pub async fn accept_claim_async(
         // pay path binds the attempt + receipt to the exact request the seller quoted. A v1 claim
         // carries no creq ⇒ `None` ⇒ binding behaves as before piece-14.
         creq_hash: claim.creq.as_deref().map(crate::gateway::creq_hash_hex),
+        // Piece-14 Job E: record the creq's accepted-mint list so the pay path picks the realized
+        // mint from it. Empty when there is no creq (v1) or it fails to parse (the pay path then
+        // falls back to the pinned default mint).
+        accepted_mints: claim
+            .creq
+            .as_deref()
+            .and_then(|creq| crate::gateway::creq::parse_creq(creq).ok())
+            .map(|request| request.mints.iter().map(|mint| mint.to_string()).collect())
+            .unwrap_or_default(),
         contribution,
     };
     write_accepted_bind(home, &bind)?;
@@ -917,6 +930,9 @@ pub fn authorize_request_from_bind(
         // Piece-14: thread the recorded creq hash so the attempt + receipt bind the seller's
         // request. `None` ⇒ v1 claim (today's path).
         creq_hash: bind.creq_hash.clone(),
+        // Piece-14 Job E: thread the creq's accepted-mint list so the buyer chooses the realized
+        // mint. Empty ⇒ v1 claim (pay from the pinned default mint).
+        accepted_mints: bind.accepted_mints.clone(),
         // Piece-10: thread the contribution binds so authorize_pay runs the contribution
         // verify-path + authorship seam. `None` ⇒ from-scratch (today's path).
         contribution: bind.contribution.as_ref().map(|c| {
@@ -1414,6 +1430,7 @@ mod tests {
             accepted_at: 1,
             seller_signature: "ab".repeat(32),
             creq_hash: None,
+            accepted_mints: Vec::new(),
             contribution: None,
         };
         write_accepted_bind(&home, &bind).expect("write");
@@ -1440,6 +1457,7 @@ mod tests {
             accepted_at: 1,
             seller_signature: "ab".repeat(32),
             creq_hash: None,
+            accepted_mints: Vec::new(),
             contribution: None,
         };
         let err = authorize_request_from_bind(&bind, 1, String::new()).expect_err("empty hash");
@@ -1476,6 +1494,7 @@ mod tests {
             accepted_at: 1,
             seller_signature: "ab".repeat(32),
             creq_hash: None,
+            accepted_mints: Vec::new(),
             contribution: None,
         };
         let bad_seller = "00".repeat(32);
@@ -1893,6 +1912,7 @@ mod tests {
             accepted_at: 1,
             seller_signature: "ab".repeat(32),
             creq_hash: None,
+            accepted_mints: Vec::new(),
             contribution: Some(AcceptedContribution {
                 target_owner_pubkey: "aa".repeat(32),
                 target_clone_url: "https://mobee-relay.orveth.dev/git/owner/repo.git".into(),

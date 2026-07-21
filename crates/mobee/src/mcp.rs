@@ -902,6 +902,7 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
             seller_signature: seller_signature_arg.clone(),
             // Piece-14: filled from the accept-bind below when one exists (like seller_signature).
             creq_hash: None,
+            accepted_mints: Vec::new(),
             contribution: None,
         };
         let accept_bind = job_lifecycle::load_accepted_bind(&state.home, &job_id)
@@ -921,6 +922,11 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
             // form binds the same attempt + receipt as the accept-first path.
             if request.creq_hash.is_none() {
                 request.creq_hash = bind.creq_hash.clone();
+            }
+            // Piece-14 Job E: thread the creq accepted-mint list so the explicit form picks the
+            // realized mint like the accept-first path.
+            if request.accepted_mints.is_empty() {
+                request.accepted_mints = bind.accepted_mints.clone();
             }
             // Piece-10: thread contribution binds from the accept-bind so the explicit form still
             // runs the contribution verify-path + authorship seam.
@@ -973,6 +979,7 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
             commit_oid: require_str("commit_oid")?,
             seller_signature: seller_signature_arg.clone(),
             creq_hash: None,
+            accepted_mints: Vec::new(),
             contribution: None,
         }
     };
@@ -1946,6 +1953,7 @@ mod tests {
             accepted_at: 0,
             seller_signature: String::new(),
             creq_hash: None,
+            accepted_mints: Vec::new(),
             contribution: None,
         };
         let jobs_dir = state.home.root.join("jobs");

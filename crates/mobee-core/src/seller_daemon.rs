@@ -872,12 +872,16 @@ impl SellerDaemon {
         &mut self,
         received: ReceivedPayment,
     ) -> Result<Option<ReceiptOutcome>, DaemonError> {
-        // Bind to the delivered-but-unpaid job this payment declares (exact job + result).
+        // Bind to the delivered-but-unpaid job this payment declares (by job id — the NUT-18
+        // payload's `id`). `result_id` is resolved LOCALLY from the bound job: NUT-18 carries no
+        // result id (only `id` == the job id), and a job id is unique in `awaiting_payment`.
         // Never scans `active` — the processing slot is not a payment target.
-        let Some(idx) = self.awaiting_payment.iter().position(|job| {
-            job.job_id == received.payload.job_id
-                && job.result_id.as_deref() == Some(received.payload.result_id.as_str())
-        }) else {
+        let payload_job = received.payload.job_id().to_owned();
+        let Some(idx) = self
+            .awaiting_payment
+            .iter()
+            .position(|job| job.job_id.as_str() == payload_job)
+        else {
             // No delivered job binds this payment yet — caller should buffer.
             return Ok(None);
         };
@@ -889,41 +893,45 @@ impl SellerDaemon {
             .expect("awaiting-payment job always carries a result_id");
         let expected_amount = job.offer.amount;
         let offer = job.offer.clone();
-        // PIECE-14 Job B (temporary): the mint recorded on the redeem log / journal receipt /
-        // announce is the seller's default accepted mint rather than `offer.mint_url`. Job E
-        // replaces this with the realized mint from the buyer's payment payload.
-        let mint = self.home.config.default_mint().to_owned();
+        // PIECE-14 Job E: the redeem terms + all money-path records (redeem log / journal receipt /
+        // announce) key off the REALIZED mint the buyer actually paid at (the NUT-18 payload's
+        // `mint`), not the seller default. The redeem guard below refuses unless that mint is one
+        // the seller advertised in its creq.
+        let payload_mint = received.payload.mint().clone();
+        let mint = payload_mint.to_string();
+        let token = received.payload.to_token();
 
-        let payload_job = received.payload.job_id.clone();
-        let payload_result = received.payload.result_id.clone();
         // B2: bind BEFORE journal — wrong-job refuse (no misattribution). Matched by
         // construction above; kept as a defensive guard.
-        if payload_job != local_job || payload_result != local_result {
+        if payload_job != local_job {
             return Err(DaemonError::Policy(format!(
-                "payment bind refused: payload job/result ({payload_job}/{payload_result}) != local ({local_job}/{local_result})"
+                "payment bind refused: payload job ({payload_job}) != local ({local_job})"
             )));
         }
 
         let buyer = received.buyer_pubkey.to_hex();
-        // PIECE-14 Job B (temporary): build the redeem allowlist from the seller's own
-        // `accepted_mints` rather than the offer's mint. `terms_for_offer` still reads
-        // `offer.mint_url` for now; Job E re-points that read onto the seller-authored creq.
-        let policy = PaymentPolicy::new(
-            self.home
-                .config
-                .accepted_mints
-                .iter()
-                .map(|entry| mint_url(entry))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        let terms = policy.terms_for_offer(&offer, &self.seller_pubkey)?;
+        // PIECE-14 Job E redeem guard: the paid token's mint must be one the seller advertised
+        // (`∈ accepted_mints`) AND equal the payload's declared mint. Build the accepted set from
+        // the seller's OWN config (the same list authored into the creq `m`), pin the terms to the
+        // realized mint, and hand both to the receive guard.
+        let accepted_mints = self
+            .home
+            .config
+            .accepted_mints
+            .iter()
+            .map(|entry| mint_url(entry))
+            .collect::<Result<std::collections::HashSet<_>, _>>()?;
+        let policy = PaymentPolicy::new(accepted_mints.iter().cloned());
+        let terms = policy.terms_for_offer(payload_mint.clone(), &offer, &self.seller_pubkey)?;
         // Amount in terms == offer.amount (NOT rate_sats).
         let secret = home::read_secret_key_hex(&self.home)?;
         let cashu_key = cashu_secret_from_nostr_hex(&secret)?;
         // Must await — seller loop already owns a tokio runtime; blocking open nests block_on → panic.
         let wallet = buyer_fund::open_testnut_wallet_async(&self.home).await?;
         let adapter = CdkSellerReceive::new(&wallet, cashu_key);
-        let amount = adapter.receive(&received.payload.token, &terms).await?;
+        let amount = adapter
+            .receive(&token, &terms, &accepted_mints, &payload_mint)
+            .await?;
         let amount_received = amount.to_u64();
         // (g) collect-leg observability: sats redeemed at the mint (no key/token material).
         eprintln!(
@@ -941,7 +949,8 @@ impl SellerDaemon {
             &local_job,
             &local_result,
             &payload_job,
-            &payload_result,
+            // NUT-18 carries no result id; the bound job's result id is authoritative.
+            &local_result,
             amount_received,
             expected_amount,
             &mint,
@@ -1136,23 +1145,34 @@ impl SellerDaemon {
         // Derive the delivery discriminator from the SAME typed `Delivery` the buyer's pay path
         // uses (was a `DeliveryKind::Fork` hardcode) so both sides agree by construction ("fork").
         let delivery_kind = seller_delivery_kind(&seller_cfg.git_remote, &branch, &commit)?;
+        // PIECE-14 Job E: bind the seller-authored `creq` into the receipt so BOTH co-signatures
+        // commit to the payment terms the seller published. The creq is reconstructed from the
+        // SAME inputs used at claim time (`build_seller_creq` is pure over job id / amount / unit /
+        // accepted_mints / seller key), so its hash equals the one the buyer read off the claim
+        // and threaded through its pay path — the co-signatures agree by construction. The mint is
+        // the realized mint the buyer pays at (the seller's default accepted mint), normalized as a
+        // `MintUrl` exactly as the buyer builds it, so the two receipt bytes cannot drift.
+        let authored_creq = gateway::creq::build_seller_creq(
+            &active.job_id,
+            active.offer.amount,
+            &active.offer.unit,
+            &self.home.config.accepted_mints,
+            &self.seller_pubkey,
+        )
+        .map_err(|error| DaemonError::Seller(SellerError::Io(error.to_string())))?;
+        let realized_mint = mint_url(self.home.config.default_mint())?.to_string();
         let preimage = crate::receipt::ReceiptPreimage {
             job_hash: job_hash.clone(),
             offer_id: active.job_id.clone(),
             amount: active.offer.amount,
             unit: "sat".to_owned(),
-            mint: active.offer.mint_url.clone(),
+            mint: realized_mint,
             buyer_pubkey: active.buyer_pubkey.clone(),
             seller_pubkey: self.seller_pubkey.clone(),
             delivery_integrity_hash: commit.clone(),
             delivery_kind: delivery_kind.as_str().to_owned(),
             exec_metadata_commitment: crate::receipt::EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
-            // Piece-14 (Job D): the preimage now carries the seller-authored creq hash. `None`
-            // today keeps this seller receipt byte-identical to the pre-piece-14 (v1) form so it
-            // co-signs identically to the buyer, which also binds `None` for a v1 claim. Jobs C/E
-            // author the creq on the claim + active job; this MUST then be set to
-            // `gateway::creq_hash_hex(<the authored creq>)` so both co-signatures agree.
-            creq_hash: None,
+            creq_hash: Some(gateway::creq_hash_hex(&authored_creq)),
         };
         let seller_sig = sign_receipt_hash(&self.keys, &preimage.digest_hex())?;
         // Piece-9 Item 2: harness-generic PUBLIC seller-claimed usage block (opportunistic;
@@ -2178,11 +2198,12 @@ async fn try_apply_or_buffer(
     event_id: String,
     received: ReceivedPayment,
 ) -> Result<ApplyResult, DaemonError> {
-    // Does a delivered-but-unpaid job bind this payment (exact job + result)?
-    let binds = daemon.awaiting_payment.iter().any(|job| {
-        job.job_id == received.payload.job_id
-            && job.result_id.as_deref() == Some(received.payload.result_id.as_str())
-    });
+    // Does a delivered-but-unpaid job bind this payment? Bind by job id (the NUT-18 payload's
+    // `id`) — result id is resolved locally in `try_apply_payment` (NUT-18 carries no result id).
+    let binds = daemon
+        .awaiting_payment
+        .iter()
+        .any(|job| job.job_id.as_str() == received.payload.job_id());
     if !binds {
         // No delivered job matches yet — buffer it (early pay for a still-processing job, or
         // the wrap arrived before its delivery was recorded). Misattribution is impossible:
