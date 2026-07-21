@@ -687,20 +687,36 @@ pub async fn accept_claim_async(
         .commit_oid
         .clone()
         .ok_or_else(|| JobLifecycleError::Input("result missing commit_oid".into()))?;
-    let job_hash = result
+    // Bind the OFFER's amount (buyer-signed authority) — NEVER the seller-authored result
+    // amount, which a malicious seller could inflate.
+    let amount_sats = offer.amount_sats;
+    // Recompute the canonical job-hash from the buyer's signed offer and REQUIRE the seller's
+    // result to echo it exactly; never trust the result's self-authored job-hash. The seller
+    // co-signs the receipt preimage over THIS hash, so an offer-derived hash that the result
+    // does not match means the result quoted a different task/amount — refuse.
+    let expected_job_hash = job_hash_for_offer(&request.job_id, &offer.task, offer.amount_sats);
+    let result_job_hash = result
         .job_hash
         .clone()
         .ok_or_else(|| JobLifecycleError::Input("result missing job-hash".into()))?;
-    let amount_sats = result.amount_sats.unwrap_or(offer.amount_sats);
+    if result_job_hash != expected_job_hash {
+        return Err(JobLifecycleError::Input(format!(
+            "result job-hash {result_job_hash} does not match offer-derived job-hash \
+             {expected_job_hash} (seller quoted a different task/amount) — refused"
+        )));
+    }
+    let job_hash = expected_job_hash;
 
     // Resolve contribution binds from the buyer's SIGNED OFFER (authority), refusing a
     // malformed contribution offer and equality-checking the seller echo — never trusting
     // the echo. From-scratch offers (no `job-class=contribution`) leave `contribution = None`.
     let contribution = resolve_accepted_contribution(offer, result, &commit_oid)?;
 
-    // Fail-closed: a present-but-malformed creq REFUSES the accept (see
-    // [`accepted_mints_from_claim_creq`]).
-    let accepted_mints = accepted_mints_from_claim_creq(claim.creq.as_deref())?;
+    // Fail-closed STRICT verification of the accepted claim's seller-authored creq: creq is
+    // REQUIRED and its payment-terms (payment_id, amount, unit, mints) are verified field by
+    // field before the bind is written (see [`verify_accepted_claim_creq`]).
+    let accepted_mints =
+        verify_accepted_claim_creq(claim.creq.as_deref(), &request.job_id, offer.amount_sats)?;
 
     let buyer_pubkey = keys.public_key().to_hex();
     let draft = accept_draft(
@@ -755,28 +771,58 @@ pub async fn accept_claim_async(
 ///
 /// The recorded binds (`target_*`, `base_*`) come from the OFFER; the fork is the result's
 /// repo/branch; `store_ref` is derived from the fork-tip `commit_oid`.
-/// Fail-closed: resolve the accepted claim's `creq` accepted-mint list (`m`).
+/// Fail-closed STRICT verification of the accepted claim's seller-authored NUT-18 `creq`,
+/// mirroring the seller-side field-by-field rebind ([`crate::seller_daemon`]'s
+/// `reconstruct_delivered_bind`). The buyer must not accept-then-pay a claim whose payment
+/// terms it did not fully verify, so before the accept-bind is written this requires:
 ///
-/// - `None` (a claim with no creq) ⇒ empty list; the pay path then uses the pinned default
-///   mint.
-/// - `Some(creq)` that PARSES ⇒ its `m` mints (normalized).
-/// - `Some(creq)` that does NOT parse ⇒ REFUSE. The buyer must not accept-then-pay a claim whose
-///   payment terms it could not read; silently degrading a present-but-malformed creq to the empty
-///   default-mint path would pay against unreadable terms.
-fn accepted_mints_from_claim_creq(creq: Option<&str>) -> Result<Vec<String>, JobLifecycleError> {
-    match creq {
-        Some(creq) => Ok(crate::gateway::creq::parse_creq(creq)
-            .map_err(|error| {
-                JobLifecycleError::Input(format!(
-                    "accepted claim carries an unparseable creq (refusing accept, fail-closed): {error}"
-                ))
-            })?
-            .mints
-            .iter()
-            .map(|mint| mint.to_string())
-            .collect()),
-        None => Ok(Vec::new()),
+/// - a creq is PRESENT (a claim carrying none is refused — every seller claim authors one);
+/// - the creq PARSES as a NUT-18 payment request;
+/// - `payment_id == job_id`;
+/// - `amount == offer.amount_sats` (the buyer-signed offer amount, never the result's echo);
+/// - `unit == sat`;
+/// - the accepted-mint list (`m`) is NON-EMPTY.
+///
+/// Returns the normalized accepted-mint list (`m`) on success. Any failure REFUSES the accept.
+fn verify_accepted_claim_creq(
+    creq: Option<&str>,
+    job_id: &str,
+    offer_amount_sats: u64,
+) -> Result<Vec<String>, JobLifecycleError> {
+    let creq = creq.ok_or_else(|| {
+        JobLifecycleError::Input(
+            "accepted claim carries no creq (cannot verify payment terms) — refused".into(),
+        )
+    })?;
+    let request = crate::gateway::creq::parse_creq(creq).map_err(|error| {
+        JobLifecycleError::Input(format!(
+            "accepted claim carries an unparseable creq (refusing accept, fail-closed): {error}"
+        ))
+    })?;
+    if request.payment_id.as_deref() != Some(job_id) {
+        return Err(JobLifecycleError::Input(format!(
+            "accepted claim creq payment id {:?} != job_id {job_id} — refused",
+            request.payment_id
+        )));
     }
+    if request.amount != Some(cashu::Amount::from(offer_amount_sats)) {
+        return Err(JobLifecycleError::Input(format!(
+            "accepted claim creq amount {:?} != offer amount {offer_amount_sats} — refused",
+            request.amount
+        )));
+    }
+    if request.unit.as_ref() != Some(&cashu::CurrencyUnit::Sat) {
+        return Err(JobLifecycleError::Input(format!(
+            "accepted claim creq unit {:?} != sat — refused",
+            request.unit
+        )));
+    }
+    if request.mints.is_empty() {
+        return Err(JobLifecycleError::Input(
+            "accepted claim creq carries no accepted mints (m) — refused".into(),
+        ));
+    }
+    Ok(request.mints.iter().map(|mint| mint.to_string()).collect())
 }
 
 fn resolve_accepted_contribution(
@@ -911,9 +957,25 @@ pub fn authorize_request_from_bind(
             delivery_integrity_hash, bind.commit_oid
         )));
     }
+    // The caller-supplied amount must equal the accept-bind amount (which was itself bound from
+    // the buyer's signed offer at accept). Refuse any drift so the pay amount can never diverge
+    // from the amount the buyer authorized.
+    if amount_sats != bind.amount_sats {
+        return Err(JobLifecycleError::Input(format!(
+            "authorize_pay(job_id) amount_sats {amount_sats} does not match accepted bind amount {} — refused",
+            bind.amount_sats
+        )));
+    }
     Ok(crate::authorize_pay::AuthorizePayRequest {
         job_id: bind.job_id.clone(),
         result_id: bind.result_id.clone(),
+        // Sound because accept is fail-closed: a contribution-class offer with malformed pins is
+        // refused at accept, so `bind.contribution == None` iff the offer was from-scratch.
+        job_class: if bind.contribution.is_some() {
+            crate::authorize_pay::JobClass::Contribution
+        } else {
+            crate::authorize_pay::JobClass::FromScratch
+        },
         delivery_integrity_hash,
         job_hash: bind.job_hash.clone(),
         seller_pubkey: bind.seller_pubkey.clone(),
@@ -959,6 +1021,13 @@ pub fn fill_explicit_request_from_bind(
     bind: &AcceptedBind,
 ) {
     request.job_hash = bind.job_hash.clone();
+    // The bind is authoritative for the job class (resolved from the signed offer at accept), so
+    // the explicit form matches the bind form and cannot declare a divergent class.
+    request.job_class = if bind.contribution.is_some() {
+        crate::authorize_pay::JobClass::Contribution
+    } else {
+        crate::authorize_pay::JobClass::FromScratch
+    };
     if request.seller_signature.is_empty() {
         request.seller_signature = bind.seller_signature.clone();
     }
@@ -1445,35 +1514,80 @@ mod tests {
     use super::*;
     use crate::home;
 
-    // A claim carrying a present-but-malformed creq REFUSES the accept — it does NOT silently
-    // degrade to the empty/default-mint path.
+    // Finding A: accept-side creq verification is STRICT and fail-closed. A well-formed creq
+    // whose payment terms match the job+offer yields its `m` mints; every other shape refuses.
     #[test]
-    fn accept_refuses_a_present_but_unparseable_creq() {
-        // A claim with no creq yields an empty list — no refusal.
-        assert!(accepted_mints_from_claim_creq(None).unwrap().is_empty());
-
-        // A well-formed creq yields its `m` mints.
+    fn accept_verify_creq_is_strict_and_fail_closed() {
         let seller = nostr_sdk::Keys::generate().public_key().to_hex();
-        let creq = crate::gateway::creq::build_seller_creq(
-            "job",
-            7,
-            "sat",
-            &["https://testnut.cashudevkit.org".to_string()],
-            &seller,
-        )
-        .expect("build creq");
+        let mint = "https://testnut.cashudevkit.org".to_string();
+        let good = crate::gateway::creq::build_seller_creq("job", 7, "sat", &[mint.clone()], &seller)
+            .expect("build creq");
+
+        // Matching terms → accepted, returns the m list.
         assert_eq!(
-            accepted_mints_from_claim_creq(Some(&creq)).unwrap(),
-            vec!["https://testnut.cashudevkit.org".to_string()]
+            verify_accepted_claim_creq(Some(&good), "job", 7).unwrap(),
+            vec![mint.clone()]
         );
 
-        // Present but garbage → REFUSE (fail-closed), not the empty fallback.
-        let error =
-            accepted_mints_from_claim_creq(Some("creqAnot-valid-base64-cbor")).unwrap_err();
+        // No creq at all → REFUSE (was previously the silent empty/default path).
+        let err = verify_accepted_claim_creq(None, "job", 7).unwrap_err();
+        assert!(err.to_string().contains("no creq"), "got: {err}");
+
+        // Present but garbage → REFUSE.
+        let err = verify_accepted_claim_creq(Some("creqAnot-valid-cbor"), "job", 7).unwrap_err();
+        assert!(err.to_string().contains("unparseable creq"), "got: {err}");
+
+        // payment_id != job_id → REFUSE.
+        let err = verify_accepted_claim_creq(Some(&good), "other-job", 7).unwrap_err();
+        assert!(err.to_string().contains("payment id"), "got: {err}");
+
+        // amount != offer amount → REFUSE (the load-bearing money check).
+        let err = verify_accepted_claim_creq(Some(&good), "job", 8).unwrap_err();
+        assert!(err.to_string().contains("amount"), "got: {err}");
+
+        // Non-sat unit → REFUSE.
+        let usd = crate::gateway::creq::build_seller_creq("job", 7, "usd", &[mint.clone()], &seller)
+            .expect("build usd creq");
+        let err = verify_accepted_claim_creq(Some(&usd), "job", 7).unwrap_err();
+        assert!(err.to_string().contains("unit"), "got: {err}");
+
+        // Empty accepted-mint list → REFUSE.
+        let no_mints = crate::gateway::creq::build_seller_creq("job", 7, "sat", &[], &seller)
+            .expect("build no-mint creq");
+        let err = verify_accepted_claim_creq(Some(&no_mints), "job", 7).unwrap_err();
+        assert!(err.to_string().contains("accepted mints"), "got: {err}");
+    }
+
+    // Finding B: authorize_request_from_bind refuses a caller amount that drifts from the bind.
+    #[test]
+    fn authorize_from_bind_refuses_amount_drift() {
+        let bind = AcceptedBind {
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "cc".repeat(32),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 5,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            contribution: None,
+        };
+        // Drifted amount → refuse.
+        let err = authorize_request_from_bind(&bind, 6, bind.commit_oid.clone())
+            .expect_err("amount drift");
         assert!(
-            error.to_string().contains("unparseable creq"),
-            "unexpected error: {error}"
+            err.to_string().contains("does not match accepted bind amount"),
+            "got: {err}"
         );
+        // Matching amount → ok.
+        let req = authorize_request_from_bind(&bind, 5, bind.commit_oid.clone()).expect("ok");
+        assert_eq!(req.amount_sats, 5);
     }
 
     // Load-bearing: the explicit 9-field form (with bind-fill applied) and the
@@ -1510,6 +1624,7 @@ mod tests {
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
             job_id: bind.job_id.clone(),
             result_id: bind.result_id.clone(),
+            job_class: crate::authorize_pay::JobClass::FromScratch,
             delivery_integrity_hash: bind.commit_oid.clone(),
             job_hash: "ff".repeat(32), // caller-supplied, DIFFERENT from bind.job_hash
             seller_pubkey: bind.seller_pubkey.clone(),
@@ -1562,6 +1677,7 @@ mod tests {
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
             job_id: bind.job_id.clone(),
             result_id: bind.result_id.clone(),
+            job_class: crate::authorize_pay::JobClass::FromScratch,
             delivery_integrity_hash: bind.commit_oid.clone(),
             job_hash: bind.job_hash.clone(), // byte-equal, as in the live failure
             seller_pubkey: bind.seller_pubkey.clone(),

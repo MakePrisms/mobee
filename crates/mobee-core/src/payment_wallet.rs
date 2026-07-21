@@ -217,7 +217,10 @@ impl<'a> CdkBuyerMint<'a> {
     }
 
     /// Returns the existing token for an attempt or creates one seller-locked send.
-    pub async fn lock_or_reconcile(
+    ///
+    /// Crate-private: this is the raw seller-locked send primitive. Sealed so the only
+    /// out-of-crate spend path stays `authorize_pay` → `PaymentService::run` (budget-gated).
+    pub(crate) async fn lock_or_reconcile(
         &self,
         attempt_id: &AttemptId,
         terms: &PaymentTerms,

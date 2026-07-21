@@ -640,7 +640,11 @@ impl LockedPayment {
 }
 
 /// Injected wallet, verifier, send, and receipt effects.
-pub trait PaymentEffects {
+///
+/// Crate-private: its methods (notably `send_payment`) move funds and take in-crate-only
+/// inputs (`LockedPayment`/`VerifiedPayment`). Sealed so no out-of-crate caller can drive a
+/// send through the trait, bypassing the budget gate.
+pub(crate) trait PaymentEffects {
     /// Creates or reconciles the wallet lock for an attempt.
     fn lock_or_reconcile(
         &mut self,
@@ -692,7 +696,7 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
     /// `authorize_pay` / MCP call site (compiler refuse). In-crate unit tests that inject
     /// fake verifiers use [`Self::run_with_verifier`] (`#[cfg(test)]` only — absent from
     /// release / non-test builds).
-    pub fn run<E: PaymentEffects>(
+    pub(crate) fn run<E: PaymentEffects>(
         &self,
         delivery: &GitDelivery,
         delivery_verifier: &mut PayPathDeliveryVerifier,

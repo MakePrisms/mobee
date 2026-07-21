@@ -1388,6 +1388,36 @@
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Finding G: a journal read error in the already-receipted guard must FAIL CLOSED — buffer the
+    // wrap rather than treat the error as "no receipt" and fall through to redeem (which could
+    // re-pay an already-receipted job).
+    #[tokio::test]
+    async fn has_receipt_read_error_fails_closed_and_buffers() {
+        let (root, mut daemon) = test_daemon("has-receipt-failclosed");
+        let buyer = nostr_sdk::Keys::generate();
+        let job_id = "job-corrupt-journal";
+        let received = recon_received(job_id, DEFAULT_MINT_URL, &buyer);
+
+        // Corrupt the journal so has_receipt() returns Err (a corrupt-line Journal error).
+        let journal_path = daemon.home.root.join("seller-journal.jsonl");
+        std::fs::write(&journal_path, "this-is-not-json\n").expect("corrupt journal");
+        assert!(
+            daemon.journal.has_receipt(job_id).is_err(),
+            "corrupt journal must make has_receipt error"
+        );
+
+        let outcome = try_apply_or_buffer(&mut daemon, "evt-corrupt".into(), received)
+            .await
+            .expect("fail-closed path returns Ok(Buffered), never an error");
+        assert!(matches!(outcome, ApplyResult::Buffered));
+        assert_eq!(
+            daemon.pay_buffer.len(),
+            1,
+            "wrap must be buffered on journal read error, not redeemed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // A result authored by ANOTHER seller for J → refuse (never bind money to a foreign delivery).
     #[test]
     fn reconstruct_refuses_foreign_authored_result() {

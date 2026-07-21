@@ -36,6 +36,11 @@ pub enum WalletVerifyError {
         actual: Option<CurrencyUnit>,
     },
     LockMismatch { expected: PublicKey },
+    /// The proof carries P2PK spending conditions the seller key ALONE cannot satisfy (a
+    /// multisig `n_sigs`, an additional required pubkey, a locktime/refund clawback, or a
+    /// sig-flag the seller cannot meet). Canonical accepted shape: a single seller pubkey with no
+    /// extra conditions.
+    UnsatisfiableLock(String),
     DuplicateProofY(PublicKey),
     DuplicateState(PublicKey),
     MissingState(PublicKey),
@@ -62,6 +67,9 @@ impl fmt::Display for WalletVerifyError {
             },
             Self::LockMismatch { expected } => {
                 write!(f, "P2PK lock does not match seller key {expected}")
+            }
+            Self::UnsatisfiableLock(reason) => {
+                write!(f, "P2PK lock not seller-satisfiable: {reason}")
             }
             Self::DuplicateProofY(y) => write!(f, "duplicate proof y {y}"),
             Self::DuplicateState(y) => write!(f, "duplicate NUT-07 state for proof {y}"),
@@ -157,8 +165,65 @@ fn require_seller_lock(token: &Token, seller_lock: PublicKey) -> Result<(), Wall
                 expected: seller_lock,
             });
         }
+        // Reject any additional spending conditions the seller key ALONE cannot satisfy. The
+        // canonical accepted shape is a single seller pubkey with NO extra conditions; anything
+        // else (multisig, a foreign required signer, a locktime/refund clawback path, or a
+        // sig-flag the seller cannot meet) means the buyer could later reclaim or the seller could
+        // not spend — refuse before crediting.
+        if let SpendingConditions::P2PKConditions {
+            conditions: Some(extra),
+            ..
+        } = &conditions
+        {
+            reject_non_seller_satisfiable(extra)?;
+        }
     }
 
+    Ok(())
+}
+
+/// Refuse P2PK [`cashu::nuts::nut11::Conditions`] the seller key alone cannot satisfy.
+/// Accepted shape carries none of these; each set field is a distinct refusal.
+fn reject_non_seller_satisfiable(
+    conditions: &cashu::nuts::nut10::Conditions,
+) -> Result<(), WalletVerifyError> {
+    // >1 required signature ⇒ the single seller key cannot spend.
+    if conditions.num_sigs.unwrap_or(1) > 1 {
+        return Err(WalletVerifyError::UnsatisfiableLock(format!(
+            "requires {} signatures (seller holds one key)",
+            conditions.num_sigs.unwrap_or(1)
+        )));
+    }
+    // Any additional required pubkey is a foreign co-signer the seller does not control.
+    if conditions
+        .pubkeys
+        .as_ref()
+        .is_some_and(|keys| !keys.is_empty())
+    {
+        return Err(WalletVerifyError::UnsatisfiableLock(
+            "carries additional required pubkeys (foreign co-signer)".into(),
+        ));
+    }
+    // A locktime + refund key lets the buyer (refund key holder) claw the funds back after the
+    // locktime — the seller cannot rely on holding them.
+    if conditions.locktime.is_some()
+        || conditions
+            .refund_keys
+            .as_ref()
+            .is_some_and(|keys| !keys.is_empty())
+    {
+        return Err(WalletVerifyError::UnsatisfiableLock(
+            "carries a locktime/refund clawback path".into(),
+        ));
+    }
+    // SigAll (vs the default SigInputs) demands signatures over outputs the seller does not
+    // control at receive time.
+    if conditions.sig_flag != cashu::nuts::nut11::SigFlag::SigInputs {
+        return Err(WalletVerifyError::UnsatisfiableLock(format!(
+            "carries non-default sig flag {:?}",
+            conditions.sig_flag
+        )));
+    }
     Ok(())
 }
 
@@ -392,6 +457,70 @@ mod tests {
         );
     }
 
+    // Finding E: refuse any P2PK spending condition the seller key ALONE cannot safely realize.
+    // The canonical accepted shape is a single seller pubkey with no extra conditions; each unsafe
+    // shape below is refused before the token is credited.
+    #[test]
+    fn verify_rejects_conditions_seller_cannot_satisfy() {
+        let seller = public_key(1);
+        let buyer = public_key(2);
+
+        // Canonical shape (single seller key, no conditions) → accepted.
+        let ok = token(MINT, vec![proof_with_conditions(7, seller, None)]);
+        let ok_ys = token_ys(&ok).unwrap();
+        assert!(
+            verify_trade_p2pk(&ok, &trade_lock(MINT, 7, seller), &unspent(&ok_ys)).is_ok(),
+            "canonical single-seller lock must verify"
+        );
+
+        let refuse = |conditions: Conditions, what: &str| {
+            let tok = token(MINT, vec![proof_with_conditions(7, seller, Some(conditions))]);
+            let ys = token_ys(&tok).unwrap();
+            assert!(
+                matches!(
+                    verify_trade_p2pk(&tok, &trade_lock(MINT, 7, seller), &unspent(&ys)),
+                    Err(WalletVerifyError::UnsatisfiableLock(_))
+                ),
+                "{what} must refuse as not-seller-satisfiable"
+            );
+        };
+
+        // Multisig (n_sigs > 1): the single seller key cannot meet the quorum.
+        refuse(
+            Conditions {
+                pubkeys: Some(vec![buyer]),
+                num_sigs: Some(2),
+                ..Default::default()
+            },
+            "n_sigs>1 multisig",
+        );
+        // Additional allowed pubkey (default n_sigs=1): the buyer could also spend the token.
+        refuse(
+            Conditions {
+                pubkeys: Some(vec![buyer]),
+                ..Default::default()
+            },
+            "foreign allowed pubkey",
+        );
+        // Locktime + refund key: the buyer (refund holder) can claw the funds back after locktime.
+        refuse(
+            Conditions {
+                locktime: Some(1),
+                refund_keys: Some(vec![buyer]),
+                ..Default::default()
+            },
+            "locktime+refund clawback",
+        );
+        // Non-default sig flag (SigAll instead of SigInputs).
+        refuse(
+            Conditions {
+                sig_flag: cashu::nuts::nut11::SigFlag::SigAll,
+                ..Default::default()
+            },
+            "SigAll flag",
+        );
+    }
+
     #[test]
     fn connector_check_computes_ys_without_keyset_fetch() {
         let seller = public_key(1);
@@ -499,15 +628,20 @@ mod tests {
         MintUrl::from_str(url).expect("valid mint URL")
     }
 
-    fn proof(amount: u64, seller: PublicKey, nonce: u8) -> Proof {
-        let secret = Secret::try_from(SpendingConditions::new_p2pk(
-            seller,
-            Some(Conditions {
-                pubkeys: Some(vec![public_key(nonce)]),
-                ..Default::default()
-            }),
-        ))
-        .expect("valid P2PK spending condition");
+    // Canonical accepted shape: a single seller pubkey with NO extra conditions. The `_nonce`
+    // param is retained for call-site compatibility but no longer needed for uniqueness — the
+    // NUT-10 secret carries a random nonce, so repeated calls already yield distinct secrets.
+    fn proof(amount: u64, seller: PublicKey, _nonce: u8) -> Proof {
+        proof_with_conditions(amount, seller, None)
+    }
+
+    fn proof_with_conditions(
+        amount: u64,
+        seller: PublicKey,
+        conditions: Option<Conditions>,
+    ) -> Proof {
+        let secret = Secret::try_from(SpendingConditions::new_p2pk(seller, conditions))
+            .expect("valid P2PK spending condition");
         Proof::new(
             Amount::from(amount),
             Id::from_str(KEYSET_ID).expect("valid v2 keyset id"),

@@ -444,13 +444,22 @@ pub async fn announce_seller_delivery_repo_async(
     use nostr_sdk::nips::nip34::GitRepositoryAnnouncement;
     use nostr_sdk::prelude::{EventBuilder, Url};
 
+    // Run the SAME transport allowlist the delivery path enforces on any seller-supplied locator
+    // (https + relay-git only; `ext:`/`file:`/`ssh:`/scp forms and URLs embedding credentials are
+    // refused). The refusal messages never echo the raw URL, so a credential-bearing remote does
+    // not leak into logs.
+    crate::delivery_transport::assert_allowed_repo_locator(remote_url)
+        .map_err(|refuse| ProfileError::Input(refuse.to_string()))?;
+
+    // Errors below deliberately do NOT interpolate the raw URL (redacted) — the allowlist above
+    // already rejected credentials-in-URL, but keep secrets out of error strings regardless.
     let repo_id = home::relay_git_repo_id(remote_url).ok_or_else(|| {
-        ProfileError::Input(format!(
-            "cannot derive NIP-34 repo id from git-remote {remote_url:?}"
-        ))
+        ProfileError::Input(
+            "cannot derive NIP-34 repo id from the configured git-remote (redacted)".into(),
+        )
     })?;
     let clone = Url::parse(remote_url)
-        .map_err(|error| ProfileError::Input(format!("git-remote URL: {error}")))?;
+        .map_err(|_| ProfileError::Input("git-remote URL failed to parse (redacted)".into()))?;
     let name = home
         .config
         .profile
@@ -582,7 +591,14 @@ pub async fn fetch_names_async(
 /// Defensive kind-0 content parse — `name` only (cosmetic).
 fn parse_kind0_name(content: &str) -> Option<String> {
     let raw = if content.len() > PROFILE_CONTENT_MAX {
-        &content[..PROFILE_CONTENT_MAX]
+        // Truncate on a char boundary — a plain `content[..PROFILE_CONTENT_MAX]` byte slice
+        // panics when a multibyte char straddles the cap. Walk down to the nearest boundary
+        // (a byte-cap over-fetch only feeds the JSON parser, which fails closed on garbage).
+        let mut end = PROFILE_CONTENT_MAX;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        &content[..end]
     } else {
         content
     };
@@ -609,6 +625,51 @@ mod tests {
         assert_eq!(parse_kind0_name(r#"{"about":"only"}"#), None);
         assert_eq!(parse_kind0_name("not-json"), None);
         assert_eq!(parse_kind0_name(r#"{"name":"   "}"#), None);
+    }
+
+    // Finding D: parse_kind0_name must not panic when the PROFILE_CONTENT_MAX byte cap falls in
+    // the middle of a multibyte char. A plain `content[..MAX]` byte slice panics on that boundary.
+    #[test]
+    fn parse_kind0_name_survives_multibyte_char_on_byte_cap() {
+        // '😀' is 4 bytes; placing it so it starts at PROFILE_CONTENT_MAX-1 makes byte index
+        // PROFILE_CONTENT_MAX land INSIDE the char (not a char boundary).
+        let mut content = "a".repeat(PROFILE_CONTENT_MAX - 1);
+        content.push('😀');
+        content.push_str("bbbb");
+        assert!(!content.is_char_boundary(PROFILE_CONTENT_MAX));
+        // Must return without panicking (the over-cap content is not valid JSON → None).
+        assert_eq!(parse_kind0_name(&content), None);
+    }
+
+    // Finding D: the delivery-repo announce runs the transport allowlist BEFORE any publish and
+    // never leaks the raw locator (which could embed credentials) into error strings.
+    #[test]
+    fn announce_delivery_repo_refuses_bad_locators_without_leaking_url() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-announce-allowlist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+
+        // Forbidden scheme (ext::) refuses at the allowlist, before any relay I/O.
+        let err = announce_seller_delivery_repo(&home, "ext::sh -c evil").expect_err("ext refused");
+        assert!(err.to_string().contains("refused"), "got: {err}");
+
+        // Credentials-in-URL refuses AND the secret never appears in the error string.
+        let err = announce_seller_delivery_repo(&home, "https://user:sup3rsecret@example.invalid/repo.git")
+            .expect_err("credentials refused");
+        let message = err.to_string();
+        assert!(message.contains("credentials"), "got: {message}");
+        assert!(
+            !message.contains("sup3rsecret") && !message.contains("user:"),
+            "error leaked the credential-bearing URL: {message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

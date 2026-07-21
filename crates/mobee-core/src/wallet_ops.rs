@@ -444,6 +444,12 @@ pub async fn send_async(
         return Err(WalletOpsError::Wallet("amount must be > 0".into()));
     }
     let mint_url = resolve_mint(home, mint_override)?;
+    // Fail closed against the real-mint gate before opening the wallet. Operator sends are a
+    // deliberate action OUTSIDE the job-pay budget gate (BudgetGate is deliberately not wired in
+    // here — owner decision pending), but they must still honor `allow_real_mints`.
+    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+        return Err(WalletOpsError::MintNotAllowed { mint_url });
+    }
     let wallet = open_wallet_async(home, &mint_url).await?;
     let before = wallet
         .total_balance()
@@ -542,6 +548,12 @@ pub async fn melt_async(
         return Err(WalletOpsError::Wallet("bolt11 invoice is empty".into()));
     }
     let mint_url = resolve_mint(home, mint_override)?;
+    // Fail closed against the real-mint gate before opening the wallet. Operator melts are a
+    // deliberate action OUTSIDE the job-pay budget gate (BudgetGate is deliberately not wired in
+    // here — owner decision pending), but they must still honor `allow_real_mints`.
+    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+        return Err(WalletOpsError::MintNotAllowed { mint_url });
+    }
     let wallet = open_wallet_async(home, &mint_url).await?;
     let quote = wallet
         .melt_quote(PaymentMethod::BOLT11, bolt11, None, None)

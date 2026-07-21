@@ -27,11 +27,28 @@ use crate::payment_send::NostrPaymentSend;
 use crate::payment_wallet::{CdkPaymentEffects, PaymentWalletError};
 use crate::receipt::{DeliveryKind, ReceiptPreimage, EXEC_METADATA_COMMITMENT_EMPTY};
 
+/// Trusted job-class input for [`authorize_pay_async`], derived by the caller from the buyer's
+/// SIGNED OFFER (never a seller echo). Sealing input: a [`JobClass::Contribution`] request whose
+/// `contribution` binds are `None` is REFUSED (defense in depth). The MCP layer already
+/// re-derives the class and refuses fail-closed; carrying it into the crate API makes the entry
+/// point itself fail-closed so no in-crate caller can pay a contribution job as from-scratch and
+/// skip the contribution gates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobClass {
+    /// From-scratch job — no contribution verify (byte-identical produced artifacts).
+    FromScratch,
+    /// Contribution job — requires `contribution` binds; the fork verify-path + authorship seam run.
+    Contribution,
+}
+
 /// Inputs for the authorize_pay composed path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizePayRequest {
     pub job_id: String,
     pub result_id: String,
+    /// Buyer-derived job class (from the signed offer). Sealing input: `Contribution` with
+    /// `contribution: None` is refused (see [`JobClass`]).
+    pub job_class: JobClass,
     /// Buyer's independent commitment (full git oid) — must tip-match after verify.
     pub delivery_integrity_hash: String,
     pub job_hash: String,
@@ -186,6 +203,18 @@ pub async fn authorize_pay_async(
             "delivery_integrity_hash {} does not match seller-advertised commit_oid {} (buyer tip-match required; refuse mismatch)",
             request.delivery_integrity_hash, request.commit_oid
         )));
+    }
+
+    // Entry-point seal (defense in depth): a contribution-class job MUST carry contribution binds.
+    // Without this the caller contract below is enforced only by every caller remembering to
+    // re-derive the class; here the crate API itself refuses to pay a contribution job as
+    // from-scratch (which would skip the four contribution gates + the authorship-tuple bind).
+    if request.job_class == JobClass::Contribution && request.contribution.is_none() {
+        return Err(AuthorizePayError::Input(
+            "job_class=contribution requires contribution binds; refusing to pay a contribution job \
+             as from-scratch (contribution-gate bypass)"
+                .into(),
+        ));
     }
 
     let job_id = JobId::new(request.job_id.clone())
@@ -798,6 +827,7 @@ mod tests {
         let request = AuthorizePayRequest {
             job_id: "job-d2-empty".into(),
             result_id: "result-d2".into(),
+            job_class: JobClass::FromScratch,
             delivery_integrity_hash: String::new(),
             job_hash: "bb".repeat(32),
             seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
@@ -837,6 +867,7 @@ mod tests {
         let request = AuthorizePayRequest {
             job_id: "job-d2".into(),
             result_id: "result-d2".into(),
+            job_class: JobClass::FromScratch,
             delivery_integrity_hash: "aa".repeat(20),
             job_hash: "bb".repeat(32),
             seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
@@ -856,6 +887,48 @@ mod tests {
             "unexpected error: {message}"
         );
         assert_eq!(gate.spent(), 0, "tip-match refuse must not burn spent");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Finding C: the crate pay entry itself refuses a contribution-class job with no contribution
+    // binds (defense in depth — a caller that skips the class re-derivation cannot pay it as
+    // from-scratch and thereby skip the contribution gates). Zero spend.
+    #[test]
+    fn authorize_pay_refuses_contribution_class_without_binds() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-authorize-pay-jobclass-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let mut gate = BudgetGate::from_home(&home).expect("gate");
+        let oid = "aa".repeat(20);
+        let request = AuthorizePayRequest {
+            job_id: "job-jc".into(),
+            result_id: "result-jc".into(),
+            job_class: JobClass::Contribution,
+            delivery_integrity_hash: oid.clone(),
+            job_hash: "bb".repeat(32),
+            seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
+            amount_sats: 2,
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            commit_oid: oid,
+            seller_signature: String::new(),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            contribution: None,
+        };
+        let err = authorize_pay_blocking(&home, &mut gate, request).expect_err("contribution no binds");
+        assert!(
+            err.to_string().contains("job_class=contribution requires contribution binds"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(gate.spent(), 0, "seal refuse must not burn spent");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -887,6 +960,7 @@ mod tests {
         let request = AuthorizePayRequest {
             job_id: "job-ext".into(),
             result_id: "result-ext".into(),
+            job_class: JobClass::FromScratch,
             delivery_integrity_hash: "aa".repeat(20),
             job_hash: "bb".repeat(32),
             seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
@@ -994,6 +1068,7 @@ mod tests {
         let request = AuthorizePayRequest {
             job_id: "job-forged".into(),
             result_id: "result-forged".into(),
+            job_class: JobClass::FromScratch,
             delivery_integrity_hash: oid.clone(),
             job_hash,
             seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
@@ -1049,6 +1124,7 @@ mod tests {
         let request = AuthorizePayRequest {
             job_id: "job-diag".into(),
             result_id: "result-diag".into(),
+            job_class: JobClass::FromScratch,
             delivery_integrity_hash: oid.clone(),
             job_hash: job_hash.clone(),
             seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
@@ -1121,6 +1197,7 @@ mod tests {
         let tampered_amount = AuthorizePayRequest {
             job_id: "job-tamper".into(),
             result_id: "result-tamper".into(),
+            job_class: JobClass::FromScratch,
             delivery_integrity_hash: honest_oid.clone(),
             job_hash: honest_hash.clone(),
             seller_pubkey: seller_hex.clone(),
@@ -1150,6 +1227,7 @@ mod tests {
         let tampered_delivery = AuthorizePayRequest {
             job_id: "job-tamper2".into(),
             result_id: "result-tamper2".into(),
+            job_class: JobClass::FromScratch,
             delivery_integrity_hash: tampered_oid.clone(),
             job_hash: honest_hash,
             seller_pubkey: seller_hex,

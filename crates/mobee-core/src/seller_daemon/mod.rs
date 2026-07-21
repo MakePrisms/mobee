@@ -67,6 +67,12 @@ const BACKFILL_CHECK_TIMEOUT_SECS: u64 = 5;
 /// only as a test seam (mirrors the heartbeat cadence).
 const WRAP_BACKFILL_INTERVAL_SECS: u64 = 300;
 
+/// Slack subtracted from the oldest-unsettled-delivery timestamp when it bounds the wrap-backfill
+/// `since` cursor. The buyer's payment wrap is created AFTER the seller's delivery, but clock skew
+/// between the two parties could place the wrap's `created_at` slightly before the delivery ts;
+/// this margin (1h) keeps such a wrap inside the fetch window.
+const WRAP_BACKFILL_MARGIN_SECS: u64 = 3600;
+
 /// Test-only env seam overriding [`WRAP_BACKFILL_INTERVAL_SECS`] (NOT a user config knob; mirrors
 /// `MOBEE_HEARTBEAT_INTERVAL_SECS`). A `0` or unparseable value is ignored. No production path
 /// sets it — the periodic cadence is the fixed constant in production.
@@ -2469,11 +2475,25 @@ async fn try_apply_or_buffer(
     let payload_job = received.payload.job_id().to_owned();
     // An already-receipted job's wrap is a re-see of consumed money (idempotent) — skip it,
     // do NOT buffer it forever. The journal pay-once guard is the source of truth.
-    if daemon.journal.has_receipt(&payload_job).unwrap_or(false) {
-        eprintln!(
-            "seller wrap event={event_id}: job {payload_job} already receipted, skipping (not buffered)"
-        );
-        return Ok(ApplyResult::Buffered);
+    match daemon.journal.has_receipt(&payload_job) {
+        Ok(true) => {
+            eprintln!(
+                "seller wrap event={event_id}: job {payload_job} already receipted, skipping (not buffered)"
+            );
+            return Ok(ApplyResult::Buffered);
+        }
+        Ok(false) => {}
+        Err(error) => {
+            // Fail closed: a journal read error must NOT read as "no receipt yet" (which would fall
+            // through and redeem a job that may already be paid). Buffer the wrap and refuse to
+            // receive until the journal reads clean again. Non-secret diagnostic only.
+            eprintln!(
+                "seller wrap event={event_id}: has_receipt journal read failed for job {payload_job} \
+                 (buffering, fail-closed): {error}"
+            );
+            daemon.buffer_payment(event_id, received);
+            return Ok(ApplyResult::Buffered);
+        }
     }
     // Does a delivered-but-unpaid job bind this payment? Bind by job id (the NUT-18 payload's
     // `id`) — result id is resolved locally in `try_apply_payment` (NUT-18 carries no result id).
@@ -2921,7 +2941,17 @@ async fn run_wrap_backfill(
     source: &str,
     authed_note: &str,
 ) -> usize {
-    let backfill_since = daemon.journal.last_receipt_ts().unwrap_or(None).unwrap_or(0);
+    // Cursor = the last receipt ts, BUT never later than the oldest delivered-but-unpaid job
+    // (minus a skew margin). The global `last_receipt_ts` alone is wrong: a receipt for a NEWER
+    // job would advance the cursor past an OLDER unsettled job, skipping its still-uncollected
+    // payment wrap forever. Clamping to the oldest unsettled delivery keeps that wrap in range;
+    // the per-job idempotency guards (`has_receipt` skip, mint already-redeemed refuse) make the
+    // wider window safe to re-scan.
+    let last_receipt = daemon.journal.last_receipt_ts().unwrap_or(None).unwrap_or(0);
+    let backfill_since = match daemon.journal.oldest_unsettled_delivery_ts().unwrap_or(None) {
+        Some(oldest) => last_receipt.min(oldest.saturating_sub(WRAP_BACKFILL_MARGIN_SECS)),
+        None => last_receipt,
+    };
     // Log the ATTEMPT unconditionally, BEFORE the fetch — silence must never read as "no wraps".
     eprintln!(
         "seller wrap backfill{source}: fetching stored kind-1059(s) since ts={backfill_since}{authed_note}"
@@ -3142,6 +3172,29 @@ pub(crate) async fn run_forever_hooked(
     // Boot push preflight: surface WRITE-auth/git-version breakage now, not at job-delivery time.
     // Advisory only — logs-and-continues; never refuses boot (see run_boot_push_preflight).
     run_boot_push_preflight_for_daemon(&daemon);
+
+    // NIP-34 delivery-repo announce (kind-30617): advertise the seller's canonical relay-git
+    // delivery remote so buyers/clients can discover it before any push. Parameterized-replaceable
+    // (idempotent across launches) and best-effort — logs and continues; a refused/unreachable
+    // relay never blocks boot. Only relay-git remotes carry a derivable NIP-34 repo id (BYO https
+    // sellers push to their own remote, outside this discovery surface), so gate on that.
+    if let Some(seller_cfg) = daemon.home.config.seller.clone() {
+        if crate::delivery_transport::is_relay_git_locator(&seller_cfg.git_remote) {
+            match crate::profile::announce_seller_delivery_repo_async(
+                &daemon.home,
+                &seller_cfg.git_remote,
+            )
+            .await
+            {
+                Ok(event_id) => {
+                    eprintln!("seller NIP-34 delivery-repo announce ok event={event_id}")
+                }
+                Err(error) => eprintln!(
+                    "seller WARN: NIP-34 delivery-repo announce failed (continuing): {error}"
+                ),
+            }
+        }
+    }
 
     // Both offer filters ride ONE subscription, so the relay delivers each offer once even when
     // a targeted offer matches both filters. Keep an event-id dedup as defense-in-depth (e.g.

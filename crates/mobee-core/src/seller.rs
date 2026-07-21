@@ -327,6 +327,38 @@ impl SellerJournal {
             .max())
     }
 
+    /// Oldest `Delivery` timestamp among jobs that are still UNSETTLED (no matching `Receipt` or
+    /// `Release`). This is the safe lower bound for the wrap-backfill `since` cursor: a receipt for
+    /// a NEWER job must never advance the cursor past an OLDER delivered-but-unpaid job whose
+    /// payment wrap has not yet been collected. `Ok(None)` when nothing is unsettled.
+    pub fn oldest_unsettled_delivery_ts(&self) -> Result<Option<u64>, SellerError> {
+        let entries = match self.entries() {
+            Ok(entries) => entries,
+            Err(SellerError::Io(_)) => return Ok(None),
+            Err(other) => return Err(other),
+        };
+        let mut settled: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for entry in &entries {
+            match entry {
+                JournalEntry::Receipt { job_id, .. } | JournalEntry::Release { job_id, .. } => {
+                    settled.insert(job_id.as_str());
+                }
+                _ => {}
+            }
+        }
+        Ok(entries
+            .iter()
+            .filter_map(|entry| match entry {
+                JournalEntry::Delivery { job_id, ts, .. }
+                    if !settled.contains(job_id.as_str()) =>
+                {
+                    Some(*ts)
+                }
+                _ => None,
+            })
+            .min())
+    }
+
     /// Journal a CLAIMED transition. `claim_id`/`buyer_pubkey`/`deadline_unix` are the
     /// anchors restart-reconcile needs to release an orphan without the relay.
     pub fn append_claim(
@@ -797,6 +829,53 @@ offer_backfill_secs = {backfill}
             .expect("receipt");
         let ts = journal.last_receipt_ts().expect("ts").expect("some after receipt");
         assert!(ts >= before, "receipt ts {ts} must be >= {before}");
+    }
+
+    // Finding F: a receipt for a NEWER job must not let the wrap-backfill cursor skip an OLDER
+    // delivered-but-unpaid job. `last_receipt_ts` advances to the newer receipt, but
+    // `oldest_unsettled_delivery_ts` (the clamp for the cursor) still points at the older wrap.
+    #[test]
+    fn oldest_unsettled_delivery_ts_survives_newer_receipt() {
+        let root = temp_home("oldest-unsettled");
+        let _ = fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("bootstrap");
+        let journal = SellerJournal::open(&home).expect("journal");
+
+        let delivery = |job: &str, ts: u64| JournalEntry::Delivery {
+            job_id: job.into(),
+            result_id: format!("r-{job}"),
+            amount: 5,
+            unit: "sat".into(),
+            buyer_pubkey: "buyer".into(),
+            ts,
+        };
+        let receipt = |job: &str, ts: u64| JournalEntry::Receipt {
+            job_id: job.into(),
+            result_id: format!("r-{job}"),
+            amount_received: 5,
+            mint: "https://testnut.cashudevkit.org".into(),
+            buyer: "buyer".into(),
+            swap_ok: true,
+            ts,
+        };
+
+        // Two deliveries: older (ts=100), newer (ts=200); both unpaid.
+        journal.append(delivery("old", 100)).expect("old delivery");
+        journal.append(delivery("new", 200)).expect("new delivery");
+        // A receipt arrives for the NEWER job only.
+        journal.append(receipt("new", 250)).expect("newer receipt");
+
+        assert_eq!(journal.last_receipt_ts().expect("ts"), Some(250));
+        assert_eq!(
+            journal.oldest_unsettled_delivery_ts().expect("ts"),
+            Some(100),
+            "cursor clamp must still reach the older unpaid wrap"
+        );
+
+        // Settling the older job too leaves nothing unsettled.
+        journal.append(receipt("old", 300)).expect("older receipt");
+        assert_eq!(journal.oldest_unsettled_delivery_ts().expect("ts"), None);
+        let _ = fs::remove_dir_all(&root);
     }
 
     // #57: a delivered-but-unpaid job (Claim + Delivery, no Receipt) is NOT an orphaned in-flight
