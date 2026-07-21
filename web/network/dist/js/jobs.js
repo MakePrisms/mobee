@@ -54,7 +54,7 @@ export function aggregateJobs(events, profiles = new Map(), now = nowSeconds()) 
 /**
  * Group marketplace events into per-job buckets, keyed by offer id. Exposed so profile
  * metrics can read the raw sub-events (with authors + timestamps) without re-deriving
- * the linking rules. Each bucket: { id, offer, claims, accepts, results, receipts, refusals }.
+ * the linking rules. Each bucket: { id, offer, claims, awards, results, receipts, feedbacks }.
  * @param {any[]} events normalized events
  * @returns {Map<string, any>}
  */
@@ -64,7 +64,7 @@ export function groupEvents(events) {
   const group = (jobId) => {
     let g = groups.get(jobId);
     if (!g) {
-      g = { id: jobId, offer: null, claims: [], accepts: [], results: [], receipts: [], refusals: [] };
+      g = { id: jobId, offer: null, claims: [], awards: [], results: [], receipts: [], feedbacks: [] };
       groups.set(jobId, g);
     }
     return g;
@@ -76,13 +76,19 @@ export function groupEvents(events) {
       case "offer":
         group(ev.id).offer = ev;
         break;
+      case "claim": {
+        const jobId = ev.claim?.offerId;
+        if (jobId) group(jobId).claims.push(ev);
+        break;
+      }
+      case "award": {
+        const jobId = ev.award?.offerId;
+        if (jobId) group(jobId).awards.push(ev);
+        break;
+      }
       case "feedback": {
         const jobId = ev.feedback?.offerId;
-        if (!jobId) break;
-        const g = group(jobId);
-        if (ev.feedback.isRefusal) g.refusals.push(ev);
-        else if (ev.feedback.isAccept) g.accepts.push(ev);
-        else if (ev.feedback.isClaim) g.claims.push(ev);
+        if (jobId) group(jobId).feedbacks.push(ev);
         break;
       }
       case "result": {
@@ -127,10 +133,10 @@ export function jobFromGroup(g, profiles = new Map(), now = nowSeconds()) {
   const all = [
     offer,
     ...g.claims,
-    ...g.accepts,
+    ...g.awards,
     ...g.results,
     ...g.receipts,
-    ...g.refusals,
+    ...g.feedbacks,
   ].filter(Boolean);
   const createdAt = all.length ? Math.min(...all.map((e) => e.created_at)) : now;
   const lastActivity = all.length ? Math.max(...all.map((e) => e.created_at)) : now;
@@ -158,10 +164,10 @@ export function jobFromGroup(g, profiles = new Map(), now = nowSeconds()) {
  */
 function deriveStatus(g, deadline, now) {
   if (g.receipts.length) return JOB_STATUS.PAID;
-  if (g.refusals.length) return JOB_STATUS.REFUSED;
+  if (g.feedbacks.some((f) => f.feedback?.isError)) return JOB_STATUS.REFUSED;
   if (g.results.length) return JOB_STATUS.DELIVERED;
   if (deadline != null && deadline < now) return JOB_STATUS.EXPIRED;
-  if (g.accepts.length) return JOB_STATUS.WORKING;
+  if (g.awards.length) return JOB_STATUS.WORKING;
   if (g.claims.length) return JOB_STATUS.CLAIMED;
   return JOB_STATUS.OPEN;
 }
@@ -181,14 +187,15 @@ function buildTimeline(g) {
   for (const c of g.claims) {
     entries.push({ at: c.created_at, actor: "seller", pubkey: c.pubkey, text: "claimed the job" });
   }
-  for (const a of g.accepts) {
+  for (const a of g.awards) {
     entries.push({ at: a.created_at, actor: "buyer", pubkey: a.pubkey, text: "accepted the claim" });
   }
   for (const r of g.results) {
     entries.push({ at: r.created_at, actor: "seller", pubkey: r.pubkey, text: "delivered the result" });
   }
-  for (const r of g.refusals) {
-    entries.push({ at: r.created_at, actor: "seller", pubkey: r.pubkey, text: "reported the job failed" });
+  for (const f of g.feedbacks) {
+    const text = f.feedback?.isError ? "reported the job failed" : "posted a progress update";
+    entries.push({ at: f.created_at, actor: "seller", pubkey: f.pubkey, text });
   }
   for (const r of g.receipts) {
     const amt = r.receipt?.amount_sats;
@@ -221,8 +228,9 @@ export function computePulse(events, jobs, now = nowSeconds()) {
       satsSettledToday += ev.receipt?.amount_sats || 0;
     }
     if (ev.created_at >= activeWindow) {
-      if (ev.role === "result" || ev.role === "handler") activeSellers.add(ev.pubkey);
-      else if (ev.role === "feedback" && ev.feedback?.isClaim) activeSellers.add(ev.pubkey);
+      if (ev.role === "result" || ev.role === "handler" || ev.role === "claim") {
+        activeSellers.add(ev.pubkey);
+      }
     }
   }
 

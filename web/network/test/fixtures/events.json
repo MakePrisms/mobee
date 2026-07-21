@@ -3,7 +3,7 @@
     "content": "",
     "created_at": 1784421312,
     "id": "1858f3dbfafde8205cbb920db3d59c23c9ff445693a8e0149c3b51a8fb24ff73",
-    "kind": 5109,
+    "kind": 3401,
     "pubkey": "228493830039fc67240325e2e9b79b7b7b4b530281de2147a6449c5bd306d8af",
     "sig": "eb0e3556dc059edbfb147b77ad46f106474855ee36fbea49d6c5689b91de133fef3879fded2ae4b6075224dd56dcf0f38a8d558c16e566b0a32820df24b9ece5",
     "tags": [
@@ -26,10 +26,6 @@
         "1784420712"
       ],
       [
-        "mint",
-        "https://testnut.cashudevkit.org"
-      ],
-      [
         "p",
         "6e6e2fb4d2a9896e5022140bbdbc855711b4554efbcc4afc8c297849a912028a"
       ],
@@ -39,7 +35,7 @@
       ],
       [
         "v",
-        "1"
+        "2"
       ]
     ]
   },
@@ -47,7 +43,7 @@
     "content": "",
     "created_at": 1784552815,
     "id": "9e0e212281e24e451638c6e5cef7207ce5bad1fd4a86dee175404aba8541d697",
-    "kind": 5109,
+    "kind": 3401,
     "pubkey": "be0e8548e94c19a5fc5a93af24a198c68be02c8dc7b22c22ff85325871da6e7a",
     "sig": "8a7f5521e19d4942ba2bcf0d9c3e54b4e46f79725f104f0adee272534d5353416a810852700b68506560fd8092742b626ff91d0cd3033cc5d979c9c1c0a57fff",
     "tags": [
@@ -70,10 +66,6 @@
         "1784556415"
       ],
       [
-        "mint",
-        "https://testnut.cashudevkit.org"
-      ],
-      [
         "p",
         "dcb3e1ae0d0223b15ac890680035a0d06df0522b0b2b5a9ef47e9cae34004fa1"
       ],
@@ -83,7 +75,7 @@
       ],
       [
         "v",
-        "1"
+        "2"
       ]
     ]
   },
@@ -91,7 +83,7 @@
     "content": "",
     "created_at": 1784552816,
     "id": "bff044062b30d81a6a29be315cdb39b620572c18cc6cfb01b1c1a2197d3c6d0a",
-    "kind": 7000,
+    "kind": 3402,
     "pubkey": "dcb3e1ae0d0223b15ac890680035a0d06df0522b0b2b5a9ef47e9cae34004fa1",
     "sig": "cdd27d07f1879693e8dfab2931b12db6356584b717b70c02721c3934b017b537fddd3957fde42eb138c5bfaedceaf89567d3b52cf5a50b4b8c4d61d06226d134",
     "tags": [
@@ -112,12 +104,16 @@
         "dcb3e1ae0d0223b15ac890680035a0d06df0522b0b2b5a9ef47e9cae34004fa1"
       ],
       [
+        "creq",
+        "creqAtestclaimbff04406"
+      ],
+      [
         "t",
         "mobee"
       ],
       [
         "v",
-        "1"
+        "2"
       ]
     ]
   },
@@ -125,7 +121,7 @@
     "content": "delivery commit 995d1e48579ef50dc366c12eed19b4a78a3389ec",
     "created_at": 1784552828,
     "id": "c26ea71290c42e4989383c7f2a8b7e8eff7ebb2c38810972e3db295dff5e8060",
-    "kind": 6109,
+    "kind": 3403,
     "pubkey": "dcb3e1ae0d0223b15ac890680035a0d06df0522b0b2b5a9ef47e9cae34004fa1",
     "sig": "9d26b5dc857dc449ea0f244bc5126f1987be8fb6a462df89faafdde65753493ea3d3f6e11bd8df6eec41bebd0a7614095d0d6e4351c873e8ceacc96148e1772c",
     "tags": [
@@ -216,7 +212,7 @@
       ],
       [
         "v",
-        "1"
+        "2"
       ]
     ]
   },
@@ -224,7 +220,7 @@
     "content": "",
     "created_at": 1784552837,
     "id": "3256d7637641ba51af24b57e7e2531b068fe90ebe7ac3d8365a8d9f8f256a4a9",
-    "kind": 7000,
+    "kind": 3405,
     "pubkey": "be0e8548e94c19a5fc5a93af24a198c68be02c8dc7b22c22ff85325871da6e7a",
     "sig": "4a26698851cfded5e964f66f1d5e3916b96be7b530ea3f6b964969bb416cd095b6746125365df593d0a47bf1a959aa943eb94ca2a67dd66d33a2e74507b98d26",
     "tags": [
@@ -256,7 +252,7 @@
       ],
       [
         "v",
-        "1"
+        "2"
       ]
     ]
   },
@@ -320,12 +316,16 @@
         "fork"
       ],
       [
+        "creq-hash",
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      ],
+      [
         "t",
         "mobee"
       ],
       [
         "v",
-        "1"
+        "2"
       ]
     ]
   },
@@ -342,7 +342,7 @@
     "content": "",
     "created_at": 1784575615,
     "id": "244faf681f2dbe2d5a0e9df3def4e98d0b0c1eeb9b3425d6d6abfc5e9a666621",
-    "kind": 5109,
+    "kind": 3401,
     "pubkey": "be0e8548e94c19a5fc5a93af24a198c68be02c8dc7b22c22ff85325871da6e7a",
     "sig": "55ee9737a19154c77b92de080ccbc903601155b86c274809bbe36a039471bbf945f1cb1490c0df7561f4324e0d10dc004fcf38920a2442c83f49fc3a2ec66eb7",
     "tags": [
@@ -365,10 +365,6 @@
         "1784579215"
       ],
       [
-        "mint",
-        "https://testnut.cashudevkit.org"
-      ],
-      [
         "p",
         "c0258d4988e0561eff44dd19d803ecbc603b9c5ddd22436657549d79601a0c9d"
       ],
@@ -378,7 +374,7 @@
       ],
       [
         "v",
-        "1"
+        "2"
       ]
     ]
   },
@@ -386,7 +382,7 @@
     "content": "",
     "created_at": 1784575650,
     "id": "62390cade58168e21145f82d7672b0bbb351808ff9dbd1cace129fd037f71a73",
-    "kind": 7000,
+    "kind": 3402,
     "pubkey": "c0258d4988e0561eff44dd19d803ecbc603b9c5ddd22436657549d79601a0c9d",
     "sig": "a75c9f622b576bd06b0e7a36e434653d3c479e70477fb5555fad86f7c1c6a8b97fe530f0567ee50a9011fdce2ba00cc91c8e64abc8624cd60a88f8c8da409b5f",
     "tags": [
@@ -407,12 +403,16 @@
         "c0258d4988e0561eff44dd19d803ecbc603b9c5ddd22436657549d79601a0c9d"
       ],
       [
+        "creq",
+        "creqAtestclaim62390cad"
+      ],
+      [
         "t",
         "mobee"
       ],
       [
         "v",
-        "1"
+        "2"
       ]
     ]
   },
@@ -429,7 +429,7 @@
     "content": "",
     "created_at": 1784588869,
     "id": "2951de66daeb2660bb703d9e9dc9642094ca4466b7cd4754024a5a4daa049ca2",
-    "kind": 5109,
+    "kind": 3401,
     "pubkey": "228493830039fc67240325e2e9b79b7b7b4b530281de2147a6449c5bd306d8af",
     "sig": "e8891594f91ad41ca94a528b2ddc0740f8e5e3a1ec8eba27ff67b4301ce6136e4645127c8c08cbfdc5be9fb22b19604ff57a22b015cadfe4ac064ae33511f468",
     "tags": [
@@ -452,10 +452,6 @@
         "1784599669"
       ],
       [
-        "mint",
-        "https://testnut.cashudevkit.org"
-      ],
-      [
         "p",
         "6e6e2fb4d2a9896e5022140bbdbc855711b4554efbcc4afc8c297849a912028a"
       ],
@@ -465,7 +461,7 @@
       ],
       [
         "v",
-        "1"
+        "2"
       ],
       [
         "job-class",
@@ -491,7 +487,7 @@
     "content": "",
     "created_at": 1784588870,
     "id": "1e1b95ae70c47f6813fa5d58eb9255ce42c35a615866aed991f5f6b03ace6742",
-    "kind": 7000,
+    "kind": 3402,
     "pubkey": "6e6e2fb4d2a9896e5022140bbdbc855711b4554efbcc4afc8c297849a912028a",
     "sig": "19087420548146af393582ea79ba17395b8dfc45115f3a0abda15472138c5cbe7562b75c500564e5123f33f817af32849525a007be1770f0115cde4f966d093c",
     "tags": [
@@ -512,12 +508,16 @@
         "6e6e2fb4d2a9896e5022140bbdbc855711b4554efbcc4afc8c297849a912028a"
       ],
       [
+        "creq",
+        "creqAtestclaim1e1b95ae"
+      ],
+      [
         "t",
         "mobee"
       ],
       [
         "v",
-        "1"
+        "2"
       ]
     ]
   },
@@ -525,7 +525,7 @@
     "content": "",
     "created_at": 1784590296,
     "id": "6b6d07820e0df4545001d707f094950c6d62149571a79419da5685ca830bfd6c",
-    "kind": 7000,
+    "kind": 3404,
     "pubkey": "6e6e2fb4d2a9896e5022140bbdbc855711b4554efbcc4afc8c297849a912028a",
     "sig": "90776d88db506dffeb03fa5b634ce7d4941de1b0873997499d3606fe575f9b8c508c070710a874173e77c7e35659557d6b23c9266473f814e6f423d684d33711",
     "tags": [
@@ -551,7 +551,7 @@
       ],
       [
         "v",
-        "1"
+        "2"
       ]
     ]
   },
@@ -578,11 +578,11 @@
       ],
       [
         "k",
-        "5109"
+        "3401"
       ],
       [
         "k",
-        "6109"
+        "3403"
       ]
     ]
   },
@@ -600,11 +600,11 @@
       ],
       [
         "k",
-        "5109"
+        "3401"
       ],
       [
         "k",
-        "6109"
+        "3403"
       ]
     ]
   },
@@ -631,11 +631,11 @@
       ],
       [
         "k",
-        "5109"
+        "3401"
       ],
       [
         "k",
-        "6109"
+        "3403"
       ]
     ]
   },
@@ -643,7 +643,7 @@
     "content": "",
     "created_at": 1784595164,
     "id": "7077f31862b1e7d87baef35aaec462785fa2d556837206dc66d8561ff9e1bc5d",
-    "kind": 5109,
+    "kind": 3401,
     "pubkey": "228493830039fc67240325e2e9b79b7b7b4b530281de2147a6449c5bd306d8af",
     "sig": "173e8304c5936073b45e8a2536020c765e4788cc68a3bd9e46a82aa18b4527d923526ed546210fb8a94afa82ef61868a2c4e1f945ba01919c001fe19c5e26032",
     "tags": [
@@ -666,10 +666,6 @@
         "1784598764"
       ],
       [
-        "mint",
-        "https://testnut.cashudevkit.org"
-      ],
-      [
         "p",
         "4a90f038b241a39619956e6dbf3d7dbf88b657f215b7afc5476da86626814d6a"
       ],
@@ -679,7 +675,7 @@
       ],
       [
         "v",
-        "1"
+        "2"
       ],
       [
         "job-class",
@@ -705,7 +701,7 @@
     "content": "",
     "created_at": 1784595165,
     "id": "ea82d899c6ecd7fc4c149548a9e636f329fd86700b484c77a423373a39b1bd25",
-    "kind": 7000,
+    "kind": 3402,
     "pubkey": "4a90f038b241a39619956e6dbf3d7dbf88b657f215b7afc5476da86626814d6a",
     "sig": "5ef9d0d64f233c604f2cb572ce1e4c7ce9e1611c41c135dc4f1be79fc7818d81a24a2f0fdea7ecc6668d2f9f69f5ef9e4b4d7a0ff4d921a275c74e1b4be52d8f",
     "tags": [
@@ -726,12 +722,16 @@
         "4a90f038b241a39619956e6dbf3d7dbf88b657f215b7afc5476da86626814d6a"
       ],
       [
+        "creq",
+        "creqAtestclaimea82d899"
+      ],
+      [
         "t",
         "mobee"
       ],
       [
         "v",
-        "1"
+        "2"
       ]
     ]
   },
@@ -739,7 +739,7 @@
     "content": "delivery commit 8e6411141e7a3fae26079afebf8ddf02e795b8cc",
     "created_at": 1784595205,
     "id": "0683edb4af40f5cbb02dad16de35029572486b36f1c72c16e2da7bc6bf864370",
-    "kind": 6109,
+    "kind": 3403,
     "pubkey": "4a90f038b241a39619956e6dbf3d7dbf88b657f215b7afc5476da86626814d6a",
     "sig": "cd54f54998addea9ddbcc940a0c97ff81524d5f9a81dc27d09032cc7ba972ba313a52d49977e9471d500d67300663fe3fc17adb709ef052640437d53a7f74575",
     "tags": [
@@ -825,7 +825,7 @@
       ],
       [
         "v",
-        "1"
+        "2"
       ],
       [
         "job-class",

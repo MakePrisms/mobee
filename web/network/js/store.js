@@ -66,11 +66,9 @@ export function createStore() {
           offers.set(normalized.id, normalized);
         }
         break;
-      case "feedback": {
-        const fb = normalized.feedback;
-        if (fb?.isClaim && fb.offerId) {
-          pushMap(claimsByOffer, fb.offerId, normalized);
-        }
+      case "claim": {
+        const offerId = normalized.claim?.offerId;
+        if (offerId) pushMap(claimsByOffer, offerId, normalized);
         break;
       }
       case "result": {
@@ -163,7 +161,7 @@ export function createStore() {
   function economics() {
     /** @type {any[]} */
     const rows = [];
-    // Resolve the usage a receipt's PAID job actually incurred — it lives on the kind-6109
+    // Resolve the usage a receipt's PAID job actually incurred — it lives on the kind-3403
     // RESULT the receipt settles (usage tags ride the result, not the receipt). Prefer the
     // exact result the receipt binds (its reply-tag id); else the newest result for the same
     // offer. Returns null when no result is visible → the paid row shows usage dashes.
@@ -204,7 +202,7 @@ export function createStore() {
         });
       }
     }
-    // piece-9: the seller's kind-6109 RESULT is the AUTHORITATIVE usage source (the kind-3400
+    // piece-9: the seller's kind-3403 RESULT is the AUTHORITATIVE usage source (the kind-3400
     // receipt echo is a convenience copy, and no 3400s are published on dev yet). A settled
     // trade therefore fills the dashboard from its result. Skip offers that already carry a
     // receipt row (echo stands in there) to avoid double counting; an UNTAGGED result
@@ -216,7 +214,7 @@ export function createStore() {
         rows.push({
           id: ev.id,
           created_at: ev.created_at,
-          // Only a kind-6109 result backs this row (no receipt yet) → DELIVERED, not paid.
+          // Only a kind-3403 result backs this row (no receipt yet) → DELIVERED, not paid.
           // The label MUST stay distinct so "delivered" never reads as "paid".
           source: "delivered",
           paid_price_sats: u.paid_price_sats ?? ev.result?.amount_sats ?? null,
