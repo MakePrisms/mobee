@@ -1,7 +1,7 @@
 //! Buyer wallet fund path for packaged `~/.mobee` (testnut only).
 //!
 //! Flow: mint quote → (testnut FakeWallet auto-marks paid) → mint.
-//! The wallet mint is the configured mint ([`crate::home::MobeeConfig::default_mint`]) — issue #49.
+//! The wallet mint is the configured mint ([`crate::home::MobeeConfig::default_mint`]).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -76,7 +76,7 @@ fn sqlite_path(wallet_dir: &Path) -> std::path::PathBuf {
 /// runtime — [`open_testnut_wallet_blocking`] fails fast if a Tokio runtime is
 /// already current (no nested `block_on` panic).
 pub async fn open_testnut_wallet_async(home: &MobeeHome) -> Result<Wallet, FundError> {
-    // Issue #49: the wallet opens at the CONFIGURED mint (`MobeeConfig::default_mint`), the same
+    // The wallet opens at the CONFIGURED mint (`MobeeConfig::default_mint`), the same
     // source of truth the pay path resolves the realized mint from — no compile-time pin. A
     // malformed mint URL fails closed inside `Wallet::new`.
     let secret = home::read_secret_key_hex(home)?;
@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(a.len(), 64);
     }
 
-    // Issue #49: the wallet opens at the CONFIGURED mint, not a compile-time pin — a buyer
+    // The wallet opens at the CONFIGURED mint, not a compile-time pin — a buyer
     // configured at a non-default mint spends from that mint (no `MintPinned` refusal).
     #[test]
     fn wallet_opens_at_the_configured_mint() {

@@ -1,4 +1,4 @@
-//! MCP / CLI pay entry: BudgetGate → piece-6 [`PaymentService::run`] only.
+//! MCP / CLI pay entry: BudgetGate → [`PaymentService::run`] only.
 //!
 //! By construction the delivery verifier is [`PayPathDeliveryVerifier`] (allowlist sealed).
 //! Stable [`PaymentKey::attempt_id`] feeds `run()`'s reconcile saga — no bespoke pay path,
@@ -40,38 +40,36 @@ pub struct AuthorizePayRequest {
     pub repo: String,
     pub branch: String,
     pub commit_oid: String,
-    /// Seller schnorr signature (hex) over the piece-9 receipt preimage — read from the
+    /// Seller schnorr signature (hex) over the receipt preimage — read from the
     /// accepted result's `sig/seller` tag. Empty ⇒ the buyer cannot co-sign a valid
     /// receipt (the receipt authority fails closed at publish).
     pub seller_signature: String,
-    /// Piece-14: SHA-256 hex of the seller-authored NUT-18 payment request (`creqA…`), sourced
-    /// from the accepted claim's `creq` tag (threaded through the accept-bind). `None` for a v1
-    /// claim with no `creq` — the attempt id and receipt preimage then bind byte-identically to
-    /// before piece-14. NOT mandatory this job (A′ flips requirements); `Some` once Job C authors
-    /// the creq. Bound into the [`PaymentKey`] attempt id and the co-signed receipt preimage.
+    /// SHA-256 hex of the seller-authored NUT-18 payment request (`creqA…`), sourced
+    /// from the accepted claim's `creq` tag (threaded through the accept-bind). `None` for a
+    /// claim with no `creq` — the attempt id and receipt preimage then bind byte-identically.
+    /// Bound into the [`PaymentKey`] attempt id and the co-signed receipt preimage.
     pub creq_hash: Option<String>,
-    /// Piece-14 Job E: the seller-authored `creq`'s accepted-mint list (`m`), read off the
+    /// The seller-authored `creq`'s accepted-mint list (`m`), read off the
     /// accepted claim. The buyer pays from a mint it holds balance at that appears here; empty for
-    /// a v1 claim with no `creq` — the buyer then pays from the pinned default mint exactly as
-    /// before piece-14.
+    /// a claim with no `creq` — the buyer then pays from the pinned default mint.
     #[allow(clippy::struct_field_names)]
     pub accepted_mints: Vec<String>,
-    /// Piece-10 contribution binds. `None` ⇒ from-scratch job — EXACTLY today's path (no new
-    /// verify, byte-identical produced artifacts). `Some(..)` ⇒ the fork contribution verify-path
-    /// (custody fetch + base-from-pin + descendant + content) + the authorship tuple seam run
-    /// pre-pay, all against these buyer-controlled binds.
+    /// Contribution binds. `None` ⇒ from-scratch job (no new verify, byte-identical produced
+    /// artifacts). `Some(..)` ⇒ the fork contribution verify-path (custody fetch + base-from-pin +
+    /// descendant + content) + the authorship tuple seam run pre-pay, all against these
+    /// buyer-controlled binds.
     pub contribution: Option<ContributionPayBinds>,
 }
 
 /// Buyer-controlled contribution binds threaded from the signed offer / accept-bind into the pay
 /// path. `repo`/`branch`/`commit_oid` on the enclosing request ARE the fork (`fork_ref` + fork tip);
 /// these add the pinned target + base + the seller's authorship signature. All authority is the
-/// buyer's signed offer — never a seller echo (MUST-4).
+/// buyer's signed offer — never a seller echo.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContributionPayBinds {
     /// Pinned target owner pubkey (hex) — from the buyer's signed offer.
     pub target_owner_pubkey: String,
-    /// Pinned target clone URL — base_oid is fetched from HERE (MUST-2), never the seller echo.
+    /// Pinned target clone URL — base_oid is fetched from HERE, never the seller echo.
     pub target_clone_url: String,
     /// Base branch the exact `base_oid` lives on in the pinned target.
     pub base_branch: String,
@@ -102,7 +100,7 @@ pub enum AuthorizePayError {
     Home(String),
     Effects(String),
     /// Pre-pay seller co-signature refusal, carrying the buyer's computed preimage fields + digest
-    /// (public trade data, no secrets) so the divergent field self-identifies (#53 diagnostic).
+    /// (public trade data, no secrets) so the divergent field self-identifies (diagnostic).
     CosigRefused(String),
 }
 
@@ -159,7 +157,7 @@ impl From<PaymentWalletError> for AuthorizePayError {
 ///
 /// Spent is keyed by stable `PaymentKey::attempt_id()`: first authorize persists
 /// spent **before** `run()` (write-before-mint); a reconciled retry does not
-/// re-count. `run()` delivery-verifies first and reconciles inside the piece-6 saga.
+/// re-count. `run()` delivery-verifies first and reconciles inside the saga.
 pub fn authorize_pay(
     home: &MobeeHome,
     gate: &mut BudgetGate,
@@ -192,7 +190,7 @@ pub async fn authorize_pay_async(
     gate: &mut BudgetGate,
     request: AuthorizePayRequest,
 ) -> Result<AuthorizePayOutcome, AuthorizePayError> {
-    // D2 (both job_id and explicit forms): buyer tip-match hash is required and must
+    // Both job_id and explicit forms: buyer tip-match hash is required and must
     // equal the seller-advertised commit_oid. Never derive/default the hash from the
     // claim/result oid — caller must supply it; mismatch refuses.
     if request.delivery_integrity_hash.trim().is_empty() {
@@ -218,7 +216,7 @@ pub async fn authorize_pay_async(
     let seller_nostr = NostrPublicKey::parse(&request.seller_pubkey)
         .map_err(|error| AuthorizePayError::Input(format!("seller_pubkey: {error}")))?;
     let seller_p2pk = cashu_compressed_from_nostr(&seller_nostr)?;
-    // Piece-14 Job E + issue #49: choose the realized mint the buyer pays at from the seller's
+    // Choose the realized mint the buyer pays at from the seller's
     // `creq` `m` list, keyed off the buyer's CONFIGURED mint (same source `buyer_fund` opens the
     // spending wallet at) — never a compile-time pin.
     let mint = resolve_realized_mint(
@@ -256,7 +254,7 @@ pub async fn authorize_pay_async(
         .map_err(|error| AuthorizePayError::Home(format!("buyer key parse: {error}")))?;
     let buyer_nostr = keys.public_key();
     let authority = ReceiptAuthority {
-        // External anchors (piece-9 Item 1): buyer == the offer's author (this buyer's own
+        // External anchors: buyer == the offer's author (this buyer's own
         // key), seller == the accepted-claim seller. NEVER the receipt's own p-tags.
         buyer: buyer_nostr,
         seller: seller_nostr,
@@ -275,7 +273,7 @@ pub async fn authorize_pay_async(
     // bases and local-path fixtures fetch anonymously (git_transport gates the header on relay-git).
     let mut verifier = PayPathDeliveryVerifier::new(custody, Some(secret_hex.clone()));
 
-    // Piece-10 contribution verify-path — ALL PRE-PAY (before the budget gate ⇒ zero spend on any
+    // Contribution verify-path — ALL PRE-PAY (before the budget gate ⇒ zero spend on any
     // refusal), ALL against BUYER-CONTROLLED binds. The fork (`delivery`) is custody-fetched +
     // tip-matched, `base_oid` is fetched from the PINNED target (never the seller echo), the
     // delivery must DESCEND from base, and the content gate + buyer policy hook must pass. The
@@ -337,7 +335,7 @@ pub async fn authorize_pay_async(
         &request.seller_signature,
         contribution_bind,
     ) {
-        // #53 diagnostic: on cosig refusal, surface the buyer's EXACT computed preimage (each
+        // Diagnostic: on cosig refusal, surface the buyer's EXACT computed preimage (each
         // field + digest) so the next occurrence self-identifies which field diverged from the
         // seller-signed bytes. Public trade data only — a ReceiptPreimage carries no secret key or
         // proof material (asserted by the never-echo test). Still fail-closed: zero spend.
@@ -398,7 +396,7 @@ pub async fn authorize_pay_async(
     })
 }
 
-/// Resolve the buyer's piece-10 content policy hook (MUST-5) from `[contribution]` config, or the
+/// Resolve the buyer's content policy hook from `[contribution]` config, or the
 /// FLOOR (refuse only empty diffs) when unconfigured. Buyer-side; never seller-influenced.
 fn contribution_policy(home: &MobeeHome) -> crate::contribution::ContentPolicy {
     match &home.config.contribution {
@@ -411,14 +409,14 @@ fn contribution_policy(home: &MobeeHome) -> crate::contribution::ContentPolicy {
     }
 }
 
-/// PIECE-14 Job E buyer mint selection (§ The Lightning bridge), config-driven (issue #49).
+/// Buyer mint selection for the pay path, config-driven.
 ///
 /// `buyer_mint_url` is the mint the buyer's wallet spends from — the home config's default mint
 /// ([`crate::home::MobeeConfig::default_mint`]), the SAME source `buyer_fund` opens the wallet at.
 /// The buyer pays from a mint it holds balance at that the seller listed in its `creq` `m` array;
 /// since the buyer wallet is single-mint, that reduces to: is the buyer's configured mint listed?
 ///
-/// - **empty creq list (v1 / no creq):** pay from the buyer's configured mint.
+/// - **empty creq list (no creq):** pay from the buyer's configured mint.
 /// - **configured mint listed:** pay directly from it (the direct path).
 /// - **configured mint NOT listed:** the buyer would have to BRIDGE over Lightning
 ///   ([`crate::payment_wallet::bridge_to_accepted_mint`]). That live cross-mint path is fail-closed
@@ -430,7 +428,7 @@ fn resolve_realized_mint(
     accepted_mints: &[String],
     allow_real_mints: bool,
 ) -> Result<MintUrl, AuthorizePayError> {
-    // Real-mint fence (issue #49): the buyer's own paying mint must be admissible under the flag.
+    // Real-mint fence: the buyer's own paying mint must be admissible under the flag.
     // Default (`allow_real_mints=false`) admits only the testnut/dev allow-list; a real mint is
     // refused fail-closed before any spend unless the operator opts in.
     if !crate::home::mint_allowed(buyer_mint_url, allow_real_mints) {
@@ -460,7 +458,7 @@ fn resolve_realized_mint(
     ))))
 }
 
-/// Render a co-signed [`ReceiptPreimage`] as a single-line diagnostic (#53): the digest plus every
+/// Render a co-signed [`ReceiptPreimage`] as a single-line diagnostic: the digest plus every
 /// covered field. EVERY field here is public trade data already on the relay (offer/claim/result/
 /// receipt tags) — a `ReceiptPreimage` never holds a secret key or proof/token material — so this
 /// is safe to log/return on a cosig refusal. The never-echo test asserts no secret leaks.
@@ -497,7 +495,7 @@ fn cashu_compressed_from_nostr(key: &NostrPublicKey) -> Result<CashuPublicKey, A
 /// byte-identical to the bytes it later co-signs and publishes — the two can never drift.
 /// `delivery_kind` is derived from the typed [`Delivery`] variant (`Commit` → `"fork"`);
 /// `exec_metadata_commitment` is the empty marker (exec-metadata is seller-claimed, not
-/// co-signed — piece-9 Item 2). Field set / order matches `receipt.rs` `ReceiptPreimage`.
+/// co-signed). Field set / order matches `receipt.rs` `ReceiptPreimage`.
 fn receipt_preimage_for(
     key: &PaymentKey,
     buyer_pubkey_hex: &str,
@@ -515,22 +513,22 @@ fn receipt_preimage_for(
         delivery_integrity_hash: key.delivery_integrity_hash.as_str().to_owned(),
         delivery_kind: delivery_kind.as_str().to_owned(),
         exec_metadata_commitment: EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
-        // Piece-14: bind the seller-authored request hash the key carries, so the pre-pay tooth
-        // and the published receipt co-sign the same bytes (byte-identical when `None` — v1).
+        // Bind the seller-authored request hash the key carries, so the pre-pay tooth
+        // and the published receipt co-sign the same bytes (byte-identical when `None`).
         creq_hash: key.creq_hash.clone(),
     }
 }
 
-/// Piece-9 Item 1: build + publish the buyer-authored kind-3400 receipt for a sent
+/// Build + publish the buyer-authored kind-3400 receipt for a sent
 /// payment, and return the co-signature evidence the [`ReceiptAuthority`] verifies.
 ///
 /// The buyer reconstructs the SAME receipt preimage the seller signed at delivery (binds
-/// the trade + the delivered git object, D4; `exec_metadata_commitment` = empty marker —
+/// the trade + the delivered git object; `exec_metadata_commitment` = empty marker —
 /// exec-metadata is seller-claimed, not co-signed), counter-signs it deterministically,
 /// builds the kind-3400 with a FRESH wall-clock `created_at`, and publishes it. `receipt_id`
-/// is that 3400 event id — NOT the kind-1059 payment envelope — and is now NON-deterministic
+/// is that 3400 event id — NOT the kind-1059 payment envelope — and is NON-deterministic
 /// per publish attempt (see [`receipt_created_at`]). Empty `relay_success` is enforced
-/// fail-closed by [`ReceiptAuthority::verify`]; piece-6 recovery re-runs this publish (a fresh
+/// fail-closed by [`ReceiptAuthority::verify`]; recovery re-runs this publish (a fresh
 /// id each attempt — verify-irrelevant, never a re-sent payment).
 fn build_and_publish_receipt(
     buyer_keys: &Keys,
@@ -550,7 +548,7 @@ fn build_and_publish_receipt(
     let digest = preimage.digest_bytes();
     // Buyer counter-signature (no aux-rand): a `sig/buyer` tag that is a pure function of the
     // preimage. This makes only the co-SIGNATURE deterministic — NOT the event id, which also
-    // hashes the (now fresh) `created_at` and so differs per publish (see `receipt_created_at`).
+    // hashes the fresh `created_at` and so differs per publish (see `receipt_created_at`).
     let secp = Secp256k1::new();
     let keypair = buyer_keys.secret_key().keypair(&secp);
     let buyer_signature = secp
@@ -567,14 +565,14 @@ fn build_and_publish_receipt(
         key.job_hash.as_str(),
         seller_signature,
         &buyer_signature,
-        // Piece-14: the receipt event carries the bound request hash (absent for a v1 trade).
+        // The receipt event carries the bound request hash (absent for a trade with no creq).
         key.creq_hash.as_deref(),
         Some(gateway::ReceiptDelivery {
             integrity_hash: key.delivery_integrity_hash.as_str(),
             kind: delivery_kind.as_str(),
         }),
-        // No exec-metadata echo in this arc: the commitment is the empty marker, so echoing
-        // seller-claimed tags here would be cosmetic-only (a named follow-up).
+        // No exec-metadata echo: the commitment is the empty marker, so echoing
+        // seller-claimed tags here would be cosmetic-only.
         &[],
     );
     let builder = gateway::nostr::event_builder(&draft)
@@ -583,7 +581,7 @@ fn build_and_publish_receipt(
         .custom_created_at(receipt_created_at(&digest))
         .sign_with_keys(buyer_keys)
         .map_err(|error| EffectError::new(format!("receipt sign: {error}")))?;
-    // Non-deterministic per publish attempt now (fresh `created_at`); `receipt_id` records
+    // Non-deterministic per publish attempt (fresh `created_at`); `receipt_id` records
     // whichever id the accepted publish produced — verify-irrelevant metadata.
     let receipt_id = event.id.to_hex();
     let relay_success = publish_receipt_event(relay_url, buyer_keys, &event)?;
@@ -600,29 +598,28 @@ fn build_and_publish_receipt(
 
 /// FRESH wall-clock `created_at` for each kind-3400 receipt publish attempt.
 ///
-/// SUPERSEDES the former `deterministic_created_at`, which derived `created_at` from the
-/// preimage digest (windowed into 2023-11 .. ~2027) so a recovery republish reproduced the
-/// SAME event id — relay-native idempotency (a relay stores an event once, by id). But that
-/// digest-derived timestamp almost never fell inside a real relay's accept window (mobee-relay
-/// ≈ ±30 min of server time), so the receipt was rejected and the payment held at `Sent`
-/// forever. A fresh wall-clock timestamp satisfies the relay window, so the receipt publishes.
+/// A digest-derived `created_at` (windowed into 2023-11 .. ~2027) would reproduce the SAME
+/// event id on a recovery republish — relay-native idempotency (a relay stores an event once,
+/// by id) — but that timestamp almost never falls inside a real relay's accept window
+/// (mobee-relay ≈ ±30 min of server time), so the receipt is rejected and the payment holds at
+/// `Sent` forever. A fresh wall-clock timestamp satisfies the relay window, so the receipt
+/// publishes.
 ///
 /// DELIBERATE TRADE-OFF (a deterministic id and a fresh timestamp are mutually exclusive — the
-/// event id hashes `created_at`): the receipt event id is now NON-deterministic per attempt.
+/// event id hashes `created_at`): the receipt event id is NON-deterministic per attempt.
 /// Money-safe: [`ReceiptAuthority::verify`] never uses the id (it gates on relay acceptance +
 /// author + preimage + both schnorr co-signatures), and re-publishing a receipt never re-sends
 /// money (the send is durable at `Sent`; the reducer re-runs only the receipt leg). In the
 /// normal path the first attempt publishes and the state advances `Sent`→`ReceiptPublished`,
 /// so there is no second attempt. A duplicate (inert) kind-3400 is possible ONLY if the process
 /// crashes AFTER the relay accepts but BEFORE the WAL records `ReceiptPublished`; nothing in the
-/// money path reads kind-3400 back, so it is harmless today.
+/// money path reads kind-3400 back, so it is harmless.
 ///
-/// FOLLOW-UP (named, NOT built here — branch scribe/receipt-created-at-fix): if/when a Rust
-/// receipts-reader is added it MUST dedup on read by (author, job-hash), NOT by event id, to
-/// collapse such a duplicate — this replaces the removed relay-native id-dedup.
+/// If a Rust receipts-reader is ever added it MUST dedup on read by (author, job-hash), NOT by
+/// event id, to collapse such a duplicate — in place of relay-native id-dedup.
 ///
-/// `_digest` is accepted only for call-site parity with the superseded digest-derived form and
-/// is intentionally unused: the timestamp must track wall-clock, never the preimage.
+/// `_digest` is accepted only for call-site parity with a digest-derived form and is
+/// intentionally unused: the timestamp must track wall-clock, never the preimage.
 fn receipt_created_at(_digest: &[u8; 32]) -> Timestamp {
     Timestamp::now()
 }
@@ -634,7 +631,7 @@ fn receipt_created_at(_digest: &[u8; 32]) -> Timestamp {
 ///
 /// mobee-relay requires NIP-42 AUTH for ALL writes, so this path completes + WAITS FOR the
 /// auth handshake before `send_event_to` (mirroring the seller's `wait_for_nip42_auth`); the
-/// payment WRAP path already authenticates, only this receipt path did not. On auth
+/// payment WRAP path already authenticates, as does this receipt path. On auth
 /// timeout/failure the send is NOT reached and an empty `relay_success` is returned (never a
 /// forced success) ⇒ [`ReceiptAuthority::verify`] fails closed, the payment reducer holds at
 /// `Sent`, and the receipt republishes on recovery (a FRESH id per attempt — see
@@ -721,9 +718,9 @@ fn publish_receipt_event(
     })
 }
 
-// interim: dedup with seller_daemon::wait_for_nip42_auth (follow-up: unify after builder-2
-// lands). Inlined here to keep this money-core auth fix confined to authorize_pay.rs while a
-// concurrent worker owns seller_daemon.rs.
+// Temporary: duplicates seller_daemon::wait_for_nip42_auth. Inlined here to keep this
+// money-core auth handling confined to authorize_pay.rs while a concurrent worker owns
+// seller_daemon.rs; unify the two once that settles.
 //
 /// Drain the relay's notification stream until NIP-42 AUTH resolves. Returns `true` ONLY on
 /// [`RelayNotification::Authenticated`]; every other terminal (`AuthenticationFailed` /
@@ -758,10 +755,10 @@ mod tests {
     use crate::budget::BudgetGate;
     use crate::home::{self, DEFAULT_MINT_URL};
 
-    // A real (non-testnut) mint — admissible ONLY when `allow_real_mints` is true (issue #49).
+    // A real (non-testnut) mint — admissible ONLY when `allow_real_mints` is true.
     const REAL_MINT: &str = "https://minibits.example";
 
-    // Empty creq list (v1 / no creq) → pay from the buyer's configured mint (config-driven, #49).
+    // Empty creq list → pay from the buyer's configured mint (config-driven).
     // Default flag (false): the configured testnut/dev mint resolves.
     #[test]
     fn resolve_realized_mint_empty_creq_uses_configured_mint() {
@@ -797,7 +794,7 @@ mod tests {
         assert!(error.to_string().contains("mint_unreachable_pay"));
     }
 
-    // Issue #49 real-mint switch: a buyer configured at a real mint X is REFUSED by the fence when
+    // Real-mint switch: a buyer configured at a real mint X is REFUSED by the fence when
     // `allow_real_mints` is false (default safety posture)...
     #[test]
     fn resolve_realized_mint_real_mint_refused_by_default() {
@@ -885,7 +882,7 @@ mod tests {
             accepted_mints: Vec::new(),
             contribution: None,
         };
-        let err = authorize_pay(&home, &mut gate, request).expect_err("D2 empty");
+        let err = authorize_pay(&home, &mut gate, request).expect_err("empty tip-match hash");
         let message = err.to_string();
         assert!(
             message.contains("delivery_integrity_hash is required"),
@@ -923,13 +920,13 @@ mod tests {
             accepted_mints: Vec::new(),
             contribution: None,
         };
-        let err = authorize_pay(&home, &mut gate, request).expect_err("D2 mismatch");
+        let err = authorize_pay(&home, &mut gate, request).expect_err("tip-match mismatch");
         let message = err.to_string();
         assert!(
             message.contains("does not match seller-advertised commit_oid"),
             "unexpected error: {message}"
         );
-        assert_eq!(gate.spent(), 0, "D2 refuse must not burn spent");
+        assert_eq!(gate.spent(), 0, "tip-match refuse must not burn spent");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -950,7 +947,7 @@ mod tests {
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         // Fee-safe tiny amount (testnut fee=1 → need ≥2) within default caps.
         // Dust guard runs before delivery verify; amount=1 would false-pass this test.
-        // A VALID seller co-signature is now required to reach this point: the pre-pay tooth
+        // A VALID seller co-signature is required to reach this point: the pre-pay tooth
         // runs first, so a bad/empty sig would refuse at ZERO spend and this test would no
         // longer exercise the write-before-effect (spent==2) path it guards. Signing here lets
         // the pre-pay gate PASS, so the pay path still refuses at the ext locator AFTER spent.
@@ -1095,7 +1092,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // #53 diagnostic: on a pre-pay cosig refusal the returned error carries the buyer's computed
+    // Diagnostic: on a pre-pay cosig refusal the returned error carries the buyer's computed
     // preimage — the digest AND every covered field — so the next live occurrence self-identifies
     // the divergent field. Never-echo: the buyer secret key must not appear (a ReceiptPreimage
     // holds only public trade data).
@@ -1245,8 +1242,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // --- NIP-42 receipt auth-wait gate (the receipt-auth fix) --------------------------
-    // Smallest testable seam of the fix: the decision that gates the receipt
+    // --- NIP-42 receipt auth-wait gate --------------------------
+    // Smallest testable seam: the decision that gates the receipt
     // `send_event_to` on a confirmed relay AUTH. The full live publish is real relay I/O
     // (proven by the coordinator's live re-run); the auth-ordering / fail-closed decision
     // is pure and is asserted here (red-on-revert: defeating the gate turns the
@@ -1305,10 +1302,10 @@ mod tests {
         );
     }
 
-    // --- created_at freshness (the receipt-created-at fix) --------------------------------
+    // --- created_at freshness --------------------------------
     // The receipt event's `created_at` must be FRESH wall-clock per publish (so a real relay's
     // ±time-window accepts it), NOT derived from the preimage digest. Red-on-revert: restoring
-    // the superseded digest-derived body makes `created` land in 2023..2027 (≈1_747_303_441 for
+    // a digest-derived body makes `created` land in 2023..2027 (≈1_747_303_441 for
     // this fixed digest), OUTSIDE [before, after], and this assert FAILS.
     #[test]
     fn receipt_created_at_is_fresh_wall_clock_not_digest_derived() {

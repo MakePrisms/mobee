@@ -28,7 +28,7 @@ use crate::wallet::{TradeLock, VerifiedPayment, verify_trade_p2pk_with_connector
 
 const ATTEMPT_METADATA: &str = "mobee_attempt_id";
 
-/// Default bound for the mint-touching legs of the buyer money path (issue #48).
+/// Default bound for the mint-touching legs of the buyer money path.
 ///
 /// A live keyset/fee fetch against a dead or unroutable mint would otherwise hang
 /// past the 15s MCP tool deadline; we bound each such leg and refuse fast instead.
@@ -48,11 +48,11 @@ pub struct RetireReport {
     /// Mapped `Send(TokenCreated)` pending claims left alone (not a wedge).
     pub mapped_token_created: usize,
     /// Stranded Swap sagas rolled back after mint-truth said the reserved inputs
-    /// were all UNSPENT — the swap never executed (issue #63).
+    /// were all UNSPENT — the swap never executed.
     pub swap_rolled_back: usize,
     /// Stranded Swap sagas completed after mint-truth said the reserved inputs
     /// were all SPENT — the swap executed; inputs marked spent and outputs
-    /// re-derived from the wallet seed via NUT-13 `Wallet::restore` (issue #63).
+    /// re-derived from the wallet seed via NUT-13 `Wallet::restore`.
     pub swap_recovered: usize,
 }
 
@@ -73,7 +73,7 @@ pub enum PaymentWalletError {
         predicted_fee: Amount,
     },
     /// The configured mint could not be reached within the bounded timeout — a
-    /// dead/unroutable mint (transport failure) or an elapsed deadline (issue #48).
+    /// dead/unroutable mint (transport failure) or an elapsed deadline.
     ///
     /// The buyer money path fails fast with this instead of hanging past the MCP
     /// tool deadline. `reason` is a stable code (`mint_unreachable` for the
@@ -133,7 +133,7 @@ impl PaymentPolicy {
     /// Maps a validated offer + accepted seller into shared typed terms, at the *realized* mint
     /// the buyer actually paid at.
     ///
-    /// PIECE-14 Job E: the mint is NO LONGER read off the offer (`offer.mint_url` is dead here).
+    /// The mint is not read off the offer (`offer.mint_url` is dead here).
     /// It is the mint the buyer declared in its NUT-18 payload (`payload.mint`) — the seller pins
     /// the redeem terms to what was actually paid. `amount`/`unit` are still copied from the offer,
     /// which is exactly what the seller-authored `creq` copied (`creq.a`/`creq.u`), so checking a
@@ -183,10 +183,10 @@ impl PaymentPolicy {
     }
 }
 
-/// PIECE-14 Job E redeem guard: the paid token's mint must be one the seller advertised in its
+/// Redeem guard: the paid token's mint must be one the seller advertised in its
 /// `creq` (`∈ accepted_mints`) AND must equal the mint the buyer declared in its NUT-18 payload
 /// (`payload.mint`). A token from any other mint is refused `wrong_mint` — no swap runs, so no
-/// funds move; the buyer re-pays from a listed mint (PIECE-14 § Money-path detection).
+/// funds move; the buyer re-pays from a listed mint.
 pub fn assert_redeem_mint(
     token_mint: &MintUrl,
     payload_mint: &MintUrl,
@@ -424,7 +424,7 @@ impl<'a> CdkBuyerMint<'a> {
     }
 }
 
-/// Classified outcome of a bounded mint fee query (issue #48).
+/// Classified outcome of a bounded mint fee query.
 enum BoundedFee {
     /// Live fee read within the bound.
     Fee(Amount),
@@ -437,7 +437,7 @@ enum BoundedFee {
 
 /// A transport-class cdk error means the mint returned no HTTP response at all —
 /// connection refused, DNS/routing failure, or connect timeout: `HttpError` with
-/// no status code. These are the "configured mint is down" signals for issue #48.
+/// no status code. These are the "configured mint is down" signals.
 fn is_mint_unreachable(error: &cdk::Error) -> bool {
     matches!(error, cdk::Error::HttpError(None, _))
 }
@@ -464,7 +464,7 @@ async fn mint_input_fee_for_count_raw(
     wallet.get_keyset_count_fee(&keyset.id, proof_count).await
 }
 
-/// Live active-keyset redeem fee bounded by `timeout` (issue #48).
+/// Live active-keyset redeem fee bounded by `timeout`.
 ///
 /// A dead/unroutable mint (transport failure) or an elapsed deadline classifies as
 /// [`BoundedFee::Unreachable`] instead of hanging past the caller's MCP tool
@@ -512,7 +512,7 @@ async fn cached_input_fee_floor(
 /// Refuse amounts that cannot yield a redeemable locked token after mint input fees.
 ///
 /// Uses the N=1 floor from the live keyset (`ceil(ppk/1000)`), bounded so a dead
-/// mint refuses fast with `mint_unreachable_pay` instead of hanging (issue #48).
+/// mint refuses fast with `mint_unreachable_pay` instead of hanging.
 /// Callers that know the real input set must also gate on CDK
 /// `get_proofs_fee` / `send_fee`.
 pub async fn require_fee_safe_amount(
@@ -532,7 +532,7 @@ pub async fn require_fee_safe_amount(
 
 /// Post-time dust guard: same N=1 floor, but degrades to the cached keyset fee
 /// floor when the mint is unreachable so posting (which needs no funds) is not
-/// hard-blocked by a dead mint (issue #48).
+/// hard-blocked by a dead mint.
 ///
 /// Fail-closed: a guard that can read NO fee at all — neither live nor cached —
 /// refuses (fast, with `mint_unreachable`); it never silently skips the dust check.
@@ -646,7 +646,7 @@ pub async fn retire_eligible_incomplete_sagas(
                 report.mapped_token_created += 1;
             }
             // Swap-family sagas (proofs_reserved / swap_requested): resolve on mint
-            // truth (issue #63). A mid-swap mint outage otherwise strands these
+            // truth. A mid-swap mint outage otherwise strands these
             // forever — retire never handled them and recover_unmapped_sagas refused
             // them via its `other` arm. Resolve deletes resolvable sagas; a
             // mixed/pending/unreachable answer returns Err (fail-closed).
@@ -858,7 +858,7 @@ async fn revert_reserved_and_delete_saga(
     Ok(())
 }
 
-/// Mint-truth outcome for a stranded Swap saga's reserved INPUT proofs (issue #63).
+/// Mint-truth outcome for a stranded Swap saga's reserved INPUT proofs.
 enum SwapInputTruth {
     /// Every reserved input is UNSPENT at the mint — the swap never executed.
     AllUnspent,
@@ -900,7 +900,7 @@ fn classify_swap_inputs(
     }
 }
 
-/// Mint-truth resolution for a stranded Swap-family saga (issue #63).
+/// Mint-truth resolution for a stranded Swap-family saga.
 ///
 /// A mid-swap mint outage can leave a `swap_requested` (or `proofs_reserved`) Swap
 /// saga that `retire_eligible_incomplete_sagas` never handled and that
@@ -950,7 +950,7 @@ async fn resolve_one_swap_saga(
     Ok(())
 }
 
-/// Roll back a Swap saga whose inputs are all UNSPENT at the mint (issue #63): the
+/// Roll back a Swap saga whose inputs are all UNSPENT at the mint: the
 /// swap never executed, so restore the reserved inputs to spendable and drop the
 /// saga. TOCTOU: re-fetch and re-prove (still a Swap saga, reservation non-empty,
 /// still all-unspent at the mint) immediately before mutating.
@@ -998,7 +998,7 @@ async fn rollback_swap_saga(
     revert_reserved_and_delete_saga(wallet, saga).await
 }
 
-/// Complete a Swap saga whose inputs are all SPENT at the mint (issue #63): the
+/// Complete a Swap saga whose inputs are all SPENT at the mint: the
 /// swap executed. Re-derive the outputs from the wallet seed via NUT-13
 /// `Wallet::restore` — the only output-recovery path cdk 0.17.2 exposes publicly
 /// (the saga-scoped `restore_outputs` is crate-private) — then mark the spent
@@ -1352,7 +1352,7 @@ impl<'a> CdkSellerReceive<'a> {
 
     /// Swaps the received token at its mint before returning its redeemable amount.
     ///
-    /// PIECE-14 Job E: `accepted_mints` is the seller's advertised mint set and `payload_mint` is
+    /// `accepted_mints` is the seller's advertised mint set and `payload_mint` is
     /// the mint the buyer declared in its NUT-18 payload. The redeem guard refuses `wrong_mint`
     /// unless the token's mint is `∈ accepted_mints` AND equals `payload_mint`.
     pub async fn receive(
@@ -1386,7 +1386,7 @@ impl<'a> CdkSellerReceive<'a> {
         require_wallet_matches(self.wallet, terms)?;
         let token_mint = token.mint_url().map_err(wallet_error)?;
         let face = token.value().map_err(wallet_error)?;
-        // Job E redeem guard: token mint ∈ accepted_mints AND == payload.mint. `terms.mint` is the
+        // Redeem guard: token mint ∈ accepted_mints AND == payload.mint. `terms.mint` is the
         // realized (payload) mint the seller pinned, so `token_mint != terms.mint` below is a
         // defensive re-check of the same invariant.
         assert_redeem_mint(&token_mint, payload_mint, accepted_mints)?;
@@ -1483,8 +1483,8 @@ pub struct BridgeQuote {
     pub invoice: String,
 }
 
-/// The three cross-mint wallet operations of the buyer-side Lightning bridge (PIECE-14 § The
-/// Lightning bridge). Abstracted behind a trait so the orchestration below is exercised by a mock
+/// The three cross-mint wallet operations of the buyer-side Lightning bridge.
+/// Abstracted behind a trait so the orchestration below is exercised by a mock
 /// in `lightning_bridge` — the live cross-mint wiring cannot be validated without two reachable
 /// mints (v2 is fail-closed testnut-only), so it is deliberately not connected here (see
 /// [`bridge_to_accepted_mint`]).
@@ -1515,8 +1515,8 @@ pub trait LightningBridge {
 ///
 /// Best-effort + synchronous within the pay attempt. Any leg failing refuses `mint_unreachable_pay`
 /// with NO partial state committed — the receipt only co-signs after the seller confirms
-/// redemption, so an aborted bridge leaves no binding (PIECE-14 § The Lightning bridge, § Failure
-/// semantics). Fees on both legs come out of the buyer's balance; the seller receives exactly
+/// redemption, so an aborted bridge leaves no binding. Fees on both legs come out of the buyer's
+/// balance; the seller receives exactly
 /// `amount` at `accepted_mint`.
 pub async fn bridge_to_accepted_mint<B: LightningBridge>(
     bridge: &B,
@@ -1545,8 +1545,8 @@ pub async fn bridge_to_accepted_mint<B: LightningBridge>(
     Ok(token)
 }
 
-/// Every bridge refusal maps to the `mint_unreachable_pay` money-path reason code (PIECE-14
-/// § Failure semantics): the buyer could not fund/mint at an accepted mint, so it walks away with
+/// Every bridge refusal maps to the `mint_unreachable_pay` money-path reason code:
+/// the buyer could not fund/mint at an accepted mint, so it walks away with
 /// no payload and no binding.
 fn bridge_refuse(detail: String) -> PaymentWalletError {
     PaymentWalletError::Wallet(format!("mint_unreachable_pay: {detail}"))
@@ -1599,7 +1599,7 @@ mod tests {
 
     #[test]
     fn policy_rejects_a_realized_mint_outside_the_allowlist() {
-        // Job E: the mint is the REALIZED (payload) mint, not read off the offer. A realized mint
+        // The mint is the REALIZED (payload) mint, not read off the offer. A realized mint
         // the seller never advertised is `wrong_mint`.
         let seller = secret_key(1).public_key().to_string();
         let policy = PaymentPolicy::new([mint(MINT)]);
@@ -2137,7 +2137,7 @@ mod tests {
 
     #[tokio::test]
     async fn nut07_empty_states_refuses_retire() {
-        // Temper HIGH: states=[] previously passed refuse_if_not_all_unspent.
+        // An empty NUT-07 states list must not pass refuse_if_not_all_unspent.
         let (wallet, saga_id, proof_y) = reserved_saga_with_nut07_states(20, vec![]).await;
         assert_nut07_incomplete_refuses(&wallet, saga_id, proof_y).await;
     }
@@ -2381,7 +2381,7 @@ mod tests {
         require_amount_covers_fee(Amount::from(2), Amount::from(1)).unwrap();
     }
 
-    // Issue #48: an unroutable mint URL that refuses the TCP connect instantly, so
+    // An unroutable mint URL that refuses the TCP connect instantly, so
     // the bounded fee query returns a transport error well inside the timeout — the
     // deterministic stand-in for a down mint (no live network, no real hang wait).
     const DEAD_MINT: &str = "https://127.0.0.1:1";
@@ -2703,7 +2703,7 @@ mod tests {
         ));
     }
 
-    // PIECE-14 Job E acceptance: a payload whose mint ∉ the seller's creq `m` list is refused
+    // A payload whose mint ∉ the seller's creq `m` list is refused
     // `wrong_mint`, and the token mint must equal the payload's declared mint.
     #[test]
     fn pay_matches_creq() {
@@ -2731,7 +2731,7 @@ mod tests {
         assert!(assert_redeem_mint(&listed, &listed, &creq_mints).is_ok());
     }
 
-    // PIECE-14 Job E acceptance: the seller redeem accepts a token from a listed mint that equals
+    // The seller redeem accepts a token from a listed mint that equals
     // the payload's mint, and refuses otherwise — the guard fails BEFORE the mint swap (no funds
     // move on refusal).
     #[tokio::test]
@@ -2789,7 +2789,7 @@ mod tests {
         );
     }
 
-    // PIECE-14 Job E acceptance: with balance only at an unlisted mint, the buyer bridges over
+    // With balance only at an unlisted mint, the buyer bridges over
     // Lightning — mint-quote at a listed mint → melt (pay it) at its own mint → mint a fresh token
     // from the listed mint. Driven by a mock wallet (live cross-mint bridging is fail-closed in v2).
     #[tokio::test]
@@ -3459,7 +3459,7 @@ mod tests {
         }
     }
 
-    /// Fake mint for stranded-Swap-saga resolution (issue #63). Answers NUT-07
+    /// Fake mint for stranded-Swap-saga resolution. Answers NUT-07
     /// `/v1/checkstate` with configured input states and NUT-13 `/v1/restore` with
     /// an empty batch (no output signatures) — the existing scaffolding does not
     /// simulate a signing mint, so the AllSpent branch exercises the completion
@@ -3605,7 +3605,7 @@ mod tests {
 
     #[tokio::test]
     async fn swap_saga_all_inputs_unspent_rolls_back() {
-        // Issue #63: a stranded swap_requested saga whose reserved inputs are all
+        // A stranded swap_requested saga whose reserved inputs are all
         // UNSPENT at the mint never executed — roll it back to spendable.
         let seller = secret_key(1).public_key();
         let proof = p2pk_proof(7, seller);
@@ -3652,7 +3652,7 @@ mod tests {
 
     #[tokio::test]
     async fn swap_saga_all_inputs_spent_recovers_via_restore() {
-        // Issue #63: a stranded swap_requested saga whose reserved inputs are all
+        // A stranded swap_requested saga whose reserved inputs are all
         // SPENT at the mint executed — complete it: re-derive outputs via NUT-13
         // restore (no-op against the fake), mark inputs Spent, drop the saga.
         let seller = secret_key(1).public_key();
@@ -3700,7 +3700,7 @@ mod tests {
 
     #[tokio::test]
     async fn swap_saga_mixed_input_states_refuses() {
-        // Issue #63: a partial/mixed answer (one input Spent, one Unspent) is
+        // A partial/mixed answer (one input Spent, one Unspent) is
         // inconsistent — keep refusing fail-closed, leave the saga wedged.
         let seller = secret_key(1).public_key();
         let proof_a = p2pk_proof(4, seller);

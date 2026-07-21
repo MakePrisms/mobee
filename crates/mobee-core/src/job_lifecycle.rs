@@ -6,7 +6,7 @@
 //!   [`authorize_pay`](crate::authorize_pay) (seller / result / commit). Claims/results
 //!   themselves remain relay-truth.
 //!
-//! Local bind under `~/.mobee/jobs/<job_id>.json` is accept-state only — Gate D / D2.
+//! Local bind under `~/.mobee/jobs/<job_id>.json` is accept-state only.
 
 use std::fmt;
 use std::fs::{self, File};
@@ -50,17 +50,17 @@ pub struct PostJobRequest {
     /// Optional git delivery bind tags on the offer (repo + branch).
     pub repo: Option<String>,
     pub branch: Option<String>,
-    /// Piece-10 contribution-offer params (§ Offer shape). OPTIONAL and **ALL-OR-NOTHING**: if any
+    /// Contribution-offer params. OPTIONAL and **ALL-OR-NOTHING**: if any
     /// of these is present this is a `job-class=contribution` offer and `target_repo_owner`,
     /// `target_repo_url`, `base_branch`, `base_oid` are ALL required; absent entirely ⇒ from-scratch
-    /// (no additive tags, byte-identical to a pre-contribution offer). See
+    /// (no additive tags, byte-identical to a non-contribution offer). See
     /// [`contribution_offer_from_request`].
     pub target_repo_owner: Option<String>,
     pub target_repo_url: Option<String>,
     pub base_branch: Option<String>,
     pub base_oid: Option<String>,
     /// Positional `accepts` values; defaults to `["fork"]` when contribution params are present.
-    /// v1 supports fork only, so a supplied `accepts` MUST include `"fork"`.
+    /// Fork is the only supported delivery, so a supplied `accepts` MUST include `"fork"`.
     pub accepts: Option<Vec<String>>,
 }
 
@@ -137,7 +137,7 @@ pub struct OfferView {
     pub targeted: bool,
     pub repo: Option<String>,
     pub branch: Option<String>,
-    /// Raw `job-class` tag value (piece-10). `Some("contribution")` ⇒ a contribution offer; absent
+    /// Raw `job-class` tag value. `Some("contribution")` ⇒ a contribution offer; absent
     /// ⇒ from-scratch. Carried raw so a `contribution`-class offer whose pins failed to parse is
     /// visible as `job_class=Some, contribution=None` and REFUSED at accept (never run from-scratch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,7 +148,7 @@ pub struct OfferView {
     pub contribution: Option<ContributionOfferView>,
 }
 
-/// Serializable view of a well-formed contribution offer's pins (piece-10).
+/// Serializable view of a well-formed contribution offer's pins.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ContributionOfferView {
     pub target_owner_pubkey: String,
@@ -158,7 +158,7 @@ pub struct ContributionOfferView {
     pub accepts: Vec<String>,
 }
 
-/// Serializable view of a seller result's contribution echo + authorship signature (piece-10).
+/// Serializable view of a seller result's contribution echo + authorship signature.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ContributionResultView {
     pub target_owner_pubkey: String,
@@ -178,10 +178,9 @@ pub struct ClaimView {
     pub display_name: Option<String>,
     pub status: String,
     pub live: bool,
-    /// Piece-14: the seller-authored NUT-18 payment request (`creqA…`) string read from the
-    /// claim's `["creq", …]` tag, when present. Job C authors this tag; reading it is Job D's.
-    /// `None` for a v1 claim — the accept-bind then records no `creq_hash` and binding behaves as
-    /// before piece-14.
+    /// The seller-authored NUT-18 payment request (`creqA…`) string read from the
+    /// claim's `["creq", …]` tag, when present. `None` for a claim that carries none — the
+    /// accept-bind then records no `creq_hash` and binding behaves identically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creq: Option<String>,
 }
@@ -199,15 +198,15 @@ pub struct ResultView {
     pub commit_oid: Option<String>,
     pub amount_sats: Option<u64>,
     /// Seller schnorr signature (hex) from the result's `["sig","seller",..]` tag — the
-    /// buyer counter-signs the same piece-9 receipt preimage to co-sign the kind-3400.
+    /// buyer counter-signs the same receipt preimage to co-sign the kind-3400.
     pub seller_signature: Option<String>,
-    /// Piece-10 contribution echo + authorship signature. `Some` iff the result carries a
+    /// Contribution echo + authorship signature. `Some` iff the result carries a
     /// well-formed `job-class=contribution` echo AND a `sig/seller-contribution` tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contribution: Option<ContributionResultView>,
 }
 
-/// Local accept-bind recorded by [`accept_claim`] for authorize_pay Gate D / D2.
+/// Local accept-bind recorded by [`accept_claim`] for authorize_pay.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptedBind {
     pub job_id: String,
@@ -222,29 +221,29 @@ pub struct AcceptedBind {
     pub accept_event_id: String,
     pub accepted_at: u64,
     /// Seller schnorr signature (hex) over the receipt preimage, captured from the
-    /// accepted result's `sig/seller` tag (piece-9). Empty for legacy/pre-piece-9 results.
+    /// accepted result's `sig/seller` tag. Empty when the result carries no such tag.
     #[serde(default)]
     pub seller_signature: String,
-    /// Piece-14: SHA-256 hex of the accepted claim's seller-authored `creq` (`creqA…`) string,
+    /// SHA-256 hex of the accepted claim's seller-authored `creq` (`creqA…`) string,
     /// recorded at accept so authorize_pay binds the attempt id + receipt preimage to it. `None`
-    /// for a v1 claim that carries no `creq` — binding then behaves byte-identically to before.
+    /// for a claim that carries no `creq` — binding then behaves byte-identically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creq_hash: Option<String>,
-    /// Piece-14 Job E: the accepted claim's `creq` accepted-mint list (`m`), recorded at accept so
-    /// the buyer pay path chooses the realized mint from it. Empty for a v1 claim with no `creq`.
+    /// The accepted claim's `creq` accepted-mint list (`m`), recorded at accept so
+    /// the buyer pay path chooses the realized mint from it. Empty for a claim with no `creq`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_mints: Vec<String>,
-    /// Piece-10 contribution binds, recorded at accept when the OFFER is a contribution (authority
+    /// Contribution binds, recorded at accept when the OFFER is a contribution (authority
     /// = the buyer's signed offer; the result echo is equality-checked, never trusted). Absent ⇒
-    /// from-scratch (EXACTLY today's path).
+    /// from-scratch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contribution: Option<AcceptedContribution>,
 }
 
-/// Contribution binds captured in the accept-bind (piece-10). `target_*` / `base_*` come from the
+/// Contribution binds captured in the accept-bind. `target_*` / `base_*` come from the
 /// buyer's SIGNED offer (authority); `tuple_signature` is the seller's signed-result authorship sig
 /// from the accepted result; `custody_local_ref` is the buyer-controlled ref the fork tip is
-/// retained under (MUST-6 custody-retention; merge uses THIS, never the live fork branch).
+/// retained under (custody-retention; merge uses THIS, never the live fork branch).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptedContribution {
     pub target_owner_pubkey: String,
@@ -344,18 +343,18 @@ pub async fn post_job_async(
         }
         _ => {}
     }
-    // Piece-10: validate the optional contribution params up front (fail-closed, before the wallet
+    // Validate the optional contribution params up front (fail-closed, before the wallet
     // opens). `None` ⇒ from-scratch (no additive tags). Emission happens in `build_offer_draft`.
     let contribution = contribution_offer_from_request(&request)?;
     let deadline_unix = resolve_post_deadline(request.deadline_unix, now_unix_secs()?)?;
 
-    // F2 buyer-fix: refuse a post whose amount exceeds the per-job budget cap AT POST — a job you
+    // Refuse a post whose amount exceeds the per-job budget cap AT POST — a job you
     // can post but can never pay (authorize_pay refuses at the SAME cap) is a UX trap. Read the
     // cap from the SAME config the budget gate uses (`home.config.per_job_budget_sats`).
     assert_amount_within_budget_cap(request.amount_sats, home.config.per_job_budget_sats)?;
 
     // Dust guard: live keyset N=1 floor, fail-closed (no hardcoded fee=1). Bounded
-    // and mint-unreachable-aware (issue #48): a dead mint degrades to the cached
+    // and mint-unreachable-aware: a dead mint degrades to the cached
     // keyset fee floor, and only refuses (fast, `mint_unreachable`) when no fee can
     // be read at all — posting needs no funds, so it must not hang on a dead mint.
     #[cfg(feature = "wallet")]
@@ -410,7 +409,7 @@ fn resolve_post_deadline(
     }
 }
 
-/// F2 buyer-fix: refuse a post whose `amount_sats` exceeds the per-job budget cap. Mirrors the
+/// Refuse a post whose `amount_sats` exceeds the per-job budget cap. Mirrors the
 /// budget gate's refuse condition (`amount > per_job_cap`; see [`crate::budget`]) at POST time so a
 /// buyer never posts a job that can never be paid. At-cap and under-cap pass unchanged. The message
 /// NAMES the config key + both numbers + the remedy; it never auto-raises — the cap is a safety
@@ -431,11 +430,11 @@ fn assert_amount_within_budget_cap(
     Ok(())
 }
 
-/// Build the offer-kind offer event draft. The optional git-delivery tags **and** the piece-10
+/// Build the offer-kind offer event draft. The optional git-delivery tags **and** the
 /// contribution tags are emitted HERE so the post path and its round-trip test share ONE
 /// tag-emission seam (pure — no publish, no wallet). `contribution` is the pre-validated canonical
 /// offer from [`contribution_offer_from_request`]; `None` ⇒ from-scratch, so NO additive
-/// contribution tags are emitted (byte-identical to a pre-contribution offer).
+/// contribution tags are emitted (byte-identical to a non-contribution offer).
 fn build_offer_draft(
     request: &PostJobRequest,
     deadline_unix: u64,
@@ -478,8 +477,8 @@ fn build_offer_draft(
     Ok(draft)
 }
 
-/// Validate the OPTIONAL piece-10 contribution params on a [`PostJobRequest`] and build the
-/// canonical [`ContributionOffer`](crate::contribution::ContributionOffer) (§ Offer shape).
+/// Validate the OPTIONAL contribution params on a [`PostJobRequest`] and build the
+/// canonical [`ContributionOffer`](crate::contribution::ContributionOffer).
 ///
 /// - **Absent entirely** (no owner / url / branch / oid / accepts) ⇒ `Ok(None)` — from-scratch.
 /// - **ALL-OR-NOTHING:** if ANY contribution field is present, ALL required (owner, url, branch,
@@ -489,7 +488,7 @@ fn build_offer_draft(
 ///   [`ContributionBase`](crate::contribution::ContributionBase)), and the clone URL additionally
 ///   passes the SAME transport allowlist the pay path fetches under — `ext::`/file/ssh are refused
 ///   at POST time so a buyer never publishes an offer nobody can safely verify. `accepts` defaults
-///   to `["fork"]` and MUST include `"fork"` (v1 fork-only).
+///   to `["fork"]` and MUST include `"fork"` (fork is the only supported delivery).
 fn contribution_offer_from_request(
     request: &PostJobRequest,
 ) -> Result<Option<crate::contribution::ContributionOffer>, JobLifecycleError> {
@@ -567,7 +566,7 @@ fn contribution_offer_from_request(
     };
     if !accepts.iter().any(|a| a == ACCEPTS_FORK) {
         return Err(JobLifecycleError::Input(format!(
-            "contribution accepts must include \"fork\" (v1 supports fork only); got {accepts:?}"
+            "contribution accepts must include \"fork\" (fork is the only supported delivery); got {accepts:?}"
         )));
     }
 
@@ -646,7 +645,7 @@ pub async fn get_job_async(
     }
 }
 
-/// Accept a live claim: publish feedback-kind `accepted` and persist the pay-bind (Gate D).
+/// Accept a live claim: publish feedback-kind `accepted` and persist the pay-bind.
 /// Sync entry for CLI/tests — nested call fails fast; MCP uses [`accept_claim_async`].
 pub fn accept_claim(
     home: &MobeeHome,
@@ -716,12 +715,12 @@ pub async fn accept_claim_async(
         .ok_or_else(|| JobLifecycleError::Input("result missing job-hash".into()))?;
     let amount_sats = result.amount_sats.unwrap_or(offer.amount_sats);
 
-    // Piece-10: resolve contribution binds from the buyer's SIGNED OFFER (authority), refusing a
-    // malformed contribution offer and equality-checking the seller echo (MUST-4) — never trusting
+    // Resolve contribution binds from the buyer's SIGNED OFFER (authority), refusing a
+    // malformed contribution offer and equality-checking the seller echo — never trusting
     // the echo. From-scratch offers (no `job-class=contribution`) leave `contribution = None`.
     let contribution = resolve_accepted_contribution(offer, result, &commit_oid)?;
 
-    // Piece-14 Job E (fail-closed): a present-but-malformed creq REFUSES the accept (see
+    // Fail-closed: a present-but-malformed creq REFUSES the accept (see
     // [`accepted_mints_from_claim_creq`]).
     let accepted_mints = accepted_mints_from_claim_creq(claim.creq.as_deref())?;
 
@@ -750,13 +749,13 @@ pub async fn accept_claim_async(
         amount_sats,
         accept_event_id: accept_event_id.clone(),
         accepted_at,
-        // Capture sig/seller so authorize_pay can co-sign the receipt preimage (piece-9).
+        // Capture sig/seller so authorize_pay can co-sign the receipt preimage.
         seller_signature: result.seller_signature.clone().unwrap_or_default(),
-        // Piece-14: hash the seller-authored creq from the accepted claim (when present) so the
-        // pay path binds the attempt + receipt to the exact request the seller quoted. A v1 claim
-        // carries no creq ⇒ `None` ⇒ binding behaves as before piece-14.
+        // Hash the seller-authored creq from the accepted claim (when present) so the
+        // pay path binds the attempt + receipt to the exact request the seller quoted. A claim
+        // that carries no creq ⇒ `None` ⇒ binding behaves identically.
         creq_hash: claim.creq.as_deref().map(crate::gateway::creq_hash_hex),
-        // Piece-14 Job E: the creq's accepted-mint list (validated + parsed above, fail-closed).
+        // The creq's accepted-mint list (validated + parsed above, fail-closed).
         accepted_mints,
         contribution,
     };
@@ -768,7 +767,7 @@ pub async fn accept_claim_async(
     })
 }
 
-/// Piece-10 accept-time contribution resolution (MUST-4). Authority is the buyer's SIGNED OFFER:
+/// Accept-time contribution resolution. Authority is the buyer's SIGNED OFFER:
 /// - not a contribution offer (`job_class != contribution`) ⇒ `Ok(None)` (from-scratch);
 /// - a `contribution`-class offer whose pins failed to parse ⇒ REFUSE (fail-closed — never
 ///   silently run from-scratch);
@@ -778,10 +777,10 @@ pub async fn accept_claim_async(
 ///
 /// The recorded binds (`target_*`, `base_*`) come from the OFFER; the fork is the result's
 /// repo/branch; `custody_local_ref` is derived from the fork-tip `commit_oid`.
-/// PIECE-14 Job E (fail-closed): resolve the accepted claim's `creq` accepted-mint list (`m`).
+/// Fail-closed: resolve the accepted claim's `creq` accepted-mint list (`m`).
 ///
-/// - `None` (a true v1 claim with no creq) ⇒ empty list; the pay path then uses the pinned default
-///   mint, byte-identically to before piece-14.
+/// - `None` (a claim with no creq) ⇒ empty list; the pay path then uses the pinned default
+///   mint.
 /// - `Some(creq)` that PARSES ⇒ its `m` mints (normalized).
 /// - `Some(creq)` that does NOT parse ⇒ REFUSE. The buyer must not accept-then-pay a claim whose
 ///   payment terms it could not read; silently degrading a present-but-malformed creq to the empty
@@ -830,7 +829,7 @@ fn resolve_accepted_contribution(
                 .into(),
         )
     })?;
-    // MUST-4 equality-check: seller-echoed target/base MUST equal the buyer's signed offer.
+    // Equality-check: seller-echoed target/base MUST equal the buyer's signed offer.
     if echo.target_owner_pubkey != offer_contribution.target_owner_pubkey
         || echo.target_clone_url != offer_contribution.target_clone_url
     {
@@ -881,7 +880,7 @@ pub fn load_accepted_bind(
     Ok(Some(bind))
 }
 
-/// Refuse authorize_pay fields that disagree with a recorded accept-bind (Gate D).
+/// Refuse authorize_pay fields that disagree with a recorded accept-bind.
 pub fn assert_authorize_matches_bind(
     bind: &AcceptedBind,
     seller_pubkey: &str,
@@ -910,9 +909,9 @@ pub fn assert_authorize_matches_bind(
 }
 
 /// Build an [`AuthorizePayRequest`](crate::authorize_pay::AuthorizePayRequest) from the
-/// accept-bind + buyer-supplied tip-match (D2).
+/// accept-bind + buyer-supplied tip-match.
 ///
-/// D2 rules:
+/// Rules:
 /// - `delivery_integrity_hash` is a **required** buyer arg (never defaulted/derived from
 ///   claim feedback or result oid).
 /// - Compare it to the seller's advertised `commit_oid` and **refuse on mismatch**.
@@ -945,14 +944,14 @@ pub fn authorize_request_from_bind(
         branch: bind.branch.clone(),
         commit_oid: bind.commit_oid.clone(),
         seller_signature: bind.seller_signature.clone(),
-        // Piece-14: thread the recorded creq hash so the attempt + receipt bind the seller's
-        // request. `None` ⇒ v1 claim (today's path).
+        // Thread the recorded creq hash so the attempt + receipt bind the seller's
+        // request. `None` ⇒ a claim with no creq.
         creq_hash: bind.creq_hash.clone(),
-        // Piece-14 Job E: thread the creq's accepted-mint list so the buyer chooses the realized
-        // mint. Empty ⇒ v1 claim (pay from the pinned default mint).
+        // Thread the creq's accepted-mint list so the buyer chooses the realized
+        // mint. Empty ⇒ a claim with no creq (pay from the pinned default mint).
         accepted_mints: bind.accepted_mints.clone(),
-        // Piece-10: thread the contribution binds so authorize_pay runs the contribution
-        // verify-path + authorship seam. `None` ⇒ from-scratch (today's path).
+        // Thread the contribution binds so authorize_pay runs the contribution
+        // verify-path + authorship seam. `None` ⇒ from-scratch.
         contribution: bind.contribution.as_ref().map(|c| {
             crate::authorize_pay::ContributionPayBinds {
                 target_owner_pubkey: c.target_owner_pubkey.clone(),
@@ -967,16 +966,16 @@ pub fn authorize_request_from_bind(
 
 /// Fill an explicit-form [`AuthorizePayRequest`](crate::authorize_pay::AuthorizePayRequest) from
 /// the accept-bind so it builds the SAME co-signed receipt preimage as
-/// [`authorize_request_from_bind`] (issue #53). Call AFTER [`assert_authorize_matches_bind`].
+/// [`authorize_request_from_bind`]. Call AFTER [`assert_authorize_matches_bind`].
 ///
 /// `job_hash` feeds the receipt preimage and is taken from the bind unconditionally: it was
-/// recorded at accept from the seller's own result, so the bind is authoritative. Before this fix
-/// the explicit form kept the caller's `job_hash` arg (the only preimage field neither asserted
-/// against nor filled from the bind), so a caller whose `job_hash` diverged from the bind built a
-/// preimage the seller never co-signed and the pay refused "pre-pay seller co-signature invalid" —
-/// while the bind-first form (always using `bind.job_hash`) paid clean. `seller_signature`,
-/// `creq_hash`, `accepted_mints`, and the contribution binds fill from the bind only when the
-/// explicit caller left them empty/absent.
+/// recorded at accept from the seller's own result, so the bind is authoritative. It is the only
+/// preimage field neither asserted against nor otherwise filled from the bind, so a caller whose
+/// `job_hash` diverged from the bind would build a preimage the seller never co-signed and the pay
+/// would refuse "pre-pay seller co-signature invalid"; sourcing it from the bind keeps the explicit
+/// form byte-identical to the bind-first form. `seller_signature`, `creq_hash`, `accepted_mints`,
+/// and the contribution binds fill from the bind only when the explicit caller left them
+/// empty/absent.
 pub fn fill_explicit_request_from_bind(
     request: &mut crate::authorize_pay::AuthorizePayRequest,
     bind: &AcceptedBind,
@@ -1173,14 +1172,14 @@ pub(crate) async fn fetch_job_view_async(
         .map_err(|error| JobLifecycleError::Relay(format!("add relay: {error}")))?;
     client.connect().await;
 
-    // PIECE-14 A′: every fetch filter carries the `#t=mobee` namespace guard so a foreign event
+    // Every fetch filter carries the `#t=mobee` namespace guard so a foreign event
     // squatting a mobee kind is never returned.
     let offer_filter = Filter::new()
         .id(offer_id)
         .kind(Kind::Custom(JOB_OFFER_KIND))
         .hashtag(gateway::MOBEE_TAG);
-    // Claims (processing) and feedback (error) are now distinct kinds — fetch both so the claim
-    // view still surfaces both, as it did when they shared v1 `feedback`.
+    // Claims (processing) and feedback (error) are distinct kinds — fetch both so the claim
+    // view surfaces both.
     let feedback_filter = Filter::new()
         .kinds([
             Kind::Custom(JOB_CLAIM_KIND),
@@ -1230,7 +1229,7 @@ pub(crate) async fn fetch_job_view_async(
             targeted: parsed.as_ref().map(|p| p.is_targeted()).unwrap_or(false),
             repo: first_tag_value(&draft.tags, "repo").map(str::to_owned),
             branch: first_tag_value(&draft.tags, "branch").map(str::to_owned),
-            // Piece-10: raw job-class + parsed pins. A malformed contribution offer parses to
+            // Raw job-class + parsed pins. A malformed contribution offer parses to
             // `contribution=None` while `job_class=Some("contribution")` — accept refuses it
             // (fail-closed; never silently from-scratch).
             job_class: first_tag_value(&draft.tags, crate::contribution::TAG_JOB_CLASS)
@@ -1256,13 +1255,13 @@ pub(crate) async fn fetch_job_view_async(
             display_name: None,
             status,
             live: false,
-            // Piece-14: capture the seller-authored creq tag (Job C emits it); absent on v1 claims.
+            // Capture the seller-authored creq tag; absent on claims with no creq.
             creq: first_tag_value(&draft.tags, "creq").map(str::to_owned),
         });
     }
     claims.sort_by_key(|c| std::cmp::Reverse(c.created_at));
     // Liveness is DERIVED from `now` vs the offer deadline — a processing claim past its
-    // deadline is EXPIRED and must not read live (piece-11 behavior 3; job 0867a213).
+    // deadline is EXPIRED and must not read live.
     let offer_deadline_unix = offer.as_ref().map(|o| o.deadline_unix);
     let live_claim_id = derive_claim_liveness(&mut claims, offer_deadline_unix, now);
 
@@ -1452,7 +1451,7 @@ fn contribution_result_view(tags: &[TagSpec]) -> Option<ContributionResultView> 
     }
 }
 
-/// Value of the `["sig","seller",<hex>]` tag, if present (piece-9 co-signature capture).
+/// Value of the `["sig","seller",<hex>]` tag, if present (co-signature capture).
 fn sig_seller_value(tags: &[TagSpec]) -> Option<String> {
     tags.iter()
         .find(|tag| {
@@ -1468,11 +1467,11 @@ mod tests {
     use super::*;
     use crate::home;
 
-    // PIECE-14 Job E (fail-closed): a claim carrying a present-but-malformed creq REFUSES the
-    // accept — it does NOT silently degrade to the v1 empty/default-mint path.
+    // A claim carrying a present-but-malformed creq REFUSES the accept — it does NOT silently
+    // degrade to the empty/default-mint path.
     #[test]
     fn accept_refuses_a_present_but_unparseable_creq() {
-        // A true v1 claim (no creq) yields an empty list — no refusal.
+        // A claim with no creq yields an empty list — no refusal.
         assert!(accepted_mints_from_claim_creq(None).unwrap().is_empty());
 
         // A well-formed creq yields its `m` mints.
@@ -1499,12 +1498,11 @@ mod tests {
         );
     }
 
-    // Issue #53 (load-bearing): the explicit 9-field form (with bind-fill applied) and the
+    // Load-bearing: the explicit 9-field form (with bind-fill applied) and the
     // bind-first form must build the IDENTICAL AuthorizePayRequest over the same accept-bind —
     // identical requests ⇒ identical PaymentKey ⇒ identical co-signed receipt preimage/digest, so
-    // both forms pass the seller's pre-pay cosig. Fails on pre-fix v2 (the explicit form kept the
-    // caller's divergent job_hash); passes with fill_explicit_request_from_bind sourcing job_hash
-    // from the bind.
+    // both forms pass the seller's pre-pay cosig. `fill_explicit_request_from_bind` sources
+    // `job_hash` from the bind so the explicit form does not keep a caller's divergent job_hash.
     #[test]
     fn explicit_and_bind_forms_build_identical_request() {
         let bind = AcceptedBind {
@@ -1551,11 +1549,11 @@ mod tests {
         assert_eq!(
             explicit, from_bind,
             "explicit-form and bind-form requests must be identical so both build the same \
-             co-signed receipt preimage (issue #53)"
+             co-signed receipt preimage"
         );
     }
 
-    // Issue #53 incident diagnosis: the LIVE failure had the explicit call's job_hash BYTE-EQUAL
+    // Incident diagnosis: the LIVE failure had the explicit call's job_hash BYTE-EQUAL
     // to the bind (per the failed-run logs). Reproduce that exact shape — ALL explicit fields
     // byte-equal to the bind — and confirm the two constructed requests are identical EVEN without
     // the job_hash fix mattering. If this passes, the incident's divergence was NOT in request
@@ -1666,7 +1664,7 @@ mod tests {
         let err = authorize_request_from_bind(&bind, 1, String::new()).expect_err("empty hash");
         assert!(err.to_string().contains("delivery_integrity_hash"));
 
-        // D2: buyer-supplied hash that disagrees with seller advertised commit_oid → refuse.
+        // Buyer-supplied hash that disagrees with seller advertised commit_oid → refuse.
         let mismatch =
             authorize_request_from_bind(&bind, 1, "aa".repeat(20)).expect_err("mismatch");
         assert!(
@@ -1770,13 +1768,13 @@ mod tests {
         }
     }
 
-    // Behavior 3: a processing claim past its offer deadline surfaces as EXPIRED and is not
+    // A processing claim past its offer deadline surfaces as EXPIRED and is not
     // live. REAL claim/deadline path — a fixed `now` (injected), no relay, no wall-clock.
     #[test]
     fn processing_claim_past_deadline_is_expired_not_live() {
         let deadline = 1_700_000_000u64;
         let mut claims = vec![claim_view("orphan-claim", 100, "processing")];
-        // now well past the deadline (the 0867a213 shape: still "processing" 25 min later).
+        // now well past the deadline (still "processing" 25 min later).
         let live = derive_claim_liveness(&mut claims, Some(deadline), deadline + 1_500);
         assert_eq!(live, None, "an expired claim must never be the live claim");
         assert_eq!(
@@ -1982,7 +1980,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ── Piece-10 accept-path: contribution resolution (MUST-4 echo-equality + fail-closed) ─────
+    // ── Accept-path: contribution resolution (echo-equality + fail-closed) ─────
     fn offer_view_contribution(owner: &str, url: &str, base_branch: &str, base_oid: &str) -> OfferView {
         OfferView {
             event_id: "of".repeat(16),
@@ -2046,7 +2044,7 @@ mod tests {
         let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
         let base_oid = "77".repeat(20);
         let offer = offer_view_contribution(&"aa".repeat(32), url, "main", &base_oid);
-        // Result echoes a DIFFERENT target owner — MUST-4 equality-check refuses.
+        // Result echoes a DIFFERENT target owner — equality-check refuses.
         let result = result_view_contribution(&"bb".repeat(32), url, "main", &base_oid, "s");
         let err = resolve_accepted_contribution(&offer, &result, &"ee".repeat(20))
             .expect_err("echo target mismatch must refuse");
@@ -2160,7 +2158,7 @@ mod tests {
         assert!(contribution_offer_view(&malformed).is_none());
     }
 
-    // ── Piece-10 buyer POST-path: contribution offer params (all-or-nothing + tag emission) ─────
+    // ── Buyer POST-path: contribution offer params (all-or-nothing + tag emission) ─────
     fn contribution_post_request(
         owner: Option<&str>,
         url: Option<&str>,
@@ -2268,7 +2266,7 @@ mod tests {
         .to_event_draft();
         assert_eq!(draft, expected, "from-scratch draft must be byte-identical");
         assert!(!crate::contribution::is_contribution_tags(&draft.tags));
-        // F2: the budget guard fires ONLY over-cap and does NOT touch tag emission — a normal
+        // The budget guard fires ONLY over-cap and does NOT touch tag emission — a normal
         // within-cap post (amount 3 <= default cap 21) passes the guard, so emitted tags for a
         // normal post are unchanged (byte-identical, asserted above).
         assert!(
@@ -2362,7 +2360,7 @@ mod tests {
             None
         ))
         .is_err());
-        // accepts present but without "fork" (v1 fork-only) ⇒ refuse.
+        // accepts present but without "fork" (fork is the only supported delivery) ⇒ refuse.
         assert!(contribution_offer_from_request(&contribution_post_request(
             Some(&owner),
             Some(url),
@@ -2389,7 +2387,7 @@ mod tests {
         assert!(err.to_string().contains("refused"), "{err}");
     }
 
-    // ── F2 buyer-fix: post-time per-job budget-cap validation ───────────────────────────────────
+    // ── Post-time per-job budget-cap validation ───────────────────────────────────
     #[test]
     fn budget_cap_guard_over_cap_refuses_at_and_under_cap_pass() {
         // over-cap ⇒ refuse, naming the config key + BOTH numbers + the restart remedy.

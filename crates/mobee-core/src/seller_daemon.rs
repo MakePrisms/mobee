@@ -1,14 +1,14 @@
-//! Seller daemon state machine (freeze checklist).
+//! Seller daemon state machine.
 //!
 //! Loop:
 //! 1. Subscribe **offers + gift-wraps from START** (early pay buffered).
-//! 2. On targeted offer passing B1 rate-gate → claim feedback → journal claim (single-flight).
+//! 2. On targeted offer passing the rate-gate → claim feedback → journal claim (single-flight).
 //! 3. Run agent (`--features acp` fail-closed) → git push (allowlist+scrub) → result.
 //! 4. **Reconcile** buffered/already-received 1059 wraps against the new result.
-//! 5. B2 bind job_id(+result_id) → `terms_for_offer` → `CdkSellerReceive::receive`
+//! 5. Bind job_id(+result_id) → `terms_for_offer` → `CdkSellerReceive::receive`
 //!    (`Amount == offer.amount`) → journal receipt (`amount_received == offer.amount`).
 //!
-//! Never logs NIP-17 plaintext / tokens / key material. Observatory untouched.
+//! Never logs NIP-17 plaintext / tokens / key material.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,7 @@ static FLIGHT: AtomicBool = AtomicBool::new(false);
 /// Reaching it back-pressures new claims with a logged skip reason (never a silent drop).
 const AWAITING_PAYMENT_CAP: usize = 16;
 
-/// Item #16(c): bound on agent attempts per job. A transient agent error is retried up to
+/// Bound on agent attempts per job. A transient agent error is retried up to
 /// this many times, but only while the job deadline still has room — the retry loop never
 /// outlives the deadline (see [`run_agent_with_retry`]).
 const MAX_AGENT_ATTEMPTS: u32 = 3;
@@ -57,7 +57,7 @@ const MAX_AGENT_ATTEMPTS: u32 = 3;
 /// check fails CLOSED (skip), so a small budget is safe.
 const BACKFILL_CHECK_TIMEOUT_SECS: u64 = 5;
 
-/// Cadence (seconds) of the periodic seller wrap backfill (#57). A running daemon re-runs the
+/// Cadence (seconds) of the periodic seller wrap backfill. A running daemon re-runs the
 /// SAME stored-wrap backfill the boot path uses every this-many seconds, so an AGED relay
 /// subscription that has silently stopped delivering kind-1059 payment gift-wraps still recovers
 /// WITHOUT a restart. Field-observed: fresh subscriptions deliver a wrap within ~1 min, but a
@@ -338,7 +338,7 @@ fn reconcile_reason(liveness: ClaimLiveness) -> &'static str {
     match liveness {
         ClaimLiveness::Expired => "claim expired before daemon restart (deadline passed, unpaid)",
         ClaimLiveness::Live => {
-            "daemon restarted mid-execution; live claim released (v1 does not resume in-memory job state)"
+            "daemon restarted mid-execution; live claim released (does not resume in-memory job state)"
         }
     }
 }
@@ -372,7 +372,7 @@ impl SellerDaemon {
                 "seller accepted_mints must be non-empty".to_owned(),
             ));
         }
-        // Real-mint fence (issue #49): with `allow_real_mints=false` (default), only the
+        // Real-mint fence: with `allow_real_mints=false` (default), only the
         // testnut/dev allow-list is admissible; set `allow_real_mints=true` to admit any
         // well-formed https mint (the deliberate real-money switch).
         for mint in &home.config.accepted_mints {
@@ -552,10 +552,9 @@ impl SellerDaemon {
             return Err(DaemonError::Seller(SellerError::Io(error.to_string())));
         }
 
-        // CLAIMED visibility: before this feature the daemon claimed an offer SILENTLY (the claim
-        // was journaled but emitted no log line and no observable event — the sidecar's earliest
-        // positive signal was `delivered`). Emit the first-ever claim signal on BOTH surfaces: a
-        // stderr line (for the log-tailing sidecar) and the structured announce event.
+        // CLAIMED visibility: emit the claim signal on BOTH surfaces so a claim is observable
+        // (not merely journaled) ahead of `delivered` — a stderr line (for the log-tailing
+        // sidecar) and the structured announce event.
         eprintln!(
             "seller claimed offer job_id={} claim_id={claim_id} buyer={} amount={} deadline={}",
             intent.job_id, intent.buyer_pubkey, intent.offer.amount, intent.deadline_unix
@@ -778,12 +777,12 @@ impl SellerDaemon {
     }
 
     /// DELIVERED transition: move the PROCESSING job to `awaiting_payment` and free the
-    /// single-flight slot so new offers can be claimed while payment is pending (#15).
+    /// single-flight slot so new offers can be claimed while payment is pending.
     /// The payment binding is preserved (job_id + result_id) for [`try_apply_payment`].
     fn mark_delivered(&mut self) {
         if let Some(job) = self.active.take() {
             // `result_id` was set by `execute_active_job` on the successful publish path.
-            // #57: durably journal the delivered-but-unpaid transition so a restart rebuilds this
+            // Durably journal the delivered-but-unpaid transition so a restart rebuilds this
             // job into awaiting_payment and a stored/buffered wrap can bind + redeem. Best-effort
             // but LOUD — a failed write risks re-stranding the payment across a restart.
             if let Some(result_id) = job.result_id.as_deref() {
@@ -832,7 +831,7 @@ impl SellerDaemon {
         Ok(plan)
     }
 
-    /// #57: rebuild delivered-but-unpaid jobs (journaled `Delivery`, no `Receipt`/`Release`) into
+    /// Rebuild delivered-but-unpaid jobs (journaled `Delivery`, no `Receipt`/`Release`) into
     /// `awaiting_payment` at boot, so a backfilled or buffered payment wrap can bind and redeem.
     /// Without this, a job the offer-scan classifies "already delivered" is never re-added and its
     /// wrap buffers forever. Idempotent: skips jobs already present; respects the backlog cap. The
@@ -1112,7 +1111,7 @@ impl SellerDaemon {
         ingest_gift_wrap(self, event).await
     }
 
-    /// After publishing result: reconcile buffered wraps so early pay still lands (B2).
+    /// After publishing result: reconcile buffered wraps so early pay still lands.
     pub async fn reconcile_payments(&mut self) -> Result<Option<ReceiptOutcome>, DaemonError> {
         reconcile_after_result(self).await
     }
@@ -1160,7 +1159,7 @@ impl SellerDaemon {
         let mint = payload_mint.to_string();
         let token = received.payload.to_token();
 
-        // B2: bind BEFORE journal — wrong-job refuse (no misattribution). Matched by
+        // Bind BEFORE journal — wrong-job refuse (no misattribution). Matched by
         // construction above; kept as a defensive guard.
         if payload_job != local_job {
             return Err(DaemonError::Policy(format!(
@@ -1218,7 +1217,7 @@ impl SellerDaemon {
         )?;
 
         // Capture the delivered-PAID terminal episode. Best-effort — written AFTER the
-        // authoritative receipt above and can never fail or alter it. Seeds the retro (§ Retro).
+        // authoritative receipt above and can never fail or alter it. Seeds the retro.
         self.record_paid_episode(&job, amount_received, expected_amount);
         // COLLECTED announce: sats redeemed at the mint + receipt journaled. Emitted AFTER the
         // authoritative receipt; a sink failure can never affect the money that already landed.
@@ -1256,7 +1255,7 @@ impl SellerDaemon {
         }
 
         let seller_cfg = require_seller_config(&self.home)?.clone();
-        // Gate #10 (empty-base): stamp delivery identity into a fresh git workdir (no
+        // Empty-base: stamp delivery identity into a fresh git workdir (no
         // harness commit). Deliver only if every commit is agent-authored + non-empty tree.
         // Do NOT capture before-OID on empty / require advancement — dogfood is agent-from-empty.
         let identity = seller_git::DeliveryAgentIdentity::for_seller(&self.seller_pubkey);
@@ -1269,7 +1268,7 @@ impl SellerDaemon {
         let init_result = match &active.contribution {
             Some(contribution) => {
                 // Fork base fetch needs NIP-98 auth for relay-git reads — same seller key the
-                // push path reads below (:879). Kept local to this arm so the anonymous
+                // push path reads below. Kept local to this arm so the anonymous
                 // empty-base path is untouched; fetch itself gates auth to relay-git targets.
                 let fork_auth = seller_git::PushAuth {
                     secret_key_hex: home::read_secret_key_hex(&self.home)?,
@@ -1298,7 +1297,7 @@ impl SellerDaemon {
             return Err(error.into());
         }
         let run_started = std::time::Instant::now();
-        // Item #16(e): the daemon OWNS delivery — append explicit, secret-free instructions so
+        // The daemon OWNS delivery — append explicit, secret-free instructions so
         // the agent commits its deliverable to git (the daemon pushes it) instead of guessing.
         // Read-on-start: inline the MEMORY.md index when memory is enabled (byte-identical
         // prompt when disabled).
@@ -1308,7 +1307,7 @@ impl SellerDaemon {
             &seller_cfg.git_remote,
             memory_section.as_deref(),
         );
-        // Item #16(c): retry a transient agent error while the deadline still has room. The
+        // Retry a transient agent error while the deadline still has room. The
         // feedback-kind error (fail_active, below) is published only after the attempt budget or
         // the deadline is spent — a transient failure never burns the claim early.
         let run_result = run_agent_with_retry(
@@ -1316,7 +1315,7 @@ impl SellerDaemon {
             MAX_AGENT_ATTEMPTS,
             now_unix,
             |_attempt| {
-                // Item #16(b): each attempt runs under the job's *remaining* deadline, not a
+                // Each attempt runs under the job's *remaining* deadline, not a
                 // hardcoded 300s.
                 let job_timeout = unified_job_timeout(active.deadline_unix, now_unix());
                 run_agent_job(
@@ -1393,9 +1392,9 @@ impl SellerDaemon {
         // The seller signs the RECEIPT PREIMAGE (binds the trade + the
         // delivered git object, D4) — not the bare job-hash. The buyer reconstructs this
         // exact preimage and co-signs it. `exec_metadata_commitment` is the empty marker:
-        // exec-metadata is NOT covered by the co-signature (Item 2, seller-claimed).
+        // exec-metadata is NOT covered by the co-signature (seller-claimed).
         // Derive the delivery discriminator from the SAME typed `Delivery` the buyer's pay path
-        // uses (was a `DeliveryKind::Fork` hardcode) so both sides agree by construction ("fork").
+        // uses (rather than a `DeliveryKind::Fork` hardcode) so both sides agree by construction ("fork").
         let delivery_kind = seller_delivery_kind(&seller_cfg.git_remote, &branch, &commit)?;
         // Bind the seller-authored `creq` into the receipt so BOTH co-signatures
         // commit to the payment terms the seller published. The creq is reconstructed from the
@@ -1594,7 +1593,7 @@ impl SellerDaemon {
                 return None;
             }
         };
-        // Seed the retro with the episode + the ABSOLUTE transcript path (§ Retro: fresh turn
+        // Seed the retro with the episode + the ABSOLUTE transcript path (fresh turn
         // seeded with episode + transcript_ref; the transcript is a pointer, never copied).
         let episode_json = serde_json::to_string_pretty(&episode).unwrap_or_default();
         let transcript_abs = episode
@@ -1960,8 +1959,8 @@ fn seller_delivery_kind(
 /// Token / model / cost tags are appended **only where the driver surfaced them**
 /// (absent-stays-absent, never zero-filled — a fabricated `0` is worse than a rendered dash).
 /// `total` = `input + output + reasoning` (locked rule); cache siblings are evidence and are
-/// NEVER summed into `total`. When `usage` is `None` the block is exactly the pre-plumbing
-/// four tags — legacy/no-capture trades stay honestly dashed.
+/// NEVER summed into `total`. When `usage` is `None` the block is exactly the four base
+/// tags — no-capture trades stay honestly dashed.
 fn seller_exec_metadata(
     agent_command: &[String],
     agent_preset: Option<&str>,
@@ -2025,8 +2024,8 @@ fn seller_exec_metadata(
 /// The configured **preset label** (`claude`|`cursor`|`codex`, [`SellerConfig::agent`]) is the
 /// authoritative harness/adapter identity and is preferred over argv inspection: presets launch
 /// the ACP adapter via `npx <adapter-package>` (argv0 = `npx`), so an argv0-naive id emitted
-/// `npx` — which the observatory (`harnessFamilyFromId`) maps to `harness_family="other"`, hiding
-/// real claude/codex/cursor jobs on the dashboard. When no preset label is present (raw
+/// `npx` — which a downstream harness-family classifier maps to `harness_family="other"`, hiding
+/// real claude/codex/cursor jobs. When no preset label is present (raw
 /// `--agent-argv` power-user hatch) fall back to scanning the FULL adapter argv (not just argv0):
 /// the adapter package name (e.g. `@agentclientprotocol/claude-agent-acp`) still carries the
 /// family. Unknown ⇒ the command basename + the conservative `side-channel`.
@@ -2077,7 +2076,7 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Item #16(b): the ONE coherent job timeout. The ACP driver's idle/response timeout is
+/// The ONE coherent job timeout. The ACP driver's idle/response timeout is
 /// derived from the job's own deadline (`--job-timeout-secs` → offer deadline → default, via
 /// [`job_deadline_unix`]) so a job has a single predictable deadline. Before this the driver
 /// used a hardcoded 300s idle-timeout that silently conflicted with `--job-timeout-secs`
@@ -2088,14 +2087,14 @@ fn unified_job_timeout(deadline_unix: u64, now_unix: u64) -> Duration {
     Duration::from_secs(deadline_unix.saturating_sub(now_unix))
 }
 
-/// Item #16(c): run the agent with bounded retries that stay WITHIN the job deadline.
+/// Run the agent with bounded retries that stay WITHIN the job deadline.
 ///
 /// A transient agent error is retried until either the attempt budget (`max_attempts`) is
 /// spent OR the deadline (`deadline_unix`, checked against injected `now`) passes. The error
 /// is surfaced to the caller — which then publishes the feedback-kind error exactly once — ONLY
 /// after one of those limits is reached. This stops a transient failure from immediately
-/// burning the claim while the deadline still has room (job 0867a213 failed where 4d982c54
-/// paid). `run` is invoked with the 1-based attempt number and awaited to completion before
+/// burning the claim while the deadline still has room. `run` is invoked with the 1-based
+/// attempt number and awaited to completion before
 /// any retry, so attempts never overlap.
 async fn run_agent_with_retry<F, Fut>(
     deadline_unix: u64,
@@ -2120,7 +2119,7 @@ where
     }
 }
 
-/// Item #16(e): daemon-owned delivery. The daemon appends explicit, secret-free delivery
+/// Daemon-owned delivery. The daemon appends explicit, secret-free delivery
 /// instructions to the agent's task prompt so the agent delivers by committing its work to
 /// the git repository in its working directory — rather than guessing a delivery channel.
 /// The daemon performs the authenticated push of the committed branch to the bound remote
@@ -2322,7 +2321,7 @@ async fn run_agent_job(
     if agent_command.is_empty() {
         return Err(DaemonError::Config("agent_command empty".into()));
     }
-    // Item #16(b): the ACP idle/response timeout IS the unified job timeout — never a
+    // The ACP idle/response timeout IS the unified job timeout — never a
     // hardcoded 300s that could override or conflict with `--job-timeout-secs`.
     let mut driver = AcpDriver::new(
         AgentCommand::new(agent_command[0].clone(), agent_command[1..].to_vec()),
@@ -2443,7 +2442,7 @@ pub async fn ingest_gift_wrap(
     event: &nostr_sdk::Event,
 ) -> Result<Option<ReceiptOutcome>, DaemonError> {
     let event_id = event.id.to_hex();
-    // #57: log EVERY wrap the seller sees — silence must mean "no wraps", never "lost money".
+    // Log EVERY wrap the seller sees — silence must mean "no wraps", never "lost money".
     // The applied case logs a receipt at the caller; the not-ours / buffered cases log here.
     eprintln!("seller wrap seen event={event_id}");
     let Some(received) = unwrap_own_payment_gift_wrap(&daemon.keys, event).await? else {
@@ -2467,7 +2466,7 @@ async fn try_apply_or_buffer(
     received: ReceivedPayment,
 ) -> Result<ApplyResult, DaemonError> {
     let payload_job = received.payload.job_id().to_owned();
-    // #57: an already-receipted job's wrap is a re-see of consumed money (idempotent) — skip it,
+    // An already-receipted job's wrap is a re-see of consumed money (idempotent) — skip it,
     // do NOT buffer it forever. The journal pay-once guard is the source of truth.
     if daemon.journal.has_receipt(&payload_job).unwrap_or(false) {
         eprintln!(
@@ -2511,7 +2510,7 @@ async fn try_apply_or_buffer(
     }
 }
 
-/// Reconcile buffered payments after result publish (B2 early-pay). Applies every buffered
+/// Reconcile buffered payments after result publish (early-pay). Applies every buffered
 /// wrap that now binds a delivered job; leaves the rest buffered. Returns the last receipt.
 pub async fn reconcile_after_result(
     daemon: &mut SellerDaemon,
@@ -2744,10 +2743,10 @@ fn offer_subscription_filters(
 /// Each element is ONE long-lived subscription — a single NIP-01 `REQ` whose filters the relay
 /// OR-matches. The offer filters are grouped into ONE subscription: the pinned (`#p` ==
 /// self) filter AND — under `claim_open_pool` — the un-pinned open-pool filter ride the SAME
-/// `REQ`. This grouping is load-bearing: an earlier half-fix registered the un-pinned filter as
-/// a SEPARATE second subscription, which delivered stored events (backfill) but no LIVE offers —
-/// a running open-pool seller never reacted to a fresh untargeted offer, only claiming it after
-/// a restart re-fetched it from stored events. Callers MUST subscribe each group as one `REQ`
+/// `REQ`. This grouping is load-bearing: registering the un-pinned filter as a SEPARATE second
+/// subscription delivers stored events (backfill) but no LIVE offers — a running open-pool seller
+/// would never react to a fresh untargeted offer, claiming it only after a restart re-fetched it
+/// from stored events. Callers MUST subscribe each group as one `REQ`
 /// (one `pool().subscribe(filters, ..)` call), never one subscription per filter.
 fn offer_subscriptions(
     seller_pubkey: nostr_sdk::PublicKey,
@@ -2765,7 +2764,7 @@ fn offer_subscriptions(
 
 /// The seller's kind-1059 payment (gift-wrap) filter: p-tagged to the seller, **NO `t=mobee`
 /// hashtag**. NIP-59 gift-wraps are opaque and CANNOT carry a namespace tag, so a hashtag filter
-/// here would match zero wraps and silently strand real payments (#57). This is the tag-free
+/// here would match zero wraps and silently strand real payments. This is the tag-free
 /// invariant the regression test pins; it is used for BOTH the live subscription and the boot
 /// backfill.
 fn wrap_subscription_filter(seller_pubkey: nostr_sdk::PublicKey) -> nostr_sdk::Filter {
@@ -2902,7 +2901,7 @@ fn resolve_wrap_backfill_interval_secs() -> u64 {
 /// ([`ingest_gift_wrap`] → `try_apply_or_buffer`: already-receipted wraps skip, already-redeemed
 /// refuse at the mint, unverifiable buffer — all existing money guards, unchanged).
 ///
-/// Shared by the #57 BOOT backfill (recovery on restart) and the #57 PERIODIC backfill (recovery
+/// Shared by the BOOT backfill (recovery on restart) and the PERIODIC backfill (recovery
 /// for a RUNNING daemon whose aged relay subscription silently stopped delivering wraps). The
 /// `since` cursor and filter are identical on both paths; a fresh short-lived REQ (`fetch_events`)
 /// is what recovers the aged-subscription case. Timeout-bounded + log-and-continue: a slow or
@@ -3015,8 +3014,8 @@ pub(crate) async fn run_forever_hooked(
     };
 
     // Restart-reconcile: release any orphaned in-flight claims from a prior run BEFORE
-    // serving new offers, so a claim left live by a crash never reads "processing" forever
-    // (evidence job 0867a213). Durable via journal; feedback-kind surface is best-effort.
+    // serving new offers, so a claim left live by a crash never reads "processing" forever.
+    // Durable via journal; feedback-kind surface is best-effort.
     match daemon.reconcile_on_startup(now_unix()).await {
         Ok(plan) if !plan.is_empty() => {
             eprintln!(
@@ -3028,7 +3027,7 @@ pub(crate) async fn run_forever_hooked(
         Err(error) => eprintln!("seller reconcile failed on startup (continuing): {error}"),
     }
 
-    // #57: rebuild delivered-but-unpaid jobs into awaiting_payment BEFORE the wrap subscribe +
+    // Rebuild delivered-but-unpaid jobs into awaiting_payment BEFORE the wrap subscribe +
     // backfill, so a stored/buffered payment wrap can bind and redeem on this boot (the missing leg
     // between "wrap seen" and "collect ok"). Non-fatal on error.
     match daemon.restore_delivered_unpaid() {
@@ -3044,8 +3043,8 @@ pub(crate) async fn run_forever_hooked(
     // Offer subscription: the TARGETED filter (p-tag == seller) AND — under open-pool — the
     // BOUNDED un-pinned filter ride ONE long-lived subscription (a single REQ, OR-matched per
     // NIP-01) via `offer_subscriptions` + `pool().subscribe`. Registered as a SEPARATE second
-    // subscription (the earlier half-fix) the un-pinned filter delivered stored events (backfill)
-    // but never LIVE offers, so a running open-pool seller ignored fresh untargeted offers. Group
+    // subscription, the un-pinned filter would deliver stored events (backfill) but never LIVE
+    // offers, so a running open-pool seller would ignore fresh untargeted offers. Group
     // them into ONE REQ (`Client::subscribe` takes a single filter — one REQ per filter is the
     // bug). The event-id dedup in the loop still processes each offer exactly once. Sub id(s) are
     // captured so the Loud-Closed fallback can detect a relay CLOSE of the offer subscription.
@@ -3053,7 +3052,7 @@ pub(crate) async fn run_forever_hooked(
     // Create the notifications receiver BEFORE any REQ (offer subscribe, wrap subscribe, wrap
     // backfill). A tokio broadcast only delivers to receivers that already exist, so a stored event
     // returned by a REQ before this receiver is created would be dropped. This latent race widened
-    // once the #57 boot backfill added a network round-trip between the offer subscribe and the
+    // once the boot backfill added a network round-trip between the offer subscribe and the
     // loop — capture the receiver up front so backfilled offers/wraps are never missed.
     let mut notifications = client.notifications();
     let (claim_open_pool, offer_backfill_secs) = require_seller_config(&daemon.home)
@@ -3107,10 +3106,10 @@ pub(crate) async fn run_forever_hooked(
         let _ = ready.send(());
     }
 
-    // #57 boot backfill (recovery) — runs AFTER online/readiness so the daemon reports up promptly
+    // Boot backfill (recovery) — runs AFTER online/readiness so the daemon reports up promptly
     // and the backfill can never hide behind a hang. kind-1059 is auth-gated on mobee-relay (dark
     // kind): a REQ sent before NIP-42 completes is CLOSED `restricted:` and dropped, so the stored
-    // wrap is never served (the #57 live-acceptance failure). Confirm auth FIRST, then fetch stored
+    // wrap is never served (the live-acceptance failure). Confirm auth FIRST, then fetch stored
     // wraps p-tagged to us since the last journaled receipt and run each through the SAME redeem
     // path — idempotent via the journal pay-once guard, so it can never double-spend. A live offer
     // posted during this window is buffered in `notifications` and drained when the loop starts.
@@ -3163,7 +3162,7 @@ pub(crate) async fn run_forever_hooked(
         );
     }
 
-    // #57 periodic wrap backfill: re-run the boot stored-wrap backfill every N seconds so a
+    // Periodic wrap backfill: re-run the boot stored-wrap backfill every N seconds so a
     // running daemon whose relay subscription has aged out (silently stopped delivering kind-1059
     // wraps) recovers WITHOUT a restart. `interval_at` (not `interval`) starts one period out, so
     // the first periodic run does NOT double the boot backfill we just ran. It rides the SAME
@@ -3193,7 +3192,7 @@ pub(crate) async fn run_forever_hooked(
                 publish_heartbeat(&daemon).await;
                 continue;
             }
-            // Periodic wrap backfill tick (#57). Same idempotent redeem path as boot; a fresh REQ
+            // Periodic wrap backfill tick. Same idempotent redeem path as boot; a fresh REQ
             // recovers an aged, silently-deaf subscription. Timeout-bounded inside the helper.
             _ = wrap_backfill_interval.tick() => {
                 let count = run_wrap_backfill(
@@ -3267,7 +3266,7 @@ pub(crate) async fn run_forever_hooked(
                                 Ok(result_id) => {
                                     eprintln!("seller published result_id={result_id}");
                                     // DELIVERED: free the single-flight slot so new offers can
-                                    // be claimed while this job awaits payment (#15).
+                                    // be claimed while this job awaits payment.
                                     daemon.mark_delivered();
                                     match reconcile_after_result(&mut daemon).await {
                                         Ok(Some(receipt)) => {
@@ -3294,7 +3293,7 @@ pub(crate) async fn run_forever_hooked(
                     }
                 }
             }
-            // Loud-Closed fallback (hardening #3): the relay CLOSED a subscription. If it's the
+            // Loud-Closed fallback: the relay CLOSED a subscription. If it's the
             // grouped OFFER subscription (e.g. the relay restricts the broad open-pool filter),
             // the seller would go SILENTLY deaf to offers. LOG IT LOUDLY and degrade to the
             // TARGETED-only offer filter (`#p==self`) — which a relay that only objects to the
@@ -3371,7 +3370,7 @@ mod tests {
         ))
     }
 
-    /// #57 TEST (1) — periodic backfill CADENCE decision function. The interval is a fixed
+    /// Periodic backfill CADENCE decision function. The interval is a fixed
     /// constant in production (300s); the env seam (used only by tests) overrides it, and a
     /// `0`/unparseable value is ignored. This is the extracted `resolve_wrap_backfill_interval_secs`
     /// that lets the cadence be exercised without a live relay. Serialised against the daemon
@@ -3452,7 +3451,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Issue #49 real-mint switch: with `allow_real_mints=true` the boot fence admits a real
+    // Real-mint switch: with `allow_real_mints=true` the boot fence admits a real
     // (non-testnut) accepted_mints entry that is refused by default.
     #[test]
     fn open_admits_real_mint_when_allow_real_mints_true() {
@@ -3557,7 +3556,7 @@ mod tests {
         SellerDaemon::end_flight();
     }
 
-    // Item #16(b): the ACP timeout is unified with `--job-timeout-secs` — one deadline.
+    // The ACP timeout is unified with `--job-timeout-secs` — one deadline.
     #[test]
     fn unified_job_timeout_is_the_remaining_deadline_not_a_hardcoded_constant() {
         // The effective timeout is strictly the remaining window to the job's deadline.
@@ -3575,7 +3574,7 @@ mod tests {
         assert_eq!(unified_job_timeout(1_000, 5_000), Duration::ZERO);
     }
 
-    // Item #16(c): a transient agent error is retried WITHIN the deadline; feedback-kind is
+    // A transient agent error is retried WITHIN the deadline; feedback-kind is
     // published only after the attempt budget or the deadline is spent.
     #[tokio::test]
     async fn retry_recovers_from_a_transient_error_within_the_deadline() {
@@ -3631,7 +3630,7 @@ mod tests {
         assert_eq!(attempts.get(), 1, "no retry once the deadline has passed");
     }
 
-    // Item #16(e): the daemon appends explicit, secret-free delivery instructions.
+    // The daemon appends explicit, secret-free delivery instructions.
     #[test]
     fn composed_prompt_carries_task_and_daemon_owned_delivery_instructions() {
         let remote = "https://relay.example/git/abc.git";
@@ -3688,7 +3687,7 @@ mod tests {
 
     #[test]
     fn claude_preset_resolves_harness_family_claude_despite_npx_argv0() {
-        // Mirror the observatory reader (web/network/js/parse.js `harnessFamilyFromId`):
+        // Mirror the downstream harness-family classifier:
         // a family substring wins; present-but-unrecognized (e.g. "npx") → "other".
         fn harness_family(id: &str) -> &'static str {
             let s = id.to_ascii_lowercase();
@@ -3709,7 +3708,7 @@ mod tests {
         };
 
         // The `claude` preset launches the ACP adapter via `npx` (argv0 = "npx"). An argv0-naive
-        // id emits "npx" → harness_family "other" (the gudnuf-visible dashboard bug). The preset
+        // id emits "npx" → harness_family "other" (the dashboard bug). The preset
         // label must drive resolution to "claude-agent-acp" → family "claude".
         let npx_claude = vec![
             "/usr/bin/npx".to_string(),
@@ -3840,8 +3839,8 @@ mod tests {
         );
     }
 
-    // #57 regression: the seller's kind-1059 payment filter must match a gift-wrap that carries NO
-    // t=mobee tag. NIP-59 wraps are opaque and cannot carry a namespace tag; an A′-style hashtag
+    // Regression: the seller's kind-1059 payment filter must match a gift-wrap that carries NO
+    // t=mobee tag. NIP-59 wraps are opaque and cannot carry a namespace tag; a hashtag-namespace
     // filter here would return zero wraps and silently strand real payments.
     #[test]
     fn wrap_filter_matches_untagged_gift_wrap() {
@@ -3858,7 +3857,7 @@ mod tests {
             .expect("sign wrap");
         assert!(
             filter.match_event(&wrap, MatchEventOptions::new()),
-            "seller 1059 filter must match a p-tagged wrap that has no t=mobee tag (#57)"
+            "seller 1059 filter must match a p-tagged wrap that has no t=mobee tag"
         );
 
         // A wrap p-tagged to someone else must NOT match.
@@ -3897,10 +3896,10 @@ mod tests {
 
         // Open-pool: the offer filters are registered as EXACTLY ONE live subscription (a single
         // REQ) carrying BOTH the pinned and the (bounded) un-pinned filter, so the un-pinned
-        // filter rides the same long-lived subscription and streams LIVE offers. The half-fix
-        // registered the un-pinned filter as a SEPARATE second subscription (two subscriptions),
-        // which the relay dropped after backfill. RED-ON-REVERT: return one subscription per
-        // filter (as the half-fix did) and this `len() == 1` assertion fails.
+        // filter rides the same long-lived subscription and streams LIVE offers. Registering the
+        // un-pinned filter as a SEPARATE second subscription (two subscriptions) leaves the relay
+        // dropping it after backfill. RED-ON-REVERT: return one subscription per filter and this
+        // `len() == 1` assertion fails.
         let subs = offer_subscriptions(seller.public_key(), true, Timestamp::now(), 300);
         assert_eq!(
             subs.len(),
@@ -4065,7 +4064,7 @@ mod tests {
 
     #[test]
     fn seller_exec_metadata_emits_captured_usage_into_result_tags() {
-        use crate::driver::{UsageCost, UsageMetadata, UsageTransport};
+        use crate::driver::{UsageCost, UsageMetadata};
 
         // A tag qualified by cell index 1 (value) + cell 2 (qualifier), e.g. ["tokens","140","total"].
         let qualified = |tags: &[TagSpec], name: &str, qualifier: &str| -> Option<String> {
@@ -4090,12 +4089,11 @@ mod tests {
                 amount: "0.0123".into(),
                 basis: "harness-reported-usd".into(),
             }),
-            transport: Some(UsageTransport::AcpNative),
         };
-        // claude command would statically declare side-channel; a REAL acp-native capture wins.
+        // usage_transport is the harness's declared axis: a claude command is side-channel.
         let tags = seller_exec_metadata(&["claude".into()], None, 4321, Some(&usage));
 
-        assert_eq!(value(&tags, "usage_transport").as_deref(), Some("acp-native"));
+        assert_eq!(value(&tags, "usage_transport").as_deref(), Some("side-channel"));
         assert_eq!(value(&tags, "model").as_deref(), Some("claude-opus-4-8"));
         // total = input + output (reasoning absent = unknown, not zero); cache NOT folded in.
         assert_eq!(qualified(&tags, "tokens", "total").as_deref(), Some("140"));
@@ -4114,7 +4112,6 @@ mod tests {
         // Partial capture (output only) → NO total tag (a partial never masquerades as complete).
         let partial = UsageMetadata {
             output_tokens: Some(40),
-            transport: Some(UsageTransport::AcpNative),
             ..UsageMetadata::default()
         };
         let partial_tags = seller_exec_metadata(&["claude".into()], None, 1, Some(&partial));
@@ -4289,7 +4286,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Behavior 1 (#15): a delivered-but-unpaid job MUST NOT block claiming a new offer;
+    // Behavior 1: a delivered-but-unpaid job MUST NOT block claiming a new offer;
     // only a PROCESSING job holds single-flight, and any skip is a NAMED reason.
     #[test]
     fn delivered_unpaid_does_not_block_new_offer_but_processing_does() {
@@ -4346,7 +4343,7 @@ mod tests {
         let buyer = "cc".repeat(32);
 
         // A real journaled in-flight claim with a PAST deadline, no receipt, no release —
-        // exactly the orphaned live claim a crashed daemon leaves behind (job 0867a213).
+        // exactly the orphaned live claim a crashed daemon leaves behind.
         daemon
             .journal
             .append_claim("orphan-job", "orphan-claim", &buyer, 1_000_000_000)
@@ -4574,7 +4571,7 @@ mod tests {
     }
 
     #[test]
-    // #57: a delivered-but-unpaid job in the journal is rebuilt into awaiting_payment on boot, so a
+    // A delivered-but-unpaid job in the journal is rebuilt into awaiting_payment on boot, so a
     // stored/buffered wrap can bind and redeem. Without this the wrap buffers forever.
     #[test]
     fn restore_delivered_unpaid_rebuilds_awaiting_payment() {
@@ -4898,11 +4895,11 @@ mod tests {
 
     // ── Layer-0 episode capture ────────────────────────────────────────────────────
 
-    /// Acceptance (piece A): a delivered→paid job appends exactly ONE episode line with
+    /// A delivered→paid job appends exactly ONE episode line with
     /// `outcome=delivered_paid`, populated `result_id`/`commit_oid`/`amount_received` and a
     /// `transcript_ref` pointing at an on-disk `seller-run.jsonl`. `record_paid_episode` is the
     /// exact writer `try_apply_payment` invokes after journaling the receipt — reverting its body
-    /// drops the line (line-count 1→0), which is the piece-A red-on-revert for the paid writer.
+    /// drops the line (line-count 1→0), the red-on-revert for the paid writer.
     #[test]
     fn paid_episode_writer_appends_one_complete_delivered_paid_line() {
         let (root, daemon) = test_daemon("ep-paid");
@@ -4953,11 +4950,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Acceptance (piece A): a refused offer appends exactly one `episode_kind=refused` episode
+    /// A refused offer appends exactly one `episode_kind=refused` episode
     /// with a non-empty `refusal_reason_code` matching the `OfferSkip` variant, AND the money-path
     /// `seller-journal.jsonl` is byte-unchanged (episodes are a separate stream) and still parses
     /// green. Drives the real daemon writer via `on_offer_event` → reverting the
-    /// `record_refused_episode` call drops the line (piece-A red-on-revert for the refused writer).
+    /// `record_refused_episode` call drops the line (red-on-revert for the refused writer).
     #[tokio::test]
     async fn refused_offer_appends_one_refused_episode_and_leaves_journal_untouched() {
         let (root, mut daemon) = test_daemon("ep-refused");
@@ -5020,11 +5017,11 @@ Anything not committed to git will not be delivered.";
         assert_eq!(
             compose_agent_prompt("build a widget", remote, None),
             expected,
-            "disabled-memory prompt must be byte-identical to the pre-piece-13 golden"
+            "disabled-memory prompt must be byte-identical to the golden"
         );
     }
 
-    /// Acceptance (piece B): memory_enabled=false ⇒ the daemon produces NO read-on-start section
+    /// memory_enabled=false ⇒ the daemon produces NO read-on-start section
     /// and does not even create the memory dir.
     #[tokio::test]
     async fn disabled_memory_yields_no_section_and_no_dir() {
@@ -5038,7 +5035,7 @@ Anything not committed to git will not be delivered.";
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Acceptance (piece B): with memory enabled and a non-empty index, the composed prompt
+    /// With memory enabled and a non-empty index, the composed prompt
     /// contains the index text and the absolute memory path; and first use seeds operator-notes.md
     /// stamped author: operator.
     #[tokio::test]
@@ -5067,7 +5064,7 @@ Anything not committed to git will not be delivered.";
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Acceptance (piece B): the read-on-start template seam overrides the in-repo default when
+    /// The read-on-start template seam overrides the in-repo default when
     /// `read_on_start_template_path` is set (daemon path).
     #[tokio::test]
     async fn read_on_start_template_seam_used_by_daemon() {
@@ -5170,7 +5167,7 @@ Anything not committed to git will not be delivered.";
             .expect("append paid episode");
     }
 
-    /// Acceptance (piece C): a completed job triggers exactly ONE extra agent turn (carrying the
+    /// A completed job triggers exactly ONE extra agent turn (carrying the
     /// retro prompt) and `MEMORY.md` exists afterward. The turn's session cwd is the memory dir
     /// (set by `run_retro_turn`; the merge-not-clobber test below depends on that cwd's writes).
     #[tokio::test]
@@ -5204,7 +5201,7 @@ Anything not committed to git will not be delivered.";
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Acceptance (piece C): with retro_enabled=false no retro is planned (no extra turn issued).
+    /// With retro_enabled=false no retro is planned (no extra turn issued).
     #[test]
     fn retro_disabled_plans_nothing() {
         let (root, mut daemon) = test_daemon("retro-off");
@@ -5217,7 +5214,7 @@ Anything not committed to git will not be delivered.";
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Acceptance (piece C): the retro plan is seeded with the episode (JSON) + the ABSOLUTE
+    /// The retro plan is seeded with the episode (JSON) + the ABSOLUTE
     /// transcript path, uses the default framing (which instructs `author: agent` + never touch
     /// operator files), and honors the retro_prompt_path seam. No paid episode ⇒ no plan.
     #[test]
@@ -5251,7 +5248,7 @@ Anything not committed to git will not be delivered.";
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Acceptance (piece C): a retro forced to fail surfaces an error the caller swallows, and the
+    /// A retro forced to fail surfaces an error the caller swallows, and the
     /// MONEY path is green — the journal (a real claim+receipt) is byte-unchanged and still parses.
     #[tokio::test]
     async fn retro_failure_leaves_money_path_green() {
@@ -5283,9 +5280,9 @@ Anything not committed to git will not be delivered.";
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Acceptance (piece C): merge-not-clobber across a retro RUN. An agent that clobbers an
+    /// Merge-not-clobber across a retro RUN. An agent that clobbers an
     /// `author: operator` file mid-turn is byte-reverted by `run_retro_turn`. Reverting the
-    /// restore leaves the file HIJACKED — the piece-C red-on-revert target.
+    /// restore leaves the file HIJACKED — the red-on-revert target.
     #[tokio::test]
     async fn retro_run_reverts_operator_clobber() {
         let root = temp("retro-merge");
@@ -5323,7 +5320,7 @@ Anything not committed to git will not be delivered.";
 
     // ── GATE-RED regression: the daemon must not go deaf to kind-1059 payments ────────────────
 
-    /// Root-cause guard #1 (deaf-daemon): a broadcast LAG must NOT terminate the event loop.
+    /// Deaf-daemon guard: a broadcast LAG must NOT terminate the event loop.
     /// Before the fix, `while let Ok(..) = recv().await` ended the loop on `Lagged`, so a seller
     /// that fell behind during a long agent turn went silently deaf to ALL further offers and
     /// kind-1059 payments (wraps parked, never collected) until restart. Reverting the fix
@@ -5400,7 +5397,7 @@ Anything not committed to git will not be delivered.";
         }
     }
 
-    /// Root-cause guard #2 (retro must not block the loop): a retro turn runs to completion on a
+    /// Retro-must-not-block-the-loop guard: a retro turn runs to completion on a
     /// DETACHED thread, so the caller (the event loop) is not blocked for the retro's duration.
     /// This is exactly the pattern `maybe_run_retro` now uses (own thread + own runtime). Before
     /// the fix the retro ran inline via `.await`, blocking wrap collection for the whole turn.
@@ -5648,7 +5645,7 @@ mod local_relay_it {
         })
     }
 
-    /// Like [`spawn_daemon_thread`] but also wires the PERIODIC wrap-backfill hook, so the #57
+    /// Like [`spawn_daemon_thread`] but also wires the PERIODIC wrap-backfill hook, so the
     /// periodic tests can observe each periodic run's stored-1059 count without scraping stderr.
     fn spawn_daemon_thread_with_backfill_hook(
         daemon: SellerDaemon,
@@ -5769,7 +5766,7 @@ mod local_relay_it {
         relay.shutdown();
     }
 
-    // ── #57: boot backfill retrieves a stored kind-1059 without wedging the daemon ───────────
+    // ── Boot backfill retrieves a stored kind-1059 without wedging the daemon ───────────
     // A stored gift-wrap p-tagged to the seller (the stranded-payment shape) is seeded BEFORE boot.
     // The reordered boot backfill (after online/readiness, auth-confirmed, hard-capped) must fetch
     // and ingest it, reach READY, and keep processing LIVE offers. Proves the recovery path runs
@@ -5846,7 +5843,7 @@ mod local_relay_it {
         relay.shutdown();
     }
 
-    // ── #57 TEST (2): a wrap stored AFTER boot is picked up by a PERIODIC backfill run ────────
+    // ── A wrap stored AFTER boot is picked up by a PERIODIC backfill run ────────
     // The field bug: a live-but-AGED relay subscription silently stops delivering kind-1059 wraps,
     // so a payment sent to a running daemon sits unredeemed until restart. The fix is a periodic
     // timer that re-runs the boot stored-wrap backfill. TESTABILITY (honest): the in-process relay
@@ -5918,7 +5915,7 @@ mod local_relay_it {
         relay.shutdown();
     }
 
-    // ── #57 TEST (3): repeated periodic runs stay idempotent and never wedge the loop ─────────
+    // ── Repeated periodic runs stay idempotent and never wedge the loop ─────────
     // A stored wrap seeded BEFORE boot is re-seen by EVERY periodic run. Each run re-ingests it
     // through the SAME guarded, idempotent path (`ingest_gift_wrap` → `try_apply_or_buffer`:
     // journal pay-once / mint-refuse — money guards unchanged and covered by the money-path tests;
@@ -6343,7 +6340,7 @@ mod local_relay_it {
         seller_hex: &str,
     ) -> nostr_sdk::EventId {
         let offer = OfferDraft::new(
-            "improve the forge repo",
+            "improve the repo",
             "text/plain",
             10,
             now_unix() + 3_600,
@@ -6353,7 +6350,7 @@ mod local_relay_it {
         let contribution = crate::contribution::ContributionOffer {
             target: crate::contribution::TargetRepoPin::new(
                 "aa".repeat(32),
-                "https://mobee-relay.orveth.dev/git/forge/repo.git",
+                "https://mobee-relay.orveth.dev/git/owner/repo.git",
             )
             .unwrap(),
             base: crate::contribution::ContributionBase::new("main", "77".repeat(20)).unwrap(),

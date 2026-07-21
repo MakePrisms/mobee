@@ -21,9 +21,9 @@ use crate::wallet::VerifiedPayment;
 
 const ATTEMPT_DOMAIN: &[u8] = b"mobee/v1/payment-attempt";
 
-/// Nostr event kind of a piece-9 co-signed settlement receipt. Stamped on
-/// [`ReceiptRecord`] so a consumer discriminates a real receipt from a legacy
-/// (kind-1059-aliased) record with a LOCAL check — never "missing id".
+/// Nostr event kind of a co-signed settlement receipt. Stamped on
+/// [`ReceiptRecord`] so a consumer discriminates a real receipt from a record
+/// with no `receipt_kind` field (kind-1059-aliased) with a LOCAL check — never "missing id".
 // The co-signed receipt kind — the single registry lives in `crate::kinds`.
 use crate::gateway::JOB_RECEIPT_KIND as RECEIPT_EVENT_KIND;
 
@@ -128,9 +128,10 @@ impl AttemptId {
         hash_field(&mut hasher, &key.amount.to_string());
         hash_field(&mut hasher, &key.unit.to_string());
         hash_field(&mut hasher, &key.mint.to_string());
-        // Piece-14: fold the seller-authored creq hash ONLY when present, so a v1 claim (no creq
-        // ⇒ `None`) reconciles to byte-identical AttemptIds as before this change — existing
-        // in-flight journals keep resolving. A v2 claim (`Some`) makes the attempt distinct.
+        // Fold the seller-authored creq hash ONLY when present: a claim with no creq (`None`)
+        // folds nothing extra, so its AttemptId is byte-identical to a no-creq attempt and
+        // existing in-flight journals keep resolving. A claim with a creq (`Some`) makes the
+        // attempt distinct.
         if let Some(creq_hash) = &key.creq_hash {
             hash_field(&mut hasher, creq_hash);
         }
@@ -178,11 +179,11 @@ pub struct PaymentKey {
     pub amount: Amount,
     pub unit: CurrencyUnit,
     pub mint: MintUrl,
-    /// Piece-14: SHA-256 hex of the seller-authored NUT-18 payment request (`creqA…`), folded
+    /// SHA-256 hex of the seller-authored NUT-18 payment request (`creqA…`), folded
     /// into the [`AttemptId`] so two claims for the same offer with different creqs reconcile as
-    /// distinct attempts. `None` for a v1 claim with no `creq` (byte-identical attempt id to
-    /// before piece-14); `Some` once the seller authors a creq (Job C). The `mint`/`amount`/`unit`
-    /// fields still denote the realized terms — Job E re-points `mint` to the payload's mint.
+    /// distinct attempts. `None` for a claim with no `creq` (byte-identical attempt id to a
+    /// no-creq claim); `Some` once the seller authors a creq. The `mint`/`amount`/`unit`
+    /// fields denote the realized terms, with `mint` re-pointed to the payload's mint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creq_hash: Option<String>,
 }
@@ -190,8 +191,8 @@ pub struct PaymentKey {
 impl PaymentKey {
     /// Builds a key from trade identity and typed payment terms.
     ///
-    /// `creq_hash` is the seller-authored request hash bound into the attempt (piece-14); pass
-    /// `None` for a v1 claim that carries no `creq` (behaves byte-identically to before).
+    /// `creq_hash` is the seller-authored request hash bound into the attempt; pass
+    /// `None` for a claim that carries no `creq` (behaves byte-identically to a no-creq claim).
     pub fn new(
         job_id: JobId,
         result_id: ResultId,
@@ -222,13 +223,13 @@ impl PaymentKey {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Durable metadata for a published receipt.
 pub struct ReceiptRecord {
-    /// The published kind-3400 receipt event id (piece-9). For legacy records this is the
-    /// kind-1059 payment-envelope id (see `receipt_kind`).
+    /// The published kind-3400 receipt event id. For a record with no `receipt_kind` field this
+    /// is the kind-1059 payment-envelope id (see `receipt_kind`).
     pub receipt_id: String,
-    /// Nostr event kind of the settlement receipt. `3400` = piece-9 co-signed receipt
-    /// event; `0` (serde default on pre-piece-9 journals) = legacy record whose
-    /// `receipt_id` aliases the kind-1059 envelope. LOCAL legacy discriminator — no relay
-    /// fetch, and `Sent`-with-no-receipt stays new-and-incomplete (not legacy).
+    /// Nostr event kind of the settlement receipt. `3400` = co-signed receipt event; `0`
+    /// (serde default) = a record with no `receipt_kind` field, whose `receipt_id` aliases the
+    /// kind-1059 envelope. A LOCAL discriminator — no relay fetch, and `Sent`-with-no-receipt
+    /// stays new-and-incomplete.
     #[serde(default)]
     pub receipt_kind: u16,
 }
@@ -558,8 +559,7 @@ impl ReceiptAuthority {
     ///
     /// SHARED SEAM — do NOT inline this at call sites. It is the single pre-pay point at which
     /// every seller bind is checked. The receipt (job-hash) preimage signature is checked always;
-    /// piece-10 Step-1 (freelance-PR fork, `docs/meta/PIECE-10-FREELANCE-PR-DELIVERY.md`) EXTENDS
-    /// THIS POINT — for a `contribution` result, an ADDITIONAL seller signature over its signed-result
+    /// for a `contribution` result, an ADDITIONAL seller signature over its signed-result
     /// tuple bind `{job_id, seller_pubkey, target_repo, base_oid, fork_ref, commit_oid}` is verified
     /// against the SAME claim-seller anchor. One seam, more binds — never a parallel pre-pay gate.
     /// From-scratch trades pass `contribution = None` ⇒ byte-identical to the single-bind behavior.
@@ -579,7 +579,7 @@ impl ReceiptAuthority {
             ))
         })?;
         if let Some(contribution) = contribution {
-            // MUST-3: the seller's own schnorr signature ties `seller_pubkey → this job_id → this
+            // The seller's own schnorr signature ties `seller_pubkey → this job_id → this
             // exact commit_oid` (against the pinned target + base + fork). A commit signed over a
             // DIFFERENT tuple (any field tampered post-signing) fails here ⇒ zero-spend refusal.
             let tuple_message = Message::from_digest(contribution.tuple_digest);
@@ -598,7 +598,7 @@ impl ReceiptAuthority {
     }
 }
 
-/// Additional pre-pay seller bind for a piece-10 contribution: the seller's schnorr signature over
+/// Additional pre-pay seller bind for a contribution: the seller's schnorr signature over
 /// the authorship tuple digest (`contribution::AuthorshipTuple::digest_bytes`). Verified at the ONE
 /// pre-pay seam [`ReceiptAuthority::verify_seller_prepay_cosig`] alongside the receipt cosig.
 #[derive(Clone, Copy, Debug)]
@@ -1194,12 +1194,12 @@ mod tests {
         assert_ne!(sat.attempt_id(), msat.attempt_id());
     }
 
-    // Piece-14: the seller-authored creq hash is part of the attempt identity. Two claims for the
-    // same offer that quote different creqs reconcile as DISTINCT attempts; a v1 claim with no creq
-    // (`None`) keeps the pre-piece-14 AttemptId byte-for-byte (the regression guard — existing
+    // The seller-authored creq hash is part of the attempt identity. Two claims for the
+    // same offer that quote different creqs reconcile as DISTINCT attempts; a claim with no creq
+    // (`None`) keeps the no-creq AttemptId byte-for-byte (the regression guard — existing
     // journals still resolve).
     #[test]
-    fn attempt_id_binds_creq_hash_with_none_byte_identical_to_v1() {
+    fn attempt_id_binds_creq_hash_with_none_byte_identical_to_no_creq() {
         let none = key();
         assert_eq!(none.creq_hash, None);
 
@@ -1210,20 +1210,20 @@ mod tests {
 
         // Same offer, different creq ⇒ different attempt ids.
         assert_ne!(creq_a.attempt_id(), creq_b.attempt_id());
-        // A creq-bearing attempt is distinct from the v1 (no-creq) attempt.
+        // A creq-bearing attempt is distinct from the no-creq attempt.
         assert_ne!(none.attempt_id(), creq_a.attempt_id());
-        // Regression guard: `None` reproduces the exact pre-piece-14 attempt id (the no-creq path
-        // folds nothing extra). This constant is the AttemptId of `key()` before piece-14 — if the
+        // Regression guard: `None` reproduces the exact no-creq attempt id (the no-creq path
+        // folds nothing extra). This constant is the AttemptId of `key()` with no creq — if the
         // None fold ever changes the hash preimage, this pin breaks.
         assert_eq!(none.attempt_id().as_str(), V1_KEY_ATTEMPT_ID);
     }
 
-    // Frozen pre-piece-14 AttemptId of `key()` (no creq). Guards the None-creq regression path.
+    // Frozen AttemptId of `key()` with no creq. Guards the None-creq regression path.
     const V1_KEY_ATTEMPT_ID: &str =
         "99e8e7b4c53c7af9f2329e16a9625133e9f788d3ffe1257f0a5a121c549de3cd";
 
     #[test]
-    fn legacy_content_hash_field_name_refuses_to_deserialize() {
+    fn content_hash_field_name_refuses_to_deserialize() {
         let mut value = serde_json::to_value(key()).expect("serialize payment key");
         let object = value.as_object_mut().expect("payment key object");
         let hash = object
@@ -1629,7 +1629,7 @@ mod tests {
     #[test]
     fn receipt_authority_rejects_tampered_delivery_binding() {
         // Flip the signed delivery oid AFTER signing — the co-signature no longer matches
-        // the digest (D4: the delivered object is really bound, not decorative).
+        // the digest (the delivered object is really bound, not decorative).
         let mut evidence = valid_evidence(&key());
         evidence.preimage.delivery_integrity_hash = "ab".repeat(20);
         assert!(matches!(
@@ -1651,13 +1651,13 @@ mod tests {
     }
 
     #[test]
-    fn receipt_record_legacy_journal_without_kind_defaults_to_legacy() {
-        // A pre-piece-9 journal record has no `receipt_kind` field. It must still
-        // deserialize (serde default 0 = legacy, kind-1059-aliased id) — never rejected.
-        let legacy: ReceiptRecord =
-            serde_json::from_str(r#"{"receipt_id":"1059envelopeid"}"#).expect("legacy parse");
-        assert_eq!(legacy.receipt_kind, 0);
-        assert_eq!(legacy.receipt_id, "1059envelopeid");
+    fn receipt_record_journal_without_kind_defaults_to_zero() {
+        // A journal record with no `receipt_kind` field must still
+        // deserialize (serde default 0 = kind-1059-aliased id) — never rejected.
+        let record: ReceiptRecord =
+            serde_json::from_str(r#"{"receipt_id":"1059envelopeid"}"#).expect("parse");
+        assert_eq!(record.receipt_kind, 0);
+        assert_eq!(record.receipt_id, "1059envelopeid");
 
         // A new record round-trips with the 3400 stamp.
         let new = ReceiptRecord {
@@ -2001,8 +2001,8 @@ mod tests {
         keys.sign_schnorr(&Message::from_digest(digest)).to_string()
     }
 
-    // ── Piece-10 MUST-3: the pre-pay seam ALSO binds the seller-signed authorship tuple ────────
-    // The SAME seam that verifies the receipt cosig now verifies an additional seller signature
+    // ── The pre-pay seam ALSO binds the seller-signed authorship tuple ───────────────────────
+    // The SAME seam that verifies the receipt cosig also verifies an additional seller signature
     // over {job_id, seller_pubkey, target_repo, base_oid, fork_ref, commit_oid} — one seam, more
     // binds. A valid pair passes; a sig over a DIFFERENT commit_oid or a tampered field refuses.
     fn authorship_tuple(commit_oid: &str) -> crate::contribution::AuthorshipTuple {

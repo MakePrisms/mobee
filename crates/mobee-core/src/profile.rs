@@ -407,7 +407,7 @@ async fn publish_nip89_announce_async(
     .to_string();
 
     // NIP-89 handler advertises the mobee kinds this seller handles: the OFFER it consumes and the
-    // RESULT it produces (renumbered to the mobee block in PIECE-14 A′).
+    // RESULT it produces.
     let k_offer = Tag::parse(["k", &crate::gateway::JOB_OFFER_KIND.to_string()])
         .map_err(|error| ProfileError::Relay(format!("NIP-89 k tag: {error}")))?;
     let k_result = Tag::parse(["k", &crate::gateway::JOB_RESULT_KIND.to_string()])
