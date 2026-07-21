@@ -1,8 +1,8 @@
-//! Buyer job lifecycle over the mobee relay (kinds 5109 / 7000 / 6109).
+//! Buyer job lifecycle over the mobee relay (kinds offer / feedback / result).
 //!
-//! - [`post_job`] publishes a real kind-5109 offer (targeted p-tag = documented default).
+//! - [`post_job`] publishes a real offer-kind offer (targeted p-tag = documented default).
 //! - [`get_job`] reads claim/result state from relay events (not local invent).
-//! - [`accept_claim`] publishes kind-7000 `accepted` and records a local pay-bind for
+//! - [`accept_claim`] publishes feedback-kind `accepted` and records a local pay-bind for
 //!   [`authorize_pay`](crate::authorize_pay) (seller / result / commit). Claims/results
 //!   themselves remain relay-truth.
 //!
@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::gateway::{
     self, accept_draft, parse_git_result_delivery, parse_offer, EventDraft, OfferDraft, TagSpec,
-    JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RESULT_KIND,
+    JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RESULT_KIND,
 };
 use crate::home::{self, HomeError, MobeeHome};
 #[cfg(feature = "wallet")]
@@ -36,7 +36,7 @@ const DEFAULT_DEADLINE_SECS: u64 = 3_600;
 /// Never a relay status value — it is computed by [`derive_claim_liveness`] from `now`.
 pub const CLAIM_STATUS_EXPIRED: &str = "expired";
 
-/// Inputs for posting a kind-5109 offer.
+/// Inputs for posting a offer-kind offer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PostJobRequest {
     pub task: String,
@@ -131,7 +131,6 @@ pub struct OfferView {
     pub output: String,
     pub amount_sats: u64,
     pub deadline_unix: u64,
-    pub mint_url: String,
     pub seller_pubkey: Option<String>,
     /// Cosmetic kind-0 `name` for targeted `seller_pubkey` (untrusted; never replaces hex).
     pub seller_display_name: Option<String>,
@@ -166,7 +165,7 @@ pub struct ContributionResultView {
     pub target_clone_url: String,
     pub base_branch: String,
     pub base_oid: String,
-    /// Seller schnorr signature (hex) over the signed-6109 authorship tuple (`sig/seller-contribution`).
+    /// Seller schnorr signature (hex) over the signed-result authorship tuple (`sig/seller-contribution`).
     pub tuple_signature: String,
 }
 
@@ -243,7 +242,7 @@ pub struct AcceptedBind {
 }
 
 /// Contribution binds captured in the accept-bind (piece-10). `target_*` / `base_*` come from the
-/// buyer's SIGNED offer (authority); `tuple_signature` is the seller's signed-6109 authorship sig
+/// buyer's SIGNED offer (authority); `tuple_signature` is the seller's signed-result authorship sig
 /// from the accepted result; `custody_local_ref` is the buyer-controlled ref the fork tip is
 /// retained under (MUST-6 custody-retention; merge uses THIS, never the live fork branch).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -302,7 +301,7 @@ impl From<HomeError> for JobLifecycleError {
     }
 }
 
-/// Publish a kind-5109 offer to the configured relay. Returns the offer event id as `job_id`.
+/// Publish a offer-kind offer to the configured relay. Returns the offer event id as `job_id`.
 /// Sync entry for CLI/tests — nested call fails fast; MCP uses [`post_job_async`].
 pub fn post_job(home: &MobeeHome, request: PostJobRequest) -> Result<PostJobOutcome, JobLifecycleError> {
     crate::runtime_guard::refuse_nested_block_on("post_job")
@@ -366,12 +365,7 @@ pub async fn post_job_async(
             .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
     }
 
-    let draft = build_offer_draft(
-        &request,
-        home.config.default_mint(),
-        deadline_unix,
-        contribution.as_ref(),
-    )?;
+    let draft = build_offer_draft(&request, deadline_unix, contribution.as_ref())?;
 
     let keys = buyer_keys(home)?;
     let event_id = publish_draft_async(home, &keys, &draft).await?;
@@ -431,14 +425,13 @@ fn assert_amount_within_budget_cap(
     Ok(())
 }
 
-/// Build the kind-5109 offer event draft. The optional git-delivery tags **and** the piece-10
+/// Build the offer-kind offer event draft. The optional git-delivery tags **and** the piece-10
 /// contribution tags are emitted HERE so the post path and its round-trip test share ONE
 /// tag-emission seam (pure — no publish, no wallet). `contribution` is the pre-validated canonical
 /// offer from [`contribution_offer_from_request`]; `None` ⇒ from-scratch, so NO additive
 /// contribution tags are emitted (byte-identical to a pre-contribution offer).
 fn build_offer_draft(
     request: &PostJobRequest,
-    mint_url: &str,
     deadline_unix: u64,
     contribution: Option<&crate::contribution::ContributionOffer>,
 ) -> Result<EventDraft, JobLifecycleError> {
@@ -448,7 +441,6 @@ fn build_offer_draft(
             request.output.clone(),
             request.amount_sats,
             deadline_unix,
-            mint_url.to_owned(),
         )
     } else {
         OfferDraft::new(
@@ -456,7 +448,6 @@ fn build_offer_draft(
             request.output.clone(),
             request.amount_sats,
             deadline_unix,
-            mint_url.to_owned(),
             request.seller_pubkey.clone().ok_or_else(|| {
                 JobLifecycleError::Input(
                     "post_job requires seller_pubkey (targeted default) or untargeted=true".into(),
@@ -649,7 +640,7 @@ pub async fn get_job_async(
     }
 }
 
-/// Accept a live claim: publish kind-7000 `accepted` and persist the pay-bind (Gate D).
+/// Accept a live claim: publish feedback-kind `accepted` and persist the pay-bind (Gate D).
 /// Sync entry for CLI/tests — nested call fails fast; MCP uses [`accept_claim_async`].
 pub fn accept_claim(
     home: &MobeeHome,
@@ -917,7 +908,7 @@ pub fn assert_authorize_matches_bind(
 ///
 /// D2 rules:
 /// - `delivery_integrity_hash` is a **required** buyer arg (never defaulted/derived from
-///   claim 7000 or result 6109 oid).
+///   claim feedback or result oid).
 /// - Compare it to the seller's advertised `commit_oid` and **refuse on mismatch**.
 /// - Matching is fine when the buyer independently tip-matched the same oid; auto-fill
 ///   from the seller advertisement is the circular-bind failure mode.
@@ -1137,13 +1128,24 @@ pub(crate) async fn fetch_job_view_async(
         .map_err(|error| JobLifecycleError::Relay(format!("add relay: {error}")))?;
     client.connect().await;
 
-    let offer_filter = Filter::new().id(offer_id).kind(Kind::Custom(JOB_OFFER_KIND));
-    // Kind + #e is enough to gather marketplace traffic; t=mobee is on drafts we publish.
+    // PIECE-14 A′: every fetch filter carries the `#t=mobee` namespace guard so a foreign event
+    // squatting a mobee kind is never returned.
+    let offer_filter = Filter::new()
+        .id(offer_id)
+        .kind(Kind::Custom(JOB_OFFER_KIND))
+        .hashtag(gateway::MOBEE_TAG);
+    // Claims (processing) and feedback (error) are now distinct kinds — fetch both so the claim
+    // view still surfaces both, as it did when they shared v1 `feedback`.
     let feedback_filter = Filter::new()
-        .kind(Kind::Custom(JOB_FEEDBACK_KIND))
+        .kinds([
+            Kind::Custom(JOB_CLAIM_KIND),
+            Kind::Custom(JOB_FEEDBACK_KIND),
+        ])
+        .hashtag(gateway::MOBEE_TAG)
         .event(offer_id);
     let result_filter = Filter::new()
         .kind(Kind::Custom(JOB_RESULT_KIND))
+        .hashtag(gateway::MOBEE_TAG)
         .event(offer_id);
 
     let offer_events = client
@@ -1178,10 +1180,6 @@ pub(crate) async fn fetch_job_view_async(
                 .unwrap_or_default(),
             amount_sats: parsed.as_ref().map(|p| p.amount).unwrap_or(0),
             deadline_unix: parsed.as_ref().map(|p| p.deadline_unix).unwrap_or(0),
-            mint_url: parsed
-                .as_ref()
-                .map(|p| p.mint_url.clone())
-                .unwrap_or_default(),
             seller_pubkey: parsed.as_ref().and_then(|p| p.seller_pubkey.clone()),
             seller_display_name: None,
             targeted: parsed.as_ref().map(|p| p.is_targeted()).unwrap_or(false),
@@ -1335,7 +1333,7 @@ fn select_result<'a>(
             .find(|result| result.result_id == id)
             .ok_or_else(|| JobLifecycleError::NotFound(format!("result {id}")))?;
         // CROSS-BIND TOOTH: a result is bindable to this claim ONLY if the result's author
-        // (its kind-6109 event pubkey) IS the claim seller. NEVER trust an operator-supplied
+        // (its result-kind event pubkey) IS the claim seller. NEVER trust an operator-supplied
         // `result_id` to override this — accepting seller A's claim with seller B's result is
         // the live 21-sat cross-bind (the buyer pays A, who is p2pk-locked into the token, for
         // B's artifact). The `result_id == None` branch below already author-filters; this
@@ -1801,7 +1799,7 @@ mod tests {
     async fn publish_draft_sync_refuses_inside_runtime() {
         let (root, home) = temp_job_home("nested-publish-draft");
         let keys = nostr_sdk::Keys::generate();
-        let draft = EventDraft::new(5109, Vec::new(), "nested-guard");
+        let draft = EventDraft::new(JOB_OFFER_KIND, Vec::new(), "nested-guard");
         let err = publish_draft(&home, &keys, &draft).expect_err("must refuse nested block_on");
         assert!(
             err.to_string().contains("nested block_on refused"),
@@ -1842,7 +1840,6 @@ mod tests {
             output: "o".into(),
             amount_sats: 1,
             deadline_unix: 10,
-            mint_url: "https://testnut.cashudevkit.org".into(),
             seller_pubkey: None,
             seller_display_name: None,
             targeted: false,
@@ -2050,8 +2047,7 @@ mod tests {
             .expect("valid contribution params")
             .expect("is a contribution offer");
         let draft =
-            build_offer_draft(&request, "https://testnut.cashudevkit.org", 10, Some(&contribution))
-                .expect("draft built");
+            build_offer_draft(&request, 10, Some(&contribution)).expect("draft built");
 
         // (a) canonical parse of the BUILT tags yields exactly the pinned values.
         let parsed = crate::contribution::parse_contribution_offer(&draft.tags)
@@ -2105,7 +2101,6 @@ mod tests {
         assert!(contribution.is_none(), "no params ⇒ from-scratch");
         let draft = build_offer_draft(
             &request,
-            "https://testnut.cashudevkit.org",
             10,
             contribution.as_ref(),
         )
@@ -2115,7 +2110,6 @@ mod tests {
             "text/plain",
             3,
             10,
-            "https://testnut.cashudevkit.org",
             "bb".repeat(32),
         )
         .to_event_draft();

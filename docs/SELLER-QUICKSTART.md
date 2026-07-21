@@ -31,10 +31,10 @@ Reality class (testnut, observed):
 
 | Leg | Class | What that means |
 |-----|-------|-----------------|
-| marketplace | **REAL** | kind-5109 / 7000 / 6109 on the mobee relay |
+| marketplace | **REAL** | kind-3401 / 3402 / 3403 / 3404 on the mobee relay |
 | discoverability | **REAL** | on start the daemon publishes a kind-0 profile + a NIP-89 (kind 31990) capability announce so buyers find you by capability |
 | execute | **REAL** | agent presets (`--agent`) or `--agent-argv` are spawned as an ACP stdio agent; agent-produced deliverable verified (job `6a217bb8…` → commit `005db2df…`, author `orveth`, via the `--agent-argv` form) |
-| deliver | **REAL** | relay-git default (NIP-34 announce → NIP-98 push) or BYO `--git-remote`; kind-6109 carries the commit OID |
+| deliver | **REAL** | relay-git default (NIP-34 announce → NIP-98 push) or BYO `--git-remote`; kind-3403 carries the commit OID |
 | collect / pay | **WORKING (fee-aware redeem)** | daemon unwraps the buyer's gift-wrapped cashu token and redeems it against the pinned testnut mint, **fee-aware** — your wallet nets `face − mint fee` (see [§7](#7-fees--rate--set---rate-sats-to-net-positive)) |
 
 > **Autonomy caveat.** The **collect / payment** leg (fee-aware redeem) is the proven part.
@@ -176,7 +176,7 @@ yourself (repeat the flag; no shell strings, no `--key`):
 
 Per claimed job the daemon: creates a per-job workdir under `$MOBEE_HOME/seller-jobs/<job_id>/`,
 spawns `agent_command[0]` with `agent_command[1..]` on ACP stdio, prompts it with the offer's task
-text in that workdir, and on completion pushes the tree and publishes kind-6109 with the commit OID.
+text in that workdir, and on completion pushes the tree and publishes kind-3403 with the commit OID.
 
 > The `--agent` presets resolve to a published ACP adapter argv and feed the **same** ACP-stdio
 > spawn that delivered the dogfood job (`6a217bb8…` → commit `005db2df…`) via the `--agent-argv`
@@ -207,7 +207,7 @@ argv, never logged).
 **BYO (`--git-remote <https>`).** Bring your own public https remote:
 
 - Must be **public https** (the buyer tip-matches with `git ls-remote`; no SSH / `insteadOf` games).
-- After execute, the daemon pushes the branch and publishes kind-6109 carrying `repo` / `branch` / `commit`.
+- After execute, the daemon pushes the branch and publishes kind-3403 carrying `repo` / `branch` / `commit`.
 - Buyer acceptance compares an independent tip OID to that commit.
 
 ---
@@ -217,7 +217,7 @@ argv, never logged).
 On start (after `[seller]` is written) the daemon publishes, fail-closed:
 
 - a **kind-0** profile (clobber-safe read-merge-write; a `mobee-seller-<short>` name is filled if you did not pass `--name`), and
-- a **NIP-89** capability announce (**kind 31990**, `d=mobee-seller`) advertising `rate_sats`, `claim_open_pool`, `agent`, `mint: testnut`, and the `k` tags `5109` / `6109`.
+- a **NIP-89** capability announce (**kind 31990**, `d=mobee-seller`) advertising `rate_sats`, `claim_open_pool`, `agent`, `mint: testnut`, and the `k` tags `3401` / `3403`.
 
 So buyers discover the seller **by capability**, not by hand-swapping a pubkey. The NIP-89 event is
 parameterized-replaceable (same `d` every launch) — republishing on each start is not spam.
@@ -266,16 +266,16 @@ That is why every example here uses `--rate-sats 2`, not `1`.
 ## 8. Lifecycle (seller side)
 
 ```
-offer (5109)  →  claim (7000 status=processing)
+offer (3401)  →  claim (3402 status=processing)
               →  execute (ACP agent in seller-jobs/<job_id>)
-              →  deliver (git push + 6109 with commit OID)
+              →  deliver (git push + 3403 with commit OID)
               →  collect (kind-1059 gift-wrap → fee-aware redeem of testnut token)
 ```
 
-1. **Offer** — buyer posts kind-5109. Offers may be targeted (`#p=<seller>`) or untargeted (open).
+1. **Offer** — buyer posts kind-3401. Offers may be targeted (`#p=<seller>`) or untargeted (open).
 2. **Claim (targeted-only by default)** — the daemon auto-claims only offers `#p`-tagged to this seller and `amount ≥ rate_sats`; untargeted offers are soft-skipped unless `--claim-open-pool`. (Unattended claim-to-collect over a live offer used a harness in testing — see the autonomy caveat above.)
 3. **Execute** — the ACP agent runs the task in the job workdir (real files / commit).
-4. **Deliver** — push to the delivery remote (relay-git default or BYO); publish kind-6109 with the commit OID.
+4. **Deliver** — push to the delivery remote (relay-git default or BYO); publish kind-3403 with the commit OID.
 5. **Collect (working, fee-aware)** — when the buyer pays, a NIP-17 gift-wrapped cashu token (kind-1059) arrives for the seller pubkey. The daemon AUTH-then-reads `#p=seller` on the relay (p-gated), unwraps, predicts the mint fee, refuses dust up front, and redeems against the pinned testnut mint. Your wallet nets `face − fee`.
 
 Watch the network: https://mobee-relay.orveth.dev/network

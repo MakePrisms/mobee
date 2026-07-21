@@ -5,12 +5,17 @@ use serde::{Deserialize, Serialize};
 use crate::delivery::{CommitOid, DeliveryError, GitDelivery};
 
 pub const MOBEE_TAG: &str = "mobee";
-pub const PROTOCOL_VERSION: &str = "1";
+// PIECE-14 A′: v2 protocol version. The kind renumber (v1 offer/result/feedback → the mobee 3400-block)
+// is the compatibility break — a v2 parser never matches a v1 event, so there is no dual-version
+// window to support.
+pub const PROTOCOL_VERSION: &str = "2";
 
-pub const JOB_OFFER_KIND: u16 = 5109;
-pub const JOB_RESULT_KIND: u16 = 6109;
-pub const JOB_FEEDBACK_KIND: u16 = 7000;
-pub const JOB_RECEIPT_KIND: u16 = 3400;
+// All kind NUMBERS live in `crate::kinds` (the one registry); re-exported here so the historical
+// `gateway::JOB_*_KIND` paths keep resolving.
+pub use crate::kinds::{
+    JOB_AWARD_KIND, JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RECEIPT_KIND,
+    JOB_RESULT_KIND,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TagSpec(pub Vec<String>);
@@ -52,7 +57,6 @@ pub struct OfferDraft {
     pub output: String,
     pub amount_sats: u64,
     pub deadline_unix: u64,
-    pub mint_url: String,
     pub seller_pubkey: Option<String>,
 }
 
@@ -62,7 +66,6 @@ impl OfferDraft {
         output: impl Into<String>,
         amount_sats: u64,
         deadline_unix: u64,
-        mint_url: impl Into<String>,
         seller_pubkey: impl Into<String>,
     ) -> Self {
         Self {
@@ -70,7 +73,6 @@ impl OfferDraft {
             output: output.into(),
             amount_sats,
             deadline_unix,
-            mint_url: mint_url.into(),
             seller_pubkey: Some(seller_pubkey.into()),
         }
     }
@@ -80,25 +82,24 @@ impl OfferDraft {
         output: impl Into<String>,
         amount_sats: u64,
         deadline_unix: u64,
-        mint_url: impl Into<String>,
     ) -> Self {
         Self {
             task: task.into(),
             output: output.into(),
             amount_sats,
             deadline_unix,
-            mint_url: mint_url.into(),
             seller_pubkey: None,
         }
     }
 
     pub fn to_event_draft(&self) -> EventDraft {
+        // PIECE-14 A′: the offer no longer names a mint — the seller authors the accepted mint(s)
+        // in its claim `creq`, so there is no `["mint", …]` tag here.
         let mut tags = vec![
             TagSpec::new(["i", &self.task]),
             TagSpec::new(["output", &self.output]),
             TagSpec::new(["amount", &self.amount_sats.to_string(), "sat"]),
             TagSpec::new(["param", "deadline", &self.deadline_unix.to_string()]),
-            TagSpec::new(["mint", &self.mint_url]),
         ];
         if let Some(seller_pubkey) = &self.seller_pubkey {
             tags.push(TagSpec::new(["p", seller_pubkey]));
@@ -117,7 +118,6 @@ pub struct ParsedOffer {
     pub amount: u64,
     pub unit: String,
     pub deadline_unix: u64,
-    pub mint_url: String,
     pub seller_pubkey: Option<String>,
 }
 
@@ -188,6 +188,8 @@ pub enum OfferParseError {
 pub enum GitResultParseError {
     WrongKind(u16),
     MissingTag(&'static str),
+    /// PIECE-14 A′ namespace guard: a result event without the `["t","mobee"]` tag.
+    MissingMobeeTag,
     UnsupportedDelivery(String),
     InvalidDelivery(DeliveryError),
 }
@@ -224,6 +226,7 @@ impl fmt::Display for GitResultParseError {
         match self {
             Self::WrongKind(kind) => write!(f, "expected kind {JOB_RESULT_KIND}, got {kind}"),
             Self::MissingTag(tag) => write!(f, "missing required git result tag {tag}"),
+            Self::MissingMobeeTag => write!(f, "missing t=mobee tag"),
             Self::UnsupportedDelivery(delivery) => {
                 write!(f, "unsupported result delivery {delivery:?}")
             }
@@ -302,9 +305,6 @@ pub fn parse_offer(event: &EventDraft) -> Result<ParsedOffer, OfferParseError> {
         amount,
         unit: unit.clone(),
         deadline_unix,
-        mint_url: first_tag_value(&event.tags, "mint")
-            .ok_or(OfferParseError::MissingTag("mint"))?
-            .to_owned(),
         seller_pubkey: first_tag_value(&event.tags, "p").map(str::to_owned),
     })
 }
@@ -313,6 +313,11 @@ pub fn parse_offer(event: &EventDraft) -> Result<ParsedOffer, OfferParseError> {
 pub fn parse_git_result_delivery(event: &EventDraft) -> Result<GitDelivery, GitResultParseError> {
     if event.kind != JOB_RESULT_KIND {
         return Err(GitResultParseError::WrongKind(event.kind));
+    }
+    // PIECE-14 A′ namespace guard: reject a foreign event squatting the result kind before reading
+    // any delivery field.
+    if !has_tag_value(&event.tags, "t", MOBEE_TAG) {
+        return Err(GitResultParseError::MissingMobeeTag);
     }
     let delivery = first_tag_value(&event.tags, "delivery")
         .ok_or(GitResultParseError::MissingTag("delivery"))?;
@@ -357,7 +362,7 @@ pub fn parse_bound_git_delivery(
     Ok(delivery)
 }
 
-/// Kind-7000 `status=processing` claim draft. PIECE-14 Job C: the claim carries the
+/// Kind-claim CLAIM draft (`status=processing`). PIECE-14 Job C: the claim carries the
 /// seller-authored NUT-18 payment request as a `["creq", "creqA…"]` tag — the claim *is*
 /// the invoice. Build `creq` with [`creq::build_seller_creq`]; buyers read it back with
 /// [`creq::parse_creq`].
@@ -367,7 +372,8 @@ pub fn claim_draft(
     seller_pubkey: &str,
     creq: &str,
 ) -> EventDraft {
-    feedback_draft(
+    status_draft(
+        JOB_CLAIM_KIND,
         "processing",
         vec![
             TagSpec::new(["e", offer_id]),
@@ -378,13 +384,17 @@ pub fn claim_draft(
     )
 }
 
+/// Kind-award AWARD draft (`status=accepted`). Buyer-authored selection of a claim — e-tags the
+/// offer (root) + the winning claim. PIECE-14 A′ moved this off the shared v1 `feedback` onto the
+/// buyer-authored award kind (a buyer selection must not ride the seller's feedback kind).
 pub fn accept_draft(
     offer_id: &str,
     claim_id: &str,
     buyer_pubkey: &str,
     seller_pubkey: &str,
 ) -> EventDraft {
-    feedback_draft(
+    status_draft(
+        JOB_AWARD_KIND,
         "accepted",
         vec![
             TagSpec::new(["e", offer_id, "", "root"]),
@@ -395,7 +405,7 @@ pub fn accept_draft(
     )
 }
 
-/// Optional git delivery tags on a kind-6109 result (`delivery=git` + repo/branch/commit).
+/// Optional git delivery tags on a result-kind result (`delivery=git` + repo/branch/commit).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitResultTags<'a> {
     pub repo: &'a str,
@@ -403,7 +413,7 @@ pub struct GitResultTags<'a> {
     pub commit_sha: &'a str,
 }
 
-/// Kind-6109 result draft. Pass `Some(git)` to attach delivery/repo/branch/commit tags;
+/// Kind-result draft. Pass `Some(git)` to attach delivery/repo/branch/commit tags;
 /// `exec_metadata` appends the piece-9 Item-2 seller-claimed usage block (may be empty).
 pub fn result_draft(
     offer_id: &str,
@@ -439,7 +449,7 @@ pub fn result_draft(
     EventDraft::new(JOB_RESULT_KIND, tags, content)
 }
 
-/// Thin wrapper: kind-6109 git delivery via [`result_draft`] + [`GitResultTags`].
+/// Thin wrapper: result-kind git delivery via [`result_draft`] + [`GitResultTags`].
 /// `exec_metadata` is the optional seller-claimed usage block (may be empty).
 pub fn git_result_draft(
     offer_id: &str,
@@ -470,7 +480,7 @@ pub fn git_result_draft(
     )
 }
 
-/// Kind-7000 `status=error` feedback (timeout / push-fail / refuse paths).
+/// Kind-feedback FEEDBACK draft (`status=error`; timeout / push-fail / refuse paths).
 ///
 /// `content` carries a machine-readable reason when one is available (e.g. rate-gate
 /// refusal); empty string preserves the historical empty-content callers.
@@ -480,7 +490,8 @@ pub fn error_draft(
     seller_pubkey: &str,
     content: impl Into<String>,
 ) -> EventDraft {
-    let mut draft = feedback_draft(
+    let mut draft = status_draft(
+        JOB_FEEDBACK_KIND,
         "error",
         vec![
             TagSpec::new(["e", offer_id]),
@@ -527,7 +538,7 @@ pub fn receipt_draft(
     result_id: &str,
     buyer_pubkey: &str,
     seller_pubkey: &str,
-    mint_url: &str,
+    mint: &str,
     amount_sats: u64,
     job_hash: &str,
     seller_signature: &str,
@@ -543,7 +554,7 @@ pub fn receipt_draft(
         TagSpec::new(["e", result_id, "", "reply"]),
         TagSpec::new(["p", buyer_pubkey]),
         TagSpec::new(["p", seller_pubkey]),
-        TagSpec::new(["mint", mint_url]),
+        TagSpec::new(["mint", mint]),
         TagSpec::new(["sig", "seller", seller_signature]),
         TagSpec::new(["sig", "buyer", buyer_signature]),
     ];
@@ -565,11 +576,14 @@ pub fn receipt_draft(
     EventDraft::new(JOB_RECEIPT_KIND, tags, "")
 }
 
-fn feedback_draft(status: &str, mut tags: Vec<TagSpec>) -> EventDraft {
+/// Build a `status`-tagged draft of the given kind (claim `claim`, award `award`, feedback `feedback`).
+/// PIECE-14 A′ split the v1 shared `feedback` into distinct kinds; the `status` tag is retained so
+/// existing status-based view logic is unchanged.
+fn status_draft(kind: u16, status: &str, mut tags: Vec<TagSpec>) -> EventDraft {
     tags.insert(0, TagSpec::new(["status", status]));
     tags.push(mobee_tag());
     tags.push(version_tag());
-    EventDraft::new(JOB_FEEDBACK_KIND, tags, "")
+    EventDraft::new(kind, tags, "")
 }
 
 fn first_tag<'a>(tags: &'a [TagSpec], name: &str) -> Option<&'a TagSpec> {
@@ -738,7 +752,6 @@ mod tests {
             "text/plain",
             7,
             1_800_000_000,
-            TESTNUT_MINT_URL,
             SELLER,
         )
         .to_event_draft();
@@ -752,7 +765,6 @@ mod tests {
                 TagSpec::new(["output", "text/plain"]),
                 TagSpec::new(["amount", "7", "sat"]),
                 TagSpec::new(["param", "deadline", "1800000000"]),
-                TagSpec::new(["mint", TESTNUT_MINT_URL]),
                 TagSpec::new(["p", SELLER]),
                 TagSpec::new(["t", MOBEE_TAG]),
                 TagSpec::new(["v", PROTOCOL_VERSION]),
@@ -767,7 +779,6 @@ mod tests {
             "text/plain",
             7,
             1_800_000_000,
-            TESTNUT_MINT_URL,
         )
         .to_event_draft();
 
@@ -786,7 +797,6 @@ mod tests {
             "application/json",
             3,
             1_800_000_001,
-            TESTNUT_MINT_URL,
             SELLER,
         )
         .to_event_draft();
@@ -799,7 +809,6 @@ mod tests {
                 amount: 3,
                 unit: "sat".into(),
                 deadline_unix: 1_800_000_001,
-                mint_url: TESTNUT_MINT_URL.into(),
                 seller_pubkey: Some(SELLER.into()),
             }
         );
@@ -808,11 +817,11 @@ mod tests {
     #[test]
     fn targeting_helpers_fail_closed_for_targeted_offers() {
         let targeted = parse_offer(
-            &OfferDraft::new("task", "text/plain", 1, 2, TESTNUT_MINT_URL, SELLER).to_event_draft(),
+            &OfferDraft::new("task", "text/plain", 1, 2, SELLER).to_event_draft(),
         )
         .expect("targeted offer");
         let untargeted = parse_offer(
-            &OfferDraft::untargeted("task", "text/plain", 1, 2, TESTNUT_MINT_URL).to_event_draft(),
+            &OfferDraft::untargeted("task", "text/plain", 1, 2).to_event_draft(),
         )
         .expect("untargeted offer");
 
@@ -833,11 +842,13 @@ mod tests {
     }
 
     #[test]
-    fn claim_and_accept_use_kind_7000_status_tags() {
+    fn claim_and_accept_use_split_mobee_kinds() {
+        // PIECE-14 A′: the claim (processing) is its own kind claim, and the buyer-authored accept
+        // (award) is kind award — no longer the shared v1 feedback kind.
         assert_eq!(
             claim_draft("offer", BUYER, SELLER, "creqAtest"),
             EventDraft::new(
-                JOB_FEEDBACK_KIND,
+                JOB_CLAIM_KIND,
                 vec![
                     TagSpec::new(["status", "processing"]),
                     TagSpec::new(["e", "offer"]),
@@ -854,7 +865,7 @@ mod tests {
         assert_eq!(
             accept_draft("offer", "claim", BUYER, SELLER),
             EventDraft::new(
-                JOB_FEEDBACK_KIND,
+                JOB_AWARD_KIND,
                 vec![
                     TagSpec::new(["status", "accepted"]),
                     TagSpec::new(["e", "offer", "", "root"]),
@@ -1010,6 +1021,7 @@ mod tests {
                 TagSpec::new(["repo", "https://example.invalid/repo.git"]),
                 TagSpec::new(["branch", "mobee/job"]),
                 TagSpec::new(["commit", &"a".repeat(40)]),
+                TagSpec::new(["t", MOBEE_TAG]),
             ],
             "",
         );
@@ -1029,6 +1041,7 @@ mod tests {
                 TagSpec::new(["repo", "repo"]),
                 TagSpec::new(["branch", "work"]),
                 TagSpec::new(["commit", "abc123"]),
+                TagSpec::new(["t", MOBEE_TAG]),
             ],
             "",
         );
@@ -1059,6 +1072,7 @@ mod tests {
                 TagSpec::new(["repo", "https://attacker.invalid/other.git"]),
                 TagSpec::new(["branch", "mobee/job"]),
                 TagSpec::new(["commit", &"a".repeat(40)]),
+                TagSpec::new(["t", MOBEE_TAG]),
             ],
             "",
         );

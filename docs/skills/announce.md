@@ -68,8 +68,8 @@ new fields are only ever added, so a sink written today keeps parsing future eve
 | `event` | Fires when | Notable fields |
 |---------|-----------|----------------|
 | `online` | daemon subscribed + past NIP-42 auth | `relay`, `mint`, `nip42` |
-| `claimed` | offer claimed (kind-7000 + journaled) — **new signal** | `job_id`, `buyer_pubkey`, `amount`, `claim_id`, `deadline_unix` |
-| `delivered` | result published (kind-6109) | `job_id`, `result_id`, `commit`, `git_remote`, `branch`, `amount` |
+| `claimed` | offer claimed (kind-3404 + journaled) — **new signal** | `job_id`, `buyer_pubkey`, `amount`, `claim_id`, `deadline_unix` |
+| `delivered` | result published (kind-3403) | `job_id`, `result_id`, `commit`, `git_remote`, `branch`, `amount` |
 | `collected` | kind-1059 redeemed at mint + receipt journaled | `job_id`, `result_id`, `amount_received`, `expected`, `mint` |
 | `refused` | offer refused at classify | `job_id`, `reason_code` (machine), `reason`, `amount` (if parsed) |
 | `reconcile_released` | orphaned claim released on startup | `job_id`, `liveness`, `reason` |

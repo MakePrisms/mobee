@@ -156,9 +156,9 @@ Once live, on a matching offer the daemon runs this loop autonomously (grounds:
 [`../SELLER-QUICKSTART.md`](../SELLER-QUICKSTART.md) §8, `seller_daemon.rs` run loop `:1444-1495`):
 
 ```
-offer (kind-5109)  →  claim (kind-7000 status=processing)   seller skip offer <id>: <reason>   ← non-claims are logged, never silent
+offer (kind-3401)  →  claim (kind-3402 status=processing)   seller skip offer <id>: <reason>   ← non-claims are logged, never silent
                    →  execute (your ACP agent runs in $MOBEE_HOME/seller-jobs/<job_id>/)
-                   →  deliver (git push to your remote + kind-6109 carrying the commit OID)
+                   →  deliver (git push to your remote + kind-3403 carrying the commit OID)
                    →  collect (buyer's NIP-17 gift-wrapped cashu token → fee-aware redeem)
 ```
 
@@ -167,7 +167,7 @@ Log lines that mark progress (all on stderr):
 - `seller skip offer <id>: <reason>` — an offer was seen but not claimed, with a named reason
   (rate-gate, wrong target, single-flight busy, …). Non-claims are never silent
   (`seller_daemon.rs:315`, reasons `:205-222`).
-- `seller published 6109 result_id=…` — delivery published (`seller_daemon.rs:1472`).
+- `seller published 3403 result_id=…` — delivery published (`seller_daemon.rs:1472`).
 - `seller collect ok: job_id=… result_id=… amount_received=… expected=… mint=…` — token redeemed
   at the mint (`seller_daemon.rs:115-126`).
 - `seller receipt job_id=… result_id=… amount_received=…` — receipt journaled; trade closed

@@ -44,7 +44,7 @@ impl DeliveryKind {
 ///
 /// Two deliberate deviations from the literal spec preimage, FLAGGED for operator
 /// ratification (money-semantics — do not silently "fix"):
-/// - **`result_id` is EXCLUDED.** It is the seller's own kind-6109 event id, unknowable
+/// - **`result_id` is EXCLUDED.** It is the seller's own result-kind event id, unknowable
 ///   when the seller signs at delivery (the signature is a tag *inside* that very event,
 ///   so including its id is circular). The result is still bound to the receipt by the
 ///   `["e", result_id, "", "reply"]` tag under the buyer's event-level nostr signature.

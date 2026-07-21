@@ -82,7 +82,7 @@ the credentials env below.)
 }}}
 ```
 
-Publishes kind-7000 `accepted` and records the local pay-bind
+Publishes kind-3405 `accepted` and records the local pay-bind
 `$MOBEE_HOME/jobs/<job_id>.json` — `{seller_pubkey, result_id, commit_oid, repo, branch,
 job_hash, amount_sats, seller_signature, …}` (`job_lifecycle.rs:159-177`, `:414-502`, bind path
 `:601-604`; tool `mcp.rs:240-255`, `:1089-1123`). Refusals: unknown claim, claim not `processing`
@@ -158,7 +158,7 @@ BYO public-https delivery instead.
 → get_job shows the claim you accept as live:true, and results[] carries repo/branch/commit_oid
 → CAUTION ONE held: result.seller_pubkey == claim.seller_pubkey (or result_id omitted)
 → CAUTION TWO held: delivery_integrity_hash came from YOUR ls-remote and equals results[].commit_oid
-→ accept_claim wrote $MOBEE_HOME/jobs/<job_id>.json and published kind-7000 accepted
+→ accept_claim wrote $MOBEE_HOME/jobs/<job_id>.json and published kind-3405 accepted
 → authorize_pay ok:true, verifier=PayPathDeliveryVerifier, state=receipt_published|closed, spent moved
 → negative probes behave (over-cap refused, ext:: refused, wrong-hash refused with zero burn) — ../QUICKSTART.md §5
 → verify-receipt.md run on the published kind-3400

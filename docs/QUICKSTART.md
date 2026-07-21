@@ -5,7 +5,7 @@ Documented buyer steps only. **Testnut only. No real funds. The key never leaves
 Pinned surface: `dev` tip with buyer MCP job-lifecycle + composed `authorize_pay`
 (`BudgetGate` → `PayPathDeliveryVerifier` → `PaymentService::run()`).
 
-Reality class for this path: **marketplace REAL** (5109 / 7000 / 6109 on the mobee relay) +
+Reality class for this path: **marketplace REAL** (3401 / 3402 / 3403 / 3404 on the mobee relay) +
 **pay REAL-AND-LIVE (testnut)**. The full loop runs through a real Claude-Code MCP session (§1) — the
 relay-reading tools run async under a client-safe deadline, so the server stays up through the trade.
 `main` remains **BUILT-BUT-OFF** until back-pull.
@@ -42,9 +42,9 @@ Buyer MCP tools on this tip:
 |------|------|
 | `setup_wallet` | Bootstrap `~/.mobee` (config + autogen key + wallet) and fund against the hard-pinned testnut mint |
 | `set_profile` | Optional — write `[profile] name/about` + publish/replace buyer kind-0 (never required) |
-| `post_job` | Publish a real kind-5109 offer to the configured relay (targeted seller p-tag = documented default) |
+| `post_job` | Publish a real kind-3401 offer to the configured relay (targeted seller p-tag = documented default) |
 | `get_job` | Read offer / claims / results from relay events (not local invent); surfaces cosmetic `display_name` when kind-0 is present |
-| `accept_claim` | Publish kind-7000 `accepted` + record local pay-bind for `authorize_pay` |
+| `accept_claim` | Publish kind-3405 `accepted` + record local pay-bind for `authorize_pay` |
 | `stub_pay` | Exercise budget caps over a mock pay (no piece-6 `run()`) |
 | `authorize_pay` | Real capped pay. **Documented default = job_id form** (see §4) |
 
@@ -157,7 +157,7 @@ Pass criteria:
 
 ---
 
-## 3. Post job — `post_job` (real kind-5109)
+## 3. Post job — `post_job` (real kind-3401)
 
 Targeted seller is the documented default. Obtain a seller hex pubkey (seller daemon, stub keygen, or a known test seller) and post:
 
@@ -174,8 +174,8 @@ Targeted seller is the documented default. Obtain a seller hex pubkey (seller da
 
 Pass criteria:
 
-- `ok: true`, `offer_kind: 5109`, `targeted: true`
-- `job_id` is a 64-hex event id (independent relay read of kind-5109 must see it)
+- `ok: true`, `offer_kind: 3401`, `targeted: true`
+- `job_id` is a 64-hex event id (independent relay read of kind-3401 must see it)
 - response does **not** contain the buyer secret key
 
 Open / untargeted offers are allowed with `"untargeted": true` (omit `seller_pubkey`).
@@ -184,7 +184,7 @@ Open / untargeted offers are allowed with `"untargeted": true` (omit `seller_pub
 
 ## 3b. Wait for claim + result — `get_job`
 
-Seller publishes kind-7000 `status=processing` claim and kind-6109 git result (arms-length seller / stub / c2). Buyer polls relay truth:
+Seller publishes kind-3402 `status=processing` claim and kind-3403 git result (arms-length seller / stub / c2). Buyer polls relay truth:
 
 ```json
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_job","arguments":{
@@ -198,7 +198,7 @@ Pass criteria:
 
 - `source` == `relay`
 - `claims[]` entries carry `created_at`; exactly one may be flagged `live: true`
-- `results[]` include repo/branch/commit_oid from the 6109 (not invented locally)
+- `results[]` include repo/branch/commit_oid from the 3403 (not invented locally)
 - when counterparties have kind-0, `claims[].display_name` / `results[].display_name` / `offer.seller_display_name` may be non-null **alongside** the hex pubkey (never replacing it)
 
 ---
@@ -213,7 +213,7 @@ Pass criteria:
 ```
 
 Records local pay-bind `{seller_pubkey, result_id, commit_oid, repo, branch, job_hash}` under
-`~/.mobee/jobs/<job_id>.json` and publishes kind-7000 `accepted`. Subsequent
+`~/.mobee/jobs/<job_id>.json` and publishes kind-3405 `accepted`. Subsequent
 `authorize_pay` refuses seller/result/commit mismatch against this bind (Gate D).
 
 ---
@@ -244,7 +244,7 @@ Plain https — no `insteadOf`, no SSH.
 
 MCP binds seller/repo/branch/commit_oid/result_id/job_hash from the **accept_claim** record.
 **D2:** `delivery_integrity_hash` is a **required** buyer arg — never auto-filled from the
-claim (7000) or result (6109) oid. MCP **compares** it to the accepted seller `commit_oid`
+claim (3402) or result (3403) oid. MCP **compares** it to the accepted seller `commit_oid`
 and **refuses on mismatch**. Matching is fine when the buyer independently tip-matched;
 auto-fill from the seller advertisement is the circular-bind failure mode.
 
@@ -341,7 +341,7 @@ step-0: public https clone + toolchain (no insteadOf / SSH)
 → fresh home
 → documented steps only (this file)
 → setup_wallet with balance_sats > 0
-→ post_job → real 5109 on relay
+→ post_job → real 3401 on relay
 → get_job → relay claims/results
 → accept_claim → pay-bind
 → buyer tip commitment (public https ls-remote)
@@ -351,4 +351,4 @@ step-0: public https clone + toolchain (no insteadOf / SSH)
 → wrong-hash REFUSED (D2, zero burn)
 ```
 
-Seller may stay arms-length (stub/c2) for claim + 6109 publish; buyer marketplace legs are MCP-real.
+Seller may stay arms-length (stub/c2) for claim + 3403 publish; buyer marketplace legs are MCP-real.

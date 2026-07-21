@@ -82,7 +82,7 @@ pub struct SellerConfig {
     /// Opt-in to claim untargeted/open offers. Default **false** (targeted-only).
     #[serde(default)]
     pub claim_open_pool: bool,
-    /// Backfill window (seconds) for the seller's UNTARGETED (open-pool) kind-5109 offer
+    /// Backfill window (seconds) for the seller's UNTARGETED (open-pool) offer-kind offer
     /// filter. On (re)subscribe the open-pool filter requests stored offers dated at/after
     /// `now - this`, so a daemon started AFTER an open-pool offer was posted still SEES it
     /// (and claims it iff every money-safety guard passes: not deadline-expired, clears the
@@ -96,7 +96,7 @@ pub struct SellerConfig {
     #[serde(default = "default_offer_backfill_secs")]
     pub offer_backfill_secs: u64,
     /// Opt-in to the piece-10 contribution (freelance-PR fork) path. Default **true**. When
-    /// **false** the daemon behaves as a seller WITHOUT contribution support: it kind-7000
+    /// **false** the daemon behaves as a seller WITHOUT contribution support: it feedback-kind
     /// `status=error`s a `job-class=contribution` offer instead of running it as from-scratch
     /// (interop courtesy — NOT a security control; buyer refusal is the boundary).
     #[serde(default = "default_contribution_enabled")]

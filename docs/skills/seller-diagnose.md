@@ -227,7 +227,7 @@ grep -E "rate_sats|git_remote|claim_open_pool" "$MOBEE_HOME/config.toml"   # con
 
 Restarting a seller is **safe**. On startup the daemon reconciles the journal: any orphaned
 in-flight claim (a `claim` with no `receipt` and no `release`) is **RELEASED** — it reneges the
-claim rather than resuming/double-running lost in-memory work, and publishes a best-effort kind-7000
+claim rather than resuming/double-running lost in-memory work, and publishes a best-effort kind-3404
 so the buyer sees it. Release is durable-first (journaled) and idempotent across repeated restarts.
 Grounds: `seller_daemon.rs:469-489`, `:1382-1394`;
 [`../meta/PIECE-11-CLAIM-LIFECYCLE.md`](../meta/PIECE-11-CLAIM-LIFECYCLE.md) "Restart-reconcile".

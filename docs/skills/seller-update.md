@@ -21,8 +21,8 @@ Restarting a seller mid-life is safe by design (piece-11). Bounce implications b
 
 | Job state at bounce | What happens on restart | Money impact |
 |---------------------|-------------------------|--------------|
-| **Processing** (agent running, not yet delivered) | The orphaned claim is **RELEASED** (kind-7000), not resumed — v1 does not resume lost in-memory execution | None — money never received; buyer may re-post |
-| **Delivered, unpaid** (kind-6109 out, payment not yet redeemed) | The in-memory binding is lost; on restart the job is RELEASED. The buyer's gift-wrap **stays on the relay** (stuck-not-lost) | Revenue forfeiture risk **only if** you bounce in the deliver→pay window — money-safe (no double-pay, no false receipt) |
+| **Processing** (agent running, not yet delivered) | The orphaned claim is **RELEASED** (kind-3404), not resumed — v1 does not resume lost in-memory execution | None — money never received; buyer may re-post |
+| **Delivered, unpaid** (kind-3403 out, payment not yet redeemed) | The in-memory binding is lost; on restart the job is RELEASED. The buyer's gift-wrap **stays on the relay** (stuck-not-lost) | Revenue forfeiture risk **only if** you bounce in the deliver→pay window — money-safe (no double-pay, no false receipt) |
 | **Paid** (receipt journaled) | Terminal; unaffected | None |
 
 So: **bouncing while idle or between trades is free. Avoid bouncing in the brief deliver→pay
@@ -39,7 +39,7 @@ window** (payment usually lands within seconds of delivery). Grounds:
 ```bash
 tail -n 15 "$MOBEE_HOME/sell.log"
 # Safe: last line is "seller daemon online …", or a "seller receipt …" (trade closed), or idle.
-# Wait: you just saw "seller published 6109 result_id=…" with no following "seller receipt …"
+# Wait: you just saw "seller published 3403 result_id=…" with no following "seller receipt …"
 #       → a payment may be in flight; give it a moment before bouncing.
 ```
 

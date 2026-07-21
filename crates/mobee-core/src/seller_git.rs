@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 
 use crate::delivery_transport::{assert_allowed_repo_locator, TransportRefuse};
 
-/// Seller push failure (maps to kind-7000 error in the daemon).
+/// Seller push failure (maps to feedback-kind error in the daemon).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SellerGitError {
     Transport(String),

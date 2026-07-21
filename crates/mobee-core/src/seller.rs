@@ -130,10 +130,10 @@ pub enum JournalEntry {
         /// an old orphan is released, never left live).
         #[serde(default)]
         deadline_unix: u64,
-        /// kind-7000 claim event id (so restart-reconcile can reference the dead claim).
+        /// feedback-kind claim event id (so restart-reconcile can reference the dead claim).
         #[serde(default)]
         claim_id: String,
-        /// Buyer pubkey (p-tag target for a reconcile kind-7000 release). Back-compat empty.
+        /// Buyer pubkey (p-tag target for a reconcile feedback-kind release). Back-compat empty.
         #[serde(default)]
         buyer_pubkey: String,
     },
@@ -166,7 +166,7 @@ pub enum ClaimLiveness {
 
 /// An in-flight claim discovered at daemon startup (journaled Claim, no matching
 /// Receipt and no matching Release). Carries everything reconcile needs to publish a
-/// kind-7000 release WITHOUT touching the relay or re-parsing the offer.
+/// feedback-kind release WITHOUT touching the relay or re-parsing the offer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrphanClaim {
     pub job_id: String,
@@ -483,7 +483,6 @@ mod tests {
             amount,
             unit: "sat".into(),
             deadline_unix: 2_000_000_000,
-            mint_url: crate::home::DEFAULT_MINT_URL.into(),
             seller_pubkey: seller.map(str::to_owned),
         }
     }

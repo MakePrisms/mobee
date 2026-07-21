@@ -197,7 +197,7 @@ fn tools() -> Value {
         },
         {
             "name": "post_job",
-            "description": "Publish a real kind-5109 job offer to the configured mobee relay. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job (unchanged). Never echoes secrets.",
+            "description": "Publish a real mobee job offer (OFFER kind) to the configured mobee relay. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job (unchanged). Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -243,7 +243,7 @@ fn tools() -> Value {
         },
         {
             "name": "get_job",
-            "description": "Read job state from the relay (kind 5109 offer + 7000 claims + 6109 results). Surfaces claim created_at and flags the most-recent LIVE claim. Best-effort kind-0 display_name alongside each pubkey (claims[].display_name, results[].display_name, offer.seller_display_name) — cosmetic only; hex pubkey remains authoritative. Optional wait_for=claim|result long-poll. Local accept-bind attached if present. Never invents claims/results.",
+            "description": "Read job state from the relay (offer + claims + results). Surfaces claim created_at and flags the most-recent LIVE claim. Best-effort kind-0 display_name alongside each pubkey (claims[].display_name, results[].display_name, offer.seller_display_name) — cosmetic only; hex pubkey remains authoritative. Optional wait_for=claim|result long-poll. Local accept-bind attached if present. Never invents claims/results.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -257,7 +257,7 @@ fn tools() -> Value {
         },
         {
             "name": "accept_claim",
-            "description": "Accept a seller claim: publish kind-7000 status=accepted and record local pay-bind {seller_pubkey, result_id, commit_oid, repo, branch, job_hash} for authorize_pay. Requires a matching git result on the relay. Never echoes secrets.",
+            "description": "Accept a seller claim: publish the buyer AWARD (status=accepted) and record local pay-bind {seller_pubkey, result_id, commit_oid, repo, branch, job_hash} for authorize_pay. Requires a matching git result on the relay. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

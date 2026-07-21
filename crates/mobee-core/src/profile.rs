@@ -406,12 +406,14 @@ async fn publish_nip89_announce_async(
     })
     .to_string();
 
-    let k_5109 = Tag::parse(["k", "5109"])
+    // NIP-89 handler advertises the mobee kinds this seller handles: the OFFER it consumes and the
+    // RESULT it produces (renumbered to the mobee block in PIECE-14 A′).
+    let k_offer = Tag::parse(["k", &crate::gateway::JOB_OFFER_KIND.to_string()])
         .map_err(|error| ProfileError::Relay(format!("NIP-89 k tag: {error}")))?;
-    let k_6109 = Tag::parse(["k", "6109"])
+    let k_result = Tag::parse(["k", &crate::gateway::JOB_RESULT_KIND.to_string()])
         .map_err(|error| ProfileError::Relay(format!("NIP-89 k tag: {error}")))?;
     let event = EventBuilder::new(Kind::Custom(NIP89_HANDLER_KIND), content)
-        .tags([Tag::identifier(NIP89_HANDLER_D), k_5109, k_6109])
+        .tags([Tag::identifier(NIP89_HANDLER_D), k_offer, k_result])
         .sign_with_keys(keys)
         .map_err(|error| ProfileError::Relay(format!("sign NIP-89: {error}")))?;
 
