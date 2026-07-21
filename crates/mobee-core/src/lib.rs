@@ -40,6 +40,7 @@ pub mod seller;
 #[cfg(feature = "wallet")]
 pub mod seller_daemon;
 pub mod seller_memory;
+pub mod telemetry;
 #[cfg(feature = "git-delivery")]
 pub mod seller_git;
 #[cfg(feature = "wallet")]

@@ -1494,6 +1494,25 @@ impl SellerDaemon {
                 episode.job_id
             );
         }
+        // Source of truth (the append above) is attempted FIRST; only then does the brain-telemetry
+        // stream fan the same episode out to the pluggable sink/mirror. Best-effort and off the hot
+        // path — a sink/mirror failure never blocks the seller loop or affects the append above.
+        self.emit_telemetry(episode);
+    }
+
+    /// Best-effort brain/episode telemetry — fan one captured episode out to the `[telemetry]` sink
+    /// command and/or mirror file so an operator can watch the seller's reasoning/economics live.
+    /// NEVER blocks the event loop or the episode append: [`crate::telemetry::emit`] does the mirror
+    /// write inline (fast, durable append) and dispatches the sink on its OWN detached thread,
+    /// returning immediately; a missing/slow/hung/failing sink is logged once and swallowed. No-op
+    /// when the channel is disabled or unpointed. Telemetry carries only the episode (ids/amounts/
+    /// task-text/self-reported-usage) + the public seller pubkey/job id — never a token/key/secret.
+    fn emit_telemetry(&self, episode: &Episode) {
+        let cfg = &self.home.config.telemetry;
+        if !cfg.enabled {
+            return;
+        }
+        crate::telemetry::emit(cfg, &crate::telemetry::TelemetryEvent::episode(now_unix(), episode));
     }
 
     /// Best-effort lifecycle announce — dispatch one JSON event to the configured
