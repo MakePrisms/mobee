@@ -343,4 +343,108 @@ mod usage_tests {
         assert_eq!(usage.input_tokens, None);
         assert_eq!(usage.total_tokens(), None);
     }
+
+    // --- Compatibility with the maintained ACP harnesses ---------------------------------------
+    //
+    // The mobee repo carries no captured ACP-usage fixtures, so these payloads are constructed
+    // from verified sources (cited per test), not from a live capture:
+    //   - ACP `Usage` schema: agent-client-protocol-schema/src/v1/agent.rs (PromptResponse.usage,
+    //     serde rename_all = "camelCase").
+    //   - claude-code-acp: zed-industries/claude-code-acp src/acp-agent.ts `sessionUsage()`.
+    //   - codex: openai/codex codex-rs/protocol/src/protocol.rs `TokenUsage`.
+    // They pin the field names the parser must keep reading so a rename in either the spec or a
+    // maintained harness surfaces here as a failing test rather than a silent usage dropout.
+
+    #[test]
+    fn compat_claude_code_acp_prompt_result_usage() {
+        // claude-code-acp `PromptResponse.usage` from sessionUsage(): camelCase, matches the ACP
+        // spec Usage; no model or cost is present on the wire.
+        let usage = parse_acp_usage(&json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 1200,
+                "outputTokens": 340,
+                "cachedReadTokens": 8192,
+                "cachedWriteTokens": 256,
+                "totalTokens": 9988
+            }
+        }))
+        .expect("claude-code-acp usage present");
+        assert_eq!(usage.input_tokens, Some(1200));
+        assert_eq!(usage.output_tokens, Some(340));
+        assert_eq!(usage.cache_read_tokens, Some(8192));
+        assert_eq!(usage.cache_write_tokens, Some(256));
+        assert_eq!(usage.reasoning_tokens, None);
+        assert_eq!(usage.total_tokens(), Some(1540));
+        assert_eq!(usage.transport, Some(UsageTransport::AcpNative));
+        assert_eq!(usage.model, None);
+        assert_eq!(usage.cost, None);
+    }
+
+    #[test]
+    fn compat_codex_token_usage_shape() {
+        // codex `TokenUsage`: snake_case input_tokens/output_tokens/reasoning_output_tokens/
+        // cached_input_tokens/total_tokens. Codex has no cache-write counterpart.
+        let usage = parse_acp_usage(&json!({
+            "usage": {
+                "input_tokens": 900,
+                "cached_input_tokens": 512,
+                "output_tokens": 210,
+                "reasoning_output_tokens": 64,
+                "total_tokens": 1686
+            }
+        }))
+        .expect("codex usage present");
+        assert_eq!(usage.input_tokens, Some(900));
+        assert_eq!(usage.output_tokens, Some(210));
+        assert_eq!(usage.reasoning_tokens, Some(64));
+        assert_eq!(usage.cache_read_tokens, Some(512));
+        assert_eq!(usage.cache_write_tokens, None);
+        // total = input + output + reasoning (cache read is a sibling, never folded in).
+        assert_eq!(usage.total_tokens(), Some(1174));
+        assert_eq!(usage.transport, Some(UsageTransport::AcpNative));
+        assert_eq!(usage.model, None);
+        assert_eq!(usage.cost, None);
+    }
+
+    #[test]
+    fn compat_acp_spec_usage_shape_incl_cursor_baseline() {
+        // Canonical ACP `Usage` (camelCase, incl the spec-only `thoughtTokens`). cursor-agent's
+        // ACP usage shape is not publicly documented; this spec-conformant object is the compat
+        // baseline the parser holds for cursor and any other harness that emits ACP-native usage.
+        let usage = parse_acp_usage(&json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 50,
+                "outputTokens": 20,
+                "thoughtTokens": 7,
+                "cachedReadTokens": 1024,
+                "cachedWriteTokens": 128,
+                "totalTokens": 1222
+            }
+        }))
+        .expect("acp-spec usage present");
+        assert_eq!(usage.input_tokens, Some(50));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.reasoning_tokens, Some(7));
+        assert_eq!(usage.cache_read_tokens, Some(1024));
+        assert_eq!(usage.cache_write_tokens, Some(128));
+        assert_eq!(usage.total_tokens(), Some(77));
+        assert_eq!(usage.transport, Some(UsageTransport::AcpNative));
+    }
+
+    #[test]
+    fn compat_usage_under_meta_extension_point() {
+        // `_meta` is the ACP spec's sanctioned extension point; a harness that nests usage there
+        // is still captured.
+        let usage = parse_acp_usage(&json!({
+            "stopReason": "end_turn",
+            "_meta": {"usage": {"inputTokens": 5, "outputTokens": 3}}
+        }))
+        .expect("_meta usage present");
+        assert_eq!(usage.input_tokens, Some(5));
+        assert_eq!(usage.output_tokens, Some(3));
+        assert_eq!(usage.total_tokens(), Some(8));
+        assert_eq!(usage.transport, Some(UsageTransport::AcpNative));
+    }
 }
