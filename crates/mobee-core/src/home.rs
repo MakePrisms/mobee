@@ -60,8 +60,6 @@ pub struct ProfileConfig {
 
 /// Default relay-git base (delivery). Live on mobee-relay (`/git/<owner>/<repo>.git`).
 pub const DEFAULT_RELAY_GIT_BASE: &str = "https://mobee-relay.orveth.dev/git";
-/// Legacy shared leaf — NOT used as default (relay name registry is global).
-pub const DEFAULT_RELAY_GIT_REPO: &str = "mobee-seller";
 
 /// Seller daemon config (`[seller]` in config.toml). Key never lives here.
 ///
