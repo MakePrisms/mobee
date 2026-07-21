@@ -337,14 +337,14 @@ fn tools() -> Value {
         },
         {
             "name": "wallet_mint",
-            "description": "Flexible/repeatable mint-fund via bolt11 for ANY amount. Returns bolt11 before wait; testnut FakeWallet auto-pays (status=funded). Other configured mints return status=needs_payment + invoice (caller pays, then complete). No already_funded hard-block. Never echoes secrets.",
+            "description": "Flexible/repeatable mint-fund via bolt11. Two modes: (1) create — pass amount_sats to open a new quote (testnut FakeWallet auto-pays → status=funded; other mints → status=needs_payment + invoice, caller pays then completes). (2) complete — pass quote_id to finish a PAID quote from a prior create call; amount_sats optional (recovered from the local store) and used as an exact-fund guard when supplied. No already_funded hard-block. Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "amount_sats": { "type": "integer", "minimum": 1 },
+                    "quote_id": { "type": "string", "description": "Complete this paid quote instead of creating a new one" },
                     "mint": { "type": "string", "description": "Optional mint URL (must be configured)" }
                 },
-                "required": ["amount_sats"],
                 "additionalProperties": false
             }
         },
@@ -585,12 +585,28 @@ async fn wallet_balance_tool_async(state: &McpState) -> Result<Value, String> {
 #[cfg(feature = "wallet")]
 async fn wallet_mint_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
     use mobee_core::wallet_ops::{self, MintFlow};
+    let mint = arguments.get("mint").and_then(Value::as_str);
+    let home = home::bootstrap(&state.home.root).map_err(|error| error.to_string())?;
+    // quote_id routes to completion of a prior quote — NOT a fresh mint. A bare
+    // unknown arg used to be silently ignored and minted a new quote; route it
+    // explicitly instead so a completion intent never opens a second quote.
+    if let Some(quote_id) = arguments.get("quote_id").and_then(Value::as_str) {
+        let amount = arguments.get("amount_sats").and_then(Value::as_u64);
+        let outcome = wallet_ops::complete_mint_by_id_async(&home, quote_id, amount, mint)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok(tool_ok(json!({
+            "status": "funded",
+            "mint_url": outcome.mint_url,
+            "funded_sats": outcome.funded_sats,
+            "balance_sats": outcome.balance_sats,
+            "quote_id": outcome.quote_id,
+        })));
+    }
     let amount = arguments
         .get("amount_sats")
         .and_then(Value::as_u64)
-        .ok_or_else(|| "wallet_mint requires amount_sats".to_owned())?;
-    let mint = arguments.get("mint").and_then(Value::as_str);
-    let home = home::bootstrap(&state.home.root).map_err(|error| error.to_string())?;
+        .ok_or_else(|| "wallet_mint requires amount_sats (to create) or quote_id (to complete)".to_owned())?;
     let flow = wallet_ops::mint_async(&home, amount, mint)
         .await
         .map_err(|error| error.to_string())?;
@@ -1550,6 +1566,57 @@ mod tests {
         let reloaded = home::bootstrap(&root).expect("reload");
         let profile = reloaded.config.profile.expect("profile in config");
         assert_eq!(profile.name.as_deref(), Some("anvil-async-mcp"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `quote_id` argument must route to quote-completion, NOT silently mint a
+    /// fresh quote (the field-failure bug shape). With an unknown quote and no
+    /// amount, completion refuses with a "pass --amount" message — a create call
+    /// would instead demand `amount_sats`, so the message discriminates the path.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn wallet_mint_quote_id_routes_to_completion_not_fresh_mint() {
+        let root = temp_home("wallet-mint-quoteid");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = state_at(&root);
+        let response = dispatch(
+            &state,
+            &McpRequest {
+                id: Some(json!(91)),
+                method: "tools/call".into(),
+                params: json!({
+                    "name": "wallet_mint",
+                    "arguments": { "quote_id": "quote-not-in-store" }
+                }),
+            },
+        );
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("error text");
+        assert!(text.contains("pass --amount"), "unexpected error: {text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn wallet_mint_without_amount_or_quote_id_refused() {
+        let root = temp_home("wallet-mint-neither");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = state_at(&root);
+        let response = dispatch(
+            &state,
+            &McpRequest {
+                id: Some(json!(92)),
+                method: "tools/call".into(),
+                params: json!({ "name": "wallet_mint", "arguments": {} }),
+            },
+        );
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("error text");
+        assert!(text.contains("amount_sats") && text.contains("quote_id"), "unexpected error: {text}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
