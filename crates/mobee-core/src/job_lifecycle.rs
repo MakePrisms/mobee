@@ -1555,6 +1555,58 @@ mod tests {
         );
     }
 
+    // Issue #53 incident diagnosis: the LIVE failure had the explicit call's job_hash BYTE-EQUAL
+    // to the bind (per the failed-run logs). Reproduce that exact shape — ALL explicit fields
+    // byte-equal to the bind — and confirm the two constructed requests are identical EVEN without
+    // the job_hash fix mattering. If this passes, the incident's divergence was NOT in request
+    // construction (it points at the next layer: the bind on disk / re-accept rewrite / config).
+    #[test]
+    fn byte_equal_explicit_matches_bind_request() {
+        let bind = AcceptedBind {
+            job_id: "2a195bece5f6".into(),
+            claim_id: "0a8bbc5284e8".into(),
+            result_id: "058886d7b19e".into(),
+            seller_pubkey: "aa".repeat(32),
+            commit_oid: "5ce37eeb".repeat(5),
+            repo: "https://example.invalid/repo.git".into(),
+            branch: "mobee/job".into(),
+            job_hash: "699c9230".repeat(8),
+            amount_sats: 5,
+            accept_event_id: "accept-x".into(),
+            accepted_at: 1,
+            seller_signature: "dd".repeat(64),
+            creq_hash: Some("2ad9b34c".repeat(8)),
+            accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
+            contribution: None,
+        };
+        let from_bind =
+            authorize_request_from_bind(&bind, 5, bind.commit_oid.clone()).expect("bind form");
+
+        // Explicit form with EVERY field byte-equal to the bind (the incident's inputs).
+        let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            job_id: bind.job_id.clone(),
+            result_id: bind.result_id.clone(),
+            delivery_integrity_hash: bind.commit_oid.clone(),
+            job_hash: bind.job_hash.clone(), // byte-equal, as in the live failure
+            seller_pubkey: bind.seller_pubkey.clone(),
+            amount_sats: 5,
+            repo: bind.repo.clone(),
+            branch: bind.branch.clone(),
+            commit_oid: bind.commit_oid.clone(),
+            seller_signature: bind.seller_signature.clone(),
+            creq_hash: bind.creq_hash.clone(),
+            accepted_mints: bind.accepted_mints.clone(),
+            contribution: None,
+        };
+        fill_explicit_request_from_bind(&mut explicit, &bind);
+
+        assert_eq!(
+            explicit, from_bind,
+            "with byte-equal inputs the two forms already produce identical requests — the live \
+             incident was NOT request construction"
+        );
+    }
+
     #[test]
     fn accept_bind_round_trips_on_disk() {
         let root = std::env::temp_dir().join(format!(
