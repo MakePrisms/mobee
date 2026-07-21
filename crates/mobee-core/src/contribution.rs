@@ -1,11 +1,12 @@
-//! Freelance-PR (contribution) fork path — additive to the from-scratch money path.
+//! Piece-10 Step-1 — freelance-PR (contribution) fork path (additive to the from-scratch money
+//! path). See `docs/meta/PIECE-10-FREELANCE-PR-DELIVERY.md`.
 //!
 //! A **contribution** job targets a buyer-owned repo (pinned by owner pubkey + clone URL) at an
 //! exact `base_oid`; the seller forks that target, works, and delivers a fork tip that MUST
 //! **descend** from `base_oid`. The buyer verify-path (ALL pre-pay, ALL against buyer-controlled
 //! inputs) fetches the fork tip into custody, resolves `base_oid` **from the PIN** (never the
 //! seller echo), and asserts descendant + tip-match + **seller-signed tuple authorship** +
-//! content-gate + echo-equality *before* the existing `Delivery::Commit` money bind pays the
+//! content-gate + echo-equality *before* the existing fork-tip commit money bind pays the
 //! fork-tip `commit_oid`. Then the buyer merges the **custodied local oid** (custody-retention: a
 //! fork moved/deleted post-accept cannot strand the buyer).
 //!
@@ -18,10 +19,10 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
-/// `job-class` tag value marking a contribution offer. Absent ⇒ from-scratch (the default).
+/// `job-class` tag value marking a contribution offer. Absent ⇒ from-scratch (back-compat).
 pub const JOB_CLASS_CONTRIBUTION: &str = "contribution";
 
-/// The only shipped seller path (`accepts=fork`; `Delivery::Commit`). Patch (`Tree`) is deferred.
+/// Only seller path shipped in v1 (`accepts=fork`).
 pub const ACCEPTS_FORK: &str = "fork";
 
 /// Domain separator for the seller's signed-result authorship tuple. DISTINCT from the
@@ -36,14 +37,14 @@ pub const TAG_BASE: &str = "base";
 pub const TAG_ACCEPTS: &str = "accepts";
 pub const TAG_FORK_REF: &str = "fork-ref";
 /// `["sig","seller-contribution",<hex>]` — the tuple schnorr signature label. Distinct from the
-/// `["sig","seller",..]` receipt cosig so both ride the same result without ambiguity.
+/// piece-9 `["sig","seller",..]` receipt cosig so both ride the same result without ambiguity.
 pub const SIG_SELLER_CONTRIBUTION: &str = "seller-contribution";
 
 /// A target repo pinned by **owner pubkey + clone URL** — never a bare `d`-tag / name (the relay
-/// `.names` registry is GLOBAL across owners, so a bare name is spoofable). This carries the
-/// security payload of a NIP-34 `naddr` (owner + locator); the owner segment scopes the fetch so
-/// a different owner is a different repo. (The wire form here is the decoded payload; a canonical
-/// NIP-19 bech32 rendering is a deferred follow-up.)
+/// `.names` registry is GLOBAL across owners, so a bare name is spoofable; `home.rs:105`). This
+/// carries the security payload of a NIP-34 `naddr` (owner + locator); the owner segment scopes
+/// the fetch so a different owner is a different repo. (Canonical NIP-19 bech32 rendering for
+/// observatory interop is a deferred follow-up — the wire form here is the decoded payload.)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetRepoPin {
     owner_pubkey: String,
@@ -81,7 +82,7 @@ impl TargetRepoPin {
         &self.owner_pubkey
     }
 
-    /// The buyer-controlled clone URL `base_oid` is fetched from (base-from-pin).
+    /// The buyer-controlled clone URL `base_oid` is fetched from (MUST-2: base-from-pin).
     pub fn clone_url(&self) -> &str {
         &self.clone_url
     }
@@ -154,7 +155,7 @@ impl ContributionBase {
 
 /// The seller's fork **repo + branch** in the seller's own relay-git namespace (what the buyer
 /// custody-fetches and later merges). The fork tip `commit_oid` rides the existing result
-/// `commit` tag / `Delivery::Commit`.
+/// `commit` tag.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForkRef {
     repo: String,
@@ -198,12 +199,12 @@ impl ForkRef {
 pub struct ContributionOffer {
     pub target: TargetRepoPin,
     pub base: ContributionBase,
-    /// Positional multi-value `accepts` (currently `["fork"]`).
+    /// Positional multi-value `accepts` (v1 = `["fork"]`).
     pub accepts: Vec<String>,
 }
 
 impl ContributionOffer {
-    /// True when the offer accepts the fork (`Delivery::Commit`) path.
+    /// True when the offer accepts the fork path.
     pub fn accepts_fork(&self) -> bool {
         self.accepts.iter().any(|a| a == ACCEPTS_FORK)
     }
@@ -263,7 +264,7 @@ pub struct ChangedPath {
     pub bytes: u64,
 }
 
-/// Buyer-side content policy hook. The FLOOR (default) refuses only EMPTY diffs; it is
+/// Buyer-side content policy hook (MUST-5). The FLOOR (default) refuses only EMPTY diffs; it is
 /// **not** a quality gate — an in-scope-but-worthless diff can still pass (quality-judging is
 /// deferred to the payment-and-reputation chapter). Path-scope lives here (the offer table has NO
 /// paths tag): a buyer MAY tighten pre-pay with a path allowlist + forbidden paths + a max diff
@@ -374,7 +375,7 @@ pub enum ContributionError {
     /// `job-class=contribution` but a required pin/base tag is missing or malformed.
     MalformedOffer(String),
     /// Result echoed a `{target_repo|base_oid|fork_ref}` that disagrees with the buyer's signed
-    /// offer / accept-bind (equality-check; cross-check input, never authority).
+    /// offer / accept-bind (MUST-4 equality-check; cross-check input, never authority).
     EchoMismatch(String),
     /// The seller-signed authorship tuple signature did not verify.
     Authorship(String),
@@ -433,7 +434,7 @@ pub fn contribution_offer_tags(offer: &ContributionOffer) -> Vec<TagSpec> {
 }
 
 /// Parse the contribution class from an offer/result's tags. FAIL-CLOSED:
-/// - `Ok(None)` when not a contribution (no `job-class=contribution`) ⇒ from-scratch (the default).
+/// - `Ok(None)` when not a contribution (no `job-class=contribution`) ⇒ from-scratch (back-compat).
 /// - `Ok(Some(..))` for a well-formed contribution.
 /// - `Err(..)` when `job-class=contribution` but a pin/base is missing or malformed — a malformed
 ///   contribution offer is REFUSED, never silently run as from-scratch.
@@ -458,12 +459,12 @@ pub fn parse_contribution_offer(
         .unwrap_or_default();
     if accepts.is_empty() {
         return Err(ContributionError::MalformedOffer(
-            "accepts tag missing a value (accepts=fork is required)".into(),
+            "accepts tag missing a value (v1 requires accepts=fork)".into(),
         ));
     }
     if !accepts.iter().any(|a| a == ACCEPTS_FORK) {
         return Err(ContributionError::MalformedOffer(format!(
-            "only accepts=fork is supported; offer accepts {accepts:?}"
+            "v1 supports only accepts=fork; offer accepts {accepts:?}"
         )));
     }
     Ok(Some(ContributionOffer {
@@ -519,7 +520,7 @@ pub fn contribution_sig_tag(sig_hex: &str) -> TagSpec {
 /// Seller-side: additive contribution echo + authorship-signature tags for a result-kind result.
 /// The seller echoes the offer's `{job-class, target-repo, base, accepts}` and appends its
 /// `sig/seller-contribution` over the authorship tuple. The echo is EQUALITY-CHECKED by the buyer
-/// against its signed offer — never trusted as authority.
+/// against its signed offer (MUST-4) — never trusted as authority.
 pub fn contribution_result_tags(offer: &ContributionOffer, tuple_sig_hex: &str) -> Vec<TagSpec> {
     let mut tags = contribution_offer_tags(offer);
     tags.push(contribution_sig_tag(tuple_sig_hex));
@@ -618,7 +619,7 @@ mod tests {
     fn unique_branch_carries_full_job_id_not_prefix() {
         let job_id = "b".repeat(64);
         let branch = ForkRef::unique_branch(&job_id);
-        assert!(branch.contains(&job_id), "full job id must be in the ref");
+        assert!(branch.contains(&job_id), "full job id must be in the ref (MUST-6)");
         // The colliding `[:8]` prefix must NOT be the whole leaf.
         assert_ne!(branch, format!("mobee/{}", &job_id[..8]));
     }
@@ -777,7 +778,7 @@ mod tests {
             TagSpec::new([TAG_ACCEPTS, ACCEPTS_FORK]),
         ];
         assert!(parse_contribution_offer(&tags).is_err());
-        // patch-only accepts (no fork) → REFUSED.
+        // patch-only accepts (no fork) → REFUSE in v1.
         let tags = vec![
             TagSpec::new([TAG_JOB_CLASS, JOB_CLASS_CONTRIBUTION]),
             TagSpec(pin().to_tag_values().to_vec()),

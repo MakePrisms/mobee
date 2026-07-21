@@ -75,6 +75,11 @@ impl GitDelivery {
     pub fn commit_oid(&self) -> &CommitOid {
         &self.commit_oid
     }
+
+    /// Wire delivery-kind for a git (fork-tip) delivery: [`DeliveryKind::Fork`] (`"fork"`).
+    pub fn delivery_kind(&self) -> DeliveryKind {
+        DeliveryKind::Fork
+    }
 }
 
 /// Proof that the advertised branch tip was fetched into buyer custody.
@@ -110,54 +115,6 @@ impl VerifiedDelivery {
 pub trait DeliveryVerifier {
     /// Fetches and verifies a delivery before payment intent is persisted.
     fn verify(&mut self, delivery: &GitDelivery) -> Result<VerifiedDelivery, DeliveryError>;
-}
-
-/// A typed delivery over the delivered git **object**.
-///
-/// The money path binds *an object oid*; this enum names which object by variant so new
-/// delivery forms are added as variants of one abstraction, never as a parallel money-path.
-///
-/// - [`Delivery::Commit`] — the **only live** variant: the commit path. Bound object = the
-///   fork-tip `commit_oid`; verify = fetch the branch tip + peel `^{commit}` + tip-match, via
-///   the [`GitDelivery`] path, yielding a [`VerifiedDelivery`].
-///
-/// The `Tree` variant (NIP-34 patch; bound object = the resulting *tree* oid) is intentionally
-/// **OMITTED** here — there is no `Tree` verify arm — so every `match` over this enum stays
-/// exhaustive and warning-clean. Adding `Tree` later is additive (a variant + its verify arm),
-/// not a parallel money-path.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Delivery {
-    /// Commit delivery (fork tip). Carries the advertised [`GitDelivery`] fields.
-    Commit(GitDelivery),
-}
-
-impl Delivery {
-    /// The delivered git object the money path binds. `Commit` → the fork-tip `commit_oid`.
-    pub fn bound_oid(&self) -> &CommitOid {
-        match self {
-            Self::Commit(git) => git.commit_oid(),
-        }
-    }
-
-    /// Wire delivery-kind derived from the variant. `Commit` → [`DeliveryKind::Fork`] (`"fork"`) —
-    /// byte-identical to the value the pay path hardcoded before the re-type.
-    pub fn delivery_kind(&self) -> DeliveryKind {
-        match self {
-            Self::Commit(_) => DeliveryKind::Fork,
-        }
-    }
-
-    /// Dispatch delivery verification on the variant. `Commit` → the existing fetch-branch-tip +
-    /// `^{commit}` peel + tip-match, via [`DeliveryVerifier::verify`] on the carried
-    /// [`GitDelivery`] — unchanged. (`Tree` would be a strict-apply + tree-compare arm; not built.)
-    pub fn verify_with<V: DeliveryVerifier + ?Sized>(
-        &self,
-        verifier: &mut V,
-    ) -> Result<VerifiedDelivery, DeliveryError> {
-        match self {
-            Self::Commit(git) => verifier.verify(git),
-        }
-    }
 }
 
 /// Fail-closed delivery verification errors.
@@ -293,67 +250,23 @@ mod tests {
         ));
     }
 
-    fn commit_delivery(oid: &str) -> Delivery {
-        Delivery::Commit(
-            GitDelivery::new(
-                "https://example.invalid/repo.git",
-                "main",
-                CommitOid::parse(oid).expect("oid"),
-            )
-            .expect("delivery"),
+    fn commit_delivery(oid: &str) -> GitDelivery {
+        GitDelivery::new(
+            "https://example.invalid/repo.git",
+            "main",
+            CommitOid::parse(oid).expect("oid"),
         )
+        .expect("delivery")
     }
 
     #[test]
-    fn commit_variant_binds_commit_oid_and_derives_fork_kind() {
-        // The bound-oid selection and the delivery-kind derivation are load-bearing typed seams
-        // (breaking either regresses the money path). For `Commit` they yield today's values.
+    fn git_delivery_binds_commit_oid_and_derives_fork_kind() {
+        // The bound-oid and delivery-kind derivations are load-bearing seams (breaking either
+        // regresses the money path).
         let delivery = commit_delivery(&"1".repeat(40));
-        assert_eq!(delivery.bound_oid().as_str(), &"1".repeat(40));
+        assert_eq!(delivery.commit_oid().as_str(), &"1".repeat(40));
         assert_eq!(delivery.delivery_kind(), DeliveryKind::Fork);
         assert_eq!(delivery.delivery_kind().as_str(), "fork");
     }
 
-    #[test]
-    fn commit_variant_verify_dispatches_to_the_existing_tip_match() {
-        // `verify_with` must forward the `Commit` arm to `DeliveryVerifier::verify` on the carried
-        // `GitDelivery` (the existing tip-match path). Red-on-revert: breaking the `Commit`
-        // dispatch turns this — and every commit trade on the money path — red.
-        struct AcceptTip;
-        impl DeliveryVerifier for AcceptTip {
-            fn verify(
-                &mut self,
-                delivery: &GitDelivery,
-            ) -> Result<VerifiedDelivery, DeliveryError> {
-                VerifiedDelivery::from_fetched_tip(delivery, delivery.commit_oid().clone())
-            }
-        }
-        let delivery = commit_delivery(&"2".repeat(40));
-        let mut verifier = AcceptTip;
-        let verified = delivery.verify_with(&mut verifier).expect("verified");
-        assert_eq!(verified.commit_oid().as_str(), &"2".repeat(40));
-    }
-
-    #[test]
-    fn commit_variant_verify_propagates_a_tip_mismatch_refusal() {
-        // A dispatched verify that tip-mismatches must refuse IDENTICALLY to the direct path.
-        struct MismatchTip;
-        impl DeliveryVerifier for MismatchTip {
-            fn verify(
-                &mut self,
-                delivery: &GitDelivery,
-            ) -> Result<VerifiedDelivery, DeliveryError> {
-                VerifiedDelivery::from_fetched_tip(
-                    delivery,
-                    CommitOid::parse("3".repeat(40)).expect("fetched oid"),
-                )
-            }
-        }
-        let delivery = commit_delivery(&"2".repeat(40));
-        let mut verifier = MismatchTip;
-        assert!(matches!(
-            delivery.verify_with(&mut verifier),
-            Err(DeliveryError::TipMismatch { .. })
-        ));
-    }
 }
