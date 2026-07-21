@@ -691,17 +691,19 @@ offer_backfill_secs = {backfill}
         let root = temp_home("journal");
         let _ = fs::remove_dir_all(&root);
         let mut home = home::bootstrap(&root).expect("bootstrap");
-        home.config.seller = Some(SellerConfig {
-            agent_command: vec!["echo".into()],
-            rate_sats: 1,
-            git_remote: "https://example.invalid/repo.git".into(),
-            job_timeout_secs: None,
-            agent: None,
-            claim_open_pool: false,
-            offer_backfill_secs: 0,
-            contribution_enabled: true,
-        });
-        home::save_config(&home).expect("save");
+        home::save_config(&mut home, |config| {
+            config.seller = Some(SellerConfig {
+                agent_command: vec!["echo".into()],
+                rate_sats: 1,
+                git_remote: "https://example.invalid/repo.git".into(),
+                job_timeout_secs: None,
+                agent: None,
+                claim_open_pool: false,
+                offer_backfill_secs: 0,
+                contribution_enabled: true,
+            });
+        })
+        .expect("save");
 
         let journal = SellerJournal::open(&home).expect("journal");
         journal

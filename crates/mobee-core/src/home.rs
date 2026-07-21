@@ -909,9 +909,27 @@ fn write_config(path: &Path, config: &MobeeConfig) -> Result<(), HomeError> {
     fs::write(path, raw).map_err(|error| HomeError::Io(error.to_string()))
 }
 
-/// Persist `home.config` to `config.toml` (used by `set_profile` and mint migration).
-pub fn save_config(home: &MobeeHome) -> Result<(), HomeError> {
-    write_config(&home.root.join(CONFIG_FILE), &home.config)
+/// Persist an explicit config change to `config.toml`, keeping `MOBEE_*` overrides runtime-only.
+///
+/// The file is the durable layer; the `MOBEE_*` environment is an overlay applied at load
+/// ([`apply_env_layer`]) and never written back. `edit` receives the file-only view (defaults +
+/// current file, no env) and applies the caller's explicit change; that view is written, so an
+/// env-origin value the caller did not choose cannot leak into the file. `home.config` is then
+/// refreshed through the full layer pipeline so the in-process struct still reflects env.
+pub fn save_config(
+    home: &mut MobeeHome,
+    edit: impl FnOnce(&mut MobeeConfig),
+) -> Result<(), HomeError> {
+    let config_path = home.root.join(CONFIG_FILE);
+    let mut file_config = if config_path.exists() {
+        load_config(&config_path)?
+    } else {
+        MobeeConfig::default()
+    };
+    edit(&mut file_config);
+    write_config(&config_path, &file_config)?;
+    home.config = apply_env_layer(&file_config, config_env_from_process())?;
+    Ok(())
 }
 
 /// Reload `config.toml` into `home.config` without touching the key file. Routes through the same
@@ -1200,16 +1218,85 @@ mod tests {
         let root = temp_home("profile-rt");
         let _ = fs::remove_dir_all(&root);
         let mut home = bootstrap(&root).expect("bootstrap");
-        home.config.profile = Some(ProfileConfig {
-            name: Some("test-buyer".into()),
-            about: Some("testnut only".into()),
-        });
-        save_config(&home).expect("save");
+        save_config(&mut home, |config| {
+            config.profile = Some(ProfileConfig {
+                name: Some("test-buyer".into()),
+                about: Some("testnut only".into()),
+            });
+        })
+        .expect("save");
         home.config.profile = None;
         reload_config(&mut home).expect("reload");
         let profile = home.config.profile.expect("profile present");
         assert_eq!(profile.name.as_deref(), Some("test-buyer"));
         assert_eq!(profile.about.as_deref(), Some("testnut only"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_does_not_persist_env_override_values() {
+        // A field whose value came only from a MOBEE_* env override must stay runtime-only:
+        // saving an UNRELATED field must not bake the env value into config.toml.
+        let root = temp_home("save-env-noleak");
+        let _ = fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+
+        // Resolve an env override into the in-process config, as a live process would.
+        let file_before = load_config(&home.root.join(CONFIG_FILE)).expect("file before");
+        home.config = apply_env_layer(&file_before, env(&[("MOBEE_RELAY_URL", "wss://from-env")]))
+            .expect("env layer");
+        assert_eq!(home.config.relay_url, "wss://from-env");
+
+        // Save an unrelated field.
+        save_config(&mut home, |config| {
+            config.profile = Some(ProfileConfig {
+                name: Some("buyer".into()),
+                about: None,
+            });
+        })
+        .expect("save");
+
+        // The env-origin relay_url is absent from the file; the explicit field is present.
+        let raw = fs::read_to_string(home.root.join(CONFIG_FILE)).expect("read");
+        assert!(
+            !raw.contains("wss://from-env"),
+            "env override leaked into config.toml: {raw}"
+        );
+        let on_disk = load_config(&home.root.join(CONFIG_FILE)).expect("reload file");
+        assert_eq!(on_disk.relay_url, DEFAULT_RELAY_URL);
+        assert_eq!(
+            on_disk.profile.and_then(|profile| profile.name).as_deref(),
+            Some("buyer")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_persists_explicitly_chosen_field() {
+        // The guarantee is only that UNCHOSEN env values do not leak. A value the caller
+        // explicitly saves is persisted even when an env var also covers that field.
+        let root = temp_home("save-explicit");
+        let _ = fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+
+        let file_before = load_config(&home.root.join(CONFIG_FILE)).expect("file before");
+        home.config = apply_env_layer(&file_before, env(&[("MOBEE_RELAY_URL", "wss://from-env")]))
+            .expect("env layer");
+
+        save_config(&mut home, |config| {
+            config.relay_url = "wss://chosen".into();
+        })
+        .expect("save");
+
+        let on_disk = load_config(&home.root.join(CONFIG_FILE)).expect("reload file");
+        assert_eq!(
+            on_disk.relay_url, "wss://chosen",
+            "an explicitly chosen value is persisted"
+        );
+        assert_ne!(
+            on_disk.relay_url, "wss://from-env",
+            "the persisted value is the caller's choice, not the env override"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
