@@ -431,6 +431,29 @@ pub fn push_branch_with_auth(
         return Err(SellerGitError::Io("branch must be non-empty".into()));
     }
 
+    // In-process libgit2 push (removes system `git` from the delivery push path). Only for
+    // relay-git remotes with NIP-98 auth (public https keeps the system path). On ANY
+    // in-process error we log which path ran and fall back to system git — the money path
+    // must never silently trust a broken push, and system git still works on git >= 2.54.
+    #[cfg(feature = "inprocess-push")]
+    if let Some(auth) = auth {
+        if inprocess_push_enabled(seller_home)
+            && crate::delivery_transport::is_relay_git_locator(remote_url)
+        {
+            match inprocess::push_branch_inprocess(workdir, remote_url, branch, auth) {
+                Ok(oid) => {
+                    eprintln!("seller push path=inprocess remote={remote_url} branch={branch} ok");
+                    return Ok(oid);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "seller push path=inprocess FAILED ({error}); falling back to system git"
+                    );
+                }
+            }
+        }
+    }
+
     // Ensure origin points at the allowlisted remote for this push only.
     let _ = scrubbed_git_auth(workdir, seller_home, ["remote", "remove", "origin"], None);
     run_ok(
@@ -468,6 +491,7 @@ pub fn push_branch_with_auth(
         }
         return Err(SellerGitError::CommandFailed("push"));
     }
+    eprintln!("seller push path=system-git remote={remote_url} branch={branch} ok");
 
     let rev = scrubbed_git_auth(workdir, seller_home, ["rev-parse", "HEAD"], None)?;
     run_ok("rev-parse", rev.clone())?;
@@ -832,6 +856,399 @@ fn run_ok(op: &'static str, output: Output) -> Result<(), SellerGitError> {
         Ok(())
     } else {
         Err(SellerGitError::CommandFailed(op))
+    }
+}
+
+/// Resolve whether the in-process push is enabled for this seller home.
+///
+/// Env override `MOBEE_SELLER_INPROCESS_PUSH` wins (ops kill-switch / tests), then the
+/// `[seller_git] inprocess_push` config, defaulting ON. Never panics; a config read error
+/// falls back to the default (ON).
+#[cfg(feature = "inprocess-push")]
+fn inprocess_push_enabled(seller_home: &Path) -> bool {
+    if let Ok(value) = std::env::var("MOBEE_SELLER_INPROCESS_PUSH") {
+        let value = value.trim();
+        return !(value == "0" || value.eq_ignore_ascii_case("false"));
+    }
+    crate::home::bootstrap(seller_home)
+        .map(|home| home.config.seller_git.inprocess_push)
+        .unwrap_or_else(|_| crate::home::default_inprocess_push())
+}
+
+/// Build the NIP-98 (`kind:27235`) `Authorization` header value for a relay-git push.
+///
+/// Signs `u = <remote_url>` (the repo-root the relay verifies after stripping `/info/refs`
+/// or `/git-receive-pack`) with method `POST`. mobee-relay is method-agnostic on git routes
+/// and does not dedup the event id, so this ONE header is valid for both the info/refs GET
+/// advertisement and the receive-pack POST — the same token-reuse the credential helper
+/// relies on, delivered directly instead of via git's credential protocol. The secret key
+/// never appears in the returned string (only the schnorr signature does).
+#[cfg(feature = "inprocess-push")]
+fn nip98_authorization_header(
+    remote_url: &str,
+    secret_key_hex: &str,
+) -> Result<String, SellerGitError> {
+    use base64::Engine as _;
+    use nostr_sdk::nips::nip98::{HttpData, HttpMethod};
+    use nostr_sdk::prelude::{EventBuilder, Url};
+    use nostr_sdk::{JsonUtil, Keys};
+
+    let keys = Keys::parse(secret_key_hex)
+        .map_err(|error| SellerGitError::AuthFailed(format!("invalid seller key: {error}")))?;
+    let url = Url::parse(remote_url)
+        .map_err(|error| SellerGitError::Io(format!("invalid remote url: {error}")))?;
+    let event = EventBuilder::http_auth(HttpData::new(url, HttpMethod::POST))
+        .sign_with_keys(&keys)
+        .map_err(|error| SellerGitError::AuthFailed(format!("nip98 sign failed: {error}")))?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(event.as_json());
+    Ok(format!("Nostr {encoded}"))
+}
+
+/// In-process libgit2 push path. Registers a rustls-backed smart HTTP subtransport for the
+/// `https` scheme that injects the NIP-98 `Authorization` header on every request — so the
+/// receive-pack POST carries auth regardless of the local git version (git ≤ 2.53 drops the
+/// header on the streamed POST retry). No system `git`, no openssl (TLS via reqwest/rustls).
+#[cfg(feature = "inprocess-push")]
+mod inprocess {
+    use super::{nip98_authorization_header, PushAuth, SellerGitError};
+    use std::cell::RefCell;
+    use std::io::{self, Read, Write};
+    use std::path::Path;
+    use std::sync::{Once, OnceLock};
+    use std::time::Duration;
+
+    use git2::transport::{Service, SmartSubtransport, SmartSubtransportStream, Transport};
+    use git2::{PushOptions, RemoteCallbacks, Repository};
+
+    thread_local! {
+        /// Authorization header for the push running on THIS thread. Set immediately before
+        /// `remote.push`, cleared right after; the registered https factory reads it.
+        static AUTH_HEADER: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    static REGISTER: Once = Once::new();
+
+    /// Shared blocking HTTP client (rustls, bundled CA roots). Built once.
+    fn http_client() -> &'static reqwest::blocking::Client {
+        static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+        CLIENT.get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(120))
+                .build()
+                .expect("build reqwest blocking client")
+        })
+    }
+
+    /// Register the https smart subtransport exactly once for this process.
+    fn ensure_registered() {
+        REGISTER.call_once(|| {
+            // SAFETY: libgit2 requires transport registration be externally synchronized with
+            // other transport creation. `Once` guarantees a single registration, and mobee-core
+            // uses git2 ONLY for this seller push, so overriding the `https` scheme affects no
+            // other code path in the process.
+            unsafe {
+                let _ = git2::transport::register("https", |remote| {
+                    let header = AUTH_HEADER.with(|cell| cell.borrow().clone());
+                    Transport::smart(remote, true, NostrHttp { header })
+                });
+            }
+        });
+    }
+
+    /// Push `refs/heads/<branch>` to `remote_url` in-process, returning the pushed commit OID.
+    pub fn push_branch_inprocess(
+        workdir: &Path,
+        remote_url: &str,
+        branch: &str,
+        auth: &PushAuth,
+    ) -> Result<String, SellerGitError> {
+        ensure_registered();
+        let header = nip98_authorization_header(remote_url, &auth.secret_key_hex)?;
+
+        let repo = Repository::open(workdir)
+            .map_err(|error| SellerGitError::Io(format!("open workdir repo: {error}")))?;
+        let mut remote = repo
+            .remote_anonymous(remote_url)
+            .map_err(|error| SellerGitError::Io(format!("anonymous remote: {error}")))?;
+
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let rejection: std::rc::Rc<RefCell<Option<String>>> =
+            std::rc::Rc::new(RefCell::new(None));
+        let mut callbacks = RemoteCallbacks::new();
+        {
+            let rejection = rejection.clone();
+            callbacks.push_update_reference(move |refname, status| {
+                if let Some(message) = status {
+                    *rejection.borrow_mut() = Some(format!("{refname}: {message}"));
+                }
+                Ok(())
+            });
+        }
+        let mut options = PushOptions::new();
+        options.remote_callbacks(callbacks);
+
+        AUTH_HEADER.with(|cell| *cell.borrow_mut() = Some(header));
+        let push_result = remote.push(&[refspec.as_str()], Some(&mut options));
+        AUTH_HEADER.with(|cell| *cell.borrow_mut() = None);
+        drop(options);
+        push_result.map_err(map_push_error)?;
+
+        let rejected = rejection.borrow().clone();
+        if let Some(message) = rejected {
+            return Err(SellerGitError::AuthFailed(format!(
+                "remote rejected ref {message}"
+            )));
+        }
+
+        let oid = repo
+            .revparse_single(&format!("refs/heads/{branch}"))
+            .and_then(|object| object.peel_to_commit())
+            .map(|commit| commit.id().to_string())
+            .map_err(|error| SellerGitError::Io(format!("resolve pushed oid: {error}")))?;
+        if oid.len() < 40 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(SellerGitError::Io(format!("unexpected commit oid {oid:?}")));
+        }
+        Ok(oid)
+    }
+
+    /// Map a libgit2 push error to a scrubbed [`SellerGitError`]. Auth/permission signals map
+    /// to `AuthFailed` (fail-closed, parity with the system-git path); the secret is never in
+    /// a git2 error, so no redaction is needed.
+    fn map_push_error(error: git2::Error) -> SellerGitError {
+        let lowered = error.message().to_ascii_lowercase();
+        if lowered.contains("401")
+            || lowered.contains("403")
+            || lowered.contains("authentication")
+            || lowered.contains("unauthorized")
+            || lowered.contains("forbidden")
+            || lowered.contains("permission")
+        {
+            SellerGitError::AuthFailed(format!("in-process push rejected: {}", error.message()))
+        } else {
+            SellerGitError::Io(format!("in-process push failed: {}", error.message()))
+        }
+    }
+
+    /// rustls smart-HTTP subtransport that injects the NIP-98 header captured at push time.
+    struct NostrHttp {
+        header: Option<String>,
+    }
+
+    /// Map a smart-HTTP service to its `(service_name, is_post)` pair.
+    fn service_parts(service: Service) -> (&'static str, bool) {
+        match service {
+            Service::UploadPackLs => ("git-upload-pack", false),
+            Service::UploadPack => ("git-upload-pack", true),
+            Service::ReceivePackLs => ("git-receive-pack", false),
+            Service::ReceivePack => ("git-receive-pack", true),
+        }
+    }
+
+    /// Build the request URL for a service leg. POST legs hit `<base>/<service>`; the
+    /// ref-advertisement (LS) legs hit `<base>/info/refs?service=<service>` — matching
+    /// libgit2's built-in smart-HTTP transport (and what the relay strips back to the repo root).
+    fn service_url(base: &str, name: &str, is_post: bool) -> String {
+        let base = base.trim_end_matches('/');
+        if is_post {
+            format!("{base}/{name}")
+        } else {
+            format!("{base}/info/refs?service={name}")
+        }
+    }
+
+    impl SmartSubtransport for NostrHttp {
+        fn action(
+            &self,
+            url: &str,
+            service: Service,
+        ) -> Result<Box<dyn SmartSubtransportStream>, git2::Error> {
+            let (name, is_post) = service_parts(service);
+            let full_url = service_url(url, name, is_post);
+            Ok(Box::new(HttpStream {
+                header: self.header.clone(),
+                url: full_url,
+                service: name,
+                is_post,
+                sent: false,
+                request_body: Vec::new(),
+                response: None,
+            }))
+        }
+
+        fn close(&self) -> Result<(), git2::Error> {
+            Ok(())
+        }
+    }
+
+    /// One request/response leg of the smart-HTTP flow. libgit2 writes the request body (POST
+    /// legs), then reads the response; we buffer the writes and fire the HTTP request lazily on
+    /// the first read (the standard buffer-then-send pattern for stateless smart HTTP).
+    struct HttpStream {
+        header: Option<String>,
+        url: String,
+        service: &'static str,
+        is_post: bool,
+        sent: bool,
+        request_body: Vec<u8>,
+        response: Option<reqwest::blocking::Response>,
+    }
+
+    impl HttpStream {
+        fn send(&mut self) -> io::Result<()> {
+            let client = http_client();
+            let mut request = if self.is_post {
+                client
+                    .post(&self.url)
+                    .header(
+                        "Content-Type",
+                        format!("application/x-{}-request", self.service),
+                    )
+                    .header("Accept", format!("application/x-{}-result", self.service))
+                    .body(std::mem::take(&mut self.request_body))
+            } else {
+                client.get(&self.url).header("Accept", "*/*")
+            };
+            // identity encoding: never hand libgit2 a gzip stream it did not negotiate.
+            request = request.header("Accept-Encoding", "identity");
+            if let Some(header) = &self.header {
+                request = request.header("Authorization", header);
+            }
+            let response = request
+                .send()
+                .map_err(|error| io::Error::other(format!("http request: {error}")))?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(io::Error::other(format!(
+                    "http status {} for {}",
+                    status.as_u16(),
+                    self.url
+                )));
+            }
+            self.response = Some(response);
+            Ok(())
+        }
+    }
+
+    impl Read for HttpStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.sent {
+                self.send()?;
+                self.sent = true;
+            }
+            match self.response.as_mut() {
+                Some(response) => response.read(buf),
+                None => Ok(0),
+            }
+        }
+    }
+
+    impl Write for HttpStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.request_body.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn ls_legs_hit_info_refs_post_legs_hit_service() {
+            let base = "https://relay.example/git/owner/repo.git";
+            let (name, is_post) = service_parts(Service::ReceivePackLs);
+            assert_eq!(name, "git-receive-pack");
+            assert!(!is_post);
+            assert_eq!(
+                service_url(base, name, is_post),
+                "https://relay.example/git/owner/repo.git/info/refs?service=git-receive-pack"
+            );
+
+            let (name, is_post) = service_parts(Service::ReceivePack);
+            assert!(is_post);
+            assert_eq!(
+                service_url(base, name, is_post),
+                "https://relay.example/git/owner/repo.git/git-receive-pack"
+            );
+        }
+
+        #[test]
+        fn service_url_trims_one_trailing_slash_only() {
+            assert_eq!(
+                service_url("https://h/git/o/r/", "git-receive-pack", true),
+                "https://h/git/o/r/git-receive-pack"
+            );
+        }
+
+        /// LIVE proof (ignored by default): fetch a ref from the seller's own canonical repo
+        /// then push it back UNCHANGED (no-op) — exercising the receive-pack POST auth handshake
+        /// end-to-end through the in-process rustls transport. Never touches existing branches.
+        /// Run: `MOBEE_SELLER_HOME=<home> cargo test -p mobee-core --features inprocess-push \
+        ///   -- --ignored --nocapture live_noop_push_authenticates`
+        #[test]
+        #[ignore]
+        fn live_noop_push_authenticates() {
+            let home = std::path::PathBuf::from(
+                std::env::var("MOBEE_SELLER_HOME").expect("set MOBEE_SELLER_HOME"),
+            );
+            let mobee_home = crate::home::bootstrap(&home).expect("bootstrap");
+            let secret = crate::home::read_secret_key_hex(&mobee_home).expect("secret");
+            let remote_url = mobee_home
+                .config
+                .seller
+                .as_ref()
+                .expect("seller config")
+                .git_remote
+                .clone();
+
+            ensure_registered();
+            let header = super::nip98_authorization_header(&remote_url, &secret).expect("header");
+
+            let work = std::env::temp_dir().join(format!("mobee-live-noop-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&work);
+            let repo = git2::Repository::init(&work).expect("init");
+            let mut remote = repo.remote_anonymous(&remote_url).expect("anon remote");
+
+            // Fetch all branches (upload-pack read is also NIP-98-gated) to learn a ref + oid.
+            AUTH_HEADER.with(|c| *c.borrow_mut() = Some(header.clone()));
+            let fetch = remote.fetch(
+                &["+refs/heads/*:refs/remotes/origin/*"],
+                None,
+                None,
+            );
+            AUTH_HEADER.with(|c| *c.borrow_mut() = None);
+            fetch.expect("in-process fetch (read auth)");
+
+            // Pick the first fetched branch; mirror it to a local head at the SAME oid.
+            let branches: Vec<(String, git2::Oid)> = repo
+                .references_glob("refs/remotes/origin/*")
+                .expect("refs")
+                .filter_map(Result::ok)
+                .filter_map(|r| {
+                    let name = r.shorthand()?.trim_start_matches("origin/").to_owned();
+                    Some((name, r.target()?))
+                })
+                .collect();
+            let (branch, oid) = branches.first().cloned().expect("at least one remote branch");
+            eprintln!("live: no-op pushing branch={branch} oid={oid}");
+            repo.reference(&format!("refs/heads/{branch}"), oid, true, "noop")
+                .expect("local head");
+
+            let pushed = super::push_branch_inprocess(
+                &work,
+                &remote_url,
+                &branch,
+                &PushAuth { secret_key_hex: secret },
+            )
+            .expect("in-process no-op push");
+            assert_eq!(pushed, oid.to_string(), "no-op push returns the unchanged oid");
+            let _ = std::fs::remove_dir_all(&work);
+        }
     }
 }
 
@@ -1451,5 +1868,71 @@ mod tests {
             fetch_base_auth(None, relay_base).is_none(),
             "absent seller auth must fall back to anonymous fetch"
         );
+    }
+
+    #[cfg(feature = "inprocess-push")]
+    #[test]
+    fn nip98_header_binds_repo_root_and_verifies() {
+        use base64::Engine as _;
+        use nostr_sdk::{Event, JsonUtil, Keys};
+
+        let keys = Keys::generate();
+        let secret = keys.secret_key().to_secret_hex();
+        let remote = "https://relay.example/git/abcdef/repo.git";
+        let header = nip98_authorization_header(remote, &secret).expect("build header");
+
+        // Never leaks the secret; scheme is "Nostr <base64>".
+        assert!(!header.contains(&secret), "secret leaked in header");
+        let encoded = header.strip_prefix("Nostr ").expect("Nostr scheme");
+        let json = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64");
+        let event = Event::from_json(&json).expect("event json");
+        event.verify().expect("valid signature");
+        assert_eq!(event.kind.as_u16(), 27235, "NIP-98 kind");
+
+        let u = event
+            .tags
+            .iter()
+            .find(|t| t.kind() == nostr_sdk::TagKind::custom("u"))
+            .and_then(|t| t.content().map(str::to_owned))
+            .expect("u tag");
+        assert_eq!(u, remote, "u tag binds the repo-root the relay verifies");
+        let method = event
+            .tags
+            .iter()
+            .find(|t| t.kind() == nostr_sdk::TagKind::custom("method"))
+            .and_then(|t| t.content().map(str::to_owned))
+            .expect("method tag");
+        assert_eq!(method, "POST");
+    }
+
+    #[cfg(feature = "inprocess-push")]
+    #[test]
+    fn nip98_header_rejects_bad_key() {
+        let err = nip98_authorization_header("https://relay.example/git/o/r.git", "not-a-key")
+            .expect_err("must reject");
+        assert!(matches!(err, SellerGitError::AuthFailed(_)));
+    }
+
+    #[cfg(feature = "inprocess-push")]
+    #[test]
+    fn inprocess_push_env_override_forces_system_git() {
+        let home = temp("inprocess-env");
+        let _ = std::fs::remove_dir_all(&home);
+        crate::home::bootstrap(&home).expect("bootstrap");
+        // SAFETY: this test is the only reader/writer of MOBEE_SELLER_INPROCESS_PUSH.
+        unsafe {
+            // Fresh home defaults ON.
+            std::env::remove_var("MOBEE_SELLER_INPROCESS_PUSH");
+            assert!(inprocess_push_enabled(&home), "default is in-process ON");
+            // Env kill-switch forces OFF.
+            std::env::set_var("MOBEE_SELLER_INPROCESS_PUSH", "0");
+            assert!(!inprocess_push_enabled(&home), "env 0 forces system git");
+            std::env::set_var("MOBEE_SELLER_INPROCESS_PUSH", "false");
+            assert!(!inprocess_push_enabled(&home), "env false forces system git");
+            std::env::remove_var("MOBEE_SELLER_INPROCESS_PUSH");
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

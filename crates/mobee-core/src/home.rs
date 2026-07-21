@@ -244,6 +244,50 @@ pub fn default_boot_push_preflight() -> bool {
     true
 }
 
+/// Seller delivery-push transport config (`[seller_git]` section). Selects the
+/// **in-process libgit2 push** (no system `git` on the delivery push path) versus the
+/// legacy system-git path.
+///
+/// Motivation: git ≤ 2.53 silently drops the `Authorization` header on the streamed
+/// `git-receive-pack` POST retry (the body can't be re-sent after the 401), so sellers on
+/// most git versions fail every relay-git delivery. The in-process path injects the NIP-98
+/// header itself on every request (relay-git is method-agnostic and does not dedup the
+/// token), removing that git-version dependency. On any in-process error the daemon falls
+/// back to the system-git path and logs which path ran.
+///
+/// NOTE (same money-path build boundary as [`SellerPreflightConfig`]): the natural spelling
+/// would nest this under `[seller]`, but `SellerConfig`'s literal is constructed in
+/// `seller.rs` — a money file this change must not touch. Placing it top-level as
+/// `[seller_git]` on `MobeeConfig` (built only via `Default`) delivers the knob without it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SellerGitConfig {
+    /// Use the in-process libgit2 push for relay-git deliveries. Default **true**. The env
+    /// override `MOBEE_SELLER_INPROCESS_PUSH=0` (or `false`) forces the system-git path.
+    #[serde(default = "default_inprocess_push")]
+    pub inprocess_push: bool,
+}
+
+impl Default for SellerGitConfig {
+    fn default() -> Self {
+        Self {
+            inprocess_push: default_inprocess_push(),
+        }
+    }
+}
+
+impl SellerGitConfig {
+    /// True when every field is at its shipped default (so config.toml stays clean — the
+    /// section is only serialized once an operator sets a non-default knob).
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// serde default for [`SellerGitConfig::inprocess_push`] — in-process push ON.
+pub fn default_inprocess_push() -> bool {
+    true
+}
+
 impl SellerMemoryConfig {
     /// True when every field is at its shipped default (so config.toml stays clean — the section
     /// is only serialized once an operator sets a non-default knob).
@@ -385,6 +429,9 @@ pub struct MobeeConfig {
     /// `[seller_preflight]` boot push-probe config. Defaults (probe ON) when absent.
     #[serde(default, skip_serializing_if = "SellerPreflightConfig::is_default")]
     pub seller_preflight: SellerPreflightConfig,
+    /// `[seller_git]` delivery-push transport config. Defaults (in-process push ON) when absent.
+    #[serde(default, skip_serializing_if = "SellerGitConfig::is_default")]
+    pub seller_git: SellerGitConfig,
     /// Optional buyer-side piece-10 contribution content policy (the MUST-5 policy hook). Absent
     /// ⇒ the FLOOR (refuse only empty diffs). Present ⇒ tighten pre-pay with a path allowlist /
     /// forbidden paths / max diff size.
@@ -422,6 +469,7 @@ impl Default for MobeeConfig {
             seller_memory: SellerMemoryConfig::default(),
             seller_announce: SellerAnnounceConfig::default(),
             seller_preflight: SellerPreflightConfig::default(),
+            seller_git: SellerGitConfig::default(),
             contribution: None,
         }
     }
