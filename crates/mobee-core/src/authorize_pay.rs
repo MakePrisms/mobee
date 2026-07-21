@@ -44,6 +44,12 @@ pub struct AuthorizePayRequest {
     /// accepted result's `sig/seller` tag. Empty ⇒ the buyer cannot co-sign a valid
     /// receipt (the receipt authority fails closed at publish).
     pub seller_signature: String,
+    /// Piece-14: SHA-256 hex of the seller-authored NUT-18 payment request (`creqA…`), sourced
+    /// from the accepted claim's `creq` tag (threaded through the accept-bind). `None` for a v1
+    /// claim with no `creq` — the attempt id and receipt preimage then bind byte-identically to
+    /// before piece-14. NOT mandatory this job (A′ flips requirements); `Some` once Job C authors
+    /// the creq. Bound into the [`PaymentKey`] attempt id and the co-signed receipt preimage.
+    pub creq_hash: Option<String>,
     /// Piece-10 contribution binds. `None` ⇒ from-scratch job — EXACTLY today's path (no new
     /// verify, byte-identical produced artifacts). `Some(..)` ⇒ the fork contribution verify-path
     /// (custody fetch + base-from-pin + descendant + content) + the authorship tuple seam run
@@ -224,6 +230,7 @@ pub async fn authorize_pay_async(
         delivery_integrity_hash,
         job_hash,
         &terms,
+        request.creq_hash.clone(),
     );
     let attempt_id = key.attempt_id();
 
@@ -417,6 +424,9 @@ fn receipt_preimage_for(
         delivery_integrity_hash: key.delivery_integrity_hash.as_str().to_owned(),
         delivery_kind: delivery_kind.as_str().to_owned(),
         exec_metadata_commitment: EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
+        // Piece-14: bind the seller-authored request hash the key carries, so the pre-pay tooth
+        // and the published receipt co-sign the same bytes (byte-identical when `None` — v1).
+        creq_hash: key.creq_hash.clone(),
     }
 }
 
@@ -466,6 +476,8 @@ fn build_and_publish_receipt(
         key.job_hash.as_str(),
         seller_signature,
         &buyer_signature,
+        // Piece-14: the receipt event carries the bound request hash (absent for a v1 trade).
+        key.creq_hash.as_deref(),
         Some(gateway::ReceiptDelivery {
             integrity_hash: key.delivery_integrity_hash.as_str(),
             kind: delivery_kind.as_str(),
@@ -679,6 +691,7 @@ mod tests {
             branch: "master".into(),
             commit_oid: "aa".repeat(20),
             seller_signature: String::new(),
+            creq_hash: None,
             contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, request).expect_err("must refuse nested block_on");
@@ -716,6 +729,7 @@ mod tests {
             // Even if commit_oid is set, empty buyer hash must refuse (no auto-fill).
             commit_oid: "aa".repeat(20),
             seller_signature: String::new(),
+            creq_hash: None,
             contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, request).expect_err("D2 empty");
@@ -752,6 +766,7 @@ mod tests {
             branch: "master".into(),
             commit_oid: "cc".repeat(20),
             seller_signature: String::new(),
+            creq_hash: None,
             contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, request).expect_err("D2 mismatch");
@@ -800,6 +815,7 @@ mod tests {
             branch: "main".into(),
             commit_oid: "aa".repeat(20),
             seller_signature: valid_sig,
+            creq_hash: None,
             contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, request.clone()).expect_err("ext refused");
@@ -854,6 +870,7 @@ mod tests {
             DeliveryIntegrityHash::from_hex(oid).expect("oid"),
             JobHash::from_hex(job_hash).expect("job hash"),
             &terms,
+            None,
         );
         // buyer == seller == home key in these tests; `Commit` → delivery_kind "fork".
         receipt_preimage_for(&key, &hex, &hex, DeliveryKind::Fork)
@@ -904,6 +921,7 @@ mod tests {
             branch: "main".into(),
             commit_oid: oid,
             seller_signature: forged_sig,
+            creq_hash: None,
             contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, request).expect_err("forged sig refused pre-pay");
@@ -957,6 +975,7 @@ mod tests {
             branch: "main".into(),
             commit_oid: honest_oid.clone(),
             seller_signature: sig_over_2,
+            creq_hash: None,
             contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, tampered_amount).expect_err("tampered amount");
@@ -984,6 +1003,7 @@ mod tests {
             branch: "main".into(),
             commit_oid: tampered_oid,
             seller_signature: sig_over_aa,
+            creq_hash: None,
             contribution: None,
         };
         let err2 = authorize_pay(&home, &mut gate2, tampered_delivery).expect_err("tampered oid");
@@ -1091,6 +1111,7 @@ mod tests {
             &job_hash,
             "seller-sig-hex",
             "buyer-sig-hex",
+            None,
             Some(gateway::ReceiptDelivery {
                 integrity_hash: &integrity,
                 kind: "fork",

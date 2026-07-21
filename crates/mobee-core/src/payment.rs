@@ -131,6 +131,12 @@ impl AttemptId {
         hash_field(&mut hasher, &key.amount.to_string());
         hash_field(&mut hasher, &key.unit.to_string());
         hash_field(&mut hasher, &key.mint.to_string());
+        // Piece-14: fold the seller-authored creq hash ONLY when present, so a v1 claim (no creq
+        // ⇒ `None`) reconciles to byte-identical AttemptIds as before this change — existing
+        // in-flight journals keep resolving. A v2 claim (`Some`) makes the attempt distinct.
+        if let Some(creq_hash) = &key.creq_hash {
+            hash_field(&mut hasher, creq_hash);
+        }
         Self(hex::encode(hasher.finalize()))
     }
 }
@@ -175,16 +181,27 @@ pub struct PaymentKey {
     pub amount: Amount,
     pub unit: CurrencyUnit,
     pub mint: MintUrl,
+    /// Piece-14: SHA-256 hex of the seller-authored NUT-18 payment request (`creqA…`), folded
+    /// into the [`AttemptId`] so two claims for the same offer with different creqs reconcile as
+    /// distinct attempts. `None` for a v1 claim with no `creq` (byte-identical attempt id to
+    /// before piece-14); `Some` once the seller authors a creq (Job C). The `mint`/`amount`/`unit`
+    /// fields still denote the realized terms — Job E re-points `mint` to the payload's mint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creq_hash: Option<String>,
 }
 
 impl PaymentKey {
     /// Builds a key from trade identity and typed payment terms.
+    ///
+    /// `creq_hash` is the seller-authored request hash bound into the attempt (piece-14); pass
+    /// `None` for a v1 claim that carries no `creq` (behaves byte-identically to before).
     pub fn new(
         job_id: JobId,
         result_id: ResultId,
         delivery_integrity_hash: DeliveryIntegrityHash,
         job_hash: JobHash,
         terms: &PaymentTerms,
+        creq_hash: Option<String>,
     ) -> Self {
         Self {
             job_id,
@@ -195,6 +212,7 @@ impl PaymentKey {
             amount: terms.amount,
             unit: terms.unit.clone(),
             mint: terms.mint.clone(),
+            creq_hash,
         }
     }
 
@@ -1188,6 +1206,34 @@ mod tests {
         assert_ne!(sat.attempt_id(), msat.attempt_id());
     }
 
+    // Piece-14: the seller-authored creq hash is part of the attempt identity. Two claims for the
+    // same offer that quote different creqs reconcile as DISTINCT attempts; a v1 claim with no creq
+    // (`None`) keeps the pre-piece-14 AttemptId byte-for-byte (the regression guard — existing
+    // journals still resolve).
+    #[test]
+    fn attempt_id_binds_creq_hash_with_none_byte_identical_to_v1() {
+        let none = key();
+        assert_eq!(none.creq_hash, None);
+
+        let mut creq_a = key();
+        creq_a.creq_hash = Some("aa".repeat(32));
+        let mut creq_b = key();
+        creq_b.creq_hash = Some("bb".repeat(32));
+
+        // Same offer, different creq ⇒ different attempt ids.
+        assert_ne!(creq_a.attempt_id(), creq_b.attempt_id());
+        // A creq-bearing attempt is distinct from the v1 (no-creq) attempt.
+        assert_ne!(none.attempt_id(), creq_a.attempt_id());
+        // Regression guard: `None` reproduces the exact pre-piece-14 attempt id (the no-creq path
+        // folds nothing extra). This constant is the AttemptId of `key()` before piece-14 — if the
+        // None fold ever changes the hash preimage, this pin breaks.
+        assert_eq!(none.attempt_id().as_str(), V1_KEY_ATTEMPT_ID);
+    }
+
+    // Frozen pre-piece-14 AttemptId of `key()` (no creq). Guards the None-creq regression path.
+    const V1_KEY_ATTEMPT_ID: &str =
+        "99e8e7b4c53c7af9f2329e16a9625133e9f788d3ffe1257f0a5a121c549de3cd";
+
     #[test]
     fn legacy_content_hash_field_name_refuses_to_deserialize() {
         let mut value = serde_json::to_value(key()).expect("serialize payment key");
@@ -1267,6 +1313,7 @@ mod tests {
             DeliveryIntegrityHash::from_hex("44".repeat(20)).unwrap(),
             JobHash::from_hex("22".repeat(32)).unwrap(),
             &terms(),
+            None,
         );
 
         let result = PaymentService::new(&journal).run_with_verifier(
@@ -1899,6 +1946,7 @@ mod tests {
             DeliveryIntegrityHash::from_hex("11".repeat(32)).unwrap(),
             JobHash::from_hex("22".repeat(32)).unwrap(),
             &terms(),
+            None,
         )
     }
 
@@ -1918,6 +1966,7 @@ mod tests {
             DeliveryIntegrityHash::from_hex("33".repeat(20)).unwrap(),
             JobHash::from_hex("22".repeat(32)).unwrap(),
             &terms(),
+            None,
         )
     }
 
@@ -1956,6 +2005,7 @@ mod tests {
             delivery_integrity_hash: key.delivery_integrity_hash.as_str().to_owned(),
             delivery_kind: "fork".to_owned(),
             exec_metadata_commitment: crate::receipt::EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
+            creq_hash: key.creq_hash.clone(),
         }
     }
 

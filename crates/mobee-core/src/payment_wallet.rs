@@ -2325,6 +2325,7 @@ mod tests {
             DeliveryIntegrityHash::from_hex("11".repeat(32)).unwrap(),
             JobHash::from_hex("22".repeat(32)).unwrap(),
             terms,
+            None,
         )
     }
 
@@ -2380,6 +2381,7 @@ mod tests {
             delivery_integrity_hash: key.delivery_integrity_hash.as_str().to_owned(),
             delivery_kind: "fork".to_owned(),
             exec_metadata_commitment: crate::receipt::EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
+            creq_hash: key.creq_hash.clone(),
         };
         let message = nostr_sdk::secp256k1::Message::from_digest(preimage.digest_bytes());
         ReceiptEvidence {

@@ -900,6 +900,8 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
             branch: require_str("branch")?,
             commit_oid: require_str("commit_oid")?,
             seller_signature: seller_signature_arg.clone(),
+            // Piece-14: filled from the accept-bind below when one exists (like seller_signature).
+            creq_hash: None,
             contribution: None,
         };
         let accept_bind = job_lifecycle::load_accepted_bind(&state.home, &job_id)
@@ -914,6 +916,11 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
             .map_err(|error| error.to_string())?;
             if request.seller_signature.is_empty() {
                 request.seller_signature = bind.seller_signature.clone();
+            }
+            // Piece-14: bind the seller-authored creq hash recorded at accept, so the explicit
+            // form binds the same attempt + receipt as the accept-first path.
+            if request.creq_hash.is_none() {
+                request.creq_hash = bind.creq_hash.clone();
             }
             // Piece-10: thread contribution binds from the accept-bind so the explicit form still
             // runs the contribution verify-path + authorship seam.
@@ -965,6 +972,7 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
             branch: require_str("branch")?,
             commit_oid: require_str("commit_oid")?,
             seller_signature: seller_signature_arg.clone(),
+            creq_hash: None,
             contribution: None,
         }
     };
@@ -1937,6 +1945,7 @@ mod tests {
             accept_event_id: "accept-x".into(),
             accepted_at: 0,
             seller_signature: String::new(),
+            creq_hash: None,
             contribution: None,
         };
         let jobs_dir = state.home.root.join("jobs");

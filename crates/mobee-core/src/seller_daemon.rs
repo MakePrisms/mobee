@@ -1113,6 +1113,12 @@ impl SellerDaemon {
             delivery_integrity_hash: commit.clone(),
             delivery_kind: delivery_kind.as_str().to_owned(),
             exec_metadata_commitment: crate::receipt::EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
+            // Piece-14 (Job D): the preimage now carries the seller-authored creq hash. `None`
+            // today keeps this seller receipt byte-identical to the pre-piece-14 (v1) form so it
+            // co-signs identically to the buyer, which also binds `None` for a v1 claim. Jobs C/E
+            // author the creq on the claim + active job; this MUST then be set to
+            // `gateway::creq_hash_hex(<the authored creq>)` so both co-signatures agree.
+            creq_hash: None,
         };
         let seller_sig = sign_receipt_hash(&self.keys, &preimage.digest_hex())?;
         // Piece-9 Item 2: harness-generic PUBLIC seller-claimed usage block (opportunistic;

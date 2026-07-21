@@ -122,6 +122,7 @@ fn emit_valid(v: &Valid) {
         delivery_integrity_hash: delivery_integrity_hash.clone(),
         delivery_kind: delivery_kind.clone(),
         exec_metadata_commitment: EXEC_METADATA_COMMITMENT_EMPTY.to_owned(),
+        creq_hash: None,
     };
     print_artifact(&Artifact {
         fixture: v.name.to_owned(),

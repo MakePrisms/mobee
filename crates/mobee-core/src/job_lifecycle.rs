@@ -179,6 +179,12 @@ pub struct ClaimView {
     pub display_name: Option<String>,
     pub status: String,
     pub live: bool,
+    /// Piece-14: the seller-authored NUT-18 payment request (`creqA…`) string read from the
+    /// claim's `["creq", …]` tag, when present. Job C authors this tag; reading it is Job D's.
+    /// `None` for a v1 claim — the accept-bind then records no `creq_hash` and binding behaves as
+    /// before piece-14.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creq: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -220,6 +226,11 @@ pub struct AcceptedBind {
     /// accepted result's `sig/seller` tag (piece-9). Empty for legacy/pre-piece-9 results.
     #[serde(default)]
     pub seller_signature: String,
+    /// Piece-14: SHA-256 hex of the accepted claim's seller-authored `creq` (`creqA…`) string,
+    /// recorded at accept so authorize_pay binds the attempt id + receipt preimage to it. `None`
+    /// for a v1 claim that carries no `creq` — binding then behaves byte-identically to before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creq_hash: Option<String>,
     /// Piece-10 contribution binds, recorded at accept when the OFFER is a contribution (authority
     /// = the buyer's signed offer; the result echo is equality-checked, never trusted). Absent ⇒
     /// from-scratch (EXACTLY today's path).
@@ -736,6 +747,10 @@ pub async fn accept_claim_async(
         accepted_at,
         // Capture sig/seller so authorize_pay can co-sign the receipt preimage (piece-9).
         seller_signature: result.seller_signature.clone().unwrap_or_default(),
+        // Piece-14: hash the seller-authored creq from the accepted claim (when present) so the
+        // pay path binds the attempt + receipt to the exact request the seller quoted. A v1 claim
+        // carries no creq ⇒ `None` ⇒ binding behaves as before piece-14.
+        creq_hash: claim.creq.as_deref().map(crate::gateway::creq_hash_hex),
         contribution,
     };
     write_accepted_bind(home, &bind)?;
@@ -899,6 +914,9 @@ pub fn authorize_request_from_bind(
         branch: bind.branch.clone(),
         commit_oid: bind.commit_oid.clone(),
         seller_signature: bind.seller_signature.clone(),
+        // Piece-14: thread the recorded creq hash so the attempt + receipt bind the seller's
+        // request. `None` ⇒ v1 claim (today's path).
+        creq_hash: bind.creq_hash.clone(),
         // Piece-10: thread the contribution binds so authorize_pay runs the contribution
         // verify-path + authorship seam. `None` ⇒ from-scratch (today's path).
         contribution: bind.contribution.as_ref().map(|c| {
@@ -1158,6 +1176,8 @@ pub(crate) async fn fetch_job_view_async(
             display_name: None,
             status,
             live: false,
+            // Piece-14: capture the seller-authored creq tag (Job C emits it); absent on v1 claims.
+            creq: first_tag_value(&draft.tags, "creq").map(str::to_owned),
         });
     }
     claims.sort_by_key(|c| std::cmp::Reverse(c.created_at));
@@ -1393,6 +1413,7 @@ mod tests {
             accept_event_id: "11".repeat(32),
             accepted_at: 1,
             seller_signature: "ab".repeat(32),
+            creq_hash: None,
             contribution: None,
         };
         write_accepted_bind(&home, &bind).expect("write");
@@ -1418,6 +1439,7 @@ mod tests {
             accept_event_id: "11".repeat(32),
             accepted_at: 1,
             seller_signature: "ab".repeat(32),
+            creq_hash: None,
             contribution: None,
         };
         let err = authorize_request_from_bind(&bind, 1, String::new()).expect_err("empty hash");
@@ -1453,6 +1475,7 @@ mod tests {
             accept_event_id: "11".repeat(32),
             accepted_at: 1,
             seller_signature: "ab".repeat(32),
+            creq_hash: None,
             contribution: None,
         };
         let bad_seller = "00".repeat(32);
@@ -1521,6 +1544,7 @@ mod tests {
             display_name: None,
             status: status.to_owned(),
             live: false,
+            creq: None,
         }
     }
 
@@ -1868,6 +1892,7 @@ mod tests {
             accept_event_id: "11".repeat(32),
             accepted_at: 1,
             seller_signature: "ab".repeat(32),
+            creq_hash: None,
             contribution: Some(AcceptedContribution {
                 target_owner_pubkey: "aa".repeat(32),
                 target_clone_url: "https://mobee-relay.orveth.dev/git/owner/repo.git".into(),
