@@ -5,6 +5,7 @@ import { test } from "node:test";
 
 import { parseEvent } from "../js/parse.js";
 import { aggregateJobs, computePulse, JOB_STATUS } from "../js/jobs.js";
+import { AWARD, OFFER } from "../js/kinds.js";
 
 /* Recorded from the live relay (wss://mobee-relay.orveth.dev) — real event chains
  * covering each lifecycle stage. See test/fixtures/events.json. */
@@ -70,28 +71,28 @@ test("OPEN and WORKING stages derive correctly", () => {
   const openOffer = synth({
     id: "0".repeat(64),
     pubkey: "a".repeat(64),
-    kind: 5109,
+    kind: OFFER,
     created_at: 1784576000,
-    tags: [["i", "an open task"], ["amount", "7", "sat"], ["param", "deadline", String(future)], ["t", "mobee"], ["v", "1"]],
+    tags: [["i", "an open task"], ["amount", "7", "sat"], ["param", "deadline", String(future)], ["t", "mobee"], ["v", "2"]],
     content: "",
   });
   const workOffer = synth({
     id: "b".repeat(64),
     pubkey: "c".repeat(64),
-    kind: 5109,
+    kind: OFFER,
     created_at: 1784576000,
-    tags: [["i", "a working task"], ["amount", "9", "sat"], ["param", "deadline", String(future)], ["t", "mobee"], ["v", "1"]],
+    tags: [["i", "a working task"], ["amount", "9", "sat"], ["param", "deadline", String(future)], ["t", "mobee"], ["v", "2"]],
     content: "",
   });
-  const accept = synth({
+  const award = synth({
     id: "d".repeat(64),
-    pubkey: "c".repeat(64), // buyer accepts
-    kind: 7000,
+    pubkey: "c".repeat(64), // buyer awards the claim
+    kind: AWARD,
     created_at: 1784576100,
-    tags: [["status", "accepted"], ["e", "b".repeat(64)], ["p", "e".repeat(64)], ["t", "mobee"], ["v", "1"]],
+    tags: [["status", "accepted"], ["e", "b".repeat(64), "", "root"], ["e", "aa".repeat(32)], ["p", "e".repeat(64)], ["t", "mobee"], ["v", "2"]],
     content: "",
   });
-  const jobs = aggregateJobs([openOffer, workOffer, accept], new Map(), 1784576200);
+  const jobs = aggregateJobs([openOffer, workOffer, award], new Map(), 1784576200);
   assert.equal(jobStartingWith(jobs, "0000").status, JOB_STATUS.OPEN);
   assert.equal(jobStartingWith(jobs, "bbbb").status, JOB_STATUS.WORKING);
 });
@@ -148,9 +149,9 @@ test("pulse: open offers count matches OPEN-status jobs", () => {
   const openOffer = synth({
     id: "f".repeat(64),
     pubkey: "a".repeat(64),
-    kind: 5109,
+    kind: OFFER,
     created_at: 1784576000,
-    tags: [["i", "task"], ["amount", "3", "sat"], ["param", "deadline", String(future)], ["t", "mobee"], ["v", "1"]],
+    tags: [["i", "task"], ["amount", "3", "sat"], ["param", "deadline", String(future)], ["t", "mobee"], ["v", "2"]],
     content: "",
   });
   const events = [...market, openOffer];

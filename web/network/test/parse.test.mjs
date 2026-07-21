@@ -7,6 +7,7 @@ import {
   percentile,
   PROFILE_CONTENT_MAX,
 } from "../js/parse.js";
+import { CLAIM, HANDLER, OFFER, RECEIPT, RESULT } from "../js/kinds.js";
 
 function ok(ev) {
   const n = parseEvent(ev);
@@ -28,7 +29,7 @@ const garbage = [
   {
     id: "c".repeat(64),
     pubkey: "d".repeat(64),
-    kind: 5109,
+    kind: OFFER,
     created_at: 1,
     tags: "not-array",
     content: null,
@@ -36,7 +37,7 @@ const garbage = [
   {
     id: "e".repeat(64),
     pubkey: "f".repeat(64),
-    kind: 3400,
+    kind: RECEIPT,
     created_at: 1,
     tags: [["amount", "3", "sat"], ["e", "offer1", "", "root"]],
     content: "{not json",
@@ -44,7 +45,7 @@ const garbage = [
   {
     id: "g".repeat(64),
     pubkey: "h".repeat(64),
-    kind: 3400,
+    kind: RECEIPT,
     created_at: 1,
     tags: [null, ["amount", 12], ["e", "offer1"]],
     content: JSON.stringify({
@@ -69,13 +70,13 @@ store.ingest(
   ok({
     id: offerId,
     pubkey: "2".repeat(64),
-    kind: 5109,
+    kind: OFFER,
     created_at: 100,
     tags: [
       ["i", "task"],
       ["amount", "21", "sat"],
       ["t", "mobee"],
-      ["v", "1"],
+      ["v", "2"],
     ],
     content: "",
   }),
@@ -121,7 +122,7 @@ assert.notEqual(adjunct.total_tokens, 13346 + 347 + 41088);
 const oldReceipt = ok({
   id: "3".repeat(64),
   pubkey: "4".repeat(64),
-  kind: 3400,
+  kind: RECEIPT,
   created_at: 200,
   tags: [
     ["amount", "7", "sat"],
@@ -145,7 +146,7 @@ assert.equal(eco.rows[0].measured_cost_tokens, null);
 const handler = ok({
   id: "5".repeat(64),
   pubkey: "6".repeat(64),
-  kind: 31990,
+  kind: HANDLER,
   created_at: 300,
   tags: [
     ["d", "seller-a"],
@@ -167,7 +168,7 @@ store.ingest(
   ok({
     id: "f0".repeat(32),
     pubkey: "f1".repeat(32),
-    kind: 31990,
+    kind: HANDLER,
     created_at: 301,
     tags: [
       ["d", "seller-a"],
@@ -193,13 +194,13 @@ store.ingest(
   ok({
     id: "7".repeat(64),
     pubkey: "8".repeat(64),
-    kind: 7000,
+    kind: CLAIM,
     created_at: 130,
     tags: [
       ["status", "processing"],
       ["e", offerId],
       ["t", "mobee"],
-      ["v", "1"],
+      ["v", "2"],
     ],
     content: "",
   }),
@@ -208,13 +209,13 @@ store.ingest(
   ok({
     id: "a".repeat(64),
     pubkey: "b".repeat(64),
-    kind: 6109,
+    kind: RESULT,
     created_at: 180,
     tags: [
       ["e", offerId, "", "root"],
       ["amount", "21", "sat"],
       ["t", "mobee"],
-      ["v", "1"],
+      ["v", "2"],
     ],
     content: "done",
   }),
@@ -275,26 +276,26 @@ const v12 = createStore();
 const older = ok({
   id: "d1".padEnd(64, "1"),
   pubkey: "aa".repeat(32),
-  kind: 5109,
+  kind: OFFER,
   created_at: 10,
   tags: [
     ["i", "task"],
     ["amount", "1", "sat"],
     ["t", "mobee"],
-    ["v", "1"],
+    ["v", "2"],
   ],
   content: "",
 });
 const newer = ok({
   id: "d2".padEnd(64, "2"),
   pubkey: "bb".repeat(32),
-  kind: 5109,
+  kind: OFFER,
   created_at: 20,
   tags: [
     ["i", "task"],
     ["amount", "1", "sat"],
     ["t", "mobee"],
-    ["v", "1"],
+    ["v", "2"],
   ],
   content: "",
 });
@@ -322,13 +323,13 @@ assert.equal(v12.tail()[1].profile?.name, "ok-name");
 const untaggedResult = ok({
   id: "e1".padEnd(64, "0"),
   pubkey: "f1".padEnd(64, "0"),
-  kind: 6109,
+  kind: RESULT,
   created_at: 500,
   tags: [
     ["e", offerId, "", "root"],
     ["amount", "21", "sat"],
     ["t", "mobee"],
-    ["v", "1"],
+    ["v", "2"],
   ],
   content: "delivery commit abcdef0123",
 });
@@ -351,7 +352,7 @@ const untaggedResult = ok({
 const taggedResult = ok({
   id: "e2".padEnd(64, "0"),
   pubkey: "f2".padEnd(64, "0"),
-  kind: 6109,
+  kind: RESULT,
   created_at: 510,
   tags: [
     ["e", offerId, "", "root"],
@@ -367,7 +368,7 @@ const taggedResult = ok({
     ["cost", "0.0123", "usd", "harness-reported-usd"],
     ["wall_time", "4321", "ms"],
     ["t", "mobee"],
-    ["v", "1"],
+    ["v", "2"],
   ],
   content: "delivery commit abcdef0123",
 });
@@ -436,7 +437,7 @@ const paidOffer = "b1".padEnd(64, "0");
 const paidReceipt = ok({
   id: "b2".padEnd(64, "0"),
   pubkey: "b3".padEnd(64, "0"),
-  kind: 3400,
+  kind: RECEIPT,
   created_at: 600,
   tags: [
     ["amount", "9", "sat"],
@@ -457,7 +458,7 @@ bothStore.ingest(
   ok({
     id: "c1".padEnd(64, "0"),
     pubkey: "c2".padEnd(64, "0"),
-    kind: 6109,
+    kind: RESULT,
     created_at: 700,
     tags: [
       ["e", paidOffer, "", "root"],
@@ -499,7 +500,7 @@ joinStore.ingest(
   ok({
     id: jResultId,
     pubkey: "d2".padEnd(64, "0"),
-    kind: 6109,
+    kind: RESULT,
     created_at: 800,
     tags: [
       ["e", jOffer, "", "root"],
@@ -516,7 +517,7 @@ joinStore.ingest(
 const jReceipt = ok({
   id: "d3".padEnd(64, "0"),
   pubkey: "d4".padEnd(64, "0"),
-  kind: 3400,
+  kind: RECEIPT,
   created_at: 810,
   tags: [
     ["amount", "9", "sat"],
@@ -547,7 +548,7 @@ const orphanStore = createStore();
 const orphanReceipt = ok({
   id: "e9".padEnd(64, "0"),
   pubkey: "ea".padEnd(64, "0"),
-  kind: 3400,
+  kind: RECEIPT,
   created_at: 820,
   tags: [
     ["amount", "9", "sat"],

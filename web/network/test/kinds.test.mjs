@@ -9,12 +9,18 @@ import * as kinds from "../js/kinds.js";
 const NETWORK_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
 /**
- * The marketplace kind numbers that v2 will renumber. They must live in exactly one
- * file (js/kinds.js) so that renumber is a one-file change. Kind 0 (NIP-01 profile) is
- * a standard that will not move and appears everywhere as an index, so it is not gated
- * by digits — it is still routed through the PROFILE constant.
+ * The marketplace kind numbers. They must live in exactly one file (js/kinds.js) so that a
+ * renumber is a one-file change. Kind 0 (NIP-01 profile) is a standard that will not move and
+ * appears everywhere as an index, so it is not gated by digits — it is still routed through the
+ * PROFILE constant.
  */
-const RENUMBERABLE = [5109, 7000, 6109, 3400, 31990, 30340];
+const RENUMBERABLE = [3401, 3402, 3403, 3404, 3405, 3400, 31990, 30340];
+
+/**
+ * The retired v1 DVM kinds. These carry no meaning in the v2 protocol and must appear NOWHERE
+ * in the app source — not even in js/kinds.js — so a stray one is always a bug.
+ */
+const RETIRED = [5109, 6109, 7000];
 
 /** Remove block and line comments so the gate scans only operative code/strings. */
 function stripComments(src) {
@@ -22,9 +28,11 @@ function stripComments(src) {
 }
 
 test("kinds module exposes every marketplace kind as a named constant", () => {
-  assert.equal(kinds.OFFER, 5109);
-  assert.equal(kinds.CLAIM, 7000);
-  assert.equal(kinds.RESULT, 6109);
+  assert.equal(kinds.OFFER, 3401);
+  assert.equal(kinds.CLAIM, 3402);
+  assert.equal(kinds.RESULT, 3403);
+  assert.equal(kinds.FEEDBACK, 3404);
+  assert.equal(kinds.AWARD, 3405);
   assert.equal(kinds.RECEIPT, 3400);
   assert.equal(kinds.HANDLER, 31990);
   assert.equal(kinds.HEARTBEAT, 30340);
@@ -75,5 +83,21 @@ test("no marketplace kind literal appears outside js/kinds.js", () => {
     offenders,
     [],
     `kind literals must be imported from js/kinds.js, not hard-coded:\n${offenders.join("\n")}`,
+  );
+});
+
+test("no retired v1 DVM kind literal appears anywhere in the source", () => {
+  const offenders = [];
+  for (const file of sourceFiles()) {
+    const src = stripComments(readFileSync(file, "utf8"));
+    for (const n of RETIRED) {
+      const re = new RegExp(`(?<![\\d.])${n}(?![\\d.])`);
+      if (re.test(src)) offenders.push(`${file}: contains retired v1 kind literal ${n}`);
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `retired v1 DVM kinds (5109/6109/7000) must not appear in v2 source:\n${offenders.join("\n")}`,
   );
 });

@@ -3,7 +3,7 @@
  * One malformed / hostile event must never throw into the page.
  */
 
-import { CLAIM, HANDLER, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT } from "./kinds.js";
+import { AWARD, CLAIM, FEEDBACK, HANDLER, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT } from "./kinds.js";
 
 /**
  * @param {unknown} raw
@@ -35,7 +35,9 @@ export function parseEvent(raw) {
 
     if (kind === PROFILE) return { ...base, role: "profile", profile: parseProfile(base) };
     if (kind === OFFER) return { ...base, role: "offer", offer: parseOffer(base) };
-    if (kind === CLAIM) return { ...base, role: "feedback", feedback: parseFeedback(base) };
+    if (kind === CLAIM) return { ...base, role: "claim", claim: parseClaim(base) };
+    if (kind === AWARD) return { ...base, role: "award", award: parseAward(base) };
+    if (kind === FEEDBACK) return { ...base, role: "feedback", feedback: parseFeedback(base) };
     if (kind === RESULT) return { ...base, role: "result", result: parseResult(base) };
     if (kind === RECEIPT) return { ...base, role: "receipt", receipt: parseReceipt(base) };
     if (kind === HANDLER) return { ...base, role: "handler", handler: parseHandler(base) };
@@ -101,7 +103,7 @@ function isSafePictureUrl(url) {
 /**
  * Extract the piece-9 Item-2 usage adjunct.
  *
- * SPEC WINS: the seller emits exec-metadata as TAGS on the kind-6109 result (its content is a
+ * SPEC WINS: the seller emits exec-metadata as TAGS on the kind-3403 result (its content is a
  * non-JSON string like "delivery commit <oid>", so contentJson is null). We read tags first,
  * per the PIECE-9 schema, and fall back to the legacy JSON vocabulary only for fields that
  * never had a tag form (measured_cost_tokens / paid_price_tokens). `harness` is mapped to the
@@ -225,25 +227,45 @@ function parseOffer(base) {
   return {
     task: firstTagValue(base.tags, "i"),
     amount_sats: amountSatsFromTags(base.tags),
-    mint: firstTagValue(base.tags, "mint"),
     // A `p` tag on an offer = a targeted seller; absent = open-pool offer.
     seller: firstTagValue(base.tags, "p"),
-    // Sellers bind the deadline as ["param","deadline","<unix-seconds>"] (not NIP-40).
+    // The buyer binds the deadline as ["param","deadline","<unix-seconds>"] (not NIP-40).
     deadline: deadlineFromTags(base.tags),
     job_class: firstTagValue(base.tags, "job-class"),
   };
 }
 
+/** A seller's claim: it bids on the offer and carries the seller-authored `creq` invoice. */
+function parseClaim(base) {
+  return {
+    offerId: firstETag(base.tags, "root") || firstETag(base.tags, null),
+    creq: firstTagValue(base.tags, "creq"),
+  };
+}
+
+/** A buyer's award: it selects a claim, e-tagging the offer (root) and the winning claim. */
+function parseAward(base) {
+  const offerId = firstETag(base.tags, "root") || firstETag(base.tags, null);
+  let claimId = null;
+  for (const tag of base.tags) {
+    if (tag[0] === "e" && tag[1] && tag[3] !== "root" && tag[1] !== offerId) {
+      claimId = tag[1];
+      break;
+    }
+  }
+  return { offerId, claimId };
+}
+
+/** A seller's feedback: a progress note, or an error/refusal that fails the job. */
 function parseFeedback(base) {
   const status = firstTagValue(base.tags, "status");
   const offerId = firstETag(base.tags, "root") || firstETag(base.tags, null);
   return {
     status,
-    isClaim: status === "processing",
-    isAccept: status === "accepted",
-    // NIP-90 "error" = the job failed / was refused. Feed shows it as refused.
-    isRefusal: status === "error",
+    // An "error"/"refusal" status means the job failed; the feed shows it as refused.
+    isError: status === "error" || status === "refusal",
     offerId,
+    message: typeof base.content === "string" && base.content ? base.content.slice(0, 280) : null,
   };
 }
 
@@ -262,7 +284,7 @@ function parseResult(base) {
   return {
     offerId: firstETag(base.tags, "root") || firstETag(base.tags, null),
     amount_sats: amountSatsFromTags(base.tags),
-    // PIECE-9: the seller's kind-6109 result is the AUTHORITATIVE usage source (the receipt
+    // PIECE-9: the seller's kind-3403 result is the AUTHORITATIVE usage source (the receipt
     // echo is a convenience copy). Read it from the result-event TAGS.
     usage: extractUsageAdjunct(base.contentJson, base.tags),
   };

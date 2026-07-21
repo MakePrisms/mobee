@@ -1,5 +1,5 @@
 import { HISTORY_LIMIT, RELAY_URL } from "../config.js";
-import { PROFILE, SUBSCRIBE_KINDS } from "./kinds.js";
+import { MOBEE_TAG, MOBEE_TAGGED_KINDS, PROFILE, UNTAGGED_KINDS } from "./kinds.js";
 
 /**
  * Single-owner NIP-01 websocket client.
@@ -103,15 +103,22 @@ export function createRelayClient(hooks) {
   function openMarketSub(socket) {
     subSeq += 1;
     marketSubId = `mobee-net-m-${subSeq}`;
+    // Two filters in one REQ: the mobee-namespaced kinds are scoped to ["t","mobee"] so a
+    // foreign event squatting a trade kind is filtered at the relay; the handler announce
+    // carries no t-tag, so it rides an unscoped filter.
     /** @type {Record<string, unknown>} */
-    const filter = { kinds: [...SUBSCRIBE_KINDS] };
+    const tagged = { kinds: [...MOBEE_TAGGED_KINDS], "#t": [MOBEE_TAG] };
+    /** @type {Record<string, unknown>} */
+    const untagged = { kinds: [...UNTAGGED_KINDS] };
     if (sinceCursor != null) {
       // Inclusive since — store dedupes by id; avoids gaps on same-second events.
-      filter.since = sinceCursor;
+      tagged.since = sinceCursor;
+      untagged.since = sinceCursor;
     } else {
-      filter.limit = HISTORY_LIMIT;
+      tagged.limit = HISTORY_LIMIT;
+      untagged.limit = HISTORY_LIMIT;
     }
-    safeSend(socket, ["REQ", marketSubId, filter]);
+    safeSend(socket, ["REQ", marketSubId, tagged, untagged]);
   }
 
   function openProfileSub(socket) {

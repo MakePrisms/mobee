@@ -11,6 +11,7 @@ import {
   sellerMetrics,
 } from "../js/profiles.js";
 import { groupEvents } from "../js/jobs.js";
+import { HEARTBEAT, OFFER } from "../js/kinds.js";
 
 /* Real relay chains for a heavy buyer (B) and a productive seller (S), recorded from
  * wss://mobee-relay.orveth.dev. Note: the relay serves NO kind-30340 heartbeats yet, so
@@ -70,9 +71,9 @@ test("buyer metrics: a synthetic expired-unpaid job is counted", () => {
   const offer = parseEvent({
     id: "ab".repeat(32),
     pubkey: B,
-    kind: 5109,
+    kind: OFFER,
     created_at: past,
-    tags: [["i", "task"], ["amount", "5", "sat"], ["param", "deadline", String(past + 10)], ["t", "mobee"], ["v", "1"]],
+    tags: [["i", "task"], ["amount", "5", "sat"], ["param", "deadline", String(past + 10)], ["t", "mobee"], ["v", "2"]],
     content: "",
   });
   const m = buyerMetrics([offer], B, profiles, past + 1000); // now well past the deadline
@@ -105,9 +106,9 @@ test("heartbeat liveness: resolved by author+kind+d, newest wins (never by id)",
     parseEvent({
       id,
       pubkey: author,
-      kind: 30340,
+      kind: HEARTBEAT,
       created_at: created,
-      tags: [["d", d], ["status", "online"]],
+      tags: [["d", d], ["t", "mobee"], ["status", "online"]],
       content,
     });
   // An OLDER event with a LATER id must not win over the newer one (id order is irrelevant).
