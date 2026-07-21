@@ -769,6 +769,23 @@ impl SellerDaemon {
     fn mark_delivered(&mut self) {
         if let Some(job) = self.active.take() {
             // `result_id` was set by `execute_active_job` on the successful publish path.
+            // #57: durably journal the delivered-but-unpaid transition so a restart rebuilds this
+            // job into awaiting_payment and a stored/buffered wrap can bind + redeem. Best-effort
+            // but LOUD — a failed write risks re-stranding the payment across a restart.
+            if let Some(result_id) = job.result_id.as_deref() {
+                if let Err(error) = self.journal.append_delivery(
+                    &job.job_id,
+                    result_id,
+                    job.offer.amount,
+                    &job.offer.unit,
+                    &job.buyer_pubkey,
+                ) {
+                    eprintln!(
+                        "seller WARN: failed to journal delivery for job_id={} (payment recovery on restart may be degraded): {error}",
+                        job.job_id
+                    );
+                }
+            }
             self.awaiting_payment.push(job);
             while self.awaiting_payment.len() > AWAITING_PAYMENT_CAP {
                 let dropped = self.awaiting_payment.remove(0);
@@ -799,6 +816,54 @@ impl SellerDaemon {
                 .append_release(&orphan.job_id, reconcile_reason(orphan.liveness))?;
         }
         Ok(plan)
+    }
+
+    /// #57: rebuild delivered-but-unpaid jobs (journaled `Delivery`, no `Receipt`/`Release`) into
+    /// `awaiting_payment` at boot, so a backfilled or buffered payment wrap can bind and redeem.
+    /// Without this, a job the offer-scan classifies "already delivered" is never re-added and its
+    /// wrap buffers forever. Idempotent: skips jobs already present; respects the backlog cap. The
+    /// rebuilt offer carries only the money-critical fields the redeem path reads (amount/unit);
+    /// `seller_pubkey=None` so `assert_seller_matches` passes.
+    pub fn restore_delivered_unpaid(&mut self) -> Result<usize, DaemonError> {
+        let unpaid = self.journal.deliveries_awaiting_receipt()?;
+        let mut restored = 0usize;
+        for d in unpaid {
+            if self
+                .awaiting_payment
+                .iter()
+                .any(|job| job.job_id == d.job_id)
+            {
+                continue;
+            }
+            if self.awaiting_payment.len() >= AWAITING_PAYMENT_CAP {
+                break;
+            }
+            let unit = if d.unit.is_empty() {
+                "sat".to_string()
+            } else {
+                d.unit
+            };
+            self.awaiting_payment.push(ActiveJob {
+                job_id: d.job_id.clone(),
+                buyer_pubkey: d.buyer_pubkey,
+                offer: ParsedOffer {
+                    task: String::new(),
+                    output: String::new(),
+                    amount: d.amount,
+                    unit,
+                    deadline_unix: 0,
+                    seller_pubkey: None,
+                },
+                claim_id: String::new(),
+                result_id: Some(d.result_id),
+                deadline_unix: 0,
+                workdir: job_workdir(&self.home, &d.job_id),
+                contribution: None,
+                delivery: None,
+            });
+            restored += 1;
+        }
+        Ok(restored)
     }
 
     /// Full startup reconcile: durable journal release (above) + best-effort feedback-kind
@@ -2203,12 +2268,21 @@ async fn try_apply_or_buffer(
     event_id: String,
     received: ReceivedPayment,
 ) -> Result<ApplyResult, DaemonError> {
+    let payload_job = received.payload.job_id().to_owned();
+    // #57: an already-receipted job's wrap is a re-see of consumed money (idempotent) — skip it,
+    // do NOT buffer it forever. The journal pay-once guard is the source of truth.
+    if daemon.journal.has_receipt(&payload_job).unwrap_or(false) {
+        eprintln!(
+            "seller wrap event={event_id}: job {payload_job} already receipted, skipping (not buffered)"
+        );
+        return Ok(ApplyResult::Buffered);
+    }
     // Does a delivered-but-unpaid job bind this payment? Bind by job id (the NUT-18 payload's
     // `id`) — result id is resolved locally in `try_apply_payment` (NUT-18 carries no result id).
     let binds = daemon
         .awaiting_payment
         .iter()
-        .any(|job| job.job_id.as_str() == received.payload.job_id());
+        .any(|job| job.job_id.as_str() == payload_job);
     if !binds {
         // No delivered job matches yet — buffer it (early pay for a still-processing job, or
         // the wrap arrived before its delivery was recorded). Misattribution is impossible:
@@ -2586,6 +2660,19 @@ pub(crate) async fn run_forever_hooked(
         }
         Ok(_) => {}
         Err(error) => eprintln!("seller reconcile failed on startup (continuing): {error}"),
+    }
+
+    // #57: rebuild delivered-but-unpaid jobs into awaiting_payment BEFORE the wrap subscribe +
+    // backfill, so a stored/buffered payment wrap can bind and redeem on this boot (the missing leg
+    // between "wrap seen" and "collect ok"). Non-fatal on error.
+    match daemon.restore_delivered_unpaid() {
+        Ok(n) if n > 0 => {
+            eprintln!("seller reconcile: restored {n} delivered-but-unpaid job(s) into awaiting_payment")
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("seller WARN: failed to restore delivered-but-unpaid jobs (continuing): {error}")
+        }
     }
 
     // Offer subscription: the TARGETED filter (p-tag == seller) AND — under open-pool — the
@@ -4015,6 +4102,41 @@ mod tests {
             reason: "bad base oid".into(),
         });
         assert_error_content_starts_with("contribution_malformed", &malformed);
+    }
+
+    #[test]
+    // #57: a delivered-but-unpaid job in the journal is rebuilt into awaiting_payment on boot, so a
+    // stored/buffered wrap can bind and redeem. Without this the wrap buffers forever.
+    #[test]
+    fn restore_delivered_unpaid_rebuilds_awaiting_payment() {
+        let (root, mut daemon) = test_daemon("restore-unpaid");
+        let buyer = "cc".repeat(32);
+        daemon
+            .journal
+            .append_claim("del-job", "del-claim", &buyer, 1_000_000_000)
+            .expect("claim");
+        daemon
+            .journal
+            .append_delivery("del-job", "del-result", 15, "sat", &buyer)
+            .expect("delivery");
+        assert!(daemon.awaiting_payment.is_empty());
+
+        let restored = daemon.restore_delivered_unpaid().expect("restore");
+        assert_eq!(restored, 1);
+        assert_eq!(daemon.awaiting_payment.len(), 1);
+        let job = &daemon.awaiting_payment[0];
+        assert_eq!(job.job_id, "del-job");
+        assert_eq!(job.result_id.as_deref(), Some("del-result"));
+        assert_eq!(job.offer.amount, 15);
+        assert_eq!(job.offer.unit, "sat");
+        // seller_pubkey=None so the redeem's assert_seller_matches(self) passes.
+        assert!(job.offer.seller_pubkey.is_none());
+
+        // Idempotent: a delivered job already in awaiting_payment is not duplicated.
+        let again = daemon.restore_delivered_unpaid().expect("restore again");
+        assert_eq!(again, 0);
+        assert_eq!(daemon.awaiting_payment.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
