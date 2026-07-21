@@ -149,24 +149,22 @@ fn authenticated_fetch_base_succeeds_via_fork_path() {
         "upstream tree must be checked out at the fork tip"
     );
 
-    // The fixture challenged (401), then git re-presented with Authorization; pack data
-    // (the upload-pack POST) must only ever have moved on authorized requests.
+    // In-process libgit2 (#55) injects the NIP-98 header on EVERY request up front — there is no
+    // git-credential-protocol unauthenticated probe. So every request (the info/refs advertisement
+    // AND the upload-pack POST) must carry Authorization, and pack data must only move authorized.
     let requests = server.requests();
+    assert!(!requests.is_empty(), "client must have reached the fixture");
     assert!(
-        requests.iter().any(|r| r.authorization.is_none()),
-        "expected an initial unauthenticated probe answered 401: {requests:?}"
+        requests
+            .iter()
+            .all(|r| r.authorization.as_deref().is_some_and(|v| !v.is_empty())),
+        "in-process path must carry Authorization on every request: {requests:?}"
     );
     let posts: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
     assert!(!posts.is_empty(), "smart fetch must POST git-upload-pack");
     assert!(
         posts.iter().all(|r| r.target == format!("{mount}/git-upload-pack")),
         "fetch must only ever hit the upload-pack rpc: {requests:?}"
-    );
-    assert!(
-        posts
-            .iter()
-            .all(|r| r.authorization.as_deref().is_some_and(|v| !v.is_empty())),
-        "every pack transfer must carry Authorization: {requests:?}"
     );
 
     drop(server);
@@ -188,15 +186,19 @@ fn unauthenticated_fetch_of_protected_repo_fails_closed() {
     fs::create_dir_all(&home).expect("home");
     let identity = DeliveryAgentIdentity::for_seller(&"33".repeat(32));
 
-    // No seller auth → fetch_base_auth wires no credential helper → the 401 must be
-    // terminal (GIT_TERMINAL_PROMPT=0, no askpass, no netrc under the scrubbed HOME).
+    // No seller auth → the in-process path presents NO NIP-98 header → the relay's 401 on the
+    // info/refs advertisement is terminal (no credential fallback exists). Fail-closed as an auth
+    // failure, never a success or a pack transfer.
     let err = init_contribution_workdir(
         &workdir, &home, &identity, &url, "main", &base_oid,
         "mobee/contribution/unauth-itest",
         None,
     )
     .expect_err("fetch of an auth-required repo without credentials must fail closed");
-    assert_eq!(err, SellerGitError::CommandFailed("fetch-base"));
+    assert!(
+        matches!(err, SellerGitError::AuthFailed(_) | SellerGitError::Io(_)),
+        "unauthenticated fetch must fail closed (auth/transport error), got: {err:?}"
+    );
 
     // Fail-closed on the wire too: only unauthenticated probes, no pack data served.
     let requests = server.requests();

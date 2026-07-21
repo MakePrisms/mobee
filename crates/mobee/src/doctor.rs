@@ -105,40 +105,43 @@ fn parse_git_version(output: &str) -> Option<(u64, u64)> {
     Some((major, minor))
 }
 
-/// git < 2.54 silently drops the Authorization credential on the git-receive-pack POST (reads work,
-/// pushes 401). A working push path needs `(major, minor) >= (2, 54)`.
+/// git ≤ 2.53 silently dropped the Authorization credential on the git-receive-pack POST (reads
+/// work, pushes 401). Historically the seller needed `(major, minor) >= (2, 54)` for delivery push.
+/// As of issue #55 ALL of the seller's git legs are in-process libgit2 with NIP-98 signed and
+/// injected on every request, so this bug no longer affects the seller — the check is INFORMATIONAL.
 fn git_version_ok(version: (u64, u64)) -> bool {
     version >= (2, 54)
 }
 
 const GIT_VERSION_CHECK: &str = "git version";
 
+/// Informational only (issue #55): the seller does NOT use system `git` — all delivery/verify legs
+/// are in-process libgit2. This check reports the ambient git version (if any) but never fails.
 fn check_git_version() -> Check {
     let raw = match std::process::Command::new("git").arg("version").output() {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).trim().to_owned()
         }
         _ => {
-            return Check::warn(
+            return Check::pass(
                 GIT_VERSION_CHECK,
-                "git not found on PATH",
-                "install git 2.54+ (older git drops push credentials)",
+                "system git not found — OK, the seller uses in-process libgit2 (no system git required)",
             );
         }
     };
     match parse_git_version(&raw) {
-        None => Check::warn(
+        None => Check::pass(
             GIT_VERSION_CHECK,
-            format!("could not parse git version from {raw:?}"),
-            "ensure `git version` reports a standard X.Y.Z string; want 2.54+",
+            format!("could not parse git version from {raw:?} — informational only; system git is not required"),
         ),
         Some(version) if git_version_ok(version) => {
             Check::pass(GIT_VERSION_CHECK, format!("git {}.{}", version.0, version.1))
         }
-        Some((major, minor)) => Check::fail(
+        Some((major, minor)) => Check::pass(
             GIT_VERSION_CHECK,
-            format!("git {major}.{minor} drops push credentials on the receive-pack POST"),
-            "upgrade to git 2.54+",
+            format!(
+                "git {major}.{minor} (< 2.54 dropped push credentials, but the seller no longer uses system git — in-process libgit2 handles auth)"
+            ),
         ),
     }
 }
@@ -164,16 +167,19 @@ mod checks {
     const MINT_CHECK: &str = "mint reachability";
     const AGENT_CHECK: &str = "agent preset";
 
+    // Informational only (issue #55): the seller signs NIP-98 in-process (libgit2 transport), so the
+    // external `git-credential-nostr` helper is no longer required for delivery push / base fetch.
+    // We still report whether it resolves (useful for anyone driving raw `git` by hand) but never
+    // fail on its absence.
     pub(super) fn check_credential_helper() -> Check {
         match seller_git::resolve_git_credential_nostr() {
             Some(path) => Check::pass(
                 CREDENTIAL_HELPER_CHECK,
-                format!("git-credential-nostr at {}", path.display()),
+                format!("git-credential-nostr at {} (optional — seller signs NIP-98 in-process)", path.display()),
             ),
-            None => Check::fail(
+            None => Check::pass(
                 CREDENTIAL_HELPER_CHECK,
-                "git-credential-nostr not resolvable",
-                "install it, add it to PATH, or set MOBEE_GIT_CREDENTIAL_NOSTR to its path",
+                "git-credential-nostr not found — OK, not required (seller signs NIP-98 in-process via libgit2)",
             ),
         }
     }

@@ -397,47 +397,31 @@ fn atty_stderr() -> bool {
 /// kind-30617 but skips seed → later push 404s ("repository not found").
 #[cfg(feature = "wallet")]
 fn probe_relay_git_seeded(home: &MobeeHome, remote_url: &str) -> Result<(), String> {
-    use std::process::Command;
-
-    let helper = mobee_core::seller_git::resolve_git_credential_nostr().ok_or_else(|| {
-        "git-credential-nostr not found (set MOBEE_GIT_CREDENTIAL_NOSTR or install helper)"
-            .to_owned()
-    })?;
-    let helper_cfg = format!("credential.helper={}", helper.to_string_lossy());
+    // In-process libgit2 ls-remote (issue #55 — no system `git`). NIP-98 is signed from the seller
+    // secret in-process for the relay-git upload-pack advertisement; the secret never hits argv/env.
     let secret = home::read_secret_key_hex(home).map_err(|e| e.to_string())?;
-    let output = Command::new("git")
-        .args([
-            "-c",
-            helper_cfg.as_str(),
-            "-c",
-            "credential.useHttpPath=true",
-            "ls-remote",
-            remote_url,
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never")
-        .env_remove("BUZZ_PRIVATE_KEY")
-        .env("NOSTR_PRIVATE_KEY", &secret)
-        .output()
-        .map_err(|e| format!("relay-git seed probe failed to spawn git: {e}"))?;
+    let result = mobee_core::git_transport::ls_remote(remote_url, Some(&secret));
     drop(secret);
-    if output.status.success() {
-        return Ok(());
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let message = error.to_string().to_lowercase();
+            if message.contains("repository not found") || message.contains("404") {
+                Err(format!(
+                    "mobee-hosted delivery not seeded after NIP-34 announce (ls-remote 404).\n\
+                     likely cause: relay-git global name collision on repo id, or seed side-effect failed.\n\
+                     provide --git-remote <https-url> for BYO delivery, or pick a unique remote leaf.\n\
+                     remote={remote_url}"
+                ))
+            } else {
+                Err(format!(
+                    "mobee-hosted delivery seed probe failed (in-process ls-remote): {error}.\n\
+                     provide --git-remote <https-url> for BYO delivery.\n\
+                     remote={remote_url}"
+                ))
+            }
+        }
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-    if stderr.contains("repository not found") || stderr.contains("404") {
-        return Err(format!(
-            "mobee-hosted delivery not seeded after NIP-34 announce (ls-remote 404).\n\
-             likely cause: relay-git global name collision on repo id, or seed side-effect failed.\n\
-             provide --git-remote <https-url> for BYO delivery, or pick a unique remote leaf.\n\
-             remote={remote_url}"
-        ));
-    }
-    Err(format!(
-        "mobee-hosted delivery seed probe failed (git ls-remote).\n\
-         provide --git-remote <https-url> for BYO delivery.\n\
-         remote={remote_url}"
-    ))
 }
 
 fn prompt_line(

@@ -274,7 +274,9 @@ pub async fn authorize_pay_async(
     // contribution verify runs against custody BEFORE any spend). The payment-journal is created
     // LATER (after the pre-pay seam) so a pre-pay refusal leaves NO journal on disk.
     let custody = home.root.join("custody");
-    let mut verifier = PayPathDeliveryVerifier::new(custody);
+    // Buyer secret signs NIP-98 for the in-process relay-git READ (fork + base fetch). Public https
+    // bases and local-path fixtures fetch anonymously (git_transport gates the header on relay-git).
+    let mut verifier = PayPathDeliveryVerifier::new(custody, Some(secret_hex.clone()));
 
     // Piece-10 contribution verify-path — ALL PRE-PAY (before the budget gate ⇒ zero spend on any
     // refusal), ALL against BUYER-CONTROLLED binds. The fork (`delivery`) is custody-fetched +

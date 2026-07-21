@@ -1170,10 +1170,7 @@ impl SellerDaemon {
         // From-scratch: name the empty-base commits onto the job branch (best-effort). Contribution
         // is ALREADY on `branch` (set by init_contribution_workdir at base_oid), so skip the reset.
         if active.contribution.is_none() {
-            let _ = std::process::Command::new("git")
-                .args(["checkout", "-B", &branch])
-                .current_dir(&active.workdir)
-                .status();
+            let _ = seller_git::point_branch_at_head(&active.workdir, &branch);
         }
 
         // NIP-98: key from 0600 file → git child env only (never argv / never logged).
