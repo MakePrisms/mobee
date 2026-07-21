@@ -1067,6 +1067,8 @@ async fn reconcile_wallet_tool_async(state: &McpState) -> Result<Value, String> 
         "ok": true,
         "retired": report.retired,
         "mapped_token_created": report.mapped_token_created,
+        "swap_rolled_back": report.swap_rolled_back,
+        "swap_recovered": report.swap_recovered,
     });
     let rendered = body.to_string();
     let secret = home::read_secret_key_hex(&state.home).unwrap_or_default();
