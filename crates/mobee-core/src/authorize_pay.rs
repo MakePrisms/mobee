@@ -217,7 +217,11 @@ pub async fn authorize_pay_async(
     // Piece-14 Job E + issue #49: choose the realized mint the buyer pays at from the seller's
     // `creq` `m` list, keyed off the buyer's CONFIGURED mint (same source `buyer_fund` opens the
     // spending wallet at) — never a compile-time pin.
-    let mint = resolve_realized_mint(home.config.default_mint(), &request.accepted_mints)?;
+    let mint = resolve_realized_mint(
+        home.config.default_mint(),
+        &request.accepted_mints,
+        home.config.allow_real_mints,
+    )?;
     let terms = PaymentTerms::new(
         mint,
         Amount::from(request.amount_sats),
@@ -411,7 +415,17 @@ fn contribution_policy(home: &MobeeHome) -> crate::contribution::ContentPolicy {
 fn resolve_realized_mint(
     buyer_mint_url: &str,
     accepted_mints: &[String],
+    allow_real_mints: bool,
 ) -> Result<MintUrl, AuthorizePayError> {
+    // Real-mint fence (issue #49): the buyer's own paying mint must be admissible under the flag.
+    // Default (`allow_real_mints=false`) admits only the testnut/dev allow-list; a real mint is
+    // refused fail-closed before any spend unless the operator opts in.
+    if !crate::home::mint_allowed(buyer_mint_url, allow_real_mints) {
+        return Err(AuthorizePayError::Input(format!(
+            "real-mint fence: buyer mint {buyer_mint_url} is not an allow-listed testnut/dev mint; \
+             set allow_real_mints=true to pay at a real mint"
+        )));
+    }
     let buyer_mint = MintUrl::from_str(buyer_mint_url)
         .map_err(|error| AuthorizePayError::Input(format!("buyer mint url: {error}")))?;
     if accepted_mints.is_empty() {
@@ -707,18 +721,18 @@ mod tests {
     use crate::budget::BudgetGate;
     use crate::home::{self, DEFAULT_MINT_URL};
 
-    // A mint the buyer is NOT the compile-time default — proves resolution is config-driven (#49).
-    const CONFIGURED_MINT: &str = "https://minibits.example";
+    // A real (non-testnut) mint — admissible ONLY when `allow_real_mints` is true (issue #49).
+    const REAL_MINT: &str = "https://minibits.example";
 
-    // Empty creq list (v1 / no creq) → pay from the buyer's CONFIGURED mint (not a compile pin).
+    // Empty creq list (v1 / no creq) → pay from the buyer's configured mint (config-driven, #49).
+    // Default flag (false): the configured testnut/dev mint resolves.
     #[test]
     fn resolve_realized_mint_empty_creq_uses_configured_mint() {
-        let mint = resolve_realized_mint(CONFIGURED_MINT, &[]).unwrap();
-        assert_eq!(mint, MintUrl::from_str(CONFIGURED_MINT).unwrap());
+        let mint = resolve_realized_mint(DEFAULT_MINT_URL, &[], false).unwrap();
+        assert_eq!(mint, MintUrl::from_str(DEFAULT_MINT_URL).unwrap());
     }
 
     // Direct path: the buyer's configured mint is one the seller listed → pay from it directly.
-    // (Uses the default mint as the configured one to keep a default-config regression too.)
     #[test]
     fn resolve_realized_mint_direct_when_configured_mint_is_listed() {
         let mint = resolve_realized_mint(
@@ -727,6 +741,7 @@ mod tests {
                 "https://other.example".to_string(),
                 DEFAULT_MINT_URL.to_string(),
             ],
+            false,
         )
         .unwrap();
         assert_eq!(mint, MintUrl::from_str(DEFAULT_MINT_URL).unwrap());
@@ -735,22 +750,34 @@ mod tests {
     // Configured mint NOT in the creq list → refuse `mint_unreachable_pay` fail-closed (no spend).
     #[test]
     fn resolve_realized_mint_refuses_when_configured_mint_not_listed() {
-        let error =
-            resolve_realized_mint(CONFIGURED_MINT, &["https://other.example".to_string()])
-                .unwrap_err();
+        let error = resolve_realized_mint(
+            DEFAULT_MINT_URL,
+            &["https://other.example".to_string()],
+            false,
+        )
+        .unwrap_err();
         assert!(matches!(error, AuthorizePayError::Wallet(_)));
         assert!(error.to_string().contains("mint_unreachable_pay"));
     }
 
-    // Issue #49: a buyer configured at mint X pays at X when the creq lists X, and refuses when the
-    // creq lists only a DIFFERENT mint — the paying mint follows config, not the compile-time const.
+    // Issue #49 real-mint switch: a buyer configured at a real mint X is REFUSED by the fence when
+    // `allow_real_mints` is false (default safety posture)...
     #[test]
-    fn resolve_realized_mint_follows_configured_mint_x() {
-        let paid = resolve_realized_mint(CONFIGURED_MINT, &[CONFIGURED_MINT.to_string()]).unwrap();
-        assert_eq!(paid, MintUrl::from_str(CONFIGURED_MINT).unwrap());
+    fn resolve_realized_mint_real_mint_refused_by_default() {
+        let error = resolve_realized_mint(REAL_MINT, &[REAL_MINT.to_string()], false).unwrap_err();
+        assert!(matches!(error, AuthorizePayError::Input(_)));
+        assert!(error.to_string().contains("real-mint fence"));
+    }
 
+    // ...and ADMITTED (pays at X when the creq lists X) once the operator opts in with the flag.
+    #[test]
+    fn resolve_realized_mint_real_mint_admitted_when_flag_true() {
+        let paid = resolve_realized_mint(REAL_MINT, &[REAL_MINT.to_string()], true).unwrap();
+        assert_eq!(paid, MintUrl::from_str(REAL_MINT).unwrap());
+
+        // Even with the flag on, a mint the creq did NOT list still refuses (membership unchanged).
         let refused =
-            resolve_realized_mint(CONFIGURED_MINT, &[DEFAULT_MINT_URL.to_string()]).unwrap_err();
+            resolve_realized_mint(REAL_MINT, &[DEFAULT_MINT_URL.to_string()], true).unwrap_err();
         assert!(refused.to_string().contains("mint_unreachable_pay"));
     }
 
