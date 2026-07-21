@@ -450,19 +450,10 @@ pub struct PushAuth {
     pub secret_key_hex: String,
 }
 
-/// Push `branch` from `workdir` to `remote_url` (allowlisted https / relay-git only).
-///
-/// Returns the pushed commit OID (full hex). Unauthenticated / prompt-needing remotes fail closed.
-pub fn push_branch(
-    workdir: &Path,
-    remote_url: &str,
-    branch: &str,
-) -> Result<String, SellerGitError> {
-    push_branch_with_auth(workdir, remote_url, branch, None)
-}
-
-/// Like [`push_branch`], with optional NIP-98 auth for relay-git. Always in-process libgit2 — there
-/// is no system-git fallback (issue #55).
+/// Push `branch` from `workdir` to `remote_url` (allowlisted https / relay-git only), with
+/// optional NIP-98 auth for relay-git. Always in-process libgit2 — there is no system-git fallback
+/// (issue #55). Returns the pushed commit OID (full hex). Unauthenticated / prompt-needing remotes
+/// fail closed.
 pub fn push_branch_with_auth(
     workdir: &Path,
     remote_url: &str,
@@ -584,15 +575,15 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         init_repo(&root);
         assert!(matches!(
-            push_branch(&root, "git@example.invalid:repo.git", "main"),
+            push_branch_with_auth(&root, "git@example.invalid:repo.git", "main", None),
             Err(SellerGitError::Transport(_))
         ));
         assert!(matches!(
-            push_branch(&root, "/tmp/local.git", "main"),
+            push_branch_with_auth(&root, "/tmp/local.git", "main", None),
             Err(SellerGitError::Transport(_))
         ));
         assert!(matches!(
-            push_branch(&root, "ssh://example.invalid/repo.git", "main"),
+            push_branch_with_auth(&root, "ssh://example.invalid/repo.git", "main", None),
             Err(SellerGitError::Transport(_))
         ));
         let _ = fs::remove_dir_all(&root);
@@ -604,10 +595,11 @@ mod tests {
         let root = temp("file-refuse");
         let _ = fs::remove_dir_all(&root);
         init_repo(&root);
-        let err = push_branch(
+        let err = push_branch_with_auth(
             &root,
             &format!("file://{}/remote.git", root.display()),
             "main",
+            None,
         )
         .expect_err("file refused");
         assert!(matches!(err, SellerGitError::Transport(_)));
