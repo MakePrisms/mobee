@@ -57,6 +57,21 @@ const MAX_AGENT_ATTEMPTS: u32 = 3;
 /// check fails CLOSED (skip), so a small budget is safe.
 const BACKFILL_CHECK_TIMEOUT_SECS: u64 = 5;
 
+/// Cadence (seconds) of the periodic seller wrap backfill (#57). A running daemon re-runs the
+/// SAME stored-wrap backfill the boot path uses every this-many seconds, so an AGED relay
+/// subscription that has silently stopped delivering kind-1059 payment gift-wraps still recovers
+/// WITHOUT a restart. Field-observed: fresh subscriptions deliver a wrap within ~1 min, but a
+/// subscription ~10+ min old was seen to go deaf and never deliver again — a payment then sat
+/// unredeemed until the daemon was manually restarted (which re-ran the boot backfill). This is a
+/// FIXED constant, NOT a user config knob (charter: no new config); the env override below exists
+/// only as a test seam (mirrors the heartbeat cadence).
+const WRAP_BACKFILL_INTERVAL_SECS: u64 = 300;
+
+/// Test-only env seam overriding [`WRAP_BACKFILL_INTERVAL_SECS`] (NOT a user config knob; mirrors
+/// `MOBEE_HEARTBEAT_INTERVAL_SECS`). A `0` or unparseable value is ignored. No production path
+/// sets it — the periodic cadence is the fixed constant in production.
+const WRAP_BACKFILL_INTERVAL_ENV: &str = "MOBEE_WRAP_BACKFILL_INTERVAL_SECS";
+
 #[derive(Debug)]
 pub enum DaemonError {
     Seller(SellerError),
@@ -2855,6 +2870,10 @@ pub(crate) struct RunHooks {
     /// Override the NIP-42 auth wait. `None` = production default (20s). A challenge-on-connect
     /// relay authenticates in milliseconds regardless of this value.
     pub auth_wait: Option<std::time::Duration>,
+    /// Fires after each PERIODIC wrap-backfill run with the number of stored kind-1059(s) the
+    /// fetch returned. The integration test uses it to prove the periodic timer fires and re-runs
+    /// the stored-wrap backfill (test seam, not a stderr scrape). `None` in production.
+    pub wrap_backfill_done: Option<tokio::sync::mpsc::UnboundedSender<usize>>,
 }
 
 /// Long-running seller loop: NIP-42 AUTH, then subscribe offers+1059 from START.
@@ -2879,6 +2898,89 @@ fn classify_recv_error(error: &tokio::sync::broadcast::error::RecvError) -> Recv
     match error {
         tokio::sync::broadcast::error::RecvError::Lagged(_) => RecvControl::Continue,
         tokio::sync::broadcast::error::RecvError::Closed => RecvControl::Stop,
+    }
+}
+
+/// Effective periodic wrap-backfill cadence (seconds): the [`WRAP_BACKFILL_INTERVAL_ENV`] test
+/// seam wins over the [`WRAP_BACKFILL_INTERVAL_SECS`] constant; a `0` or unparseable value is
+/// ignored (falls back to the constant). This is the extracted cadence DECISION function so the
+/// timing is unit-testable without a live relay (no production config path sets the env).
+fn resolve_wrap_backfill_interval_secs() -> u64 {
+    match std::env::var(WRAP_BACKFILL_INTERVAL_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => secs,
+            _ => WRAP_BACKFILL_INTERVAL_SECS,
+        },
+        Err(_) => WRAP_BACKFILL_INTERVAL_SECS,
+    }
+}
+
+/// Fetch stored kind-1059 payment gift-wraps p-tagged to this seller since the last journaled
+/// receipt and run EACH through the SAME idempotent redeem path as the live subscription
+/// ([`ingest_gift_wrap`] → `try_apply_or_buffer`: already-receipted wraps skip, already-redeemed
+/// refuse at the mint, unverifiable buffer — all existing money guards, unchanged).
+///
+/// Shared by the #57 BOOT backfill (recovery on restart) and the #57 PERIODIC backfill (recovery
+/// for a RUNNING daemon whose aged relay subscription silently stopped delivering wraps). The
+/// `since` cursor and filter are identical on both paths; a fresh short-lived REQ (`fetch_events`)
+/// is what recovers the aged-subscription case. Timeout-bounded + log-and-continue: a slow or
+/// failing relay can NEVER wedge the caller. `source` is a log marker ("" boot, " (periodic)"
+/// periodic); `authed_note` is an optional diagnostic suffix on the fetch-attempt line. Returns
+/// the number of stored wraps the fetch returned (0 on error/timeout) so callers can surface it.
+async fn run_wrap_backfill(
+    daemon: &mut SellerDaemon,
+    client: &nostr_sdk::Client,
+    wrap_filter: nostr_sdk::Filter,
+    source: &str,
+    authed_note: &str,
+) -> usize {
+    let backfill_since = daemon.journal.last_receipt_ts().unwrap_or(None).unwrap_or(0);
+    // Log the ATTEMPT unconditionally, BEFORE the fetch — silence must never read as "no wraps".
+    eprintln!(
+        "seller wrap backfill{source}: fetching stored kind-1059(s) since ts={backfill_since}{authed_note}"
+    );
+    // Hard-cap the fetch so an auth-gated relay that never EOSEs cannot wedge the caller.
+    match tokio::time::timeout(
+        Duration::from_secs(15),
+        client.fetch_events(
+            wrap_filter.since(nostr_sdk::Timestamp::from(backfill_since)),
+            Duration::from_secs(12),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(events)) => {
+            let count = events.len();
+            eprintln!(
+                "seller wrap backfill{source}: {count} stored kind-1059(s) returned since ts={backfill_since}"
+            );
+            for event in events {
+                match ingest_gift_wrap(daemon, &event).await {
+                    Ok(Some(receipt)) => eprintln!(
+                        "seller receipt (backfill{source}) job_id={} result_id={} amount_received={}",
+                        receipt.job_id, receipt.result_id, receipt.amount_received
+                    ),
+                    Ok(None) => {}
+                    Err(error) if is_idempotent_already_redeemed(&error) => eprintln!(
+                        "seller pay: kind-1059 already redeemed (backfill{source} idempotent re-see): {error}"
+                    ),
+                    Err(error) => eprintln!("seller pay path (backfill{source}): {error}"),
+                }
+            }
+            count
+        }
+        Ok(Err(error)) => {
+            eprintln!(
+                "seller WARN: wrap backfill{source} fetch failed (continuing; live 1059 subscription active): {error}"
+            );
+            0
+        }
+        Err(_) => {
+            eprintln!(
+                "seller WARN: wrap backfill{source} fetch timed out after 15s (continuing; live 1059 subscription active)"
+            );
+            0
+        }
     }
 }
 
@@ -3038,47 +3140,17 @@ pub(crate) async fn run_forever_hooked(
             wait_for_nip42_auth(&mut relay_notifications, Duration::from_secs(3)).await,
             Ok(AuthWait::Authenticated)
         );
-    let backfill_since = daemon.journal.last_receipt_ts().unwrap_or(None).unwrap_or(0);
-    // Log the ATTEMPT unconditionally, BEFORE the fetch — silence must never read as "no wraps".
-    eprintln!(
-        "seller wrap backfill: fetching stored kind-1059(s) since ts={backfill_since} (nip42_authed={backfill_authed})"
-    );
-    // Hard-cap the fetch so an auth-gated relay that never EOSEs cannot wedge boot.
-    match tokio::time::timeout(
-        Duration::from_secs(15),
-        client.fetch_events(
-            wrap_filter.since(Timestamp::from(backfill_since)),
-            Duration::from_secs(12),
-        ),
+    // Boot recovery: run the shared stored-wrap backfill once (source marker "", auth diagnostic
+    // suffix). The periodic timer in the loop re-runs this SAME helper on a cadence so a running
+    // daemon whose subscription later ages out still recovers without a restart.
+    let _ = run_wrap_backfill(
+        &mut daemon,
+        &client,
+        wrap_filter,
+        "",
+        &format!(" (nip42_authed={backfill_authed})"),
     )
-    .await
-    {
-        Ok(Ok(events)) => {
-            eprintln!(
-                "seller wrap backfill: {} stored kind-1059(s) returned since ts={backfill_since}",
-                events.len()
-            );
-            for event in events {
-                match ingest_gift_wrap(&mut daemon, &event).await {
-                    Ok(Some(receipt)) => eprintln!(
-                        "seller receipt (backfill) job_id={} result_id={} amount_received={}",
-                        receipt.job_id, receipt.result_id, receipt.amount_received
-                    ),
-                    Ok(None) => {}
-                    Err(error) if is_idempotent_already_redeemed(&error) => eprintln!(
-                        "seller pay: kind-1059 already redeemed (backfill idempotent re-see): {error}"
-                    ),
-                    Err(error) => eprintln!("seller pay path (backfill): {error}"),
-                }
-            }
-        }
-        Ok(Err(error)) => eprintln!(
-            "seller WARN: wrap backfill fetch failed (continuing; live 1059 subscription active): {error}"
-        ),
-        Err(_) => eprintln!(
-            "seller WARN: wrap backfill fetch timed out after 15s (continuing; live 1059 subscription active)"
-        ),
-    }
+    .await;
 
     // Boot push preflight: surface WRITE-auth/git-version breakage now, not at job-delivery time.
     // Advisory only — logs-and-continues; never refuses boot (see run_boot_push_preflight).
@@ -3109,6 +3181,21 @@ pub(crate) async fn run_forever_hooked(
         );
     }
 
+    // #57 periodic wrap backfill: re-run the boot stored-wrap backfill every N seconds so a
+    // running daemon whose relay subscription has aged out (silently stopped delivering kind-1059
+    // wraps) recovers WITHOUT a restart. `interval_at` (not `interval`) starts one period out, so
+    // the first periodic run does NOT double the boot backfill we just ran. It rides the SAME
+    // select loop as the heartbeat (never a blocking side-thread) and each run is timeout-bounded
+    // + log-and-continue, so it can never wedge or crash offer/payment handling.
+    let wrap_backfill_interval_secs = resolve_wrap_backfill_interval_secs();
+    let mut wrap_backfill_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(wrap_backfill_interval_secs),
+        Duration::from_secs(wrap_backfill_interval_secs),
+    );
+    eprintln!(
+        "seller wrap backfill (periodic) enabled: re-fetch stored kind-1059(s) every {wrap_backfill_interval_secs}s"
+    );
+
     loop {
         // Resilient recv: a broadcast LAG (the loop fell behind while blocked in a long agent
         // turn) must NOT permanently deafen the daemon. tokio's broadcast drops the overflowed
@@ -3122,6 +3209,22 @@ pub(crate) async fn run_forever_hooked(
             // handling. Disabled ⇒ the branch is inert and select only waits on the relay stream.
             _ = heartbeat_interval.tick(), if heartbeat_enabled => {
                 publish_heartbeat(&daemon).await;
+                continue;
+            }
+            // Periodic wrap backfill tick (#57). Same idempotent redeem path as boot; a fresh REQ
+            // recovers an aged, silently-deaf subscription. Timeout-bounded inside the helper.
+            _ = wrap_backfill_interval.tick() => {
+                let count = run_wrap_backfill(
+                    &mut daemon,
+                    &client,
+                    wrap_subscription_filter(seller_pubkey),
+                    " (periodic)",
+                    "",
+                )
+                .await;
+                if let Some(tx) = &hooks.wrap_backfill_done {
+                    let _ = tx.send(count);
+                }
                 continue;
             }
             recv = notifications.recv() => match recv {
@@ -3284,6 +3387,48 @@ mod tests {
             "mobee-seller-daemon-{label}-{}-{id}",
             std::process::id()
         ))
+    }
+
+    /// #57 TEST (1) — periodic backfill CADENCE decision function. The interval is a fixed
+    /// constant in production (300s); the env seam (used only by tests) overrides it, and a
+    /// `0`/unparseable value is ignored. This is the extracted `resolve_wrap_backfill_interval_secs`
+    /// that lets the cadence be exercised without a live relay. Serialised against the daemon
+    /// integration tests (which also read this env) via `FLIGHT_TEST_GUARD`.
+    #[test]
+    fn wrap_backfill_interval_env_overrides_default() {
+        let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // No env seam ⇒ the fixed production constant (5 min).
+        unsafe {
+            std::env::remove_var(WRAP_BACKFILL_INTERVAL_ENV);
+        }
+        assert_eq!(WRAP_BACKFILL_INTERVAL_SECS, 300);
+        assert_eq!(
+            resolve_wrap_backfill_interval_secs(),
+            WRAP_BACKFILL_INTERVAL_SECS
+        );
+        // A valid positive override wins (the fast-cadence test seam).
+        unsafe {
+            std::env::set_var(WRAP_BACKFILL_INTERVAL_ENV, "2");
+        }
+        assert_eq!(resolve_wrap_backfill_interval_secs(), 2);
+        // `0` and unparseable values are ignored ⇒ fall back to the constant.
+        unsafe {
+            std::env::set_var(WRAP_BACKFILL_INTERVAL_ENV, "0");
+        }
+        assert_eq!(
+            resolve_wrap_backfill_interval_secs(),
+            WRAP_BACKFILL_INTERVAL_SECS
+        );
+        unsafe {
+            std::env::set_var(WRAP_BACKFILL_INTERVAL_ENV, "nonsense");
+        }
+        assert_eq!(
+            resolve_wrap_backfill_interval_secs(),
+            WRAP_BACKFILL_INTERVAL_SECS
+        );
+        unsafe {
+            std::env::remove_var(WRAP_BACKFILL_INTERVAL_ENV);
+        }
     }
 
     // RIDER: the seller-side receipt-preimage delivery discriminator is DERIVED from the typed
@@ -5501,6 +5646,7 @@ mod local_relay_it {
             ready: Some(ready),
             // Short auth-wait: the ungated in-process relay never challenges, so proceed fast.
             auth_wait: Some(Duration::from_millis(500)),
+            wrap_backfill_done: None,
         }
     }
 
@@ -5518,6 +5664,29 @@ mod local_relay_it {
                 .build()
                 .expect("daemon runtime");
             let _ = rt.block_on(run_forever_hooked(daemon, hooks(ready)));
+        })
+    }
+
+    /// Like [`spawn_daemon_thread`] but also wires the PERIODIC wrap-backfill hook, so the #57
+    /// periodic tests can observe each periodic run's stored-1059 count without scraping stderr.
+    fn spawn_daemon_thread_with_backfill_hook(
+        daemon: SellerDaemon,
+        ready: tokio::sync::mpsc::UnboundedSender<()>,
+        backfill_done: tokio::sync::mpsc::UnboundedSender<usize>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("daemon runtime");
+            let _ = rt.block_on(run_forever_hooked(
+                daemon,
+                RunHooks {
+                    ready: Some(ready),
+                    auth_wait: Some(Duration::from_millis(500)),
+                    wrap_backfill_done: Some(backfill_done),
+                },
+            ));
         })
     }
 
@@ -5692,6 +5861,181 @@ mod local_relay_it {
             "seller must still CLAIM a live offer after boot-backfilling a stored wrap (e={live_id})"
         );
 
+        wait_until(Duration::from_secs(8), || !SellerDaemon::in_flight()).await;
+        relay.shutdown();
+    }
+
+    // ── #57 TEST (2): a wrap stored AFTER boot is picked up by a PERIODIC backfill run ────────
+    // The field bug: a live-but-AGED relay subscription silently stops delivering kind-1059 wraps,
+    // so a payment sent to a running daemon sits unredeemed until restart. The fix is a periodic
+    // timer that re-runs the boot stored-wrap backfill. TESTABILITY (honest): the in-process relay
+    // CANNOT reproduce an aged, silently-deaf live subscription — fresh in-process subs always
+    // deliver. What is reproducible, and what actually fixes the bug, is the RECOVERY mechanism: a
+    // periodic run independently RE-FETCHES stored wraps p-tagged to us (a fresh short-lived REQ)
+    // and runs each through the SAME `ingest_gift_wrap` path. We seed a wrap AFTER boot and assert
+    // a periodic run returns it (count >= 1) — proving the timer fires and the fetch+ingest runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn periodic_backfill_picks_up_wrap_stored_after_boot() {
+        use nostr_sdk::prelude::{EventBuilder, Tag};
+
+        let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        SellerDaemon::end_flight();
+
+        // Fast periodic cadence via the test seam (held under the guard, so no concurrent daemon
+        // test reads this env).
+        unsafe {
+            std::env::set_var(WRAP_BACKFILL_INTERVAL_ENV, "2");
+        }
+
+        let (relay, relay_url) = start_relay(RelayBuilder::default()).await;
+        let home = seller_home(&unique_root("periodic-pickup"), &relay_url, true, 0);
+        let daemon = SellerDaemon::open(home).expect("open seller daemon");
+        let seller_pk = PublicKey::parse(daemon.seller_pubkey()).expect("seller pubkey");
+
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (backfill_tx, mut backfill_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let _daemon = spawn_daemon_thread_with_backfill_hook(daemon, ready_tx, backfill_tx);
+
+        // Up and running; boot backfill already ran (no wrap stored yet).
+        let ready = tokio::time::timeout(Duration::from_secs(12), ready_rx.recv()).await;
+        assert!(
+            matches!(ready, Ok(Some(()))),
+            "daemon must reach READY (got {ready:?})"
+        );
+
+        // Seed a stored 1059 gift-wrap p-tagged to the seller AFTER boot (the stranded-payment
+        // shape an aged live sub would miss). `last_receipt_ts == 0`, so the since-cursor covers it.
+        let seeder = connect_client(&relay_url).await;
+        let stored_wrap = EventBuilder::new(Kind::GiftWrap, "opaque-post-boot-wrap")
+            .tag(Tag::public_key(seller_pk))
+            .sign_with_keys(&Keys::generate())
+            .expect("sign stored wrap");
+        seeder
+            .send_event(&stored_wrap)
+            .await
+            .expect("seed stored wrap");
+
+        // A periodic run AFTER the wrap was stored must return >= 1 stored 1059 (fetched+ingested).
+        let picked_up = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match backfill_rx.recv().await {
+                    Some(count) if count >= 1 => break true,
+                    Some(_) => continue,
+                    None => break false,
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(picked_up, Ok(true)),
+            "a periodic backfill run must FETCH+INGEST the wrap stored after boot (got {picked_up:?})"
+        );
+
+        unsafe {
+            std::env::remove_var(WRAP_BACKFILL_INTERVAL_ENV);
+        }
+        relay.shutdown();
+    }
+
+    // ── #57 TEST (3): repeated periodic runs stay idempotent and never wedge the loop ─────────
+    // A stored wrap seeded BEFORE boot is re-seen by EVERY periodic run. Each run re-ingests it
+    // through the SAME guarded, idempotent path (`ingest_gift_wrap` → `try_apply_or_buffer`:
+    // journal pay-once / mint-refuse — money guards unchanged and covered by the money-path tests;
+    // an opaque wrap decodes to "not ours" and makes no redeem attempt at all). We prove: (a) the
+    // timer fires REPEATEDLY over the same wrap, and (b) the daemon still claims a fresh live offer
+    // afterwards — i.e. the periodic runs never block the event loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn periodic_backfill_reruns_stay_idempotent_and_healthy() {
+        use nostr_sdk::prelude::{EventBuilder, Tag};
+
+        let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        SellerDaemon::end_flight();
+        unsafe {
+            std::env::set_var(WRAP_BACKFILL_INTERVAL_ENV, "2");
+        }
+
+        let (relay, relay_url) = start_relay(RelayBuilder::default()).await;
+        let home = seller_home(&unique_root("periodic-idem"), &relay_url, true, 0);
+        let daemon = SellerDaemon::open(home).expect("open seller daemon");
+        let seller_pk = PublicKey::parse(daemon.seller_pubkey()).expect("seller pubkey");
+
+        // Seed the stored wrap BEFORE boot so every periodic run re-sees the SAME wrap.
+        let seeder = connect_client(&relay_url).await;
+        let stored_wrap = EventBuilder::new(Kind::GiftWrap, "opaque-repeat-wrap")
+            .tag(Tag::public_key(seller_pk))
+            .sign_with_keys(&Keys::generate())
+            .expect("sign stored wrap");
+        seeder
+            .send_event(&stored_wrap)
+            .await
+            .expect("seed stored wrap");
+
+        // Observer for the seller's claims (before boot, so none is missed).
+        let observer = connect_client(&relay_url).await;
+        observer
+            .subscribe(
+                Filter::new()
+                    .kinds([
+                        Kind::Custom(gateway::JOB_CLAIM_KIND),
+                        Kind::Custom(gateway::JOB_FEEDBACK_KIND),
+                    ])
+                    .author(seller_pk),
+                None,
+            )
+            .await
+            .expect("observer subscribe");
+        let claims = spawn_claim_collector(&observer, seller_pk);
+
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (backfill_tx, mut backfill_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let _daemon = spawn_daemon_thread_with_backfill_hook(daemon, ready_tx, backfill_tx);
+
+        let ready = tokio::time::timeout(Duration::from_secs(12), ready_rx.recv()).await;
+        assert!(
+            matches!(ready, Ok(Some(()))),
+            "daemon must reach READY (got {ready:?})"
+        );
+
+        // Wait for at least TWO periodic runs over the SAME stored wrap — the re-run path.
+        let mut runs = 0usize;
+        let two_runs = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match backfill_rx.recv().await {
+                    Some(count) => {
+                        assert!(count >= 1, "each periodic run must re-see the stored wrap");
+                        runs += 1;
+                        if runs >= 2 {
+                            break true;
+                        }
+                    }
+                    None => break false,
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(two_runs, Ok(true)),
+            "the periodic timer must fire repeatedly over the same wrap (got {two_runs:?}, runs={runs})"
+        );
+
+        // Still healthy after repeated backfills: a fresh targeted (live) offer is claimed without
+        // a restart — the periodic runs never block the event loop.
+        let buyer = Keys::generate();
+        let live_id = publish_offer(&seeder, &buyer, &offer_draft(Some(&seller_pk.to_hex())), None)
+            .await
+            .to_hex();
+        let claimed = wait_until(Duration::from_secs(12), || {
+            claims_contain(&claims, &live_id, "processing")
+        })
+        .await;
+        assert!(
+            claimed,
+            "seller must still CLAIM a live offer after repeated periodic backfills (e={live_id})"
+        );
+
+        unsafe {
+            std::env::remove_var(WRAP_BACKFILL_INTERVAL_ENV);
+        }
         wait_until(Duration::from_secs(8), || !SellerDaemon::in_flight()).await;
         relay.shutdown();
     }
