@@ -1,7 +1,7 @@
 //! Buyer wallet fund path for packaged `~/.mobee` (testnut only).
 //!
 //! Flow: mint quote → (testnut FakeWallet auto-marks paid) → mint.
-//! Mint URL is hard-pinned to [`crate::home::DEFAULT_MINT_URL`].
+//! The wallet mint is the configured mint ([`crate::home::MobeeConfig::default_mint`]) — issue #49.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use cdk::Amount;
 use cdk_sqlite::wallet::WalletSqliteDatabase;
 use sha2::{Digest, Sha256};
 
-use crate::home::{self, HomeError, MobeeHome, DEFAULT_MINT_URL};
+use crate::home::{self, HomeError, MobeeHome};
 
 /// Default fund amount for first-run setup (sats). Small; testnut only.
 pub const DEFAULT_FUND_AMOUNT_SATS: u64 = 21;
@@ -31,7 +31,6 @@ pub struct FundOutcome {
 #[derive(Debug)]
 pub enum FundError {
     Home(HomeError),
-    MintPinned { configured: String },
     Wallet(String),
 }
 
@@ -39,12 +38,6 @@ impl std::fmt::Display for FundError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Home(error) => write!(formatter, "{error}"),
-            Self::MintPinned { configured } => write!(
-                formatter,
-                "fund path hard-pinned to {DEFAULT_MINT_URL}; configured mint_url is {configured}. \
-                 If this is a dead testnut host (e.g. testnut.cashu.space), update ~/.mobee/config.toml \
-                 mint_url to {DEFAULT_MINT_URL} (or delete config.toml and re-run setup_wallet / bootstrap)"
-            ),
             Self::Wallet(message) => write!(formatter, "wallet fund error: {message}"),
         }
     }
@@ -75,15 +68,6 @@ pub fn seed_from_secret_hex(secret_hex: &str) -> Result<[u8; 64], FundError> {
     Ok(seed)
 }
 
-fn require_testnut_mint(home: &MobeeHome) -> Result<(), FundError> {
-    if home.config.default_mint() != DEFAULT_MINT_URL {
-        return Err(FundError::MintPinned {
-            configured: home.config.default_mint().to_owned(),
-        });
-    }
-    Ok(())
-}
-
 fn sqlite_path(wallet_dir: &Path) -> std::path::PathBuf {
     wallet_dir.join("cdk-wallet.sqlite")
 }
@@ -92,7 +76,9 @@ fn sqlite_path(wallet_dir: &Path) -> std::path::PathBuf {
 /// runtime — [`open_testnut_wallet_blocking`] fails fast if a Tokio runtime is
 /// already current (no nested `block_on` panic).
 pub async fn open_testnut_wallet_async(home: &MobeeHome) -> Result<Wallet, FundError> {
-    require_testnut_mint(home)?;
+    // Issue #49: the wallet opens at the CONFIGURED mint (`MobeeConfig::default_mint`), the same
+    // source of truth the pay path resolves the realized mint from — no compile-time pin. A
+    // malformed mint URL fails closed inside `Wallet::new`.
     let secret = home::read_secret_key_hex(home)?;
     let seed = seed_from_secret_hex(&secret)?;
     let path = sqlite_path(&home.wallet_dir);
@@ -100,7 +86,7 @@ pub async fn open_testnut_wallet_async(home: &MobeeHome) -> Result<Wallet, FundE
         .await
         .map_err(|error| FundError::Wallet(error.to_string()))?;
     Wallet::new(
-        DEFAULT_MINT_URL,
+        home.config.default_mint(),
         CurrencyUnit::Sat,
         Arc::new(store),
         seed,
@@ -137,7 +123,6 @@ pub async fn fund_testnut_wallet(
     home: &MobeeHome,
     amount_sats: u64,
 ) -> Result<FundOutcome, FundError> {
-    require_testnut_mint(home)?;
     let wallet = open_testnut_wallet_async(home).await?;
     let existing = wallet
         .total_balance()
@@ -146,7 +131,7 @@ pub async fn fund_testnut_wallet(
         .to_u64();
     if existing > 0 {
         return Ok(FundOutcome {
-            mint_url: DEFAULT_MINT_URL.to_owned(),
+            mint_url: home.config.default_mint().to_owned(),
             invoice: None,
             funded_sats: 0,
             balance_sats: existing,
@@ -202,7 +187,7 @@ pub async fn fund_testnut_wallet(
         ));
     }
     Ok(FundOutcome {
-        mint_url: DEFAULT_MINT_URL.to_owned(),
+        mint_url: home.config.default_mint().to_owned(),
         invoice: Some(invoice),
         funded_sats: funded,
         balance_sats: balance,
@@ -228,7 +213,7 @@ pub fn fund_testnut_wallet_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::home::{bootstrap, MobeeConfig};
+    use crate::home::{bootstrap, MobeeConfig, DEFAULT_MINT_URL};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -250,15 +235,17 @@ mod tests {
         assert_eq!(a.len(), 64);
     }
 
+    // Issue #49: the wallet opens at the CONFIGURED mint, not a compile-time pin — a buyer
+    // configured at a non-default mint spends from that mint (no `MintPinned` refusal).
     #[test]
-    fn non_testnut_mint_is_refused() {
-        let root = temp_home("pin");
+    fn wallet_opens_at_the_configured_mint() {
+        let root = temp_home("cfg-mint");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap(&root).expect("bootstrap");
-        home.config.accepted_mints = vec!["https://evil.example".into()];
-        let err = fund_testnut_wallet_blocking(&home, 1).expect_err("pin");
-        assert!(matches!(err, FundError::MintPinned { .. }));
-        assert!(err.to_string().contains(DEFAULT_MINT_URL));
+        home.config.accepted_mints = vec!["https://minibits.example".into()];
+        let wallet = open_testnut_wallet_blocking(&home).expect("open at configured mint");
+        assert_eq!(wallet.mint_url.to_string(), "https://minibits.example");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "current_thread")]

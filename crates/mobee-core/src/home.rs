@@ -376,6 +376,15 @@ pub struct MobeeConfig {
     /// never invents spendable credit by itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_mints: Vec<String>,
+    /// REAL-MONEY SWITCH (issue #49). When `false` (default — the safety posture) the seller
+    /// `accepted_mints` boot fence and the buyer pay-path mint resolution admit ONLY the
+    /// testnut/dev allow-list ([`DEFAULT_MINT_URL`]); a real mint is refused fail-closed. When
+    /// `true` (deliberate operator opt-in, gudnuf-authorized) any well-formed `https://` mint URL
+    /// is admitted — this is the switch that lets real sats move. It flips ONLY the allow-list
+    /// check; every other money gate (creq membership, redeem guard token==payload mint, dust
+    /// guard, budget caps, co-signatures) is unchanged.
+    #[serde(default)]
+    pub allow_real_mints: bool,
     /// Optional `[profile] name / about`. Skipped when absent so fresh homes stay unnamed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfileConfig>,
@@ -424,6 +433,24 @@ fn default_accepted_mints() -> Vec<String> {
     vec![DEFAULT_MINT_URL.to_owned()]
 }
 
+/// The single real-mint fence predicate (issue #49), shared by the seller `accepted_mints` boot
+/// check and the buyer pay-path mint resolution so both sides gate on the SAME rule.
+///
+/// - `allow_real_mints == false` (default safety posture): only the testnut/dev allow-list — today
+///   that is exactly [`DEFAULT_MINT_URL`].
+/// - `allow_real_mints == true` (operator opt-in real-money switch): any well-formed `https://`
+///   mint URL. Full URL validity is re-checked downstream (`MintUrl::from_str` / `Wallet::new`);
+///   this predicate only decides the POLICY (testnut-only vs any-https).
+pub fn mint_allowed(mint_url: &str, allow_real_mints: bool) -> bool {
+    if allow_real_mints {
+        mint_url
+            .strip_prefix("https://")
+            .is_some_and(|host| !host.is_empty())
+    } else {
+        mint_url == DEFAULT_MINT_URL
+    }
+}
+
 impl MobeeConfig {
     /// Buyer-side default mint: the first accepted mint. Falls back to [`DEFAULT_MINT_URL`]
     /// only if the list is empty (boot validation refuses an empty list for sellers). Buyer
@@ -445,6 +472,7 @@ impl Default for MobeeConfig {
             per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,
             total_budget_sats: DEFAULT_TOTAL_BUDGET_SATS,
             extra_mints: Vec::new(),
+            allow_real_mints: false,
             profile: None,
             seller: None,
             agents: BTreeMap::new(),

@@ -349,14 +349,6 @@ pub struct SellerDaemon {
     awaiting_payment: Vec<ActiveJob>,
 }
 
-/// Fail-closed real-mint fence: an `accepted_mints` entry is admissible only if it is an
-/// allow-listed testnut/dev mint. Real-mint enablement is a separate, separately-gated change
-/// (PIECE-14 § Out of scope); this allow-list is the seam. Today the fleet's only testnut/dev
-/// mint is [`DEFAULT_MINT_URL`], so that is the whole allow-list.
-fn is_allowed_seller_mint(mint_url: &str) -> bool {
-    mint_url == DEFAULT_MINT_URL
-}
-
 impl SellerDaemon {
     pub fn open(home: MobeeHome) -> Result<Self, DaemonError> {
         require_seller_config(&home)?;
@@ -365,11 +357,15 @@ impl SellerDaemon {
                 "seller accepted_mints must be non-empty".to_owned(),
             ));
         }
+        // Real-mint fence (issue #49): with `allow_real_mints=false` (default), only the
+        // testnut/dev allow-list is admissible; set `allow_real_mints=true` to admit any
+        // well-formed https mint (the deliberate real-money switch).
         for mint in &home.config.accepted_mints {
-            if !is_allowed_seller_mint(mint) {
+            if !crate::home::mint_allowed(mint, home.config.allow_real_mints) {
                 return Err(DaemonError::Config(format!(
-                    "seller mint fail-closed: every accepted_mints entry must be an \
-                     allow-listed testnut/dev mint ({DEFAULT_MINT_URL}), got {mint}"
+                    "seller mint fail-closed: accepted_mints entry {mint} is not an allow-listed \
+                     testnut/dev mint ({DEFAULT_MINT_URL}); set allow_real_mints=true to admit a \
+                     real https mint"
                 )));
             }
         }
@@ -2868,6 +2864,30 @@ mod tests {
             Err(error) => error,
         };
         assert!(err.to_string().contains("fail-closed") || err.to_string().contains("testnut"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Issue #49 real-mint switch: with `allow_real_mints=true` the boot fence admits a real
+    // (non-testnut) accepted_mints entry that is refused by default.
+    #[test]
+    fn open_admits_real_mint_when_allow_real_mints_true() {
+        let root = temp("mint-real");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("bootstrap");
+        home.config.accepted_mints = vec!["https://minibits.example".into()];
+        home.config.allow_real_mints = true;
+        home.config.seller = Some(SellerConfig {
+            agent_command: vec!["echo".into()],
+            rate_sats: 1,
+            git_remote: "https://example.invalid/repo.git".into(),
+            job_timeout_secs: None,
+            agent: None,
+            claim_open_pool: false,
+            offer_backfill_secs: 0,
+            contribution_enabled: true,
+        });
+        home::save_config(&home).expect("save");
+        SellerDaemon::open(home).expect("real mint admitted with allow_real_mints=true");
         let _ = std::fs::remove_dir_all(&root);
     }
 
