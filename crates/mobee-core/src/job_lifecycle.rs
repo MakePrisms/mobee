@@ -378,7 +378,7 @@ pub async fn post_job_async(
     // be read at all — posting needs no funds, so it must not hang on a dead mint.
     #[cfg(feature = "wallet")]
     {
-        let wallet = buyer_fund::open_testnut_wallet_async(home)
+        let wallet = buyer_fund::open_wallet_async(home)
             .await
             .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
         payment_wallet::require_fee_safe_amount_for_post(

@@ -82,10 +82,10 @@ fn sqlite_path(wallet_dir: &Path) -> std::path::PathBuf {
     wallet_dir.join("cdk-wallet.sqlite")
 }
 
-/// Open the packaged testnut wallet (async). Prefer this inside an existing
-/// runtime — [`open_testnut_wallet_blocking`] fails fast if a Tokio runtime is
+/// Open the wallet at the configured default mint (async). Prefer this inside an existing
+/// runtime — [`open_wallet_blocking`] fails fast if a Tokio runtime is
 /// already current (no nested `block_on` panic).
-pub async fn open_testnut_wallet_async(home: &MobeeHome) -> Result<Wallet, FundError> {
+pub async fn open_wallet_async(home: &MobeeHome) -> Result<Wallet, FundError> {
     // The wallet opens at the CONFIGURED mint (`MobeeConfig::default_mint`), the same
     // source of truth the pay path resolves the realized mint from — no compile-time pin. A
     // malformed mint URL fails closed inside `Wallet::new`.
@@ -107,20 +107,20 @@ pub async fn open_testnut_wallet_async(home: &MobeeHome) -> Result<Wallet, FundE
 
 /// Thin sync wrapper for non-async callers (CLI / tests).
 /// Do **not** call from inside an existing tokio runtime — use
-/// [`open_testnut_wallet_async`] instead. Nested call fails fast (no panic).
-pub fn open_testnut_wallet_blocking(home: &MobeeHome) -> Result<Wallet, FundError> {
-    crate::runtime_guard::refuse_nested_block_on("open_testnut_wallet_blocking")
+/// [`open_wallet_async`] instead. Nested call fails fast (no panic).
+pub fn open_wallet_blocking(home: &MobeeHome) -> Result<Wallet, FundError> {
+    crate::runtime_guard::refuse_nested_block_on("open_wallet_blocking")
         .map_err(FundError::Wallet)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| FundError::Wallet(error.to_string()))?;
-    runtime.block_on(open_testnut_wallet_async(home))
+    runtime.block_on(open_wallet_async(home))
 }
 
 /// Read current wallet balance against the configured default mint.
 pub async fn wallet_balance_sats(home: &MobeeHome) -> Result<u64, FundError> {
-    let wallet = open_testnut_wallet_async(home).await?;
+    let wallet = open_wallet_async(home).await?;
     let balance = wallet
         .total_balance()
         .await
@@ -128,12 +128,12 @@ pub async fn wallet_balance_sats(home: &MobeeHome) -> Result<u64, FundError> {
     Ok(balance.to_u64())
 }
 
-/// Fund via mint-quote → wait (testnut auto-pay) → mint. Idempotent if balance > 0.
-pub async fn fund_testnut_wallet(
+/// Fund via mint-quote → wait for payment → mint. Idempotent if balance > 0.
+pub async fn fund_wallet(
     home: &MobeeHome,
     amount_sats: u64,
 ) -> Result<FundOutcome, FundError> {
-    let wallet = open_testnut_wallet_async(home).await?;
+    let wallet = open_wallet_async(home).await?;
     let existing = wallet
         .total_balance()
         .await
@@ -210,18 +210,18 @@ pub async fn fund_testnut_wallet(
 }
 
 /// Blocking wrapper for CLI / tests (current-thread runtime).
-/// Nested call from an async context fails fast — use [`fund_testnut_wallet`].
-pub fn fund_testnut_wallet_blocking(
+/// Nested call from an async context fails fast — use [`fund_wallet`].
+pub fn fund_wallet_blocking(
     home: &MobeeHome,
     amount_sats: u64,
 ) -> Result<FundOutcome, FundError> {
-    crate::runtime_guard::refuse_nested_block_on("fund_testnut_wallet_blocking")
+    crate::runtime_guard::refuse_nested_block_on("fund_wallet_blocking")
         .map_err(FundError::Wallet)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| FundError::Wallet(error.to_string()))?;
-    runtime.block_on(fund_testnut_wallet(home, amount_sats))
+    runtime.block_on(fund_wallet(home, amount_sats))
 }
 
 #[cfg(test)]
@@ -257,7 +257,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap(&root).expect("bootstrap");
         home.config.accepted_mints = vec!["https://minibits.example".into()];
-        let wallet = open_testnut_wallet_blocking(&home).expect("open at configured mint");
+        let wallet = open_wallet_blocking(&home).expect("open at configured mint");
         assert_eq!(wallet.mint_url.to_string(), "https://minibits.example");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -267,7 +267,7 @@ mod tests {
         let root = temp_home("nested-refuse");
         let _ = std::fs::remove_dir_all(&root);
         let home = bootstrap(&root).expect("bootstrap");
-        let err = fund_testnut_wallet_blocking(&home, DEFAULT_FUND_AMOUNT_SATS)
+        let err = fund_wallet_blocking(&home, DEFAULT_FUND_AMOUNT_SATS)
             .expect_err("must refuse nested block_on");
         let message = err.to_string();
         assert!(
@@ -282,7 +282,7 @@ mod tests {
         let root = temp_home("nested-open-refuse");
         let _ = std::fs::remove_dir_all(&root);
         let home = bootstrap(&root).expect("bootstrap");
-        let err = open_testnut_wallet_blocking(&home).expect_err("must refuse nested block_on");
+        let err = open_wallet_blocking(&home).expect_err("must refuse nested block_on");
         let message = err.to_string();
         assert!(
             message.contains("nested block_on refused"),
@@ -297,7 +297,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let home = bootstrap(&root).expect("bootstrap");
         assert_eq!(home.config.default_mint(), DEFAULT_MINT_URL);
-        let outcome = fund_testnut_wallet_blocking(&home, DEFAULT_FUND_AMOUNT_SATS)
+        let outcome = fund_wallet_blocking(&home, DEFAULT_FUND_AMOUNT_SATS)
             .expect("live testnut fund");
         assert!(!outcome.already_funded);
         assert!(outcome.balance_sats > 0, "balance={}", outcome.balance_sats);
@@ -305,7 +305,7 @@ mod tests {
         assert_eq!(outcome.mint_url, DEFAULT_MINT_URL);
 
         // Idempotent second call — balance still visible, no double-fund required.
-        let again = fund_testnut_wallet_blocking(&home, DEFAULT_FUND_AMOUNT_SATS)
+        let again = fund_wallet_blocking(&home, DEFAULT_FUND_AMOUNT_SATS)
             .expect("already funded");
         assert!(again.already_funded);
         assert!(again.balance_sats > 0);

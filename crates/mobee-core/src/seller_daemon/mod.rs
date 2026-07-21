@@ -1186,7 +1186,7 @@ impl SellerDaemon {
         let secret = home::read_secret_key_hex(&self.home)?;
         let cashu_key = cashu_secret_from_nostr_hex(&secret)?;
         // Must await — seller loop already owns a tokio runtime; blocking open nests block_on → panic.
-        let wallet = buyer_fund::open_testnut_wallet_async(&self.home).await?;
+        let wallet = buyer_fund::open_wallet_async(&self.home).await?;
         let adapter = CdkSellerReceive::new(&wallet, cashu_key);
         let amount = adapter
             .receive(&token, &terms, &accepted_mints, &payload_mint)

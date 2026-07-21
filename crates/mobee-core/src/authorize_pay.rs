@@ -328,7 +328,7 @@ pub async fn authorize_pay_async(
         )));
     }
 
-    let wallet = buyer_fund::open_testnut_wallet_async(home).await?;
+    let wallet = buyer_fund::open_wallet_async(home).await?;
     // Dust guard (live keyset N=1 floor, fail-closed). lock_or_reconcile re-checks
     // against CDK input-count send_fee after prepare_send.
     crate::payment_wallet::require_fee_safe_amount(&wallet, terms.amount)
