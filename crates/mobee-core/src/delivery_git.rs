@@ -13,15 +13,7 @@ use git2::{DiffOptions, Oid, Repository};
 
 use crate::delivery::{CommitOid, DeliveryError, DeliveryVerifier, GitDelivery, VerifiedDelivery};
 use crate::delivery_transport::AllowlistedDeliveryVerifier;
-use crate::git_transport::{self, TransportError};
-
-/// Map an in-process transport failure onto the pay-path delivery error (fail-closed).
-fn map_transport(op: &'static str, error: TransportError) -> DeliveryError {
-    match error {
-        TransportError::Transport(_) => DeliveryError::GitCommandFailed(op),
-        _ => DeliveryError::GitCommandFailed(op),
-    }
-}
+use crate::git_transport;
 
 /// Real git-backed verifier that retains fetched objects in a buyer-owned repository.
 ///
@@ -107,7 +99,7 @@ impl GitDeliveryVerifier {
         // short_timeout=true: a hung fetch must not own the MCP stdio loop past the client timeout,
         // and must fail CLOSED before authorize_pay burns budget (verify-before-pay).
         git_transport::fetch_refspecs(&repo, delivery.repo(), &[&refspec], self.read_auth(), true)
-            .map_err(|error| map_transport("fetch", error))?;
+            .map_err(|_| DeliveryError::GitCommandFailed("fetch"))?;
 
         let fetched_object = format!("{fetched_ref}^{{commit}}");
         let commit = repo
@@ -142,7 +134,7 @@ impl GitDeliveryVerifier {
         let fetched_ref = format!("refs/mobee/bases/{}", base_oid.as_str());
         let refspec = format!("+refs/heads/{base_branch}:{fetched_ref}");
         git_transport::fetch_refspecs(&repo, base_clone_url, &[&refspec], self.read_auth(), true)
-            .map_err(|error| map_transport("fetch-base", error))?;
+            .map_err(|_| DeliveryError::GitCommandFailed("fetch-base"))?;
         // The pinned target MUST actually contain base_oid — resolve it as a commit in custody.
         let parsed = Self::parse_oid(base_oid)?;
         repo.find_commit(parsed)
@@ -389,7 +381,7 @@ impl PayPathDeliveryVerifier {
             .map_err(|_| DeliveryError::GitCommandFailed("merge-open"))?;
         // Local custody→target fetch (no network, no auth, no allowlist — both are buyer-owned).
         git_transport::fetch_refspecs(&target, &custody_url, &[&fetch_spec], None, false)
-            .map_err(|error| map_transport("fetch-from-custody", error))?;
+            .map_err(|_| DeliveryError::GitCommandFailed("fetch-from-custody"))?;
 
         let merged = GitDeliveryVerifier::parse_oid(commit_oid)?;
         // Fast-forward-only: the custodied commit must be the current HEAD or a descendant of it.
