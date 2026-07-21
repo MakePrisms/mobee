@@ -37,16 +37,6 @@ impl PaymentPayload {
         self.payload.id.as_deref().unwrap_or_default()
     }
 
-    /// The realized mint the token came from (NUT-18 `mint`).
-    pub fn mint(&self) -> &cashu::MintUrl {
-        &self.payload.mint
-    }
-
-    /// The payment unit (NUT-18 `unit`).
-    pub fn unit(&self) -> &cashu::CurrencyUnit {
-        &self.payload.unit
-    }
-
     /// Reconstruct the bearer [`cashu::Token`] from the NUT-18 proofs. Proofs are self-contained
     /// (keyset id embedded), so no mint keyset lookup is needed to rebuild the token here — the
     /// seller redeems it against its own mint.
