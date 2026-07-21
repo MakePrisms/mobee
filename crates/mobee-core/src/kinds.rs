@@ -61,7 +61,7 @@ mod tests {
                     JOB_AWARD_KIND
                 ]
                 .contains(&kind),
-                "v1 DVM kind {kind} must not be reused in the v2 block"
+                "generic DVM kind {kind} must not appear in the mobee block"
             );
         }
     }

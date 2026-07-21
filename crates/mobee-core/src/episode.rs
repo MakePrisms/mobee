@@ -445,7 +445,7 @@ mod tests {
             .unwrap();
         }
         let entries = log.entries().expect("entries");
-        assert_eq!(entries.len(), 2, "v1 reader parses a v2 line, ignoring extras");
+        assert_eq!(entries.len(), 2, "reader parses a newer line, ignoring extras");
         assert_eq!(entries[1].job_id, "job-future");
     }
 }

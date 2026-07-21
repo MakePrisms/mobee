@@ -458,12 +458,12 @@ pub fn parse_contribution_offer(
         .unwrap_or_default();
     if accepts.is_empty() {
         return Err(ContributionError::MalformedOffer(
-            "accepts tag missing a value (v1 requires accepts=fork)".into(),
+            "accepts tag missing a value (accepts=fork is required)".into(),
         ));
     }
     if !accepts.iter().any(|a| a == ACCEPTS_FORK) {
         return Err(ContributionError::MalformedOffer(format!(
-            "v1 supports only accepts=fork; offer accepts {accepts:?}"
+            "only accepts=fork is supported; offer accepts {accepts:?}"
         )));
     }
     Ok(Some(ContributionOffer {
@@ -618,7 +618,7 @@ mod tests {
     fn unique_branch_carries_full_job_id_not_prefix() {
         let job_id = "b".repeat(64);
         let branch = ForkRef::unique_branch(&job_id);
-        assert!(branch.contains(&job_id), "full job id must be in the ref (MUST-6)");
+        assert!(branch.contains(&job_id), "full job id must be in the ref");
         // The colliding `[:8]` prefix must NOT be the whole leaf.
         assert_ne!(branch, format!("mobee/{}", &job_id[..8]));
     }
