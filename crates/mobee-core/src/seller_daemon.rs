@@ -923,10 +923,11 @@ impl SellerDaemon {
                  refusing reconstruction"
             )
         })?;
-        // Recompute the creq hash from the fetched claim's creq exactly as the live claim-author
-        // path does (`build_seller_creq` → `creq_hash_hex`): binds the reconstruction to the exact
-        // seller-authored request string this seller published.
-        let _creq_hash = gateway::creq_hash_hex(creq);
+        // Bind the reconstruction to the seller-authored request FIELD BY FIELD: the checks below
+        // verify the fetched claim's creq against the payload (payment id == job id, realized mint
+        // listed, unit match) and against the on-relay offer (amount). The seller side stores no
+        // creq hash to compare a recomputed one against (the accept-bind's `creq_hash` is a buyer
+        // artifact), so the parsed fields ARE the binding.
         let request = gateway::creq::parse_creq(creq).map_err(|error| {
             format!("self claim creq for job_id={job_id} unparseable: {error}; refusing reconstruction")
         })?;
