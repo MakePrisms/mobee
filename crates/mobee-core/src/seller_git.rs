@@ -517,7 +517,7 @@ pub fn preflight_push_probe(
     .map_err(SellerGitError::from)
 }
 
-/// Resolve `git-credential-nostr` absolute path (PATH, env, dogfood locations).
+/// Resolve `git-credential-nostr` absolute path (`MOBEE_GIT_CREDENTIAL_NOSTR` override, then PATH).
 ///
 /// Retained for `mobee doctor`'s informational check only — the seller itself no longer needs the
 /// helper (all git legs are in-process libgit2 with NIP-98 signed in this process).
@@ -528,19 +528,7 @@ pub fn resolve_git_credential_nostr() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    if let Ok(path) = which_bin("git-credential-nostr") {
-        return Some(path);
-    }
-    for candidate in [
-        "/srv/forge/workspaces/buzz/target/release/git-credential-nostr",
-        "/srv/forge/workspaces/buzz/target/debug/git-credential-nostr",
-    ] {
-        let path = PathBuf::from(candidate);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    None
+    which_bin("git-credential-nostr").ok()
 }
 
 fn which_bin(name: &str) -> Result<PathBuf, ()> {
