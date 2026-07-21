@@ -3,7 +3,8 @@
  * Usage: node scripts/live-check.mjs
  * Exit 0 on successful connect + EOSE (or timeout with ≥1 event).
  */
-import { RELAY_URL, SUBSCRIBE_KINDS, HISTORY_LIMIT } from "../config.js";
+import { RELAY_URL, HISTORY_LIMIT } from "../config.js";
+import { SUBSCRIBE_KINDS } from "../js/kinds.js";
 import { parseEvent } from "../js/parse.js";
 import { createStore } from "../js/store.js";
 
