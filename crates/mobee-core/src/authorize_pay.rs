@@ -101,6 +101,9 @@ pub enum AuthorizePayError {
     Wallet(PaymentWalletError),
     Home(String),
     Effects(String),
+    /// Pre-pay seller co-signature refusal, carrying the buyer's computed preimage fields + digest
+    /// (public trade data, no secrets) so the divergent field self-identifies (#53 diagnostic).
+    CosigRefused(String),
 }
 
 impl fmt::Display for AuthorizePayError {
@@ -112,6 +115,7 @@ impl fmt::Display for AuthorizePayError {
             Self::Delivery(error) => write!(formatter, "authorize_pay delivery: {error}"),
             Self::Payment(error) => write!(formatter, "authorize_pay payment: {error}"),
             Self::Wallet(error) => write!(formatter, "authorize_pay wallet: {error}"),
+            Self::CosigRefused(message) => write!(formatter, "authorize_pay payment: {message}"),
             Self::Home(message) => write!(formatter, "authorize_pay home: {message}"),
             Self::Effects(message) => write!(formatter, "authorize_pay effects: {message}"),
         }
@@ -330,9 +334,20 @@ pub async fn authorize_pay_async(
             tuple_digest: *digest,
             tuple_signature_hex: sig.as_str(),
         });
-    authority
-        .verify_seller_prepay_cosig(&prepay_preimage, &request.seller_signature, contribution_bind)
-        .map_err(AuthorizePayError::Payment)?;
+    if let Err(error) = authority.verify_seller_prepay_cosig(
+        &prepay_preimage,
+        &request.seller_signature,
+        contribution_bind,
+    ) {
+        // #53 diagnostic: on cosig refusal, surface the buyer's EXACT computed preimage (each
+        // field + digest) so the next occurrence self-identifies which field diverged from the
+        // seller-signed bytes. Public trade data only — a ReceiptPreimage carries no secret key or
+        // proof material (asserted by the never-echo test). Still fail-closed: zero spend.
+        return Err(AuthorizePayError::CosigRefused(format!(
+            "{error}; buyer preimage [{}]",
+            cosig_refusal_diagnostic(&prepay_preimage)
+        )));
+    }
 
     let wallet = buyer_fund::open_testnut_wallet_async(home).await?;
     // Dust guard (live keyset N=1 floor, fail-closed). lock_or_reconcile re-checks
@@ -445,6 +460,30 @@ fn resolve_realized_mint(
         "mint_unreachable_pay: buyer mint {buyer_mint} is not in the creq mint list {listed:?}; \
          the live cross-mint Lightning bridge is disabled (single-mint wallet)"
     ))))
+}
+
+/// Render a co-signed [`ReceiptPreimage`] as a single-line diagnostic (#53): the digest plus every
+/// covered field. EVERY field here is public trade data already on the relay (offer/claim/result/
+/// receipt tags) — a `ReceiptPreimage` never holds a secret key or proof/token material — so this
+/// is safe to log/return on a cosig refusal. The never-echo test asserts no secret leaks.
+fn cosig_refusal_diagnostic(preimage: &ReceiptPreimage) -> String {
+    format!(
+        "digest={} job_hash={} offer_id={} amount={} unit={} mint={} buyer_pubkey={} \
+         seller_pubkey={} delivery_integrity_hash={} delivery_kind={} exec_metadata_commitment={} \
+         creq_hash={}",
+        preimage.digest_hex(),
+        preimage.job_hash,
+        preimage.offer_id,
+        preimage.amount,
+        preimage.unit,
+        preimage.mint,
+        preimage.buyer_pubkey,
+        preimage.seller_pubkey,
+        preimage.delivery_integrity_hash,
+        preimage.delivery_kind,
+        preimage.exec_metadata_commitment,
+        preimage.creq_hash.as_deref().unwrap_or("none"),
+    )
 }
 
 fn cashu_compressed_from_nostr(key: &NostrPublicKey) -> Result<CashuPublicKey, AuthorizePayError> {
@@ -1055,6 +1094,78 @@ mod tests {
         );
         let reloaded = BudgetGate::from_home(&home).expect("reload");
         assert_eq!(reloaded.spent(), 0, "durable spent must stay 0");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #53 diagnostic: on a pre-pay cosig refusal the returned error carries the buyer's computed
+    // preimage — the digest AND every covered field — so the next live occurrence self-identifies
+    // the divergent field. Never-echo: the buyer secret key must not appear (a ReceiptPreimage
+    // holds only public trade data).
+    #[test]
+    fn cosig_refusal_diagnostic_carries_every_field_and_no_secret() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-authorize-pay-diag-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let mut gate = BudgetGate::from_home(&home).expect("gate");
+        let oid = "aa".repeat(20);
+        let job_hash = "bb".repeat(32);
+        let creq_hash = "2ad9b34c".repeat(8);
+        let preimage = prepay_preimage(&home, "job-diag", "result-diag", &job_hash, &oid, 2);
+        let attacker = Keys::generate();
+        let forged_sig = attacker
+            .sign_schnorr(&Message::from_digest(preimage.digest_bytes()))
+            .to_string();
+        let request = AuthorizePayRequest {
+            job_id: "job-diag".into(),
+            result_id: "result-diag".into(),
+            delivery_integrity_hash: oid.clone(),
+            job_hash: job_hash.clone(),
+            seller_pubkey: home::public_key_hex(&home).expect("pubkey"),
+            amount_sats: 2,
+            repo: "ext::sh -c evil".into(),
+            branch: "main".into(),
+            commit_oid: oid.clone(),
+            seller_signature: forged_sig,
+            creq_hash: Some(creq_hash.clone()),
+            accepted_mints: vec![DEFAULT_MINT_URL.to_string()],
+            contribution: None,
+        };
+        let seller_pubkey = home::public_key_hex(&home).expect("pubkey");
+        let msg = authorize_pay(&home, &mut gate, request)
+            .expect_err("forged sig refused")
+            .to_string();
+
+        // Still the pre-pay tooth refusal, and it now carries the full preimage diagnostic.
+        assert!(msg.contains("pre-pay seller co-signature invalid"), "got: {msg}");
+        for needle in [
+            "digest=".to_string(),
+            format!("job_hash={job_hash}"),
+            "offer_id=job-diag".to_string(),
+            "amount=2".to_string(),
+            "unit=sat".to_string(),
+            format!("mint={DEFAULT_MINT_URL}"),
+            format!("buyer_pubkey={seller_pubkey}"),
+            format!("seller_pubkey={seller_pubkey}"),
+            format!("delivery_integrity_hash={oid}"),
+            "delivery_kind=fork".to_string(),
+            "exec_metadata_commitment=".to_string(),
+            format!("creq_hash={creq_hash}"),
+        ] {
+            assert!(msg.contains(&needle), "diagnostic missing {needle:?}: {msg}");
+        }
+
+        // Never-echo: the buyer secret key never appears in the rendered diagnostic.
+        let secret = home::read_secret_key_hex(&home).expect("secret");
+        assert!(!secret.is_empty());
+        assert!(!msg.contains(&secret), "diagnostic leaked the buyer secret key");
+        assert_eq!(gate.spent(), 0, "cosig refusal is zero spend");
         let _ = std::fs::remove_dir_all(&root);
     }
 
