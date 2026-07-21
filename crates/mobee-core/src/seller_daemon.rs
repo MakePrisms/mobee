@@ -2179,10 +2179,14 @@ pub async fn ingest_gift_wrap(
     daemon: &mut SellerDaemon,
     event: &nostr_sdk::Event,
 ) -> Result<Option<ReceiptOutcome>, DaemonError> {
+    let event_id = event.id.to_hex();
+    // #57: log EVERY wrap the seller sees — silence must mean "no wraps", never "lost money".
+    // The applied case logs a receipt at the caller; the not-ours / buffered cases log here.
+    eprintln!("seller wrap seen event={event_id}");
     let Some(received) = unwrap_own_payment_gift_wrap(&daemon.keys, event).await? else {
+        eprintln!("seller wrap event={event_id}: not a decodable own-payment wrap (skipped)");
         return Ok(None);
     };
-    let event_id = event.id.to_hex();
     match try_apply_or_buffer(daemon, event_id, received).await? {
         ApplyResult::Applied(outcome) => Ok(Some(outcome)),
         ApplyResult::Buffered => Ok(None),
@@ -2209,12 +2213,19 @@ async fn try_apply_or_buffer(
         // No delivered job matches yet — buffer it (early pay for a still-processing job, or
         // the wrap arrived before its delivery was recorded). Misattribution is impossible:
         // `try_apply_payment` only receives against an exact job+result match.
+        eprintln!(
+            "seller wrap event={event_id} buffered: no delivered job binds job_id={} yet",
+            received.payload.job_id()
+        );
         daemon.buffer_payment(event_id, received);
         return Ok(ApplyResult::Buffered);
     }
     match daemon.try_apply_payment(received).await? {
         Some(outcome) => Ok(ApplyResult::Applied(outcome)),
-        None => Ok(ApplyResult::Buffered),
+        None => {
+            eprintln!("seller wrap event={event_id}: bound job not applied (re-buffered)");
+            Ok(ApplyResult::Buffered)
+        }
     }
 }
 
@@ -2399,6 +2410,17 @@ fn offer_subscriptions(
     )]
 }
 
+/// The seller's kind-1059 payment (gift-wrap) filter: p-tagged to the seller, **NO `t=mobee`
+/// hashtag**. NIP-59 gift-wraps are opaque and CANNOT carry a namespace tag, so a hashtag filter
+/// here would match zero wraps and silently strand real payments (#57). This is the tag-free
+/// invariant the regression test pins; it is used for BOTH the live subscription and the boot
+/// backfill.
+fn wrap_subscription_filter(seller_pubkey: nostr_sdk::PublicKey) -> nostr_sdk::Filter {
+    nostr_sdk::Filter::new()
+        .kind(nostr_sdk::Kind::GiftWrap)
+        .pubkey(seller_pubkey)
+}
+
 /// Cap on the number of most-recently-seen offer ids retained for in-loop dedup.
 ///
 /// The dedup set is DEFENSE-IN-DEPTH only (see [`offer_event_should_process`]): it collapses an
@@ -2575,6 +2597,12 @@ pub(crate) async fn run_forever_hooked(
     // bug). The event-id dedup in the loop still processes each offer exactly once. Sub id(s) are
     // captured so the Loud-Closed fallback can detect a relay CLOSE of the offer subscription.
     let seller_pubkey = daemon.keys.public_key();
+    // Create the notifications receiver BEFORE any REQ (offer subscribe, wrap subscribe, wrap
+    // backfill). A tokio broadcast only delivers to receivers that already exist, so a stored event
+    // returned by a REQ before this receiver is created would be dropped. This latent race widened
+    // once the #57 boot backfill added a network round-trip between the offer subscribe and the
+    // loop — capture the receiver up front so backfilled offers/wraps are never missed.
+    let mut notifications = client.notifications();
     let (claim_open_pool, offer_backfill_secs) = require_seller_config(&daemon.home)
         .map(|cfg| (cfg.claim_open_pool, cfg.offer_backfill_secs))
         .unwrap_or((false, 0));
@@ -2599,11 +2627,49 @@ pub(crate) async fn run_forever_hooked(
             .map_err(|error| DaemonError::Relay(format!("subscribe offers: {error}")))?;
         offer_sub_ids.push(output.val);
     }
-    let wrap_filter = Filter::new().kind(Kind::GiftWrap).pubkey(seller_pubkey);
+    let wrap_filter = wrap_subscription_filter(seller_pubkey);
     client
-        .subscribe(wrap_filter, None)
+        .subscribe(wrap_filter.clone(), None)
         .await
         .map_err(|error| DaemonError::Relay(format!("subscribe 1059: {error}")))?;
+
+    // #57 boot backfill: the live 1059 subscription does not reliably replay stored gift-wraps
+    // across a restart on a p-gated DM relay, so a payment that landed while this seller was
+    // offline would be stranded (real sats P2PK-locked, unredeemed — no log line, no recovery).
+    // Explicitly fetch stored wraps p-tagged to us since the last journaled receipt and run each
+    // through the SAME redeem path. Idempotent: the journal pay-once guard makes an already-redeemed
+    // wrap a no-op, so this can never double-spend. Fetch failure is non-fatal (the live sub stays).
+    let backfill_since = daemon.journal.last_receipt_ts().unwrap_or(None).unwrap_or(0);
+    match client
+        .fetch_events(
+            wrap_filter.since(Timestamp::from(backfill_since)),
+            Duration::from_secs(15),
+        )
+        .await
+    {
+        Ok(events) => {
+            eprintln!(
+                "seller wrap backfill: {} stored kind-1059(s) since ts={backfill_since}",
+                events.len()
+            );
+            for event in events {
+                match ingest_gift_wrap(&mut daemon, &event).await {
+                    Ok(Some(receipt)) => eprintln!(
+                        "seller receipt (backfill) job_id={} result_id={} amount_received={}",
+                        receipt.job_id, receipt.result_id, receipt.amount_received
+                    ),
+                    Ok(None) => {}
+                    Err(error) if is_idempotent_already_redeemed(&error) => eprintln!(
+                        "seller pay: kind-1059 already redeemed (backfill idempotent re-see): {error}"
+                    ),
+                    Err(error) => eprintln!("seller pay path (backfill): {error}"),
+                }
+            }
+        }
+        Err(error) => eprintln!(
+            "seller WARN: wrap backfill fetch failed (continuing; live 1059 subscription active): {error}"
+        ),
+    }
 
     // Status line: never echo secrets.
     eprintln!(
@@ -2633,7 +2699,7 @@ pub(crate) async fn run_forever_hooked(
     let mut seen_offers = BoundedSeen::default();
     // Loud-Closed fallback fires at most once (targeted-only is not itself broad-filtered).
     let mut offer_fallback_done = false;
-    let mut notifications = client.notifications();
+    // `notifications` was created up front (before the REQs) so no backfilled event is dropped.
 
     // Heartbeat cadence (PIECE-14 § Heartbeat). Env overrides config for tests. `interval()`'s
     // first `tick()` completes immediately, so an enabled seller advertises liveness right after
@@ -3196,6 +3262,35 @@ mod tests {
             !matches_any(&open_pool, &stale_untargeted),
             "an untargeted offer older than the backfill window MUST NOT match the bounded filter"
         );
+    }
+
+    // #57 regression: the seller's kind-1059 payment filter must match a gift-wrap that carries NO
+    // t=mobee tag. NIP-59 wraps are opaque and cannot carry a namespace tag; an A′-style hashtag
+    // filter here would return zero wraps and silently strand real payments.
+    #[test]
+    fn wrap_filter_matches_untagged_gift_wrap() {
+        use nostr_sdk::prelude::{EventBuilder, Keys, Kind, MatchEventOptions, Tag};
+
+        let seller = Keys::generate();
+        let sender = Keys::generate();
+        let filter = wrap_subscription_filter(seller.public_key());
+
+        // A 1059 wrap p-tagged to the seller with NO t=mobee tag (as real gift-wraps are).
+        let wrap = EventBuilder::new(Kind::GiftWrap, "opaque")
+            .tag(Tag::public_key(seller.public_key()))
+            .sign_with_keys(&sender)
+            .expect("sign wrap");
+        assert!(
+            filter.match_event(&wrap, MatchEventOptions::new()),
+            "seller 1059 filter must match a p-tagged wrap that has no t=mobee tag (#57)"
+        );
+
+        // A wrap p-tagged to someone else must NOT match.
+        let other = EventBuilder::new(Kind::GiftWrap, "opaque")
+            .tag(Tag::public_key(Keys::generate().public_key()))
+            .sign_with_keys(&sender)
+            .expect("sign wrap");
+        assert!(!filter.match_event(&other, MatchEventOptions::new()));
     }
 
     #[test]
