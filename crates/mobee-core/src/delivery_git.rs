@@ -1,19 +1,27 @@
-use std::ffi::OsStr;
-use std::fs;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::thread;
-use std::time::Duration;
+//! Buyer-side delivery verification, in-process via libgit2 (issue #55 — NO system `git`).
+//!
+//! The pay path fetches the seller's delivered fork tip (and the pinned base) into a buyer-owned
+//! custody object database, all through [`crate::git_transport`]'s rustls smart-HTTP subtransport
+//! (NIP-98 auth for relay-git reads), then runs the contribution gates entirely in-process:
+//! tip-match, base-from-pin, descendant, and the content policy. A hung fetch fails CLOSED under a
+//! short per-leg HTTP timeout so `authorize_pay` never burns budget on a stalled verify.
 
-use wait_timeout::ChildExt;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use git2::{DiffOptions, Oid, Repository};
 
 use crate::delivery::{CommitOid, DeliveryError, DeliveryVerifier, GitDelivery, VerifiedDelivery};
 use crate::delivery_transport::AllowlistedDeliveryVerifier;
+use crate::git_transport::{self, TransportError};
 
-/// Hard cap for pay-path `git fetch` — timeout fails CLOSED (no pay / zero burn).
-/// Kept under MCP tool deadline (15s) and Claude-Code client read-timeout (~60s).
-const GIT_FETCH_TIMEOUT_SECS: u64 = 10;
+/// Map an in-process transport failure onto the pay-path delivery error (fail-closed).
+fn map_transport(op: &'static str, error: TransportError) -> DeliveryError {
+    match error {
+        TransportError::Transport(_) => DeliveryError::GitCommandFailed(op),
+        _ => DeliveryError::GitCommandFailed(op),
+    }
+}
 
 /// Real git-backed verifier that retains fetched objects in a buyer-owned repository.
 ///
@@ -22,6 +30,9 @@ const GIT_FETCH_TIMEOUT_SECS: u64 = 10;
 /// fetch-capable verifier, with the transport allowlist sealed in.
 pub(crate) struct GitDeliveryVerifier {
     repository: PathBuf,
+    /// Buyer secret (hex) for NIP-98 on relay-git READS. `None` ⇒ anonymous fetch (public https
+    /// bases, and the local-path fixtures in tests). Never logged, never leaves the process.
+    buyer_secret_hex: Option<String>,
 }
 
 impl GitDeliveryVerifier {
@@ -29,7 +40,14 @@ impl GitDeliveryVerifier {
     pub(crate) fn new(repository: impl Into<PathBuf>) -> Self {
         Self {
             repository: repository.into(),
+            buyer_secret_hex: None,
         }
+    }
+
+    /// Attach the buyer secret used to sign NIP-98 on relay-git reads.
+    pub(crate) fn with_buyer_secret(mut self, buyer_secret_hex: Option<String>) -> Self {
+        self.buyer_secret_hex = buyer_secret_hex;
+        self
     }
 
     /// Returns the local repository that holds verified delivery objects.
@@ -37,115 +55,82 @@ impl GitDeliveryVerifier {
         &self.repository
     }
 
+    /// NIP-98 auth to present on a read of `remote_url`: the buyer secret for relay-git targets,
+    /// `None` for public https / local-path targets (`git_transport` gates on `is_relay_git`).
+    fn read_auth(&self) -> Option<&str> {
+        self.buyer_secret_hex.as_deref()
+    }
+
+    /// Open the custody object database (bare repo).
+    fn open_custody(&self) -> Result<Repository, DeliveryError> {
+        Repository::open_bare(&self.repository)
+            .map_err(|_| DeliveryError::GitCommandFailed("open-custody"))
+    }
+
+    /// Ensure the custody repo exists. mobee sellers always emit sha1 objects (they `init` without
+    /// `--object-format`), so custody is sha1; a sha256 (64-hex) delivery is not reachable in the
+    /// mobee system and git2 0.19 cannot init a sha256 odb — so it fails CLOSED here rather than
+    /// silently mishandling one.
     fn ensure_repository(&self, oid: &CommitOid) -> Result<(), DeliveryError> {
+        if oid.as_str().len() == 64 {
+            return Err(DeliveryError::GitCommandFailed("object-format"));
+        }
         if self.repository.join("HEAD").is_file() {
-            let output = git_output([
-                OsStr::new("-C"),
-                self.repository.as_os_str(),
-                OsStr::new("rev-parse"),
-                OsStr::new("--show-object-format"),
-            ])?;
-            if !output.status.success() {
-                return Err(DeliveryError::GitCommandFailed("object-format"));
-            }
-            let actual = String::from_utf8_lossy(&output.stdout);
-            let expected = if oid.as_str().len() == 64 {
-                "sha256"
-            } else {
-                "sha1"
-            };
-            if actual.trim() != expected {
-                return Err(DeliveryError::GitCommandFailed("object-format"));
-            }
+            // Already a git dir — confirm it opens; a corrupt custody fails closed.
+            self.open_custody()?;
             return Ok(());
         }
         if let Some(parent) = self.repository.parent() {
             fs::create_dir_all(parent).map_err(|_| DeliveryError::GitCommandFailed("init"))?;
         }
-        let mut args = vec![OsStr::new("init"), OsStr::new("--bare")];
-        if oid.as_str().len() == 64 {
-            args.push(OsStr::new("--object-format=sha256"));
-        }
-        args.push(OsStr::new("--"));
-        args.push(self.repository.as_os_str());
-        let output = git_output(args)?;
-        require_success("init", output)
+        Repository::init_bare(&self.repository).map_err(|_| DeliveryError::GitCommandFailed("init"))?;
+        Ok(())
     }
 
+    /// Validate a branch name (mirrors `git check-ref-format --branch`): the `refs/heads/<branch>`
+    /// form must be a valid ref name. Fail-closed to [`DeliveryError::InvalidBranch`].
     fn check_branch(&self, branch: &str) -> Result<(), DeliveryError> {
-        let output = git_output([
-            OsStr::new("check-ref-format"),
-            OsStr::new("--branch"),
-            OsStr::new(branch),
-        ])?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(DeliveryError::InvalidBranch)
+        if branch.is_empty() || !Reference_is_valid_branch(branch) {
+            return Err(DeliveryError::InvalidBranch);
         }
+        Ok(())
+    }
+
+    fn parse_oid(oid: &CommitOid) -> Result<Oid, DeliveryError> {
+        Oid::from_str(oid.as_str()).map_err(|_| DeliveryError::InvalidCommitOid)
     }
 
     fn fetch(&self, delivery: &GitDelivery) -> Result<CommitOid, DeliveryError> {
+        let repo = self.open_custody()?;
         let fetched_ref = format!("refs/mobee/deliveries/{}", delivery.commit_oid().as_str());
         let refspec = format!("+refs/heads/{}:{fetched_ref}", delivery.branch());
-        // Timed: a hung fetch must not own the MCP stdio loop past the client timeout,
+        // short_timeout=true: a hung fetch must not own the MCP stdio loop past the client timeout,
         // and must fail CLOSED before authorize_pay burns budget (verify-before-pay).
-        let output = git_output_timed(
-            [
-                OsStr::new("-C"),
-                self.repository.as_os_str(),
-                OsStr::new("fetch"),
-                OsStr::new("--no-tags"),
-                OsStr::new("--force"),
-                OsStr::new("--end-of-options"),
-                OsStr::new(delivery.repo()),
-                OsStr::new(&refspec),
-            ],
-            Duration::from_secs(GIT_FETCH_TIMEOUT_SECS),
-        )?;
-        require_success("fetch", output)?;
+        git_transport::fetch_refspecs(&repo, delivery.repo(), &[&refspec], self.read_auth(), true)
+            .map_err(|error| map_transport("fetch", error))?;
 
         let fetched_object = format!("{fetched_ref}^{{commit}}");
-        let output = git_output([
-            OsStr::new("-C"),
-            self.repository.as_os_str(),
-            OsStr::new("rev-parse"),
-            OsStr::new("--verify"),
-            OsStr::new(&fetched_object),
-        ])?;
-        if !output.status.success() {
-            return Err(DeliveryError::MissingFetchedTip);
-        }
-        let oid = String::from_utf8(output.stdout)
-            .map_err(|_| DeliveryError::MissingFetchedTip)?
-            .trim()
-            .to_owned();
-        CommitOid::parse(oid).map_err(|_| DeliveryError::MissingFetchedTip)
+        let commit = repo
+            .revparse_single(&fetched_object)
+            .and_then(|object| object.peel_to_commit())
+            .map_err(|_| DeliveryError::MissingFetchedTip)?;
+        CommitOid::parse(commit.id().to_string()).map_err(|_| DeliveryError::MissingFetchedTip)
     }
 
     fn require_local_object(&self, oid: &CommitOid) -> Result<(), DeliveryError> {
-        let object = format!("{}^{{commit}}", oid.as_str());
-        let output = git_output([
-            OsStr::new("-C"),
-            self.repository.as_os_str(),
-            OsStr::new("cat-file"),
-            OsStr::new("-e"),
-            OsStr::new(&object),
-        ])?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(DeliveryError::MissingCommitObject)
-        }
+        let repo = self.open_custody()?;
+        let parsed = Self::parse_oid(oid)?;
+        repo.find_commit(parsed)
+            .map(|_| ())
+            .map_err(|_| DeliveryError::MissingCommitObject)
     }
 
     /// Contribution (MUST-2): fetch `base_oid` from the **pinned target** clone URL into the SAME
     /// custody odb, then prove `base_oid` is present in that target — fail-closed if absent.
     ///
-    /// FETCH DEPTH (build-item i): this is a FULL fetch of the base branch (no `--depth`), so
-    /// `base_oid` and the ancestry chain up to the fork tip are all in custody. A shallow /
-    /// tip-only fetch would make the later `merge-base --is-ancestor` FALSE-REFUSE an honest deep
-    /// contribution (fail-closed but broken); full depth is required for correctness.
+    /// FETCH DEPTH (build-item i): this is a FULL fetch of the base branch (no depth limit), so
+    /// `base_oid` and the ancestry chain up to the fork tip are all in custody. A shallow / tip-only
+    /// fetch would make the later descendant gate FALSE-REFUSE an honest deep contribution.
     fn fetch_base(
         &self,
         base_clone_url: &str,
@@ -153,62 +138,39 @@ impl GitDeliveryVerifier {
         base_oid: &CommitOid,
     ) -> Result<(), DeliveryError> {
         self.check_branch(base_branch)?;
+        let repo = self.open_custody()?;
         let fetched_ref = format!("refs/mobee/bases/{}", base_oid.as_str());
         let refspec = format!("+refs/heads/{base_branch}:{fetched_ref}");
-        let output = git_output_timed(
-            [
-                OsStr::new("-C"),
-                self.repository.as_os_str(),
-                OsStr::new("fetch"),
-                OsStr::new("--no-tags"),
-                OsStr::new("--force"),
-                OsStr::new("--end-of-options"),
-                OsStr::new(base_clone_url),
-                OsStr::new(&refspec),
-            ],
-            Duration::from_secs(GIT_FETCH_TIMEOUT_SECS),
-        )?;
-        require_success("fetch-base", output)?;
+        git_transport::fetch_refspecs(&repo, base_clone_url, &[&refspec], self.read_auth(), true)
+            .map_err(|error| map_transport("fetch-base", error))?;
         // The pinned target MUST actually contain base_oid — resolve it as a commit in custody.
-        let object = format!("{}^{{commit}}", base_oid.as_str());
-        let output = git_output([
-            OsStr::new("-C"),
-            self.repository.as_os_str(),
-            OsStr::new("rev-parse"),
-            OsStr::new("--verify"),
-            OsStr::new("--quiet"),
-            OsStr::new(&object),
-        ])?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(DeliveryError::MissingBaseObject)
-        }
+        let parsed = Self::parse_oid(base_oid)?;
+        repo.find_commit(parsed)
+            .map(|_| ())
+            .map_err(|_| DeliveryError::MissingBaseObject)
     }
 
     /// Contribution (MUST-2): refuse unless `commit_oid` descends from `base_oid`, in-process via
-    /// `git merge-base --is-ancestor`. Exit 0 = ancestor (pass); exit 1 = NOT ancestor (refuse);
-    /// any other exit = fail-closed. Both oids must already be in custody.
+    /// `graph_descendant_of`. Equal oids count as ancestor (parity with `merge-base --is-ancestor`,
+    /// exit 0) — the empty diff is then refused by the content gate. Both oids must be in custody.
     fn assert_descendant(
         &self,
         base_oid: &CommitOid,
         commit_oid: &CommitOid,
     ) -> Result<(), DeliveryError> {
-        let output = git_output([
-            OsStr::new("-C"),
-            self.repository.as_os_str(),
-            OsStr::new("merge-base"),
-            OsStr::new("--is-ancestor"),
-            OsStr::new(base_oid.as_str()),
-            OsStr::new(commit_oid.as_str()),
-        ])?;
-        match output.status.code() {
-            Some(0) => Ok(()),
-            Some(1) => Err(DeliveryError::NotDescendant {
+        let repo = self.open_custody()?;
+        let base = Self::parse_oid(base_oid)?;
+        let commit = Self::parse_oid(commit_oid)?;
+        if base == commit {
+            return Ok(());
+        }
+        match repo.graph_descendant_of(commit, base) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(DeliveryError::NotDescendant {
                 base_oid: base_oid.as_str().to_owned(),
                 commit_oid: commit_oid.as_str().to_owned(),
             }),
-            _ => Err(DeliveryError::GitCommandFailed("merge-base")),
+            Err(_) => Err(DeliveryError::GitCommandFailed("merge-base")),
         }
     }
 
@@ -221,33 +183,51 @@ impl GitDeliveryVerifier {
         base_oid: &CommitOid,
         commit_oid: &CommitOid,
     ) -> Result<Vec<crate::contribution::ChangedPath>, DeliveryError> {
-        let output = git_output([
-            OsStr::new("-C"),
-            self.repository.as_os_str(),
-            OsStr::new("diff"),
-            OsStr::new("--numstat"),
-            OsStr::new("--no-renames"),
-            OsStr::new(base_oid.as_str()),
-            OsStr::new(commit_oid.as_str()),
-            OsStr::new("--"),
-        ])?;
-        if !output.status.success() {
-            return Err(DeliveryError::GitCommandFailed("diff-numstat"));
-        }
-        let text = String::from_utf8(output.stdout).map_err(|_| DeliveryError::GitCommandFailed("diff-numstat"))?;
+        let repo = self.open_custody()?;
+        let base_tree = repo
+            .find_commit(Self::parse_oid(base_oid)?)
+            .and_then(|c| c.tree())
+            .map_err(|_| DeliveryError::GitCommandFailed("diff-numstat"))?;
+        let commit_tree = repo
+            .find_commit(Self::parse_oid(commit_oid)?)
+            .and_then(|c| c.tree())
+            .map_err(|_| DeliveryError::GitCommandFailed("diff-numstat"))?;
+        // Default git2 diff detects NO renames (parity with `--no-renames`).
+        let mut opts = DiffOptions::new();
+        let diff = repo
+            .diff_tree_to_tree(Some(&base_tree), Some(&commit_tree), Some(&mut opts))
+            .map_err(|_| DeliveryError::GitCommandFailed("diff-numstat"))?;
+
         let mut changed = Vec::new();
-        for line in text.lines() {
-            let mut cols = line.splitn(3, '\t');
-            let added = cols.next().unwrap_or("");
-            let deleted = cols.next().unwrap_or("");
-            let path = match cols.next() {
-                Some(p) if !p.is_empty() => p.to_owned(),
-                _ => continue,
+        let deltas = diff.deltas().len();
+        for idx in 0..deltas {
+            let delta = diff
+                .get_delta(idx)
+                .ok_or(DeliveryError::GitCommandFailed("diff-numstat"))?;
+            // Path: new side for adds/mods, old side for deletions.
+            let path = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .map(|p| p.to_string_lossy().into_owned());
+            let Some(path) = path.filter(|p| !p.is_empty()) else {
+                continue;
             };
-            // Binary files report `-` for both counts; register them as churn 1 so a binary-only
-            // change is neither invisible (empty-diff false-pass) nor unbounded.
-            let churn = added.parse::<u64>().unwrap_or(0) + deleted.parse::<u64>().unwrap_or(0);
-            let churn = if added == "-" || deleted == "-" { churn.max(1) } else { churn };
+            let is_binary = delta.flags().is_binary();
+            let churn = match git2::Patch::from_diff(&diff, idx) {
+                Ok(Some(patch)) => {
+                    let (_context, additions, deletions) = patch
+                        .line_stats()
+                        .map_err(|_| DeliveryError::GitCommandFailed("diff-numstat"))?;
+                    (additions + deletions) as u64
+                }
+                // A binary delta has no textual patch (None); count it as churn 1 below.
+                Ok(None) => 0,
+                Err(_) => return Err(DeliveryError::GitCommandFailed("diff-numstat")),
+            };
+            // Binary files report `-`/`-` in `git diff --numstat`; register them as churn 1 so a
+            // binary-only change is neither invisible (empty-diff false-pass) nor unbounded.
+            let churn = if is_binary { churn.max(1) } else { churn };
             changed.push(crate::contribution::ChangedPath { path, bytes: churn });
         }
         Ok(changed)
@@ -282,6 +262,13 @@ impl GitDeliveryVerifier {
             changed_paths: changed,
         })
     }
+}
+
+/// `git2::Reference::is_valid_name` on the `refs/heads/<branch>` form — the branch analog of
+/// `git check-ref-format --branch`. Split out so the verifier method reads cleanly.
+#[allow(non_snake_case)]
+fn Reference_is_valid_branch(branch: &str) -> bool {
+    git2::Reference::is_valid_name(&format!("refs/heads/{branch}"))
 }
 
 /// Proof that a contribution fork tip is in buyer custody AND descends from the pinned base, with
@@ -333,10 +320,13 @@ pub struct PayPathDeliveryVerifier {
 }
 
 impl PayPathDeliveryVerifier {
-    /// Build the allowlisted git verifier used on the authorize_pay path.
-    pub fn new(repository: impl Into<PathBuf>) -> Self {
+    /// Build the allowlisted git verifier used on the authorize_pay path. `buyer_secret_hex` signs
+    /// NIP-98 for relay-git reads (`None` ⇒ anonymous — public https bases / local-path tests).
+    pub fn new(repository: impl Into<PathBuf>, buyer_secret_hex: Option<String>) -> Self {
         Self {
-            inner: AllowlistedDeliveryVerifier::new(GitDeliveryVerifier::new(repository)),
+            inner: AllowlistedDeliveryVerifier::new(
+                GitDeliveryVerifier::new(repository).with_buyer_secret(buyer_secret_hex),
+            ),
         }
     }
 
@@ -356,7 +346,7 @@ impl PayPathDeliveryVerifier {
     ///   1. custody fetch the fork tip + tip-match (existing `Delivery::Commit` verify, allowlisted);
     ///   2. base-from-pin: fetch `base_oid` from the PINNED target clone URL into the same custody
     ///      odb (allowlisted) — fail-closed if absent from the pinned target;
-    ///   3. descendant gate: `merge-base --is-ancestor base_oid commit_oid`;
+    ///   3. descendant gate: `commit_oid` must descend from `base_oid`;
     ///   4. content gate + policy hook: refuse an empty / out-of-scope / forbidden / too-large diff.
     /// Returns the custody proof + LOCAL custody ref for the later merge. Authorship (the seller's
     /// signed tuple) + echo-equality are checked by the caller at the pre-pay seam; pay then binds
@@ -381,44 +371,52 @@ impl PayPathDeliveryVerifier {
 
     /// Merge the CUSTODIED local `commit_oid` into a buyer-owned target working clone, FF-preferred
     /// ("accept the PR"). Buyer-custody action (NOT what payment binds): it fetches the object from
-    /// the buyer's own custody odb by its LOCAL ref and `merge --ff-only`s it — so a seller that
+    /// the buyer's own custody odb by its LOCAL ref and fast-forwards to it — so a seller that
     /// deletes or moves the fork AFTER pay cannot strand the buyer (custody-retention). No transport
-    /// allowlist applies: both custody and the target clone are buyer-owned local repos.
+    /// allowlist applies: both custody and the target clone are buyer-owned LOCAL repos.
     pub fn merge_custodied_commit(
         &self,
         target_workdir: &Path,
         commit_oid: &CommitOid,
     ) -> Result<(), DeliveryError> {
         let custody = self.repository();
+        let custody_url = custody.to_string_lossy().into_owned();
         let local_ref = Self::custody_ref_for(commit_oid.as_str());
-        let fetch_spec = format!("+{local_ref}:refs/mobee/merge/{}", commit_oid.as_str());
-        let output = git_output([
-            OsStr::new("-C"),
-            target_workdir.as_os_str(),
-            OsStr::new("fetch"),
-            OsStr::new("--no-tags"),
-            OsStr::new("--end-of-options"),
-            custody.as_os_str(),
-            OsStr::new(&fetch_spec),
-        ])?;
-        require_success_merge("fetch-from-custody", output)?;
-        let output = git_output([
-            OsStr::new("-C"),
-            target_workdir.as_os_str(),
-            OsStr::new("merge"),
-            OsStr::new("--ff-only"),
-            OsStr::new("--end-of-options"),
-            OsStr::new(commit_oid.as_str()),
-        ])?;
-        require_success_merge("ff-only", output)
-    }
-}
+        let merge_ref = format!("refs/mobee/merge/{}", commit_oid.as_str());
+        let fetch_spec = format!("+{local_ref}:{merge_ref}");
 
-fn require_success_merge(operation: &'static str, output: Output) -> Result<(), DeliveryError> {
-    if output.status.success() {
+        let target = Repository::open(target_workdir)
+            .map_err(|_| DeliveryError::GitCommandFailed("merge-open"))?;
+        // Local custody→target fetch (no network, no auth, no allowlist — both are buyer-owned).
+        git_transport::fetch_refspecs(&target, &custody_url, &[&fetch_spec], None, false)
+            .map_err(|error| map_transport("fetch-from-custody", error))?;
+
+        let merged = GitDeliveryVerifier::parse_oid(commit_oid)?;
+        // Fast-forward-only: the custodied commit must be the current HEAD or a descendant of it.
+        let annotated = target
+            .find_annotated_commit(merged)
+            .map_err(|_| DeliveryError::MergeFailed("ff-only"))?;
+        let (analysis, _) = target
+            .merge_analysis(&[&annotated])
+            .map_err(|_| DeliveryError::MergeFailed("ff-only"))?;
+        if analysis.is_up_to_date() {
+            return Ok(());
+        }
+        if !analysis.is_fast_forward() {
+            return Err(DeliveryError::MergeFailed("ff-only"));
+        }
+        let object = target
+            .find_object(merged, None)
+            .map_err(|_| DeliveryError::MergeFailed("ff-only"))?;
+        target
+            .checkout_tree(&object, Some(git2::build::CheckoutBuilder::new().safe()))
+            .map_err(|_| DeliveryError::MergeFailed("ff-only"))?;
+        let mut head = target
+            .head()
+            .map_err(|_| DeliveryError::MergeFailed("ff-only"))?;
+        head.set_target(merged, "mobee ff-only merge of custodied delivery")
+            .map_err(|_| DeliveryError::MergeFailed("ff-only"))?;
         Ok(())
-    } else {
-        Err(DeliveryError::MergeFailed(operation))
     }
 }
 
@@ -428,106 +426,9 @@ impl DeliveryVerifier for PayPathDeliveryVerifier {
     }
 }
 
-fn git_output<I, S>(args: I) -> Result<Output, DeliveryError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    Command::new("git")
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never")
-        .output()
-        .map_err(|e| DeliveryError::GitSpawnFailed {
-            program: "git",
-            kind: e.kind(),
-        })
-}
-
-/// Like [`git_output`], but bounds the child by `timeout` **in-process** and fails CLOSED.
-///
-/// Spawns `git` directly (no external `timeout(1)` — macOS ships none, and BusyBox's exit
-/// codes differ) and waits with [`wait_timeout`](wait_timeout::ChildExt::wait_timeout):
-/// - the child exits in-window → return its real [`Output`] so `require_success` sees the
-///   true status (a failing fetch stays a failure; there is no fail-OPEN exit-code class);
-/// - the timeout expires → kill + reap the child and return `GitCommandFailed("fetch-timeout")`,
-///   so a hung fetch never owns the MCP stdio loop and never yields a verified delivery.
-///
-/// stdout/stderr are drained on reader threads while we wait: a fetch chatty enough to fill
-/// the ~64KB pipe buffer would otherwise block on write and never exit, and a genuinely
-/// successful large fetch must still be able to complete within the window.
-fn git_output_timed<I, S>(args: I, timeout: Duration) -> Result<Output, DeliveryError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let mut child = Command::new("git")
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| DeliveryError::GitSpawnFailed {
-            program: "git",
-            kind: e.kind(),
-        })?;
-
-    // Drain both pipes concurrently so a chatty fetch can't deadlock on a full pipe buffer
-    // before it exits (or before the timeout fires).
-    let stdout = child.stdout.take().expect("piped stdout is present");
-    let stderr = child.stderr.take().expect("piped stderr is present");
-    let stdout_reader = thread::spawn(move || drain_to_end(stdout));
-    let stderr_reader = thread::spawn(move || drain_to_end(stderr));
-
-    match child
-        .wait_timeout(timeout)
-        .map_err(|e| DeliveryError::GitSpawnFailed {
-            program: "git",
-            kind: e.kind(),
-        })? {
-        Some(status) => {
-            // Child exited on its own → its pipe write ends are closed, so the readers
-            // hit EOF and join promptly with the full output.
-            let stdout = stdout_reader.join().unwrap_or_default();
-            let stderr = stderr_reader.join().unwrap_or_default();
-            Ok(Output {
-                status,
-                stdout,
-                stderr,
-            })
-        }
-        None => {
-            // Fail CLOSED: kill the hung fetch and reap it, then report a timeout WITHOUT
-            // blocking on the readers. Joining here could re-hang if an orphaned transport
-            // helper still held a pipe open, which would defeat the whole point of the
-            // timeout (a hung fetch must not own the MCP stdio loop). We discard output on
-            // the timeout path anyway; the detached readers exit once the pipes close.
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(DeliveryError::GitCommandFailed("fetch-timeout"))
-        }
-    }
-}
-
-/// Reads a child pipe to EOF, discarding any read error (best-effort output capture).
-fn drain_to_end<R: Read>(mut reader: R) -> Vec<u8> {
-    let mut buffer = Vec::new();
-    let _ = reader.read_to_end(&mut buffer);
-    buffer
-}
-
-fn require_success(operation: &'static str, output: Output) -> Result<(), DeliveryError> {
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(DeliveryError::GitCommandFailed(operation))
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -693,7 +594,7 @@ mod tests {
             fixture.head(),
         )
         .expect("delivery shape");
-        let mut verifier = PayPathDeliveryVerifier::new(&fixture.custody);
+        let mut verifier = PayPathDeliveryVerifier::new(&fixture.custody, None);
         let err = verifier.verify(&delivery).expect_err("refuse ext");
         assert!(matches!(
             err,
@@ -708,7 +609,7 @@ mod tests {
         // Pay path must not be that type — factory always allowlists first.
         let fixture = Fixture::new();
         let advertised = fixture.delivery(fixture.head());
-        let mut pay_path = PayPathDeliveryVerifier::new(&fixture.custody);
+        let mut pay_path = PayPathDeliveryVerifier::new(&fixture.custody, None);
         let err = pay_path.verify(&advertised).expect_err("local path refused");
         assert!(matches!(
             err,
@@ -716,79 +617,55 @@ mod tests {
         ));
     }
 
+    /// PATH-stripped proof (#55): build the delivery source repo with git2 ONLY (no `Command`), then
+    /// verify through the product path (git2 fetch + tip-match + custody retention). Run with `git`
+    /// absent from PATH to prove the buyer verify money path has no hidden shell-out.
     #[test]
-    fn hanging_remote_fetch_fails_closed_via_in_process_timeout() {
-        use std::net::TcpListener;
-        use std::time::Instant;
+    fn verify_delivery_without_system_git() {
+        use git2::{Repository, Signature};
+        let id = NEXT_REPO.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("mobee-nogit-{}-{id}", std::process::id()));
+        let src = root.join("src");
+        let custody = root.join("custody.git");
+        fs::create_dir_all(&src).expect("mkdir src");
+        let repo = Repository::init(&src).expect("git2 init source");
+        fs::write(src.join("d.txt"), "one\n").expect("write");
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new("d.txt")).expect("add");
+        index.write().expect("index write");
+        let tree = repo.find_tree(index.write_tree().expect("write tree")).expect("tree");
+        let sig = Signature::now("Mobee Test", "t@t.invalid").expect("sig");
+        let oid = repo
+            .commit(Some("refs/heads/main"), &sig, &sig, "one", &tree, &[])
+            .expect("git2 commit");
 
-        // Deterministic "remote hangs" reproduction: a local listener that accepts git's
-        // connection, consumes its request, then never answers the ref advertisement — so
-        // git blocks reading. git:// uses git's built-in transport (no helper subprocess),
-        // so killing the child fully tears the fetch down.
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind hang listener");
-        let port = listener.local_addr().expect("listener addr").port();
-        let accepter = thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut scratch = [0u8; 256];
-                let _ = stream.read(&mut scratch);
-                // Hold the socket open so git keeps blocking. Bounded so that if the
-                // in-process kill were removed (red-on-revert), git eventually errors
-                // rather than hanging the suite forever.
-                thread::sleep(Duration::from_secs(10));
-                drop(stream);
-            }
-        });
-        // Detach: the fixed path kills git well before this sleep ends; joining would make
-        // the passing test wait out the full hold.
-        drop(accepter);
-
-        // git fetch needs a real local repo to fetch *into* before it reaches the transport.
-        let fixture = Fixture::new();
-        run(
-            ["init", "--bare", fixture.custody.to_str().expect("custody path")],
-            None,
-        );
-
-        let url = format!("git://127.0.0.1:{port}/hang.git");
-        let refspec = "+refs/heads/main:refs/mobee/deliveries/hang";
-        let timeout = Duration::from_secs(1);
-
-        let started = Instant::now();
-        let result = git_output_timed(
-            [
-                OsStr::new("-C"),
-                fixture.custody.as_os_str(),
-                OsStr::new("fetch"),
-                OsStr::new("--no-tags"),
-                OsStr::new("--force"),
-                OsStr::new("--end-of-options"),
-                OsStr::new(&url),
-                OsStr::new(refspec),
-            ],
-            timeout,
-        );
-        let elapsed = started.elapsed();
-
-        // FAIL-CLOSED: an unresponsive fetch surfaces as a timeout error, never as a success
-        // `Output` that could slip through `require_success` into a paid delivery.
-        assert_eq!(
-            result,
-            Err(DeliveryError::GitCommandFailed("fetch-timeout")),
-            "hung fetch must fail closed as a timeout"
-        );
-        // PROMPT: killed near the 1s window by the in-process timeout, not left to hang on
-        // git's (indefinite) native-protocol read. Generous epsilon keeps this non-flaky.
-        assert!(
-            elapsed < Duration::from_secs(8),
-            "hung fetch must be killed promptly; took {elapsed:?}"
-        );
+        let delivery = GitDelivery::new(
+            src.to_str().expect("src path"),
+            "main",
+            CommitOid::parse(oid.to_string()).expect("oid"),
+        )
+        .expect("delivery");
+        let mut verifier = GitDeliveryVerifier::new(&custody);
+        let verified = verifier.verify(&delivery).expect("git2 verify without system git");
+        assert_eq!(verified.commit_oid().as_str(), oid.to_string());
+        let cust = Repository::open_bare(&custody).expect("open custody");
+        assert!(cust.find_commit(oid).is_ok(), "custody must retain the object");
+        let _ = fs::remove_dir_all(&root);
     }
+
+    // NOTE (#55): the old `hanging_remote_fetch_fails_closed_via_in_process_timeout` test drove the
+    // removed `git_output_timed` subprocess-kill helper against a `git://` hang server. The buyer
+    // fetch is now in-process libgit2 over the rustls subtransport, and fail-closed on a hung remote
+    // is enforced BY CONSTRUCTION via `git_transport::client_short`'s connect+read timeout (a read
+    // can never exceed it — no reliance on kill/reap succeeding). The end-to-end auth/read path is
+    // exercised against a real TLS git server in `tests/relay_git_http_auth.rs`.
 }
 
 #[cfg(test)]
 mod contribution_tests {
     use super::*;
     use crate::contribution::{ChangedPath, ContentPolicy};
+    use std::process::{Command, Output};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(1);
@@ -1041,7 +918,7 @@ mod contribution_tests {
     #[test]
     fn custody_retention_survives_fork_deletion_and_merges_from_local_oid() {
         let fx = scenario(1, "src/feature.rs");
-        let pay = PayPathDeliveryVerifier::new(&fx.custody);
+        let pay = PayPathDeliveryVerifier::new(&fx.custody, None);
         // Custody-fetch via the bare verifier (local path; allowlist tested separately).
         let mut bare = GitDeliveryVerifier::new(&fx.custody);
         let verified = bare
@@ -1066,7 +943,7 @@ mod contribution_tests {
     fn pay_path_contribution_verify_refuses_ext_transport() {
         use crate::delivery_transport::TransportRefuse;
         let fx = scenario(1, "src/feature.rs");
-        let mut pay = PayPathDeliveryVerifier::new(&fx.custody);
+        let mut pay = PayPathDeliveryVerifier::new(&fx.custody, None);
         // ext:: fork repo refused before any fetch.
         let ext_fork = GitDelivery::new("ext::sh -c evil", "contribution", fx.fork_tip.clone()).unwrap();
         assert!(matches!(

@@ -1,25 +1,30 @@
-//! Seller-side git push: transport allowlist + ambient scrub + fail-closed auth.
+//! Seller-side git — ALL in-process via libgit2 (issue #55; NO system `git` on any product path).
 //!
-//! Does NOT modify buyer [`crate::delivery_git::PayPathDeliveryVerifier`]. Seller-local
-//! Command wrapper mirrors the buyer's `GIT_TERMINAL_PROMPT=0` policy and additionally
-//! strips ambient `GIT_SSH*` / `insteadOf` override env that could bypass the allowlist.
+//! Base fetch, fork checkout, and delivery push run through [`crate::git_transport`]'s rustls
+//! smart-HTTP subtransport, which injects the seller's NIP-98 `Authorization` on relay-git requests.
+//! The authorship / non-empty-tree delivery gates read the workdir's object database directly with
+//! git2 (no `git log` / `git ls-tree` subprocess).
 //!
-//! HTTPS auth is seller-owned `.netrc` under the seller home (`HOME` is set **only** for
-//! the scrubbed git child — never for the whole daemon process). Ambient / HOME-scoped
-//! `url.*.insteadOf` is neutralized HOME-independently: empty `GIT_CONFIG_GLOBAL`,
-//! `GIT_CONFIG_NOSYSTEM=1`, and a dedicated empty `XDG_CONFIG_HOME` so neither the
-//! operator XDG config nor a poisoned `$seller/.gitconfig` can rewrite HTTPS→SSH.
-//!
-//! Local workdir `.git/config` insteadOf (agent-planted) is beaten by `-c
-//! protocol.ssh/file/ext.allow=never` on every scrubbed invocation — highest precedence,
-//! so allowlisted https strings cannot be rewritten onto banned transports.
+//! ## Why the old scrub machinery is gone (and this is safe)
+//! The previous implementation shelled out to `git` and had to defend against ambient config: empty
+//! `GIT_CONFIG_GLOBAL`/`XDG_CONFIG_HOME`, `GIT_CONFIG_NOSYSTEM`, `protocol.*.allow=never`, scrubbed
+//! `GIT_SSH*`/`insteadOf`. In-process git2 needs NONE of that:
+//! - **`insteadOf` immunity is structural:** every remote is [`Repository::remote_anonymous`], which
+//!   uses the literal URL and applies NO `url.*.insteadOf` config rewrite — an agent-planted
+//!   `.git/config` (or poisoned `$HOME/.gitconfig`) can never redirect an allowlisted `https` push
+//!   onto `ssh`/`file`/`ext`.
+//! - **Transport allowlist:** every entry asserts [`assert_allowed_repo_locator`] and only `https`
+//!   is registered as a subtransport — `ext:`/`file:`/`ssh:` are refused before any remote exists.
+//! - **Key hygiene:** the seller secret signs the NIP-98 event in-process only — never on argv,
+//!   never in child env, no subprocess.
 
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
+
+use git2::build::CheckoutBuilder;
+use git2::{Direction, ObjectType, Oid, Repository, TreeWalkMode, TreeWalkResult};
 
 use crate::delivery_transport::{assert_allowed_repo_locator, TransportRefuse};
+use crate::git_transport::{self, TransportError};
 
 /// Seller push failure (maps to feedback-kind error in the daemon).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,23 +56,35 @@ impl From<TransportRefuse> for SellerGitError {
     }
 }
 
+impl From<TransportError> for SellerGitError {
+    fn from(value: TransportError) -> Self {
+        match value {
+            TransportError::Transport(m) => Self::Transport(m),
+            // A rejected ref or an auth/permission signal is a fail-closed auth failure (parity with
+            // the old system-git path, which mapped both to AuthFailed).
+            TransportError::Auth(m) | TransportError::Rejected(m) => Self::AuthFailed(m),
+            TransportError::Io(m) => Self::Io(m),
+        }
+    }
+}
+
 /// Best-effort `HEAD` OID in `workdir`. `None` when the tree has no commits yet.
 ///
 /// Used by gate #10 (delivery attribution): deliver only agent-authored, non-empty trees.
+/// `seller_home` is unused now (git2 needs no ambient-config scoping) but kept for call-site
+/// stability across the daemon and integration tests.
 pub fn try_head_oid(workdir: &Path, seller_home: &Path) -> Option<String> {
     rev_parse_oid(workdir, seller_home, "HEAD")
 }
 
-fn rev_parse_oid(workdir: &Path, seller_home: &Path, rev: &str) -> Option<String> {
-    let out = scrubbed_git(workdir, seller_home, ["rev-parse", rev]).ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let oid = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+fn rev_parse_oid(workdir: &Path, _seller_home: &Path, rev: &str) -> Option<String> {
+    let repo = Repository::open(workdir).ok()?;
+    let commit = repo.revparse_single(rev).ok()?.peel_to_commit().ok()?;
+    let oid = commit.id().to_string();
     if oid.len() < 40 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
-    Some(oid.to_ascii_lowercase())
+    Some(oid)
 }
 
 /// Stamped identity for empty-base deliveries (agent-from-empty model).
@@ -93,7 +110,8 @@ impl DeliveryAgentIdentity {
         }
     }
 
-    /// Env that overrides ambient git identity for commits made during the agent run.
+    /// Env that overrides ambient git identity for commits made during the agent run (the AGENT
+    /// process makes those commits with its own git — out of scope for the seller daemon's git2).
     pub fn git_env(&self) -> Vec<(String, String)> {
         vec![
             ("GIT_AUTHOR_NAME".into(), self.name.clone()),
@@ -104,51 +122,54 @@ impl DeliveryAgentIdentity {
     }
 }
 
-/// Empty-base setup: `git init` + stamp local identity. **No harness commit.**
-///
-/// Pre-init also makes naive `git clone <url> .` fail (workdir is non-empty), so the
-/// clone-only exploit must wipe `.git` first — after which authorship still refuses.
+/// Initialise `workdir` as a fresh repo with the stamped identity in its `.git/config` (so the
+/// AGENT's later commits carry it) and `main` as the initial branch. **No harness commit.**
 pub fn init_empty_delivery_workdir(
     workdir: &Path,
-    seller_home: &Path,
+    _seller_home: &Path,
     identity: &DeliveryAgentIdentity,
 ) -> Result<(), SellerGitError> {
+    let repo = init_repo_with_identity(workdir, identity)?;
+    drop(repo);
+    Ok(())
+}
+
+/// `git init --initial-branch=main` + `git config user.name/email` via git2.
+fn init_repo_with_identity(
+    workdir: &Path,
+    identity: &DeliveryAgentIdentity,
+) -> Result<Repository, SellerGitError> {
     if !workdir.exists() {
         std::fs::create_dir_all(workdir).map_err(|error| SellerGitError::Io(error.to_string()))?;
     }
-    let init = scrubbed_git(workdir, seller_home, ["init", "--initial-branch=main"])?;
-    if !init.status.success() {
-        return Err(SellerGitError::CommandFailed("init"));
+    let mut opts = git2::RepositoryInitOptions::new();
+    opts.initial_head("main");
+    let repo = Repository::init_opts(workdir, &opts)
+        .map_err(|error| SellerGitError::Io(format!("init: {error}")))?;
+    {
+        let mut cfg = repo
+            .config()
+            .map_err(|error| SellerGitError::Io(format!("open config: {error}")))?;
+        cfg.set_str("user.name", &identity.name)
+            .map_err(|_| SellerGitError::CommandFailed("config-user-name"))?;
+        cfg.set_str("user.email", &identity.email)
+            .map_err(|_| SellerGitError::CommandFailed("config-user-email"))?;
     }
-    run_ok(
-        "config-user-name",
-        scrubbed_git(workdir, seller_home, ["config", "user.name", &identity.name])?,
-    )?;
-    run_ok(
-        "config-user-email",
-        scrubbed_git(
-            workdir,
-            seller_home,
-            ["config", "user.email", &identity.email],
-        )?,
-    )?;
-    Ok(())
+    Ok(repo)
 }
 
 /// Contribution (piece-10) fork-from-base: initialise `workdir` as a working clone of the PINNED
 /// target `base_clone_url` at `base_oid`, on a per-job unique `branch` carrying the FULL job_id
 /// (MUST-6). The agent then commits its work on top; the daemon pushes `branch` to the seller's OWN
-/// relay-git namespace. Transport-allowlisted (https + relay-git; `ext::`/file/ssh refused) and
-/// scrubbed exactly like every other seller git child.
+/// relay-git namespace. Transport-allowlisted (https + relay-git; `ext::`/file/ssh refused).
 ///
-/// FULL-depth fetch (no `--depth`) so the fork carries `base_oid` + ancestry — a shallow fork would
-/// make the BUYER's `merge-base --is-ancestor` descendant gate false-refuse an honest contribution.
-/// The base history is foreign (the target's authors); only the commits ADDED on top are the
-/// seller's, so the daemon scopes its authorship gate to `base_oid..HEAD` (see
-/// [`require_agent_authored_contribution`]).
+/// FULL-depth fetch (no depth limit) so the fork carries `base_oid` + ancestry — a shallow fork
+/// would make the BUYER's descendant gate false-refuse an honest contribution. The base history is
+/// foreign (the target's authors); only the commits ADDED on top are the seller's, so the daemon
+/// scopes its authorship gate to `base_oid..HEAD` (see [`require_agent_authored_contribution`]).
 pub fn init_contribution_workdir(
     workdir: &Path,
-    seller_home: &Path,
+    _seller_home: &Path,
     identity: &DeliveryAgentIdentity,
     base_clone_url: &str,
     base_branch: &str,
@@ -156,78 +177,67 @@ pub fn init_contribution_workdir(
     branch: &str,
     auth: Option<&PushAuth>,
 ) -> Result<(), SellerGitError> {
-    crate::delivery_transport::assert_allowed_repo_locator(base_clone_url)?;
-    if !workdir.exists() {
-        std::fs::create_dir_all(workdir).map_err(|error| SellerGitError::Io(error.to_string()))?;
-    }
-    run_ok(
-        "init",
-        scrubbed_git(workdir, seller_home, ["init", "--initial-branch=main"])?,
-    )?;
-    run_ok(
-        "config-user-name",
-        scrubbed_git(workdir, seller_home, ["config", "user.name", &identity.name])?,
-    )?;
-    run_ok(
-        "config-user-email",
-        scrubbed_git(workdir, seller_home, ["config", "user.email", &identity.email])?,
-    )?;
-    // Full-depth fetch of the base branch from the pinned target into a local ref. mobee
-    // relay-git requires NIP-98 auth for READS, so wire the seller credential helper for
-    // relay-git bases; public/anonymous https bases fetch without it (see fetch_base_auth).
+    assert_allowed_repo_locator(base_clone_url)?;
+    let repo = init_repo_with_identity(workdir, identity)?;
+    // Full-depth fetch of the base branch from the pinned target into a local ref. mobee relay-git
+    // requires NIP-98 auth for READS, so present the seller secret for relay-git bases; public /
+    // anonymous https bases fetch without it (git_transport gates the header on is_relay_git).
     let refspec = format!("+refs/heads/{base_branch}:refs/mobee/base");
-    run_ok(
-        "fetch-base",
-        scrubbed_git_auth(
-            workdir,
-            seller_home,
-            [
-                "fetch",
-                "--no-tags",
-                "--force",
-                "--end-of-options",
-                base_clone_url,
-                &refspec,
-            ],
-            fetch_base_auth(auth, base_clone_url),
-        )?,
+    git_transport::fetch_refspecs(
+        &repo,
+        base_clone_url,
+        &[&refspec],
+        auth.map(|a| a.secret_key_hex.as_str()),
+        false,
     )?;
+    drop(repo);
     // Check out base_oid onto the per-job unique branch (the fork tip the agent extends).
-    checkout_base_branch(workdir, seller_home, branch, base_oid)
+    checkout_base_branch(workdir, _seller_home, branch, base_oid)
 }
 
-/// NIP-98 auth to present on the base fetch. `Some` only for relay-git targets (which require
-/// auth for reads) — mirrors [`push_branch_with_auth`]'s `is_relay_git_locator` gate. Public /
-/// anonymous https bases return `None` so they keep fetching without a credential helper.
-fn fetch_base_auth<'a>(auth: Option<&'a PushAuth>, base_clone_url: &str) -> Option<&'a PushAuth> {
-    if auth.is_some() && crate::delivery_transport::is_relay_git_locator(base_clone_url) {
-        auth
-    } else {
-        None
-    }
-}
-
-/// `git checkout -B <branch> <base_oid>` — the fork tip the agent extends.
-///
-/// No `--` before `base_oid`: that would make git parse it as a pathspec (checkout fails
-/// "not a commit and a branch cannot be created from it"). `base_oid` is validated as
-/// 40/64-hex upstream, so it can never be an option string that needs `--` protection.
+/// `git checkout -B <branch> <base_oid>` via git2 — the fork tip the agent extends. Force-creates
+/// the branch at `base_oid`, checks out its tree, and points HEAD at it.
 fn checkout_base_branch(
     workdir: &Path,
-    seller_home: &Path,
+    _seller_home: &Path,
     branch: &str,
     base_oid: &str,
 ) -> Result<(), SellerGitError> {
-    run_ok(
-        "checkout-base",
-        scrubbed_git(workdir, seller_home, ["checkout", "-B", branch, base_oid])?,
-    )
+    let repo =
+        Repository::open(workdir).map_err(|error| SellerGitError::Io(format!("open: {error}")))?;
+    let oid = Oid::from_str(base_oid).map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
+    let commit = repo
+        .find_commit(oid)
+        .map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
+    repo.branch(branch, &commit, true)
+        .map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
+    repo.checkout_tree(commit.as_object(), Some(CheckoutBuilder::new().force()))
+        .map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
+    repo.set_head(&format!("refs/heads/{branch}"))
+        .map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
+    Ok(())
+}
+
+/// `git checkout -B <branch>` at the current HEAD (from-scratch delivery: name the agent's commits
+/// onto the per-job branch so the daemon can push it). Best-effort — points the branch ref at HEAD
+/// and moves HEAD to it (HEAD's tree is unchanged, so no working-tree checkout is needed).
+pub fn point_branch_at_head(workdir: &Path, branch: &str) -> Result<(), SellerGitError> {
+    let repo =
+        Repository::open(workdir).map_err(|error| SellerGitError::Io(format!("open: {error}")))?;
+    let head_commit = repo
+        .head()
+        .and_then(|h| h.peel_to_commit())
+        .map_err(|_| SellerGitError::CommandFailed("point-branch-head"))?;
+    repo.branch(branch, &head_commit, true)
+        .map_err(|_| SellerGitError::CommandFailed("point-branch-head"))?;
+    repo.set_head(&format!("refs/heads/{branch}"))
+        .map_err(|_| SellerGitError::CommandFailed("point-branch-head"))?;
+    Ok(())
 }
 
 /// Contribution authorship gate (piece-10): deliver IFF every commit in `base_oid..HEAD` is
-/// agent-authored, HEAD advanced past `base_oid`, and the HEAD tree is non-empty. Scopes the
-/// empty-base authorship stamp to the commits ADDED on top of the (foreign) base — the base history
-/// is legitimately not agent-authored. Returns the HEAD oid on success.
+/// agent-authored, HEAD advanced past `base_oid`, and the HEAD tree is non-empty. Returns the HEAD
+/// oid on success.
 pub fn require_agent_authored_contribution(
     workdir: &Path,
     seller_home: &Path,
@@ -248,42 +258,54 @@ pub fn require_agent_authored_contribution(
     Ok(after.to_owned())
 }
 
+/// Every commit reachable from `after` but not from `base_oid` must match the stamped identity
+/// (author AND committer). Fail-closed on any read error.
 fn require_range_agent_authored(
     workdir: &Path,
-    seller_home: &Path,
+    _seller_home: &Path,
     identity: &DeliveryAgentIdentity,
     base_oid: &str,
     after: &str,
 ) -> Result<(), SellerGitError> {
-    let range = format!("{base_oid}..{after}");
-    let out = scrubbed_git(
-        workdir,
-        seller_home,
-        ["log", "--format=%an%x1f%ae%x1f%cn%x1f%ce%x1e", &range],
-    )?;
-    if !out.status.success() {
-        return Err(SellerGitError::Io(
-            "contribution refused: cannot read commit authors — fail-closed".into(),
-        ));
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let repo = Repository::open(workdir).map_err(|_| {
+        SellerGitError::Io("contribution refused: cannot open workdir — fail-closed".into())
+    })?;
+    let after_oid = Oid::from_str(after)
+        .map_err(|_| SellerGitError::Io("contribution refused: bad HEAD oid".into()))?;
+    let base = Oid::from_str(base_oid)
+        .map_err(|_| SellerGitError::Io("contribution refused: bad base oid".into()))?;
+    let mut walk = repo.revwalk().map_err(|_| {
+        SellerGitError::Io("contribution refused: cannot read commit authors — fail-closed".into())
+    })?;
+    walk.push(after_oid).map_err(|_| {
+        SellerGitError::Io("contribution refused: cannot read commit authors — fail-closed".into())
+    })?;
+    // `base_oid..after` — hide base and its ancestors (the foreign base history).
+    walk.hide(base).map_err(|_| {
+        SellerGitError::Io("contribution refused: cannot read commit authors — fail-closed".into())
+    })?;
+
     let mut saw_commit = false;
-    for record in text.split('\u{1e}') {
-        let record = record.trim();
-        if record.is_empty() {
-            continue;
-        }
+    for oid in walk {
+        let oid = oid.map_err(|_| {
+            SellerGitError::Io(
+                "contribution refused: cannot read commit authors — fail-closed".into(),
+            )
+        })?;
+        let commit = repo.find_commit(oid).map_err(|_| {
+            SellerGitError::Io(
+                "contribution refused: cannot read commit authors — fail-closed".into(),
+            )
+        })?;
         saw_commit = true;
-        let mut fields = record.split('\u{1f}');
-        let an = fields.next().unwrap_or("");
-        let ae = fields.next().unwrap_or("");
-        let cn = fields.next().unwrap_or("");
-        let ce = fields.next().unwrap_or("");
-        if an != identity.name || ae != identity.email || cn != identity.name || ce != identity.email
-        {
+        if !commit_matches_identity(&commit, identity) {
+            let author = commit.author();
             return Err(SellerGitError::Io(format!(
-                "contribution refused: commit on top of base not agent-authored (author={an} <{ae}>) — expected {} <{}>",
-                identity.name, identity.email
+                "contribution refused: commit on top of base not agent-authored (author={} <{}>) — expected {} <{}>",
+                author.name().unwrap_or(""),
+                author.email().unwrap_or(""),
+                identity.name,
+                identity.email
             )));
         }
     }
@@ -300,8 +322,6 @@ fn require_range_agent_authored(
 /// - `after` missing → refuse (no harness fallback)
 /// - any commit author/committer ≠ stamped identity → refuse (clone-only / foreign history)
 /// - HEAD tree == empty tree → refuse (empty/no-op commit)
-///
-/// Does **not** require a pre-agent `before` OID — empty workdirs are the product model.
 pub fn require_agent_authored_delivery(
     workdir: &Path,
     seller_home: &Path,
@@ -318,44 +338,55 @@ pub fn require_agent_authored_delivery(
     Ok(after.to_owned())
 }
 
+/// Every commit reachable from HEAD must match the stamped identity.
 fn require_all_commits_agent_authored(
     workdir: &Path,
-    seller_home: &Path,
+    _seller_home: &Path,
     identity: &DeliveryAgentIdentity,
 ) -> Result<(), SellerGitError> {
-    // %x1f field sep / %x1e record sep — every commit must match the stamp.
-    let out = scrubbed_git(
-        workdir,
-        seller_home,
-        ["log", "--format=%an%x1f%ae%x1f%cn%x1f%ce%x1e", "HEAD"],
-    )?;
-    if !out.status.success() {
-        return Err(SellerGitError::Io(
+    let repo = Repository::open(workdir).map_err(|_| {
+        SellerGitError::Io(
+            "delivery refused: cannot open workdir — fail-closed (no harness fallback)".into(),
+        )
+    })?;
+    let mut walk = repo.revwalk().map_err(|_| {
+        SellerGitError::Io(
             "delivery refused: cannot read commit authors — fail-closed (no harness fallback)"
                 .into(),
-        ));
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
+        )
+    })?;
+    walk.push_head().map_err(|_| {
+        SellerGitError::Io(
+            "delivery refused: agent left no commit (HEAD missing) — no harness fallback".into(),
+        )
+    })?;
+
     let mut saw_commit = false;
-    for record in text.split('\u{1e}') {
-        let record = record.trim();
-        if record.is_empty() {
-            continue;
-        }
+    for oid in walk {
+        let oid = oid.map_err(|_| {
+            SellerGitError::Io(
+                "delivery refused: cannot read commit authors — fail-closed (no harness fallback)"
+                    .into(),
+            )
+        })?;
+        let commit = repo.find_commit(oid).map_err(|_| {
+            SellerGitError::Io(
+                "delivery refused: cannot read commit authors — fail-closed (no harness fallback)"
+                    .into(),
+            )
+        })?;
         saw_commit = true;
-        let mut fields = record.split('\u{1f}');
-        let an = fields.next().unwrap_or("");
-        let ae = fields.next().unwrap_or("");
-        let cn = fields.next().unwrap_or("");
-        let ce = fields.next().unwrap_or("");
-        if an != identity.name
-            || ae != identity.email
-            || cn != identity.name
-            || ce != identity.email
-        {
+        if !commit_matches_identity(&commit, identity) {
+            let author = commit.author();
+            let committer = commit.committer();
             return Err(SellerGitError::Io(format!(
-                "delivery refused: commit not agent-authored (author={an} <{ae}>, committer={cn} <{ce}>; expected {} <{}>) — clone-only / foreign history",
-                identity.name, identity.email
+                "delivery refused: commit not agent-authored (author={} <{}>, committer={} <{}>; expected {} <{}>) — clone-only / foreign history",
+                author.name().unwrap_or(""),
+                author.email().unwrap_or(""),
+                committer.name().unwrap_or(""),
+                committer.email().unwrap_or(""),
+                identity.name,
+                identity.email
             )));
         }
     }
@@ -367,20 +398,55 @@ fn require_all_commits_agent_authored(
     Ok(())
 }
 
+/// True IFF the commit's author AND committer both match the stamped identity (name and email).
+fn commit_matches_identity(commit: &git2::Commit, identity: &DeliveryAgentIdentity) -> bool {
+    let author = commit.author();
+    let committer = commit.committer();
+    author.name() == Some(identity.name.as_str())
+        && author.email() == Some(identity.email.as_str())
+        && committer.name() == Some(identity.name.as_str())
+        && committer.email() == Some(identity.email.as_str())
+}
+
+/// Refuse a delivery whose HEAD tree contains no file (parity with `git ls-tree -r` being empty).
 fn require_head_tree_nonempty(
     workdir: &Path,
-    seller_home: &Path,
+    _seller_home: &Path,
     after: &str,
 ) -> Result<(), SellerGitError> {
-    // Prefer ls-tree over a hardcoded empty-tree OID — hash algo / git builds vary.
-    let out = scrubbed_git(workdir, seller_home, ["ls-tree", "-r", "--name-only", after])?;
-    if !out.status.success() {
-        return Err(SellerGitError::Io(
+    let repo = Repository::open(workdir).map_err(|_| {
+        SellerGitError::Io(
             "delivery refused: delivery tree unknown — fail-closed (no harness fallback)".into(),
-        ));
-    }
-    let listing = String::from_utf8_lossy(&out.stdout);
-    if listing.trim().is_empty() {
+        )
+    })?;
+    let oid = Oid::from_str(after).map_err(|_| {
+        SellerGitError::Io(
+            "delivery refused: delivery tree unknown — fail-closed (no harness fallback)".into(),
+        )
+    })?;
+    let tree = repo
+        .find_commit(oid)
+        .and_then(|commit| commit.tree())
+        .map_err(|_| {
+            SellerGitError::Io(
+                "delivery refused: delivery tree unknown — fail-closed (no harness fallback)".into(),
+            )
+        })?;
+    let mut has_file = false;
+    tree.walk(TreeWalkMode::PreOrder, |_, entry| {
+        if entry.kind() == Some(ObjectType::Blob) {
+            has_file = true;
+            TreeWalkResult::Abort
+        } else {
+            TreeWalkResult::Ok
+        }
+    })
+    .map_err(|_| {
+        SellerGitError::Io(
+            "delivery refused: delivery tree unknown — fail-closed (no harness fallback)".into(),
+        )
+    })?;
+    if !has_file {
         return Err(SellerGitError::Io(
             "delivery refused: empty tree (no substantive files) — no harness fallback".into(),
         ));
@@ -388,10 +454,10 @@ fn require_head_tree_nonempty(
     Ok(())
 }
 
-/// Optional NIP-98 auth for relay-git push (key never logged / never on argv).
+/// Optional NIP-98 auth for relay-git push/fetch (key never logged / never on argv).
 ///
-/// `secret_key_hex` is injected into the **git subprocess env only** as
-/// `NOSTR_PRIVATE_KEY` for `git-credential-nostr`. Callers must not print it.
+/// `secret_key_hex` signs the NIP-98 event in-process for relay-git remotes. Public / anonymous
+/// https remotes present no auth. Callers must not print it.
 #[derive(Debug, Clone)]
 pub struct PushAuth {
     pub secret_key_hex: String,
@@ -399,16 +465,7 @@ pub struct PushAuth {
 
 /// Push `branch` from `workdir` to `remote_url` (allowlisted https / relay-git only).
 ///
-/// `seller_home` is the seller's packaged home root: scrubbed git sets `HOME` to this
-/// path so libcurl can read a seller-owned `.netrc` (mode `0600`) without rewriting
-/// the daemon process environment (nostr/TLS keep ambient HOME).
-///
-/// When `auth` is `Some` and the remote is relay-git, configures
-/// `credential.helper` → `git-credential-nostr` + `credential.useHttpPath=true` and
-/// sets `NOSTR_PRIVATE_KEY` **only** on the git child env (never argv, never logged).
-///
-/// Returns the pushed commit OID (full hex). Unauthenticated / prompt-needing remotes
-/// fail closed (no hang) via `GIT_TERMINAL_PROMPT=0` + scrubbed ambient SSH/insteadOf.
+/// Returns the pushed commit OID (full hex). Unauthenticated / prompt-needing remotes fail closed.
 pub fn push_branch(
     workdir: &Path,
     remote_url: &str,
@@ -418,227 +475,52 @@ pub fn push_branch(
     push_branch_with_auth(workdir, remote_url, branch, seller_home, None)
 }
 
-/// Like [`push_branch`], with optional NIP-98 credential helper auth for relay-git.
+/// Like [`push_branch`], with optional NIP-98 auth for relay-git. Always in-process libgit2 — there
+/// is no system-git fallback (issue #55).
 pub fn push_branch_with_auth(
     workdir: &Path,
     remote_url: &str,
     branch: &str,
-    seller_home: &Path,
+    _seller_home: &Path,
     auth: Option<&PushAuth>,
 ) -> Result<String, SellerGitError> {
     assert_allowed_repo_locator(remote_url)?;
     if branch.trim().is_empty() {
         return Err(SellerGitError::Io("branch must be non-empty".into()));
     }
-
-    // In-process libgit2 push (removes system `git` from the delivery push path). Only for
-    // relay-git remotes with NIP-98 auth (public https keeps the system path). On ANY
-    // in-process error we log which path ran and fall back to system git — the money path
-    // must never silently trust a broken push, and system git still works on git >= 2.54.
-    #[cfg(feature = "inprocess-push")]
-    if let Some(auth) = auth {
-        if inprocess_push_enabled(seller_home)
-            && crate::delivery_transport::is_relay_git_locator(remote_url)
-        {
-            match inprocess::push_branch_inprocess(workdir, remote_url, branch, auth) {
-                Ok(oid) => {
-                    eprintln!("seller push path=inprocess remote={remote_url} branch={branch} ok");
-                    return Ok(oid);
-                }
-                Err(error) => {
-                    eprintln!(
-                        "seller push path=inprocess FAILED ({error}); falling back to system git"
-                    );
-                }
-            }
-        }
-    }
-
-    // Ensure origin points at the allowlisted remote for this push only.
-    let _ = scrubbed_git_auth(workdir, seller_home, ["remote", "remove", "origin"], None);
-    run_ok(
-        "remote-add",
-        scrubbed_git_auth(
-            workdir,
-            seller_home,
-            ["remote", "add", "origin", remote_url],
-            None,
-        )?,
-    )?;
-
-    let use_nip98 = auth.is_some() && crate::delivery_transport::is_relay_git_locator(remote_url);
-    let push = scrubbed_git_auth(
-        workdir,
-        seller_home,
-        ["push", "-u", "origin", branch],
-        if use_nip98 { auth } else { None },
-    )?;
-    if !push.status.success() {
-        let stderr_raw = String::from_utf8_lossy(&push.stderr);
-        let stderr = redact_secret(&stderr_raw, auth.map(|a| a.secret_key_hex.as_str())).to_lowercase();
-        if stderr.contains("authentication")
-            || stderr.contains("could not read username")
-            || stderr.contains("permission denied")
-            || stderr.contains("403")
-            || stderr.contains("401")
-            || stderr.contains("terminal prompts disabled")
-            || stderr.contains("repository not found")
-            || stderr.contains("forbidden")
-        {
-            return Err(SellerGitError::AuthFailed(
-                "unauthenticated, unannounced, or prompt-required remote (fail-closed)".into(),
-            ));
-        }
-        return Err(SellerGitError::CommandFailed("push"));
-    }
-    eprintln!("seller push path=system-git remote={remote_url} branch={branch} ok");
-
-    let rev = scrubbed_git_auth(workdir, seller_home, ["rev-parse", "HEAD"], None)?;
-    run_ok("rev-parse", rev.clone())?;
-    let oid = String::from_utf8_lossy(&rev.stdout).trim().to_owned();
-    if oid.len() < 40 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(SellerGitError::Io(format!(
-            "unexpected commit oid {oid:?}"
-        )));
-    }
+    let oid =
+        git_transport::push_branch(workdir, remote_url, branch, auth.map(|a| a.secret_key_hex.as_str()))?;
+    eprintln!("seller push path=inprocess remote={remote_url} branch={branch} ok");
     Ok(oid)
 }
 
-/// Boot-time WRITE-auth probe: stand up an ephemeral one-commit repo and `git push --dry-run` it
-/// to `remote_url`, exercising the receive-pack auth handshake WITHOUT mutating the remote (dry-run
-/// negotiates refs but sends no pack and updates nothing). Surfaces a broken write path — missing
-/// credential helper, unannounced/unreachable relay-git repo, or a write-scoped auth failure — at
-/// daemon boot instead of at job-delivery time.
+/// Boot-time WRITE-auth probe: connect to `remote_url` in the PUSH direction and read the
+/// receive-pack ref advertisement (the auth-gated leg) WITHOUT transferring a pack or mutating the
+/// remote. Surfaces a broken write path — missing/invalid credential, unannounced/unreachable
+/// relay-git repo, write-scoped auth failure — at daemon boot instead of at job-delivery time.
 ///
-/// Scope note: `--dry-run` performs the receive-pack ref ADVERTISEMENT (which mobee-relay NIP-98
-/// auth-gates) but stops before the pack POST, so it does not by itself reproduce the git < 2.54
-/// bug (that drops the Authorization credential specifically on the receive-pack POST — reads and
-/// the advertisement still succeed). `mobee doctor`'s git-version check is the definitive detector
-/// for that class; this probe catches the broader "can this seller authenticate a write at all"
-/// question cheaply and side-effect-free.
-///
-/// Allowlisted (https + relay-git; `ext::`/file/ssh refused) and scrubbed exactly like every other
-/// seller git child. Cleans up its temp workdir on the way out.
+/// git2 has no `push --dry-run`; `connect(Push) + list` is the faithful equivalent (it performs
+/// exactly the receive-pack advertisement mobee-relay NIP-98 auth-gates, then stops). Allowlisted
+/// (https + relay-git; `ext::`/file/ssh refused).
 pub fn preflight_push_probe(
-    seller_home: &Path,
+    _seller_home: &Path,
     remote_url: &str,
     auth: Option<&PushAuth>,
 ) -> Result<(), SellerGitError> {
     assert_allowed_repo_locator(remote_url)?;
-
-    let workdir = std::env::temp_dir().join(format!(
-        "mobee-preflight-{}-{}",
-        std::process::id(),
-        preflight_probe_seq()
-    ));
-    let _ = std::fs::remove_dir_all(&workdir);
-    std::fs::create_dir_all(&workdir).map_err(|error| SellerGitError::Io(error.to_string()))?;
-
-    let result = preflight_push_probe_in(&workdir, seller_home, remote_url, auth);
-    let _ = std::fs::remove_dir_all(&workdir);
-    result
-}
-
-/// Monotonic per-process counter so concurrent probes never collide on a temp dir name.
-fn preflight_probe_seq() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    SEQ.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Body of [`preflight_push_probe`] with an explicit `workdir` so the caller owns cleanup.
-fn preflight_push_probe_in(
-    workdir: &Path,
-    seller_home: &Path,
-    remote_url: &str,
-    auth: Option<&PushAuth>,
-) -> Result<(), SellerGitError> {
-    run_ok(
-        "preflight-init",
-        scrubbed_git(workdir, seller_home, ["init", "--initial-branch=main"])?,
-    )?;
-    run_ok(
-        "preflight-config-name",
-        scrubbed_git(workdir, seller_home, ["config", "user.name", "mobee-preflight"])?,
-    )?;
-    run_ok(
-        "preflight-config-email",
-        scrubbed_git(
-            workdir,
-            seller_home,
-            ["config", "user.email", "preflight@seller.mobee.invalid"],
-        )?,
-    )?;
-    std::fs::write(workdir.join("preflight.txt"), b"mobee boot push preflight\n")
-        .map_err(|error| SellerGitError::Io(error.to_string()))?;
-    run_ok(
-        "preflight-add",
-        scrubbed_git(workdir, seller_home, ["add", "preflight.txt"])?,
-    )?;
-    run_ok(
-        "preflight-commit",
-        scrubbed_git(
-            workdir,
-            seller_home,
-            ["commit", "-m", "mobee boot push preflight"],
-        )?,
-    )?;
-
-    // Point origin at the allowlisted remote for this probe only.
-    let _ = scrubbed_git_auth(workdir, seller_home, ["remote", "remove", "origin"], None);
-    run_ok(
-        "preflight-remote-add",
-        scrubbed_git_auth(
-            workdir,
-            seller_home,
-            ["remote", "add", "origin", remote_url],
-            None,
-        )?,
-    )?;
-
-    // Push to a throwaway ref name (dry-run never creates it) so a real branch is never touched.
-    let use_nip98 = auth.is_some() && crate::delivery_transport::is_relay_git_locator(remote_url);
-    let push = scrubbed_git_auth(
-        workdir,
-        seller_home,
-        [
-            "push",
-            "--dry-run",
-            "origin",
-            "HEAD:refs/heads/mobee-preflight-probe",
-        ],
-        if use_nip98 { auth } else { None },
-    )?;
-    if push.status.success() {
-        return Ok(());
-    }
-    let stderr_raw = String::from_utf8_lossy(&push.stderr);
-    let stderr =
-        redact_secret(&stderr_raw, auth.map(|a| a.secret_key_hex.as_str())).to_lowercase();
-    if stderr.contains("authentication")
-        || stderr.contains("could not read username")
-        || stderr.contains("permission denied")
-        || stderr.contains("403")
-        || stderr.contains("401")
-        || stderr.contains("terminal prompts disabled")
-        || stderr.contains("repository not found")
-        || stderr.contains("forbidden")
-    {
-        return Err(SellerGitError::AuthFailed(
-            "boot push preflight: unauthenticated, unannounced, or prompt-required remote".into(),
-        ));
-    }
-    Err(SellerGitError::CommandFailed("preflight-push"))
-}
-
-fn redact_secret(text: &str, secret: Option<&str>) -> String {
-    let Some(secret) = secret.filter(|s| s.len() >= 16) else {
-        return text.to_owned();
-    };
-    text.replace(secret, "<redacted-key>")
+    git_transport::list_remote(
+        remote_url,
+        auth.map(|a| a.secret_key_hex.as_str()),
+        Direction::Push,
+    )
+    .map(|_| ())
+    .map_err(SellerGitError::from)
 }
 
 /// Resolve `git-credential-nostr` absolute path (PATH, env, dogfood locations).
+///
+/// Retained for `mobee doctor`'s informational check only — the seller itself no longer needs the
+/// helper (all git legs are in-process libgit2 with NIP-98 signed in this process).
 pub fn resolve_git_credential_nostr() -> Option<PathBuf> {
     if let Ok(override_path) = std::env::var("MOBEE_GIT_CREDENTIAL_NOSTR") {
         let path = PathBuf::from(override_path);
@@ -672,590 +554,11 @@ fn which_bin(name: &str) -> Result<PathBuf, ()> {
     Err(())
 }
 
-/// Empty global gitconfig — defeats `~/.gitconfig` / `$HOME/.gitconfig` insteadOf.
-fn empty_git_config_global() -> &'static Path {
-    static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let path = std::env::temp_dir().join(format!(
-            "mobee-seller-gitconfig-empty-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::write(&path, "");
-        path
-    })
-    .as_path()
-}
-
-/// Empty XDG config root — defeats `$HOME/.config/git/config` (git falls back there
-/// when `XDG_CONFIG_HOME` is unset; removing the env is not enough under `HOME=$seller`).
-fn empty_xdg_config_home() -> &'static Path {
-    static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let path = std::env::temp_dir().join(format!(
-            "mobee-seller-xdg-empty-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::create_dir_all(&path);
-        path
-    })
-    .as_path()
-}
-
-fn scrubbed_git<I, S>(workdir: &Path, seller_home: &Path, args: I) -> Result<Output, SellerGitError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    scrubbed_git_auth(workdir, seller_home, args, None)
-}
-
-fn scrubbed_git_auth<I, S>(
-    workdir: &Path,
-    seller_home: &Path,
-    args: I,
-    auth: Option<&PushAuth>,
-) -> Result<Output, SellerGitError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    scrubbed_git_command(workdir, seller_home, args, auth)?
-        .output()
-        .map_err(|_| SellerGitError::Unavailable)
-}
-
-/// Build (but do not run) the scrubbed git child. Resolves the NIP-98 credential helper up
-/// front and fails closed when `auth` is set but the helper is missing (so an authenticated
-/// call can never silently degrade to an anonymous one).
-fn scrubbed_git_command<I, S>(
-    workdir: &Path,
-    seller_home: &Path,
-    args: I,
-    auth: Option<&PushAuth>,
-) -> Result<Command, SellerGitError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let helper = resolve_git_credential_nostr();
-    if auth.is_some() && helper.is_none() {
-        return Err(SellerGitError::AuthFailed(
-            "git-credential-nostr not found (set MOBEE_GIT_CREDENTIAL_NOSTR or install helper)"
-                .into(),
-        ));
-    }
-    Ok(build_scrubbed_command(
-        workdir,
-        seller_home,
-        args,
-        auth,
-        helper.as_deref(),
-    ))
-}
-
-/// Pure Command builder — no resolution, no I/O — so the credential-helper wiring is
-/// unit-inspectable. `helper` is the resolved `git-credential-nostr` path (or `None`); the
-/// NIP-98 `credential.helper` config is added only when BOTH `auth` and `helper` are present.
-fn build_scrubbed_command<I, S>(
-    workdir: &Path,
-    seller_home: &Path,
-    args: I,
-    auth: Option<&PushAuth>,
-    helper: Option<&Path>,
-) -> Command
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let mut cmd = Command::new("git");
-    // `-c` flags must precede the subcommand and beat local `.git/config` insteadOf
-    // rewrites (agent-planted url.*.insteadOf → ssh/file/ext). Keep https + relay-git.
-    cmd.current_dir(workdir)
-        .args([
-            "-c",
-            "protocol.ssh.allow=never",
-            "-c",
-            "protocol.file.allow=never",
-            "-c",
-            "protocol.ext.allow=never",
-        ]);
-
-    // Keep credential.helper string alive for the Command borrow.
-    let helper_cfg = match (auth, helper) {
-        (Some(_), Some(path)) => Some(format!("credential.helper={}", path.to_string_lossy())),
-        _ => None,
-    };
-    if let Some(cfg) = helper_cfg.as_deref() {
-        cmd.args(["-c", cfg, "-c", "credential.useHttpPath=true"]);
-    }
-    if let Some(auth) = auth {
-        // Key ONLY on this child — strip ambient first so we never inherit a stranger key.
-        cmd.env_remove("NOSTR_PRIVATE_KEY");
-        cmd.env_remove("BUZZ_PRIVATE_KEY");
-        cmd.env("NOSTR_PRIVATE_KEY", &auth.secret_key_hex);
-    } else {
-        // Never leak ambient keys into scrubbed git children.
-        cmd.env_remove("NOSTR_PRIVATE_KEY");
-        cmd.env_remove("BUZZ_PRIVATE_KEY");
-    }
-
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never")
-        // Seller-owned netrc lives at `$HOME/.netrc` — scope HOME to seller home for
-        // this child only (daemon process HOME stays ambient for nostr/TLS).
-        .env("HOME", seller_home)
-        // HOME-independent insteadOf kill: empty global + empty XDG + no system.
-        // Do NOT rely on a "clean" seller HOME — `$seller/.gitconfig` may be poisoned.
-        .env("GIT_CONFIG_GLOBAL", empty_git_config_global())
-        .env("XDG_CONFIG_HOME", empty_xdg_config_home())
-        .env_remove("GIT_CONFIG_SYSTEM")
-        .env_remove("GIT_CONFIG_COUNT")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        // Scrub ambient SSH override vectors (HTTPS must stay HTTPS under scrub).
-        .env_remove("GIT_SSH")
-        .env_remove("GIT_SSH_COMMAND")
-        .env_remove("SSH_ASKPASS")
-        .env_remove("GIT_ASKPASS");
-
-    // Clear GIT_CONFIG_KEY_/VALUE_ ambient pairs that could inject url.*.insteadOf.
-    for (key, _) in std::env::vars_os() {
-        if let Some(name) = key.to_str() {
-            if name.starts_with("GIT_CONFIG_KEY_")
-                || name.starts_with("GIT_CONFIG_VALUE_")
-                || name.starts_with("GIT_CONFIG_COUNT")
-            {
-                cmd.env_remove(name);
-            }
-        }
-    }
-
-    // Ensure helper binary is discoverable when referenced by basename.
-    if let Some(dir) = helper.and_then(Path::parent) {
-        let mut path = std::env::var_os("PATH").unwrap_or_default();
-        let prefix = dir.as_os_str();
-        if !path.is_empty() {
-            let mut combined = prefix.to_os_string();
-            combined.push(":");
-            combined.push(&path);
-            path = combined;
-        } else {
-            path = prefix.to_os_string();
-        }
-        cmd.env("PATH", path);
-    }
-
-    cmd
-}
-
-fn run_ok(op: &'static str, output: Output) -> Result<(), SellerGitError> {
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(SellerGitError::CommandFailed(op))
-    }
-}
-
-/// Resolve whether the in-process push is enabled for this seller home.
-///
-/// Env override `MOBEE_SELLER_INPROCESS_PUSH` wins (ops kill-switch / tests), then the
-/// `[seller_git] inprocess_push` config, defaulting ON. Never panics; a config read error
-/// falls back to the default (ON).
-#[cfg(feature = "inprocess-push")]
-fn inprocess_push_enabled(seller_home: &Path) -> bool {
-    if let Ok(value) = std::env::var("MOBEE_SELLER_INPROCESS_PUSH") {
-        let value = value.trim();
-        return !(value == "0" || value.eq_ignore_ascii_case("false"));
-    }
-    crate::home::bootstrap(seller_home)
-        .map(|home| home.config.seller_git.inprocess_push)
-        .unwrap_or_else(|_| crate::home::default_inprocess_push())
-}
-
-/// Build the NIP-98 (`kind:27235`) `Authorization` header value for a relay-git push.
-///
-/// Signs `u = <remote_url>` (the repo-root the relay verifies after stripping `/info/refs`
-/// or `/git-receive-pack`) with method `POST`. mobee-relay is method-agnostic on git routes
-/// and does not dedup the event id, so this ONE header is valid for both the info/refs GET
-/// advertisement and the receive-pack POST — the same token-reuse the credential helper
-/// relies on, delivered directly instead of via git's credential protocol. The secret key
-/// never appears in the returned string (only the schnorr signature does).
-#[cfg(feature = "inprocess-push")]
-fn nip98_authorization_header(
-    remote_url: &str,
-    secret_key_hex: &str,
-) -> Result<String, SellerGitError> {
-    use base64::Engine as _;
-    use nostr_sdk::nips::nip98::{HttpData, HttpMethod};
-    use nostr_sdk::prelude::{EventBuilder, Url};
-    use nostr_sdk::{JsonUtil, Keys};
-
-    let keys = Keys::parse(secret_key_hex)
-        .map_err(|error| SellerGitError::AuthFailed(format!("invalid seller key: {error}")))?;
-    let url = Url::parse(remote_url)
-        .map_err(|error| SellerGitError::Io(format!("invalid remote url: {error}")))?;
-    let event = EventBuilder::http_auth(HttpData::new(url, HttpMethod::POST))
-        .sign_with_keys(&keys)
-        .map_err(|error| SellerGitError::AuthFailed(format!("nip98 sign failed: {error}")))?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(event.as_json());
-    Ok(format!("Nostr {encoded}"))
-}
-
-/// In-process libgit2 push path. Registers a rustls-backed smart HTTP subtransport for the
-/// `https` scheme that injects the NIP-98 `Authorization` header on every request — so the
-/// receive-pack POST carries auth regardless of the local git version (git ≤ 2.53 drops the
-/// header on the streamed POST retry). No system `git`, no openssl (TLS via reqwest/rustls).
-#[cfg(feature = "inprocess-push")]
-mod inprocess {
-    use super::{nip98_authorization_header, PushAuth, SellerGitError};
-    use std::cell::RefCell;
-    use std::io::{self, Read, Write};
-    use std::path::Path;
-    use std::sync::{Once, OnceLock};
-    use std::time::Duration;
-
-    use git2::transport::{Service, SmartSubtransport, SmartSubtransportStream, Transport};
-    use git2::{PushOptions, RemoteCallbacks, Repository};
-
-    thread_local! {
-        /// Authorization header for the push running on THIS thread. Set immediately before
-        /// `remote.push`, cleared right after; the registered https factory reads it.
-        static AUTH_HEADER: RefCell<Option<String>> = const { RefCell::new(None) };
-    }
-
-    static REGISTER: Once = Once::new();
-
-    /// Shared blocking HTTP client (rustls, bundled CA roots). Built once.
-    fn http_client() -> &'static reqwest::blocking::Client {
-        static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-        CLIENT.get_or_init(|| {
-            reqwest::blocking::Client::builder()
-                .connect_timeout(Duration::from_secs(15))
-                .timeout(Duration::from_secs(120))
-                .build()
-                .expect("build reqwest blocking client")
-        })
-    }
-
-    /// Register the https smart subtransport exactly once for this process.
-    fn ensure_registered() {
-        REGISTER.call_once(|| {
-            // SAFETY: libgit2 requires transport registration be externally synchronized with
-            // other transport creation. `Once` guarantees a single registration, and mobee-core
-            // uses git2 ONLY for this seller push, so overriding the `https` scheme affects no
-            // other code path in the process.
-            unsafe {
-                let _ = git2::transport::register("https", |remote| {
-                    let header = AUTH_HEADER.with(|cell| cell.borrow().clone());
-                    Transport::smart(remote, true, NostrHttp { header })
-                });
-            }
-        });
-    }
-
-    /// Push `refs/heads/<branch>` to `remote_url` in-process, returning the pushed commit OID.
-    pub fn push_branch_inprocess(
-        workdir: &Path,
-        remote_url: &str,
-        branch: &str,
-        auth: &PushAuth,
-    ) -> Result<String, SellerGitError> {
-        ensure_registered();
-        let header = nip98_authorization_header(remote_url, &auth.secret_key_hex)?;
-
-        let repo = Repository::open(workdir)
-            .map_err(|error| SellerGitError::Io(format!("open workdir repo: {error}")))?;
-        let mut remote = repo
-            .remote_anonymous(remote_url)
-            .map_err(|error| SellerGitError::Io(format!("anonymous remote: {error}")))?;
-
-        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-        let rejection: std::rc::Rc<RefCell<Option<String>>> =
-            std::rc::Rc::new(RefCell::new(None));
-        let mut callbacks = RemoteCallbacks::new();
-        {
-            let rejection = rejection.clone();
-            callbacks.push_update_reference(move |refname, status| {
-                if let Some(message) = status {
-                    *rejection.borrow_mut() = Some(format!("{refname}: {message}"));
-                }
-                Ok(())
-            });
-        }
-        let mut options = PushOptions::new();
-        options.remote_callbacks(callbacks);
-
-        AUTH_HEADER.with(|cell| *cell.borrow_mut() = Some(header));
-        let push_result = remote.push(&[refspec.as_str()], Some(&mut options));
-        AUTH_HEADER.with(|cell| *cell.borrow_mut() = None);
-        drop(options);
-        push_result.map_err(map_push_error)?;
-
-        let rejected = rejection.borrow().clone();
-        if let Some(message) = rejected {
-            return Err(SellerGitError::AuthFailed(format!(
-                "remote rejected ref {message}"
-            )));
-        }
-
-        let oid = repo
-            .revparse_single(&format!("refs/heads/{branch}"))
-            .and_then(|object| object.peel_to_commit())
-            .map(|commit| commit.id().to_string())
-            .map_err(|error| SellerGitError::Io(format!("resolve pushed oid: {error}")))?;
-        if oid.len() < 40 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(SellerGitError::Io(format!("unexpected commit oid {oid:?}")));
-        }
-        Ok(oid)
-    }
-
-    /// Map a libgit2 push error to a scrubbed [`SellerGitError`]. Auth/permission signals map
-    /// to `AuthFailed` (fail-closed, parity with the system-git path); the secret is never in
-    /// a git2 error, so no redaction is needed.
-    fn map_push_error(error: git2::Error) -> SellerGitError {
-        let lowered = error.message().to_ascii_lowercase();
-        if lowered.contains("401")
-            || lowered.contains("403")
-            || lowered.contains("authentication")
-            || lowered.contains("unauthorized")
-            || lowered.contains("forbidden")
-            || lowered.contains("permission")
-        {
-            SellerGitError::AuthFailed(format!("in-process push rejected: {}", error.message()))
-        } else {
-            SellerGitError::Io(format!("in-process push failed: {}", error.message()))
-        }
-    }
-
-    /// rustls smart-HTTP subtransport that injects the NIP-98 header captured at push time.
-    struct NostrHttp {
-        header: Option<String>,
-    }
-
-    /// Map a smart-HTTP service to its `(service_name, is_post)` pair.
-    fn service_parts(service: Service) -> (&'static str, bool) {
-        match service {
-            Service::UploadPackLs => ("git-upload-pack", false),
-            Service::UploadPack => ("git-upload-pack", true),
-            Service::ReceivePackLs => ("git-receive-pack", false),
-            Service::ReceivePack => ("git-receive-pack", true),
-        }
-    }
-
-    /// Build the request URL for a service leg. POST legs hit `<base>/<service>`; the
-    /// ref-advertisement (LS) legs hit `<base>/info/refs?service=<service>` — matching
-    /// libgit2's built-in smart-HTTP transport (and what the relay strips back to the repo root).
-    fn service_url(base: &str, name: &str, is_post: bool) -> String {
-        let base = base.trim_end_matches('/');
-        if is_post {
-            format!("{base}/{name}")
-        } else {
-            format!("{base}/info/refs?service={name}")
-        }
-    }
-
-    impl SmartSubtransport for NostrHttp {
-        fn action(
-            &self,
-            url: &str,
-            service: Service,
-        ) -> Result<Box<dyn SmartSubtransportStream>, git2::Error> {
-            let (name, is_post) = service_parts(service);
-            let full_url = service_url(url, name, is_post);
-            Ok(Box::new(HttpStream {
-                header: self.header.clone(),
-                url: full_url,
-                service: name,
-                is_post,
-                sent: false,
-                request_body: Vec::new(),
-                response: None,
-            }))
-        }
-
-        fn close(&self) -> Result<(), git2::Error> {
-            Ok(())
-        }
-    }
-
-    /// One request/response leg of the smart-HTTP flow. libgit2 writes the request body (POST
-    /// legs), then reads the response; we buffer the writes and fire the HTTP request lazily on
-    /// the first read (the standard buffer-then-send pattern for stateless smart HTTP).
-    struct HttpStream {
-        header: Option<String>,
-        url: String,
-        service: &'static str,
-        is_post: bool,
-        sent: bool,
-        request_body: Vec<u8>,
-        response: Option<reqwest::blocking::Response>,
-    }
-
-    impl HttpStream {
-        fn send(&mut self) -> io::Result<()> {
-            let client = http_client();
-            let mut request = if self.is_post {
-                client
-                    .post(&self.url)
-                    .header(
-                        "Content-Type",
-                        format!("application/x-{}-request", self.service),
-                    )
-                    .header("Accept", format!("application/x-{}-result", self.service))
-                    .body(std::mem::take(&mut self.request_body))
-            } else {
-                client.get(&self.url).header("Accept", "*/*")
-            };
-            // identity encoding: never hand libgit2 a gzip stream it did not negotiate.
-            request = request.header("Accept-Encoding", "identity");
-            if let Some(header) = &self.header {
-                request = request.header("Authorization", header);
-            }
-            let response = request
-                .send()
-                .map_err(|error| io::Error::other(format!("http request: {error}")))?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(io::Error::other(format!(
-                    "http status {} for {}",
-                    status.as_u16(),
-                    self.url
-                )));
-            }
-            self.response = Some(response);
-            Ok(())
-        }
-    }
-
-    impl Read for HttpStream {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            if !self.sent {
-                self.send()?;
-                self.sent = true;
-            }
-            match self.response.as_mut() {
-                Some(response) => response.read(buf),
-                None => Ok(0),
-            }
-        }
-    }
-
-    impl Write for HttpStream {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.request_body.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn ls_legs_hit_info_refs_post_legs_hit_service() {
-            let base = "https://relay.example/git/owner/repo.git";
-            let (name, is_post) = service_parts(Service::ReceivePackLs);
-            assert_eq!(name, "git-receive-pack");
-            assert!(!is_post);
-            assert_eq!(
-                service_url(base, name, is_post),
-                "https://relay.example/git/owner/repo.git/info/refs?service=git-receive-pack"
-            );
-
-            let (name, is_post) = service_parts(Service::ReceivePack);
-            assert!(is_post);
-            assert_eq!(
-                service_url(base, name, is_post),
-                "https://relay.example/git/owner/repo.git/git-receive-pack"
-            );
-        }
-
-        #[test]
-        fn service_url_trims_one_trailing_slash_only() {
-            assert_eq!(
-                service_url("https://h/git/o/r/", "git-receive-pack", true),
-                "https://h/git/o/r/git-receive-pack"
-            );
-        }
-
-        /// LIVE proof (ignored by default): fetch a ref from the seller's own canonical repo
-        /// then push it back UNCHANGED (no-op) — exercising the receive-pack POST auth handshake
-        /// end-to-end through the in-process rustls transport. Never touches existing branches.
-        /// Run: `MOBEE_SELLER_HOME=<home> cargo test -p mobee-core --features inprocess-push \
-        ///   -- --ignored --nocapture live_noop_push_authenticates`
-        #[test]
-        #[ignore]
-        fn live_noop_push_authenticates() {
-            let home = std::path::PathBuf::from(
-                std::env::var("MOBEE_SELLER_HOME").expect("set MOBEE_SELLER_HOME"),
-            );
-            let mobee_home = crate::home::bootstrap(&home).expect("bootstrap");
-            let secret = crate::home::read_secret_key_hex(&mobee_home).expect("secret");
-            let remote_url = mobee_home
-                .config
-                .seller
-                .as_ref()
-                .expect("seller config")
-                .git_remote
-                .clone();
-
-            ensure_registered();
-            let header = super::nip98_authorization_header(&remote_url, &secret).expect("header");
-
-            let work = std::env::temp_dir().join(format!("mobee-live-noop-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&work);
-            let repo = git2::Repository::init(&work).expect("init");
-            let mut remote = repo.remote_anonymous(&remote_url).expect("anon remote");
-
-            // Fetch all branches (upload-pack read is also NIP-98-gated) to learn a ref + oid.
-            AUTH_HEADER.with(|c| *c.borrow_mut() = Some(header.clone()));
-            let fetch = remote.fetch(
-                &["+refs/heads/*:refs/remotes/origin/*"],
-                None,
-                None,
-            );
-            AUTH_HEADER.with(|c| *c.borrow_mut() = None);
-            fetch.expect("in-process fetch (read auth)");
-
-            // Pick the first fetched branch; mirror it to a local head at the SAME oid.
-            let branches: Vec<(String, git2::Oid)> = repo
-                .references_glob("refs/remotes/origin/*")
-                .expect("refs")
-                .filter_map(Result::ok)
-                .filter_map(|r| {
-                    let name = r.shorthand()?.trim_start_matches("origin/").to_owned();
-                    Some((name, r.target()?))
-                })
-                .collect();
-            let (branch, oid) = branches.first().cloned().expect("at least one remote branch");
-            eprintln!("live: no-op pushing branch={branch} oid={oid}");
-            repo.reference(&format!("refs/heads/{branch}"), oid, true, "noop")
-                .expect("local head");
-
-            let pushed = super::push_branch_inprocess(
-                &work,
-                &remote_url,
-                &branch,
-                &PushAuth { secret_key_hex: secret },
-            )
-            .expect("in-process no-op push");
-            assert_eq!(pushed, oid.to_string(), "no-op push returns the unchanged oid");
-            let _ = std::fs::remove_dir_all(&work);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -1373,7 +676,8 @@ mod tests {
     #[test]
     fn preflight_push_probe_fails_closed_on_unreachable_https_remote() {
         // No mutation, no hang: an allowlisted-but-unresolvable https remote must fail closed
-        // (GIT_TERMINAL_PROMPT=0) rather than block boot. Proves the probe reaches the push.
+        // rather than block boot. In-process libgit2 surfaces the DNS/connect failure as an Io
+        // transport error (the reqwest client's connect_timeout bounds it) — never a success.
         let home = temp("preflight-unreach-home");
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).expect("home");
@@ -1386,7 +690,9 @@ mod tests {
         assert!(
             matches!(
                 err,
-                SellerGitError::AuthFailed(_) | SellerGitError::CommandFailed(_)
+                SellerGitError::AuthFailed(_)
+                    | SellerGitError::CommandFailed(_)
+                    | SellerGitError::Io(_)
             ),
             "got {err:?}"
         );
@@ -1575,118 +881,6 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    #[test]
-    fn scrub_kills_global_xdg_and_home_insteadof() {
-        // Prove HOME-independent neutralization: poison seller HOME gitconfig with
-        // insteadOf; scrubbed_git must not surface it (empty GIT_CONFIG_GLOBAL +
-        // GIT_CONFIG_NOSYSTEM + empty XDG_CONFIG_HOME — never trust $seller/.gitconfig).
-        let root = temp("scrub-cfg");
-        let home = temp("scrub-cfg-home");
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&home);
-        fs::create_dir_all(&home).expect("home");
-        init_repo(&root);
-        fs::write(
-            home.join(".gitconfig"),
-            "[url \"git@poison.invalid:\"]\n\tinsteadOf = https://github.com/\n",
-        )
-        .expect("poison home gitconfig");
-        // Also drop a poisoned XDG tree under seller HOME (the path git would use if
-        // XDG_CONFIG_HOME were unset and HOME=$seller). Scrub pins empty XDG instead.
-        fs::create_dir_all(home.join(".config/git")).expect("xdg under home");
-        fs::write(
-            home.join(".config/git/config"),
-            "[url \"git@xdg-poison.invalid:\"]\n\tinsteadOf = https://github.com/\n",
-        )
-        .expect("poison home xdg gitconfig");
-
-        let listed = scrubbed_git(&root, &home, ["config", "--list", "--show-origin"])
-            .expect("scrubbed config --list");
-        assert!(listed.status.success(), "config --list failed");
-        let text = String::from_utf8_lossy(&listed.stdout).to_lowercase();
-        assert!(
-            !text.contains("insteadof"),
-            "scrub leaked insteadOf into config list:\n{text}"
-        );
-        assert!(
-            !text.contains("poison.invalid"),
-            "scrub leaked poisoned host into config list:\n{text}"
-        );
-
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn push_refuses_agent_planted_local_insteadof_ssh() {
-        // Transport bypass: hired agent authors local `.git/config` insteadOf that
-        // rewrites allowlisted https → ssh. Allowlist sees the original https string;
-        // protocol.ssh.allow=never on scrubbed_git must still kill the rewritten push.
-        let root = temp("local-insteadof");
-        let home = temp("local-insteadof-home");
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&home);
-        fs::create_dir_all(&home).expect("home");
-        init_repo(&root);
-
-        // Plant LOCAL insteadOf (survives global/XDG/system scrub).
-        let plant = Command::new("git")
-            .args([
-                "config",
-                "--local",
-                r#"url.ssh://attacker.invalid/.insteadOf"#,
-                "https://",
-            ])
-            .current_dir(&root)
-            .status()
-            .expect("plant local insteadOf");
-        assert!(plant.success(), "failed to plant local insteadOf");
-
-        // Without protocol lockdown this would attempt ssh://attacker… and hang/exfil.
-        let err = push_branch(
-            &root,
-            "https://example.invalid/git/owner/repo.git",
-            "main",
-            &home,
-        )
-        .expect_err("local insteadOf→ssh must not push");
-        match &err {
-            SellerGitError::AuthFailed(_) | SellerGitError::CommandFailed("push") => {}
-            other => panic!("expected push refuse after insteadOf→ssh, got: {other:?}"),
-        }
-
-        // Confirm scrubbed push stderr mentions protocol/ssh deny (not silent success).
-        let _ = scrubbed_git(
-            &root,
-            &home,
-            [
-                "remote",
-                "remove",
-                "origin",
-            ],
-        );
-        let _ = scrubbed_git(
-            &root,
-            &home,
-            [
-                "remote",
-                "add",
-                "origin",
-                "https://example.invalid/git/owner/repo.git",
-            ],
-        );
-        let push = scrubbed_git(&root, &home, ["push", "-u", "origin", "main"]).expect("spawn");
-        assert!(!push.status.success(), "scrubbed push must fail under insteadOf→ssh");
-        let stderr = String::from_utf8_lossy(&push.stderr).to_lowercase();
-        assert!(
-            stderr.contains("protocol") || stderr.contains("ssh") || stderr.contains("not allowed"),
-            "expected protocol.ssh deny in stderr, got:\n{stderr}"
-        );
-
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&home);
-    }
-
     // ── Piece-10 fork-from-base: allowlist + range-scoped authorship gate ──────────────────────
     fn commit_as(dir: &Path, name: &str, email: &str, path: &str, content: &str, msg: &str) -> String {
         let full = dir.join(path);
@@ -1756,6 +950,44 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
+    /// PATH-stripped proof (#55): drive the seller's LOCAL git legs (init, authorship gate,
+    /// non-empty-tree gate, branch-at-head) with git2 ONLY — the delivery commit is created with
+    /// git2, never `Command`. Run with `git` absent from PATH to prove these legs have no shell-out.
+    #[test]
+    fn seller_gates_without_system_git() {
+        use git2::{Repository, Signature};
+        let workdir = temp("nogit-seller");
+        let home = temp("nogit-seller-home");
+        let _ = fs::remove_dir_all(&workdir);
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("home");
+
+        let pk = "55".repeat(32);
+        let identity = DeliveryAgentIdentity::for_seller(&pk);
+        init_empty_delivery_workdir(&workdir, &home, &identity).expect("init");
+
+        // Agent-authored commit via git2 (no system git), stamped as the seller identity.
+        let repo = Repository::open(&workdir).expect("open");
+        fs::write(workdir.join("out.txt"), "work\n").expect("write");
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new("out.txt")).expect("add");
+        index.write().expect("index write");
+        let tree = repo.find_tree(index.write_tree().expect("write tree")).expect("tree");
+        let sig = Signature::now(&identity.name, &identity.email).expect("sig");
+        let oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "agent work", &tree, &[])
+            .expect("git2 commit");
+        let after = oid.to_string();
+
+        require_agent_authored_delivery(&workdir, &home, &identity, Some(&after))
+            .expect("agent-authored delivery gate must pass under git2");
+        point_branch_at_head(&workdir, "mobee/job").expect("branch-at-head");
+        assert_eq!(try_head_oid(&workdir, &home).expect("head"), after);
+
+        let _ = fs::remove_dir_all(&workdir);
+        let _ = fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn checkout_base_branch_from_oid_creates_fork_tip() {
         // Bug-1 regression: `git checkout -B <branch> <oid>` must NOT pass `--` before the
@@ -1800,139 +1032,4 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// Args (after the program) of a built git Command, as owned Strings.
-    fn cmd_args(cmd: &Command) -> Vec<String> {
-        cmd.get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect()
-    }
-
-    /// True when `NOSTR_PRIVATE_KEY` is being SET (not removed) on the child.
-    fn sets_nostr_key(cmd: &Command) -> bool {
-        cmd.get_envs()
-            .any(|(k, v)| k == std::ffi::OsStr::new("NOSTR_PRIVATE_KEY") && v.is_some())
-    }
-
-    #[test]
-    fn fetch_base_wires_nip98_helper_for_relay_git_only() {
-        // Bug-2 regression: the base fetch must present the seller NIP-98 credential helper
-        // for relay-git targets (mobee relay requires auth for reads), and NOT for public /
-        // anonymous https targets (which would otherwise break). Construction-level: inspect
-        // the git Command the fetch path builds. RED if fetch_base_auth stops gating (drops
-        // the auth), since the relay-git branch then wires no credential helper.
-        let td = std::env::temp_dir();
-        let auth = PushAuth {
-            secret_key_hex: "ab".repeat(32),
-        };
-        let helper = Path::new("/opt/mobee/git-credential-nostr"); // injected — no resolution/env
-        let relay_base = "https://relay.example/git/\
-            abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789/job.git";
-        let public_base = "https://example.invalid/repo.git";
-
-        // (1) relay-git base → auth applied → credential helper + key wired on the fetch child.
-        let eff = fetch_base_auth(Some(&auth), relay_base);
-        assert!(eff.is_some(), "relay-git base must present NIP-98 auth");
-        let relay_helper = eff.and(Some(helper));
-        let cmd = build_scrubbed_command(&td, &td, ["fetch", relay_base], eff, relay_helper);
-        let args = cmd_args(&cmd);
-        assert!(
-            args.iter().any(|a| a.starts_with("credential.helper=")),
-            "relay-git fetch must wire credential.helper, got args: {args:?}"
-        );
-        assert!(
-            args.iter().any(|a| a == "credential.useHttpPath=true"),
-            "relay-git fetch must set credential.useHttpPath=true, got: {args:?}"
-        );
-        assert!(
-            sets_nostr_key(&cmd),
-            "relay-git fetch must inject NOSTR_PRIVATE_KEY on the child"
-        );
-
-        // (2) public https base → anonymous: no credential helper, no key on the fetch child.
-        let eff_pub = fetch_base_auth(Some(&auth), public_base);
-        assert!(eff_pub.is_none(), "public base must stay anonymous");
-        let cmd_pub =
-            build_scrubbed_command(&td, &td, ["fetch", public_base], eff_pub, eff_pub.and(Some(helper)));
-        let args_pub = cmd_args(&cmd_pub);
-        assert!(
-            !args_pub.iter().any(|a| a.starts_with("credential.helper=")),
-            "public fetch must NOT wire a credential helper, got: {args_pub:?}"
-        );
-        assert!(
-            !sets_nostr_key(&cmd_pub),
-            "public fetch must NOT inject NOSTR_PRIVATE_KEY"
-        );
-
-        // (3) no seller auth available → anonymous even for a relay-git base (never fail hard).
-        assert!(
-            fetch_base_auth(None, relay_base).is_none(),
-            "absent seller auth must fall back to anonymous fetch"
-        );
-    }
-
-    #[cfg(feature = "inprocess-push")]
-    #[test]
-    fn nip98_header_binds_repo_root_and_verifies() {
-        use base64::Engine as _;
-        use nostr_sdk::{Event, JsonUtil, Keys};
-
-        let keys = Keys::generate();
-        let secret = keys.secret_key().to_secret_hex();
-        let remote = "https://relay.example/git/abcdef/repo.git";
-        let header = nip98_authorization_header(remote, &secret).expect("build header");
-
-        // Never leaks the secret; scheme is "Nostr <base64>".
-        assert!(!header.contains(&secret), "secret leaked in header");
-        let encoded = header.strip_prefix("Nostr ").expect("Nostr scheme");
-        let json = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .expect("base64");
-        let event = Event::from_json(&json).expect("event json");
-        event.verify().expect("valid signature");
-        assert_eq!(event.kind.as_u16(), 27235, "NIP-98 kind");
-
-        let u = event
-            .tags
-            .iter()
-            .find(|t| t.kind() == nostr_sdk::TagKind::custom("u"))
-            .and_then(|t| t.content().map(str::to_owned))
-            .expect("u tag");
-        assert_eq!(u, remote, "u tag binds the repo-root the relay verifies");
-        let method = event
-            .tags
-            .iter()
-            .find(|t| t.kind() == nostr_sdk::TagKind::custom("method"))
-            .and_then(|t| t.content().map(str::to_owned))
-            .expect("method tag");
-        assert_eq!(method, "POST");
-    }
-
-    #[cfg(feature = "inprocess-push")]
-    #[test]
-    fn nip98_header_rejects_bad_key() {
-        let err = nip98_authorization_header("https://relay.example/git/o/r.git", "not-a-key")
-            .expect_err("must reject");
-        assert!(matches!(err, SellerGitError::AuthFailed(_)));
-    }
-
-    #[cfg(feature = "inprocess-push")]
-    #[test]
-    fn inprocess_push_env_override_forces_system_git() {
-        let home = temp("inprocess-env");
-        let _ = std::fs::remove_dir_all(&home);
-        crate::home::bootstrap(&home).expect("bootstrap");
-        // SAFETY: this test is the only reader/writer of MOBEE_SELLER_INPROCESS_PUSH.
-        unsafe {
-            // Fresh home defaults ON.
-            std::env::remove_var("MOBEE_SELLER_INPROCESS_PUSH");
-            assert!(inprocess_push_enabled(&home), "default is in-process ON");
-            // Env kill-switch forces OFF.
-            std::env::set_var("MOBEE_SELLER_INPROCESS_PUSH", "0");
-            assert!(!inprocess_push_enabled(&home), "env 0 forces system git");
-            std::env::set_var("MOBEE_SELLER_INPROCESS_PUSH", "false");
-            assert!(!inprocess_push_enabled(&home), "env false forces system git");
-            std::env::remove_var("MOBEE_SELLER_INPROCESS_PUSH");
-        }
-        let _ = std::fs::remove_dir_all(&home);
-    }
 }

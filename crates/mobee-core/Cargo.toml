@@ -10,11 +10,11 @@ publish.workspace = true
 default = []
 acp = []
 gateway = ["dep:nostr-sdk"]
-git-delivery = ["dep:wait-timeout"]
-# In-process seller git push via libgit2 (removes system git from the delivery push
-# path). Needs nostr-sdk (NIP-98 signing) so it composes git-delivery + gateway.
-inprocess-push = ["git-delivery", "gateway", "dep:git2", "dep:reqwest", "dep:base64"]
-wallet = ["git-delivery", "gateway", "inprocess-push", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "tokio/sync", "tokio/time"]
+# All git legs (seller push/fetch, buyer verify-fetch, ref-advertisement probes) run in-process
+# via libgit2 — NO system `git` on any product path (issue #55). Needs nostr-sdk (NIP-98 signing)
+# so it composes gateway; git2 (rustls-backed) + reqwest + base64 carry the smart-HTTP transport.
+git-delivery = ["gateway", "dep:git2", "dep:reqwest", "dep:base64"]
+wallet = ["git-delivery", "gateway", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "tokio/sync", "tokio/time"]
 test-support = []
 
 [dependencies]
@@ -32,8 +32,6 @@ serde_json.workspace = true
 sha2 = "0.11.0"
 tokio = { version = "1.52.0", default-features = false, features = ["rt", "macros"] }
 toml = "0.8"
-# In-process timeout for the pay-path `git fetch` (no external `timeout(1)` — macOS/BusyBox safe).
-wait-timeout = { version = "0.2", optional = true }
 
 # seller_git (the code path under test) is gated behind `git-delivery`; run with
 # `cargo test -p mobee-core --features git-delivery --test relay_git_http_auth`.
