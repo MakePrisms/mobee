@@ -126,8 +126,9 @@ fn is_idempotent_already_redeemed(error: &DaemonError) -> bool {
         }
     }
     // Mint-level already-spent. cdk surfaces `TokenAlreadySpent` ("Token Already Spent") as a
-    // string in `PaymentWalletError::Wallet` — there is no typed variant to match, so this
-    // substring check is interim (TODO: expose a typed cdk-already-spent error to match on).
+    // string in `PaymentWalletError::Wallet` — there is no typed variant, so this matches on the
+    // message substring.
+    // TODO: match a typed cdk already-spent error instead of substring.
     let message = error.to_string().to_ascii_lowercase();
     message.contains("already spent") || message.contains("already redeemed")
 }
@@ -2608,7 +2609,7 @@ fn run_boot_push_preflight_for_daemon(daemon: &SellerDaemon) {
 }
 
 /// Outcome of [`wait_for_nip42_auth`].
-enum AuthWait {
+pub(crate) enum AuthWait {
     /// The relay issued a NIP-42 challenge and `automatic_authentication` completed it.
     Authenticated,
     /// The relay issued NO challenge within the window. NOT a failure (see the fn doc).
@@ -2617,6 +2618,11 @@ enum AuthWait {
 
 /// Drain `notifications` until the relay's NIP-42 AUTH completes, the relay actively rejects
 /// auth (fatal), or the window elapses with no challenge (`NoChallenge`, non-fatal).
+///
+/// Shared by the seller receive path and the buyer receipt-publish path — mobee-relay requires
+/// NIP-42 AUTH for the p-gated kind-1059 subscribe AND for all writes, and the handshake shape is
+/// identical either way. Callers map the outcome to their own gate: the seller degrades on
+/// `NoChallenge`; the buyer fails closed on anything but `Authenticated`.
 ///
 /// Caller must subscribe `relay.notifications()` **before** `connect` so the
 /// `Authenticated` event cannot be missed.
@@ -2633,7 +2639,7 @@ enum AuthWait {
 /// challenge when the daemon subscribes below, and `automatic_authentication` completes auth
 /// then. The caller logs the degrade loudly. An ACTIVE rejection (`AuthenticationFailed`) or a
 /// relay shutdown stays fatal (fail-closed), unchanged.
-async fn wait_for_nip42_auth(
+pub(crate) async fn wait_for_nip42_auth(
     notifications: &mut tokio::sync::broadcast::Receiver<nostr_sdk::pool::RelayNotification>,
     timeout: std::time::Duration,
 ) -> Result<AuthWait, DaemonError> {

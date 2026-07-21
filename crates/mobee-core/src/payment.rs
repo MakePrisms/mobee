@@ -21,9 +21,9 @@ use crate::wallet::VerifiedPayment;
 
 const ATTEMPT_DOMAIN: &[u8] = b"mobee/v1/payment-attempt";
 
-/// Nostr event kind of a co-signed settlement receipt. Stamped on
-/// [`ReceiptRecord`] so a consumer discriminates a real receipt from a record
-/// with no `receipt_kind` field (kind-1059-aliased) with a LOCAL check — never "missing id".
+/// Nostr event kind of a co-signed settlement receipt. Stamped on [`ReceiptRecord`] so a consumer
+/// discriminates a co-signed receipt (kind-3400) from a record with no co-signed receipt with a
+/// LOCAL check.
 // The co-signed receipt kind — the single registry lives in `crate::kinds`.
 use crate::gateway::JOB_RECEIPT_KIND as RECEIPT_EVENT_KIND;
 
@@ -223,13 +223,11 @@ impl PaymentKey {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Durable metadata for a published receipt.
 pub struct ReceiptRecord {
-    /// The published kind-3400 receipt event id. For a record with no `receipt_kind` field this
-    /// is the kind-1059 payment-envelope id (see `receipt_kind`).
+    /// The published kind-3400 co-signed receipt event id.
     pub receipt_id: String,
-    /// Nostr event kind of the settlement receipt. `3400` = co-signed receipt event; `0`
-    /// (serde default) = a record with no `receipt_kind` field, whose `receipt_id` aliases the
-    /// kind-1059 envelope. A LOCAL discriminator — no relay fetch, and `Sent`-with-no-receipt
-    /// stays new-and-incomplete.
+    /// Nostr event kind of the co-signed settlement receipt (`3400`). A LOCAL discriminator: `0`
+    /// (the serde default) reads as no co-signed receipt, so `Sent`-with-no-receipt stays
+    /// new-and-incomplete without a relay fetch.
     #[serde(default)]
     pub receipt_kind: u16,
 }
@@ -687,7 +685,7 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
         Self { journal }
     }
 
-    /// Verifies buyer custody before allowing the first durable payment intent.
+    /// Verifies the buyer store before allowing the first durable payment intent.
     ///
     /// By construction the pay path accepts only [`PayPathDeliveryVerifier`] — a bare
     /// or otherwise un-allowlisted `impl DeliveryVerifier` is a type error at the
@@ -1215,11 +1213,11 @@ mod tests {
         // Regression guard: `None` reproduces the exact no-creq attempt id (the no-creq path
         // folds nothing extra). This constant is the AttemptId of `key()` with no creq — if the
         // None fold ever changes the hash preimage, this pin breaks.
-        assert_eq!(none.attempt_id().as_str(), V1_KEY_ATTEMPT_ID);
+        assert_eq!(none.attempt_id().as_str(), KEY_ATTEMPT_ID);
     }
 
     // Frozen AttemptId of `key()` with no creq. Guards the None-creq regression path.
-    const V1_KEY_ATTEMPT_ID: &str =
+    const KEY_ATTEMPT_ID: &str =
         "99e8e7b4c53c7af9f2329e16a9625133e9f788d3ffe1257f0a5a121c549de3cd";
 
     #[test]

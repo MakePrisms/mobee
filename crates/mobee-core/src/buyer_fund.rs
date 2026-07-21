@@ -108,7 +108,7 @@ pub fn open_testnut_wallet_blocking(home: &MobeeHome) -> Result<Wallet, FundErro
     runtime.block_on(open_testnut_wallet_async(home))
 }
 
-/// Read current wallet balance against the hard-pinned testnut mint.
+/// Read current wallet balance against the configured default mint.
 pub async fn wallet_balance_sats(home: &MobeeHome) -> Result<u64, FundError> {
     let wallet = open_testnut_wallet_async(home).await?;
     let balance = wallet
@@ -147,8 +147,8 @@ pub async fn fund_testnut_wallet(
     let invoice = quote.request.clone();
     let quote_id = quote.id.clone();
 
-    // Poll HTTP quote status — do not use wait_and_mint_quote (WS stream hung against
-    // testnut in this environment). FakeWallet marks bolt11 paid; poll until Paid/Issued.
+    // Poll HTTP quote status — do not use wait_and_mint_quote (its WS stream can hang; polling is
+    // deterministic). FakeWallet marks bolt11 paid; poll until Paid/Issued.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {
         let status = wallet

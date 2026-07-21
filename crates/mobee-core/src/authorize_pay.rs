@@ -55,7 +55,7 @@ pub struct AuthorizePayRequest {
     #[allow(clippy::struct_field_names)]
     pub accepted_mints: Vec<String>,
     /// Contribution binds. `None` ⇒ from-scratch job (no new verify, byte-identical produced
-    /// artifacts). `Some(..)` ⇒ the fork contribution verify-path (custody fetch + base-from-pin +
+    /// artifacts). `Some(..)` ⇒ the fork contribution verify-path (store fetch + base-from-pin +
     /// descendant + content) + the authorship tuple seam run pre-pay, all against these
     /// buyer-controlled binds.
     pub contribution: Option<ContributionPayBinds>,
@@ -265,16 +265,16 @@ pub async fn authorize_pay_async(
     let seller_hex = seller_nostr.to_hex();
     let seller_signature = request.seller_signature.clone();
 
-    // Buyer-owned custody verifier (no wallet dependency; created before the pre-pay seam so the
-    // contribution verify runs against custody BEFORE any spend). The payment-journal is created
-    // LATER (after the pre-pay seam) so a pre-pay refusal leaves NO journal on disk.
-    let custody = home.root.join("custody");
+    // Buyer-owned store verifier (no wallet dependency; created before the pre-pay seam so the
+    // contribution verify runs against the buyer store BEFORE any spend). The payment-journal is
+    // created LATER (after the pre-pay seam) so a pre-pay refusal leaves NO journal on disk.
+    let store = home.root.join("store");
     // Buyer secret signs NIP-98 for the in-process relay-git READ (fork + base fetch). Public https
     // bases and local-path fixtures fetch anonymously (git_transport gates the header on relay-git).
-    let mut verifier = PayPathDeliveryVerifier::new(custody, Some(secret_hex.clone()));
+    let mut verifier = PayPathDeliveryVerifier::new(store, Some(secret_hex.clone()));
 
     // Contribution verify-path — ALL PRE-PAY (before the budget gate ⇒ zero spend on any
-    // refusal), ALL against BUYER-CONTROLLED binds. The fork (`delivery`) is custody-fetched +
+    // refusal), ALL against BUYER-CONTROLLED binds. The fork (`delivery`) is store-fetched +
     // tip-matched, `base_oid` is fetched from the PINNED target (never the seller echo), the
     // delivery must DESCEND from base, and the content gate + buyer policy hook must pass. The
     // authorship tuple sig is then verified at the ONE pre-pay seam below (extending the receipt
@@ -418,11 +418,9 @@ fn contribution_policy(home: &MobeeHome) -> crate::contribution::ContentPolicy {
 ///
 /// - **empty creq list (no creq):** pay from the buyer's configured mint.
 /// - **configured mint listed:** pay directly from it (the direct path).
-/// - **configured mint NOT listed:** the buyer would have to BRIDGE over Lightning
-///   ([`crate::payment_wallet::bridge_to_accepted_mint`]). That live cross-mint path is fail-closed
-///   (single-mint wallet — no second reachable mint to mint-quote/melt against), so it refuses
-///   `mint_unreachable_pay`; no funds move, no binding is committed. The bridge mechanism is
-///   implemented and unit-tested for a future multi-mint enablement.
+/// - **configured mint NOT listed:** the single-mint buyer wallet holds no balance at any mint the
+///   seller listed, so it cannot pay this claim and refuses `mint_unreachable_pay`; no funds move,
+///   no binding is committed.
 fn resolve_realized_mint(
     buyer_mint_url: &str,
     accepted_mints: &[String],
@@ -454,7 +452,7 @@ fn resolve_realized_mint(
     }
     Err(AuthorizePayError::Wallet(PaymentWalletError::Wallet(format!(
         "mint_unreachable_pay: buyer mint {buyer_mint} is not in the creq mint list {listed:?}; \
-         the live cross-mint Lightning bridge is disabled (single-mint wallet)"
+         the single-mint buyer wallet holds no balance at any accepted mint"
     ))))
 }
 
@@ -630,7 +628,7 @@ fn receipt_created_at(_digest: &[u8; 32]) -> Timestamp {
 /// the caller may already hold a Tokio runtime (a nested `block_on` would panic).
 ///
 /// mobee-relay requires NIP-42 AUTH for ALL writes, so this path completes + WAITS FOR the
-/// auth handshake before `send_event_to` (mirroring the seller's `wait_for_nip42_auth`); the
+/// auth handshake before `send_event_to` (via the shared `wait_for_nip42_auth`); the
 /// payment WRAP path already authenticates, as does this receipt path. On auth
 /// timeout/failure the send is NOT reached and an empty `relay_success` is returned (never a
 /// forced success) ⇒ [`ReceiptAuthority::verify`] fails closed, the payment reducer holds at
@@ -661,7 +659,7 @@ fn publish_receipt_event(
                     })?;
                     // Subscribe to the relay's notification stream BEFORE connect —
                     // `Authenticated` is emitted once and is not re-emitted (relay quirk; see
-                    // the reference `seller_daemon::wait_for_nip42_auth`).
+                    // `seller_daemon::wait_for_nip42_auth`).
                     let parsed_relay = RelayUrl::parse(relay_url).map_err(|error| {
                         EffectError::new(format!("receipt parse relay url: {error}"))
                     })?;
@@ -680,12 +678,14 @@ fn publish_receipt_event(
                     // NIP-42 AUTH. On timeout/failure we fail CLOSED with an empty relay set
                     // (send not reached, never a forced success) — the designed-safe
                     // direction (no double-pay; payment holds at `Sent` and retries).
-                    let relay_success = if wait_for_nip42_auth(
-                        &mut relay_notifications,
-                        Duration::from_secs(20),
-                    )
-                    .await
-                    {
+                    let relay_success = if matches!(
+                        crate::seller_daemon::wait_for_nip42_auth(
+                            &mut relay_notifications,
+                            Duration::from_secs(20),
+                        )
+                        .await,
+                        Ok(crate::seller_daemon::AuthWait::Authenticated)
+                    ) {
                         let output = client.send_event_to([relay_url], event).await;
                         client.disconnect().await;
                         let output = output
@@ -693,7 +693,7 @@ fn publish_receipt_event(
                         // Diagnostic (NOT money-semantics): surface the relay's per-relay
                         // rejection reason (e.g. "invalid: event timestamp too far from server
                         // time") — previously discarded. Relay URL + reason only; no key
-                        // material. This is the string that named the created_at + auth bugs.
+                        // material.
                         if !output.failed.is_empty() {
                             let reasons: Vec<String> = output
                                 .failed
@@ -716,37 +716,6 @@ fn publish_receipt_event(
             .join()
             .map_err(|_| EffectError::new("receipt publisher thread panicked"))?
     })
-}
-
-// Temporary: duplicates seller_daemon::wait_for_nip42_auth. Inlined here to keep this
-// money-core auth handling confined to authorize_pay.rs while a concurrent worker owns
-// seller_daemon.rs; unify the two once that settles.
-//
-/// Drain the relay's notification stream until NIP-42 AUTH resolves. Returns `true` ONLY on
-/// [`RelayNotification::Authenticated`]; every other terminal (`AuthenticationFailed` /
-/// `Shutdown` / channel closed / lagged / timeout) returns `false`, so the caller fails
-/// CLOSED and never reaches the send. The caller MUST obtain `notifications` BEFORE `connect`
-/// — `Authenticated` is not re-emitted.
-async fn wait_for_nip42_auth(
-    notifications: &mut tokio::sync::broadcast::Receiver<nostr_sdk::pool::RelayNotification>,
-    timeout: std::time::Duration,
-) -> bool {
-    use nostr_sdk::pool::RelayNotification;
-
-    tokio::time::timeout(timeout, async {
-        loop {
-            match notifications.recv().await {
-                Ok(RelayNotification::Authenticated) => return true,
-                Ok(RelayNotification::AuthenticationFailed) | Ok(RelayNotification::Shutdown) => {
-                    return false;
-                }
-                Ok(_) => {}
-                Err(_) => return false,
-            }
-        }
-    })
-    .await
-    .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1248,15 +1217,22 @@ mod tests {
     // (proven by the coordinator's live re-run); the auth-ordering / fail-closed decision
     // is pure and is asserted here (red-on-revert: defeating the gate turns the
     // fail-closed cases green→red).
+    use crate::seller_daemon::{wait_for_nip42_auth, AuthWait};
     use nostr_sdk::pool::RelayNotification;
     use std::time::Duration;
+
+    // The buyer receipt gate opens ONLY on `Authenticated`; every other outcome of the shared
+    // `wait_for_nip42_auth` (the seller's `NoChallenge` degrade included) fails the buyer closed.
+    fn buyer_gate_open(outcome: Result<AuthWait, crate::seller_daemon::DaemonError>) -> bool {
+        matches!(outcome, Ok(AuthWait::Authenticated))
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn nip42_auth_wait_true_only_on_authenticated() {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<RelayNotification>(8);
         tx.send(RelayNotification::Authenticated).expect("send");
         assert!(
-            wait_for_nip42_auth(&mut rx, Duration::from_secs(20)).await,
+            buyer_gate_open(wait_for_nip42_auth(&mut rx, Duration::from_secs(20)).await),
             "Authenticated must gate the send open"
         );
     }
@@ -1267,7 +1243,7 @@ mod tests {
         // send is NOT reached (empty relay_success upstream ⇒ verify holds at `Sent`).
         let (_tx, mut rx) = tokio::sync::broadcast::channel::<RelayNotification>(8);
         assert!(
-            !wait_for_nip42_auth(&mut rx, Duration::from_millis(50)).await,
+            !buyer_gate_open(wait_for_nip42_auth(&mut rx, Duration::from_millis(50)).await),
             "auth timeout must fail closed (never a forced success)"
         );
     }
@@ -1277,7 +1253,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<RelayNotification>(8);
         tx.send(RelayNotification::AuthenticationFailed).expect("send");
         assert!(
-            !wait_for_nip42_auth(&mut rx, Duration::from_secs(20)).await,
+            !buyer_gate_open(wait_for_nip42_auth(&mut rx, Duration::from_secs(20)).await),
             "AuthenticationFailed must fail closed"
         );
     }
@@ -1287,7 +1263,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<RelayNotification>(8);
         tx.send(RelayNotification::Shutdown).expect("send");
         assert!(
-            !wait_for_nip42_auth(&mut rx, Duration::from_secs(20)).await,
+            !buyer_gate_open(wait_for_nip42_auth(&mut rx, Duration::from_secs(20)).await),
             "relay Shutdown before auth must fail closed"
         );
     }
@@ -1297,7 +1273,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<RelayNotification>(8);
         drop(tx);
         assert!(
-            !wait_for_nip42_auth(&mut rx, Duration::from_secs(20)).await,
+            !buyer_gate_open(wait_for_nip42_auth(&mut rx, Duration::from_secs(20)).await),
             "notification channel closed before auth must fail closed"
         );
     }

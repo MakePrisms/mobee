@@ -242,8 +242,8 @@ pub struct AcceptedBind {
 
 /// Contribution binds captured in the accept-bind. `target_*` / `base_*` come from the
 /// buyer's SIGNED offer (authority); `tuple_signature` is the seller's signed-result authorship sig
-/// from the accepted result; `custody_local_ref` is the buyer-controlled ref the fork tip is
-/// retained under (custody-retention; merge uses THIS, never the live fork branch).
+/// from the accepted result; `store_ref` is the buyer-controlled ref the fork tip is
+/// retained under (buyer-store retention; merge uses THIS, never the live fork branch).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptedContribution {
     pub target_owner_pubkey: String,
@@ -251,7 +251,7 @@ pub struct AcceptedContribution {
     pub base_branch: String,
     pub base_oid: String,
     pub tuple_signature: String,
-    pub custody_local_ref: String,
+    pub store_ref: String,
 }
 
 /// Inputs for accepting a seller claim (and binding the matching result).
@@ -776,7 +776,7 @@ pub async fn accept_claim_async(
 ///   cross-check input, never authority) — a mismatch REFUSES.
 ///
 /// The recorded binds (`target_*`, `base_*`) come from the OFFER; the fork is the result's
-/// repo/branch; `custody_local_ref` is derived from the fork-tip `commit_oid`.
+/// repo/branch; `store_ref` is derived from the fork-tip `commit_oid`.
 /// Fail-closed: resolve the accepted claim's `creq` accepted-mint list (`m`).
 ///
 /// - `None` (a claim with no creq) ⇒ empty list; the pay path then uses the pinned default
@@ -858,7 +858,7 @@ fn resolve_accepted_contribution(
         base_branch: offer_contribution.base_branch.clone(),
         base_oid: offer_contribution.base_oid.clone(),
         tuple_signature: echo.tuple_signature.clone(),
-        custody_local_ref: crate::delivery_git::PayPathDeliveryVerifier::store_ref_for(commit_oid),
+        store_ref: crate::delivery_git::PayPathDeliveryVerifier::store_ref_for(commit_oid),
     }))
 }
 
@@ -2020,7 +2020,7 @@ mod tests {
     }
 
     #[test]
-    fn accept_contribution_records_offer_authority_and_custody_ref() {
+    fn accept_contribution_records_offer_authority_and_store_ref() {
         let owner = "aa".repeat(32);
         let url = "https://mobee-relay.orveth.dev/git/owner/repo.git";
         let base_oid = "77".repeat(20);
@@ -2034,7 +2034,7 @@ mod tests {
         assert_eq!(bind.base_oid, base_oid);
         assert_eq!(bind.tuple_signature, "sigbytes");
         assert_eq!(
-            bind.custody_local_ref,
+            bind.store_ref,
             crate::delivery_git::PayPathDeliveryVerifier::store_ref_for(&"ee".repeat(20))
         );
     }
@@ -2119,7 +2119,7 @@ mod tests {
                 base_branch: "main".into(),
                 base_oid: "77".repeat(20),
                 tuple_signature: "cafe".into(),
-                custody_local_ref: "refs/mobee/deliveries/eeee".into(),
+                store_ref: "refs/mobee/deliveries/eeee".into(),
             }),
         };
         let req = authorize_request_from_bind(&bind, 1, bind.commit_oid.clone()).expect("ok");
