@@ -281,6 +281,24 @@ impl SellerJournal {
         )))
     }
 
+    /// Newest `Receipt` timestamp in the journal — the `since` anchor for the boot wrap-backfill
+    /// (#57), so a restart re-fetches stored 1059 payments the live subscription did not replay.
+    /// `Ok(None)` when there are no receipts yet (or no journal file exists).
+    pub fn last_receipt_ts(&self) -> Result<Option<u64>, SellerError> {
+        let entries = match self.entries() {
+            Ok(entries) => entries,
+            Err(SellerError::Io(_)) => return Ok(None),
+            Err(other) => return Err(other),
+        };
+        Ok(entries
+            .iter()
+            .filter_map(|entry| match entry {
+                JournalEntry::Receipt { ts, .. } => Some(*ts),
+                _ => None,
+            })
+            .max())
+    }
+
     /// Journal a CLAIMED transition. `claim_id`/`buyer_pubkey`/`deadline_unix` are the
     /// anchors restart-reconcile needs to release an orphan without the relay.
     pub fn append_claim(
@@ -649,6 +667,38 @@ offer_backfill_secs = {backfill}
             "journal must never hold token/key material: {raw}"
         );
         assert!(raw.contains("amount_received"));
+    }
+
+    // #57: last_receipt_ts anchors the boot wrap-backfill `since`. None before any receipt (so
+    // backfill fetches all history), Some(ts) after — never a silent stranding.
+    #[test]
+    fn last_receipt_ts_none_then_some_after_receipt() {
+        let root = temp_home("last-receipt-ts");
+        let _ = fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("bootstrap");
+        let journal = SellerJournal::open(&home).expect("journal");
+        assert_eq!(journal.last_receipt_ts().expect("ts"), None);
+        // A claim (not a receipt) must not set the anchor.
+        journal
+            .append_claim("job-t", "claim-t", "buyer-t", 2_000_000_000)
+            .expect("claim");
+        assert_eq!(journal.last_receipt_ts().expect("ts"), None);
+        let before = now_unix();
+        journal
+            .append_receipt(
+                "job-t",
+                "result-t",
+                "job-t",
+                "result-t",
+                7,
+                7,
+                "https://testnut.cashudevkit.org",
+                "buyer",
+                true,
+            )
+            .expect("receipt");
+        let ts = journal.last_receipt_ts().expect("ts").expect("some after receipt");
+        assert!(ts >= before, "receipt ts {ts} must be >= {before}");
     }
 
     #[test]
