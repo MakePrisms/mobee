@@ -124,8 +124,6 @@ fn authenticated_fetch_base_succeeds_via_fork_path() {
     );
 
     let workdir = temp("authed-workdir");
-    let home = temp("authed-home");
-    fs::create_dir_all(&home).expect("home");
     let identity = DeliveryAgentIdentity::for_seller(&"11".repeat(32));
     let auth = PushAuth {
         secret_key_hex: "22".repeat(32),
@@ -133,7 +131,7 @@ fn authenticated_fetch_base_succeeds_via_fork_path() {
     let branch = "mobee/contribution/relay-auth-itest";
 
     init_contribution_workdir(
-        &workdir, &home, &identity, &url, "main", &base_oid, branch,
+        &workdir, &identity, &url, "main", &base_oid, branch,
         Some(&auth),
     )
     .expect("authenticated fetch-base through the fork path must succeed");
@@ -170,7 +168,6 @@ fn authenticated_fetch_base_succeeds_via_fork_path() {
     drop(server);
     let _ = fs::remove_dir_all(&upstream);
     let _ = fs::remove_dir_all(&workdir);
-    let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
@@ -182,15 +179,13 @@ fn unauthenticated_fetch_of_protected_repo_fails_closed() {
     let url = server.repo_url();
 
     let workdir = temp("unauth-workdir");
-    let home = temp("unauth-home");
-    fs::create_dir_all(&home).expect("home");
     let identity = DeliveryAgentIdentity::for_seller(&"33".repeat(32));
 
     // No seller auth → the in-process path presents NO NIP-98 header → the relay's 401 on the
     // info/refs advertisement is terminal (no credential fallback exists). Fail-closed as an auth
     // failure, never a success or a pack transfer.
     let err = init_contribution_workdir(
-        &workdir, &home, &identity, &url, "main", &base_oid,
+        &workdir, &identity, &url, "main", &base_oid,
         "mobee/contribution/unauth-itest",
         None,
     )
@@ -225,5 +220,4 @@ fn unauthenticated_fetch_of_protected_repo_fails_closed() {
     drop(server);
     let _ = fs::remove_dir_all(&upstream);
     let _ = fs::remove_dir_all(&workdir);
-    let _ = fs::remove_dir_all(&home);
 }

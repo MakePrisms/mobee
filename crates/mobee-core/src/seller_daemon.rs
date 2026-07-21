@@ -1277,7 +1277,6 @@ impl SellerDaemon {
                 };
                 seller_git::init_contribution_workdir(
                     &active.workdir,
-                    &self.home.root,
                     &identity,
                     contribution.target.clone_url(),
                     contribution.base.branch(),
@@ -1287,7 +1286,7 @@ impl SellerDaemon {
                 )
             }
             None => {
-                seller_git::init_empty_delivery_workdir(&active.workdir, &self.home.root, &identity)
+                seller_git::init_empty_delivery_workdir(&active.workdir, &identity)
             }
         };
         if let Err(error) = init_result {
@@ -1342,20 +1341,18 @@ impl SellerDaemon {
                 return Err(error);
             }
         };
-        let after_oid = seller_git::try_head_oid(&active.workdir, &self.home.root);
+        let after_oid = seller_git::try_head_oid(&active.workdir);
         // Contribution scopes the agent-authorship gate to `base_oid..HEAD` (the base history is the
         // target's, not agent-authored); from-scratch requires the whole history agent-authored.
         let gate_result = match &active.contribution {
             Some(contribution) => seller_git::require_agent_authored_contribution(
                 &active.workdir,
-                &self.home.root,
                 &identity,
                 contribution.base.oid(),
                 after_oid.as_deref(),
             ),
             None => seller_git::require_agent_authored_delivery(
                 &active.workdir,
-                &self.home.root,
                 &identity,
                 after_oid.as_deref(),
             ),
@@ -1381,7 +1378,6 @@ impl SellerDaemon {
             &active.workdir,
             &seller_cfg.git_remote,
             &branch,
-            &self.home.root,
             Some(&push_auth),
         ) {
             Ok(oid) => oid,
@@ -2614,12 +2610,11 @@ fn run_boot_push_preflight_for_daemon(daemon: &SellerDaemon) {
     if !crate::delivery_transport::is_relay_git_locator(&seller.git_remote) {
         return;
     }
-    let home_root = daemon.home.root.clone();
     let auth = crate::home::read_secret_key_hex(&daemon.home)
         .ok()
         .map(|secret_key_hex| crate::seller_git::PushAuth { secret_key_hex });
     let outcome = run_boot_push_preflight(enabled, || {
-        crate::seller_git::preflight_push_probe(&home_root, &seller.git_remote, auth.as_ref())
+        crate::seller_git::preflight_push_probe(&seller.git_remote, auth.as_ref())
     });
     if let Some(line) = outcome {
         eprintln!("{line}");

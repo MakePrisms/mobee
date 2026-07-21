@@ -71,13 +71,11 @@ impl From<TransportError> for SellerGitError {
 /// Best-effort `HEAD` OID in `workdir`. `None` when the tree has no commits yet.
 ///
 /// Used by gate #10 (delivery attribution): deliver only agent-authored, non-empty trees.
-/// `seller_home` is unused now (git2 needs no ambient-config scoping) but kept for call-site
-/// stability across the daemon and integration tests.
-pub fn try_head_oid(workdir: &Path, seller_home: &Path) -> Option<String> {
-    rev_parse_oid(workdir, seller_home, "HEAD")
+pub fn try_head_oid(workdir: &Path) -> Option<String> {
+    rev_parse_oid(workdir, "HEAD")
 }
 
-fn rev_parse_oid(workdir: &Path, _seller_home: &Path, rev: &str) -> Option<String> {
+fn rev_parse_oid(workdir: &Path, rev: &str) -> Option<String> {
     let repo = Repository::open(workdir).ok()?;
     let commit = repo.revparse_single(rev).ok()?.peel_to_commit().ok()?;
     let oid = commit.id().to_string();
@@ -126,7 +124,6 @@ impl DeliveryAgentIdentity {
 /// AGENT's later commits carry it) and `main` as the initial branch. **No harness commit.**
 pub fn init_empty_delivery_workdir(
     workdir: &Path,
-    _seller_home: &Path,
     identity: &DeliveryAgentIdentity,
 ) -> Result<(), SellerGitError> {
     let repo = init_repo_with_identity(workdir, identity)?;
@@ -169,7 +166,6 @@ fn init_repo_with_identity(
 /// scopes its authorship gate to `base_oid..HEAD` (see [`require_agent_authored_contribution`]).
 pub fn init_contribution_workdir(
     workdir: &Path,
-    _seller_home: &Path,
     identity: &DeliveryAgentIdentity,
     base_clone_url: &str,
     base_branch: &str,
@@ -192,14 +188,13 @@ pub fn init_contribution_workdir(
     )?;
     drop(repo);
     // Check out base_oid onto the per-job unique branch (the fork tip the agent extends).
-    checkout_base_branch(workdir, _seller_home, branch, base_oid)
+    checkout_base_branch(workdir, branch, base_oid)
 }
 
 /// `git checkout -B <branch> <base_oid>` via git2 — the fork tip the agent extends. Force-creates
 /// the branch at `base_oid`, checks out its tree, and points HEAD at it.
 fn checkout_base_branch(
     workdir: &Path,
-    _seller_home: &Path,
     branch: &str,
     base_oid: &str,
 ) -> Result<(), SellerGitError> {
@@ -240,7 +235,6 @@ pub fn point_branch_at_head(workdir: &Path, branch: &str) -> Result<(), SellerGi
 /// oid on success.
 pub fn require_agent_authored_contribution(
     workdir: &Path,
-    seller_home: &Path,
     identity: &DeliveryAgentIdentity,
     base_oid: &str,
     after: Option<&str>,
@@ -253,8 +247,8 @@ pub fn require_agent_authored_contribution(
             "contribution refused: HEAD did not advance past base_oid (no agent work)".into(),
         ));
     }
-    require_range_agent_authored(workdir, seller_home, identity, base_oid, after)?;
-    require_head_tree_nonempty(workdir, seller_home, after)?;
+    require_range_agent_authored(workdir, identity, base_oid, after)?;
+    require_head_tree_nonempty(workdir, after)?;
     Ok(after.to_owned())
 }
 
@@ -262,7 +256,6 @@ pub fn require_agent_authored_contribution(
 /// (author AND committer). Fail-closed on any read error.
 fn require_range_agent_authored(
     workdir: &Path,
-    _seller_home: &Path,
     identity: &DeliveryAgentIdentity,
     base_oid: &str,
     after: &str,
@@ -324,7 +317,6 @@ fn require_range_agent_authored(
 /// - HEAD tree == empty tree → refuse (empty/no-op commit)
 pub fn require_agent_authored_delivery(
     workdir: &Path,
-    seller_home: &Path,
     identity: &DeliveryAgentIdentity,
     after: Option<&str>,
 ) -> Result<String, SellerGitError> {
@@ -333,15 +325,14 @@ pub fn require_agent_authored_delivery(
             "delivery refused: agent left no commit (HEAD missing) — no harness fallback".into(),
         )
     })?;
-    require_all_commits_agent_authored(workdir, seller_home, identity)?;
-    require_head_tree_nonempty(workdir, seller_home, after)?;
+    require_all_commits_agent_authored(workdir, identity)?;
+    require_head_tree_nonempty(workdir, after)?;
     Ok(after.to_owned())
 }
 
 /// Every commit reachable from HEAD must match the stamped identity.
 fn require_all_commits_agent_authored(
     workdir: &Path,
-    _seller_home: &Path,
     identity: &DeliveryAgentIdentity,
 ) -> Result<(), SellerGitError> {
     let repo = Repository::open(workdir).map_err(|_| {
@@ -409,11 +400,7 @@ fn commit_matches_identity(commit: &git2::Commit, identity: &DeliveryAgentIdenti
 }
 
 /// Refuse a delivery whose HEAD tree contains no file (parity with `git ls-tree -r` being empty).
-fn require_head_tree_nonempty(
-    workdir: &Path,
-    _seller_home: &Path,
-    after: &str,
-) -> Result<(), SellerGitError> {
+fn require_head_tree_nonempty(workdir: &Path, after: &str) -> Result<(), SellerGitError> {
     let repo = Repository::open(workdir).map_err(|_| {
         SellerGitError::Io(
             "delivery refused: delivery tree unknown — fail-closed (no harness fallback)".into(),
@@ -470,9 +457,8 @@ pub fn push_branch(
     workdir: &Path,
     remote_url: &str,
     branch: &str,
-    seller_home: &Path,
 ) -> Result<String, SellerGitError> {
-    push_branch_with_auth(workdir, remote_url, branch, seller_home, None)
+    push_branch_with_auth(workdir, remote_url, branch, None)
 }
 
 /// Like [`push_branch`], with optional NIP-98 auth for relay-git. Always in-process libgit2 — there
@@ -481,7 +467,6 @@ pub fn push_branch_with_auth(
     workdir: &Path,
     remote_url: &str,
     branch: &str,
-    _seller_home: &Path,
     auth: Option<&PushAuth>,
 ) -> Result<String, SellerGitError> {
     assert_allowed_repo_locator(remote_url)?;
@@ -503,7 +488,6 @@ pub fn push_branch_with_auth(
 /// exactly the receive-pack advertisement mobee-relay NIP-98 auth-gates, then stops). Allowlisted
 /// (https + relay-git; `ext::`/file/ssh refused).
 pub fn preflight_push_probe(
-    _seller_home: &Path,
     remote_url: &str,
     auth: Option<&PushAuth>,
 ) -> Result<(), SellerGitError> {
@@ -597,53 +581,41 @@ mod tests {
     #[test]
     fn push_refuses_ssh_and_local_paths() {
         let root = temp("refuse");
-        let home = temp("refuse-home");
         let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&home);
-        fs::create_dir_all(&home).expect("home");
         init_repo(&root);
         assert!(matches!(
-            push_branch(&root, "git@example.invalid:repo.git", "main", &home),
+            push_branch(&root, "git@example.invalid:repo.git", "main"),
             Err(SellerGitError::Transport(_))
         ));
         assert!(matches!(
-            push_branch(&root, "/tmp/local.git", "main", &home),
+            push_branch(&root, "/tmp/local.git", "main"),
             Err(SellerGitError::Transport(_))
         ));
         assert!(matches!(
-            push_branch(&root, "ssh://example.invalid/repo.git", "main", &home),
+            push_branch(&root, "ssh://example.invalid/repo.git", "main"),
             Err(SellerGitError::Transport(_))
         ));
         let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
     fn push_to_local_https_style_bare_via_file_is_refused() {
         // file:// is not on allowlist — fail closed even for fixtures.
         let root = temp("file-refuse");
-        let home = temp("file-refuse-home");
         let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&home);
-        fs::create_dir_all(&home).expect("home");
         init_repo(&root);
         let err = push_branch(
             &root,
             &format!("file://{}/remote.git", root.display()),
             "main",
-            &home,
         )
         .expect_err("file refused");
         assert!(matches!(err, SellerGitError::Transport(_)));
         let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
     fn preflight_push_probe_refuses_non_allowlisted_remote() {
-        let home = temp("preflight-refuse-home");
-        let _ = fs::remove_dir_all(&home);
-        fs::create_dir_all(&home).expect("home");
         for bad in [
             "git@example.invalid:repo.git",
             "ssh://example.invalid/repo.git",
@@ -652,13 +624,12 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    preflight_push_probe(&home, bad, None),
+                    preflight_push_probe(bad, None),
                     Err(SellerGitError::Transport(_))
                 ),
                 "expected transport refuse for {bad}"
             );
         }
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -666,14 +637,7 @@ mod tests {
         // No mutation, no hang: an allowlisted-but-unresolvable https remote must fail closed
         // rather than block boot. In-process libgit2 surfaces the DNS/connect failure as an Io
         // transport error (the reqwest client's connect_timeout bounds it) — never a success.
-        let home = temp("preflight-unreach-home");
-        let _ = fs::remove_dir_all(&home);
-        fs::create_dir_all(&home).expect("home");
-        let err = preflight_push_probe(
-            &home,
-            "https://mobee-preflight.invalid/git/owner/repo.git",
-            None,
-        )
+        let err = preflight_push_probe("https://mobee-preflight.invalid/git/owner/repo.git", None)
         .expect_err("unreachable remote must fail closed");
         assert!(
             matches!(
@@ -684,7 +648,6 @@ mod tests {
             ),
             "got {err:?}"
         );
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -699,7 +662,6 @@ mod tests {
         let identity = DeliveryAgentIdentity::for_seller(&pk);
         let err = require_agent_authored_delivery(
             Path::new("/tmp/unused-gate10"),
-            Path::new("/tmp/unused-gate10-home"),
             &identity,
             None,
         )
@@ -711,16 +673,13 @@ mod tests {
     fn gate10_wired_clone_then_no_work_refuses() {
         // (a) Real workdir path: wipe stamped base, clone foreign repo, zero work → REFUSE.
         let workdir = temp("gate10-clone-noop");
-        let home = temp("gate10-clone-noop-home");
         let foreign = temp("gate10-foreign-src");
         let _ = fs::remove_dir_all(&workdir);
-        let _ = fs::remove_dir_all(&home);
         let _ = fs::remove_dir_all(&foreign);
-        fs::create_dir_all(&home).expect("home");
 
         let pk = "11".repeat(32);
         let identity = DeliveryAgentIdentity::for_seller(&pk);
-        init_empty_delivery_workdir(&workdir, &home, &identity).expect("stamp init");
+        init_empty_delivery_workdir(&workdir, &identity).expect("stamp init");
 
         // Foreign repo with non-agent authors (the clone-only payload).
         fs::create_dir_all(&foreign).expect("foreign mkdir");
@@ -769,8 +728,8 @@ mod tests {
                 .success()
         );
 
-        let after = try_head_oid(&workdir, &home).expect("clone left a HEAD");
-        let err = require_agent_authored_delivery(&workdir, &home, &identity, Some(&after))
+        let after = try_head_oid(&workdir).expect("clone left a HEAD");
+        let err = require_agent_authored_delivery(&workdir, &identity, Some(&after))
             .expect_err("clone-then-no-work must refuse");
         assert!(
             err.to_string().contains("not agent-authored")
@@ -779,7 +738,6 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&workdir);
-        let _ = fs::remove_dir_all(&home);
         let _ = fs::remove_dir_all(&foreign);
     }
 
@@ -787,16 +745,13 @@ mod tests {
     fn gate10_wired_agent_authored_nonempty_accepts() {
         // (b) Legit empty-base agent work under the stamp → ACCEPT.
         let workdir = temp("gate10-ok");
-        let home = temp("gate10-ok-home");
         let _ = fs::remove_dir_all(&workdir);
-        let _ = fs::remove_dir_all(&home);
-        fs::create_dir_all(&home).expect("home");
 
         let pk = "22".repeat(32);
         let identity = DeliveryAgentIdentity::for_seller(&pk);
-        init_empty_delivery_workdir(&workdir, &home, &identity).expect("stamp init");
+        init_empty_delivery_workdir(&workdir, &identity).expect("stamp init");
         // Empty base: no HEAD yet.
-        assert!(try_head_oid(&workdir, &home).is_none());
+        assert!(try_head_oid(&workdir).is_none());
 
         fs::write(workdir.join("out.txt"), "agent did the work\n").expect("write");
         assert!(
@@ -824,27 +779,23 @@ mod tests {
                 .success()
         );
 
-        let after = try_head_oid(&workdir, &home).expect("after");
+        let after = try_head_oid(&workdir).expect("after");
         let accepted =
-            require_agent_authored_delivery(&workdir, &home, &identity, Some(&after))
+            require_agent_authored_delivery(&workdir, &identity, Some(&after))
                 .expect("legit agent work must accept");
         assert_eq!(accepted, after);
 
         let _ = fs::remove_dir_all(&workdir);
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
     fn gate10_wired_empty_tree_refuses() {
         let workdir = temp("gate10-empty-tree");
-        let home = temp("gate10-empty-tree-home");
         let _ = fs::remove_dir_all(&workdir);
-        let _ = fs::remove_dir_all(&home);
-        fs::create_dir_all(&home).expect("home");
 
         let pk = "33".repeat(32);
         let identity = DeliveryAgentIdentity::for_seller(&pk);
-        init_empty_delivery_workdir(&workdir, &home, &identity).expect("stamp init");
+        init_empty_delivery_workdir(&workdir, &identity).expect("stamp init");
         assert!(
             Command::new("git")
                 .args(["commit", "--allow-empty", "-m", "empty"])
@@ -857,8 +808,8 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let after = try_head_oid(&workdir, &home).expect("empty commit has HEAD");
-        let err = require_agent_authored_delivery(&workdir, &home, &identity, Some(&after))
+        let after = try_head_oid(&workdir).expect("empty commit has HEAD");
+        let err = require_agent_authored_delivery(&workdir, &identity, Some(&after))
             .expect_err("empty tree must refuse");
         assert!(
             err.to_string().contains("empty tree"),
@@ -866,7 +817,6 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&workdir);
-        let _ = fs::remove_dir_all(&home);
     }
 
     // ── Piece-10 fork-from-base: allowlist + range-scoped authorship gate ──────────────────────
@@ -894,11 +844,9 @@ mod tests {
     #[test]
     fn init_contribution_workdir_refuses_ext_base() {
         let root = temp("contrib-ext");
-        let home = temp("contrib-ext-home");
         let identity = DeliveryAgentIdentity::for_seller(&"aa".repeat(32));
         let err = init_contribution_workdir(
             &root,
-            &home,
             &identity,
             "ext::sh -c evil",
             "main",
@@ -909,13 +857,11 @@ mod tests {
         .expect_err("ext base must be refused by the transport allowlist");
         assert!(matches!(err, SellerGitError::Transport(_)), "got {err}");
         let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
     fn require_agent_authored_contribution_scopes_gate_to_range() {
         let root = temp("contrib-range");
-        let home = temp("contrib-range-home");
         let identity = DeliveryAgentIdentity::for_seller(&"bb".repeat(32));
         init_repo(&root); // base commit authored by "Mobee Seller Test" (foreign to the stamp)
         let base_oid = {
@@ -925,17 +871,16 @@ mod tests {
         // Agent commit ON TOP of base, authored by the STAMPED identity.
         let after = commit_as(&root, &identity.name, &identity.email, "src/x.rs", "work\n", "agent work");
         // Range gate passes (base is foreign, but base_oid..HEAD is all agent-authored).
-        require_agent_authored_contribution(&root, &home, &identity, &base_oid, Some(&after))
+        require_agent_authored_contribution(&root, &identity, &base_oid, Some(&after))
             .expect("agent-authored range must pass despite foreign base");
 
         // A foreign commit on top of base ⇒ refuse.
         let foreign = commit_as(&root, "Stranger", "x@evil.invalid", "src/y.rs", "sneaky\n", "foreign");
-        assert!(require_agent_authored_contribution(&root, &home, &identity, &base_oid, Some(&foreign)).is_err());
+        assert!(require_agent_authored_contribution(&root, &identity, &base_oid, Some(&foreign)).is_err());
 
         // HEAD == base (no advancement) ⇒ refuse.
-        assert!(require_agent_authored_contribution(&root, &home, &identity, &base_oid, Some(&base_oid)).is_err());
+        assert!(require_agent_authored_contribution(&root, &identity, &base_oid, Some(&base_oid)).is_err());
         let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&home);
     }
 
     /// PATH-stripped proof (#55): drive the seller's LOCAL git legs (init, authorship gate,
@@ -945,14 +890,11 @@ mod tests {
     fn seller_gates_without_system_git() {
         use git2::{Repository, Signature};
         let workdir = temp("nogit-seller");
-        let home = temp("nogit-seller-home");
         let _ = fs::remove_dir_all(&workdir);
-        let _ = fs::remove_dir_all(&home);
-        fs::create_dir_all(&home).expect("home");
 
         let pk = "55".repeat(32);
         let identity = DeliveryAgentIdentity::for_seller(&pk);
-        init_empty_delivery_workdir(&workdir, &home, &identity).expect("init");
+        init_empty_delivery_workdir(&workdir, &identity).expect("init");
 
         // Agent-authored commit via git2 (no system git), stamped as the seller identity.
         let repo = Repository::open(&workdir).expect("open");
@@ -967,13 +909,12 @@ mod tests {
             .expect("git2 commit");
         let after = oid.to_string();
 
-        require_agent_authored_delivery(&workdir, &home, &identity, Some(&after))
+        require_agent_authored_delivery(&workdir, &identity, Some(&after))
             .expect("agent-authored delivery gate must pass under git2");
         point_branch_at_head(&workdir, "mobee/job").expect("branch-at-head");
-        assert_eq!(try_head_oid(&workdir, &home).expect("head"), after);
+        assert_eq!(try_head_oid(&workdir).expect("head"), after);
 
         let _ = fs::remove_dir_all(&workdir);
-        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -982,10 +923,7 @@ mod tests {
         // oid (that turns the oid into a pathspec → "not a commit ... cannot be created").
         // RED at 8253b70 (with the `--`); GREEN after removal.
         let root = temp("checkout-base");
-        let home = temp("checkout-base-home");
         let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&home);
-        fs::create_dir_all(&home).expect("home");
         init_repo(&root); // leaves a commit whose oid is present in root's object db
         let base_oid = {
             let out = Command::new("git")
@@ -996,7 +934,7 @@ mod tests {
             String::from_utf8(out.stdout).unwrap().trim().to_owned()
         };
 
-        checkout_base_branch(&root, &home, "mobee/contribution/job", &base_oid)
+        checkout_base_branch(&root, "mobee/contribution/job", &base_oid)
             .expect("checkout of a valid base_oid onto the fork branch must succeed");
 
         // Now on the per-job branch, pointing at base_oid.
@@ -1017,7 +955,6 @@ mod tests {
         assert_eq!(String::from_utf8(head.stdout).unwrap().trim(), base_oid);
 
         let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&home);
     }
 
 }
