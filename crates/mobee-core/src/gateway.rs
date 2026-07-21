@@ -357,13 +357,23 @@ pub fn parse_bound_git_delivery(
     Ok(delivery)
 }
 
-pub fn claim_draft(offer_id: &str, buyer_pubkey: &str, seller_pubkey: &str) -> EventDraft {
+/// Kind-7000 `status=processing` claim draft. PIECE-14 Job C: the claim carries the
+/// seller-authored NUT-18 payment request as a `["creq", "creqA…"]` tag — the claim *is*
+/// the invoice. Build `creq` with [`creq::build_seller_creq`]; buyers read it back with
+/// [`creq::parse_creq`].
+pub fn claim_draft(
+    offer_id: &str,
+    buyer_pubkey: &str,
+    seller_pubkey: &str,
+    creq: &str,
+) -> EventDraft {
     feedback_draft(
         "processing",
         vec![
             TagSpec::new(["e", offer_id]),
             TagSpec::new(["p", buyer_pubkey]),
             TagSpec::new(["p", seller_pubkey]),
+            TagSpec::new(["creq", creq]),
         ],
     )
 }
@@ -587,6 +597,110 @@ pub mod nostr {
     }
 }
 
+/// PIECE-14 Job C — the seller-authored NUT-18 payment request (`creq…`).
+///
+/// The party getting paid authors the payment terms: at claim time the seller builds a
+/// NUT-18 [`PaymentRequest`] (amount `a`, unit `u`, accepted mints `m`, a nostr transport
+/// to its own key, single-use `s`, no `nut10` locking condition) using the cashu crate's
+/// shipped `nut18` types, and attaches its `creqA…` `Display` as the claim's `["creq", …]`
+/// tag (see [`claim_draft`]). Buyers read it back with [`parse_creq`]. The encoding is never
+/// hand-rolled — CBOR/base64 and the `creqA` prefix come from cashu's `PaymentRequest`.
+#[cfg(feature = "wallet")]
+pub mod creq {
+    use std::fmt;
+    use std::str::FromStr;
+
+    use cashu::nuts::nut18::{PaymentRequest, PaymentRequestBuilder, Transport, TransportType};
+    use cashu::{CurrencyUnit, MintUrl};
+    use nostr_sdk::prelude::{Nip19Profile, ToBech32};
+    use nostr_sdk::PublicKey;
+
+    /// Failure building or parsing a claim `creq`.
+    #[derive(Debug)]
+    pub enum CreqError {
+        /// An `accepted_mints` entry is not a well-formed mint URL.
+        Mint(String),
+        /// The seller pubkey is not valid hex / not a valid key.
+        SellerKey(String),
+        /// Encoding the seller nprofile failed.
+        Nprofile(String),
+        /// Building the NUT-18 transport failed (missing required field).
+        Transport(&'static str),
+        /// The `creq` string did not parse as a NUT-18 payment request.
+        Parse(String),
+    }
+
+    impl fmt::Display for CreqError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Mint(m) => write!(f, "creq: invalid accepted mint url: {m}"),
+                Self::SellerKey(e) => write!(f, "creq: invalid seller pubkey: {e}"),
+                Self::Nprofile(e) => write!(f, "creq: nprofile encode failed: {e}"),
+                Self::Transport(e) => write!(f, "creq: transport build failed: {e}"),
+                Self::Parse(e) => write!(f, "creq: parse failed: {e}"),
+            }
+        }
+    }
+
+    impl std::error::Error for CreqError {}
+
+    /// Build the seller-authored NUT-18 payment request for a claim and return its `creqA…`
+    /// encoding for the claim's `["creq", …]` tag.
+    ///
+    /// - `payment_id` → NUT-18 `i` (the job/attempt id).
+    /// - `amount`/`unit` → `a`/`u`, copied from the offer.
+    /// - `accepted_mints` → `m`, the seller's own accepted-mint list (order preserved; the
+    ///   first entry is the seller's advertised default).
+    /// - `seller_pubkey_hex` → one nostr [`Transport`] whose target is the seller's `nprofile`
+    ///   with a `[["n","17"]]` NIP-17 tag.
+    ///
+    /// `s = true` (single-use: one claim, one payment) and no `nut10` locking condition is set
+    /// (payment is not coupled to a delivery/attestation condition — PIECE-14 § Metadata trust).
+    pub fn build_seller_creq(
+        payment_id: &str,
+        amount: u64,
+        unit: &str,
+        accepted_mints: &[String],
+        seller_pubkey_hex: &str,
+    ) -> Result<String, CreqError> {
+        // CurrencyUnit::from_str is infallible (unknown units fall back to Custom), so an
+        // offer unit always maps to a NUT-18 unit.
+        let unit = CurrencyUnit::from_str(unit).unwrap_or(CurrencyUnit::Custom(unit.to_owned()));
+        let mints = accepted_mints
+            .iter()
+            .map(|m| MintUrl::from_str(m).map_err(|e| CreqError::Mint(format!("{m}: {e}"))))
+            .collect::<Result<Vec<_>, _>>()?;
+        let seller_key =
+            PublicKey::from_hex(seller_pubkey_hex).map_err(|e| CreqError::SellerKey(e.to_string()))?;
+        // Empty relay list: the transport addresses the seller's key; relay hints are optional.
+        let nprofile = Nip19Profile::new(seller_key, [])
+            .to_bech32()
+            .map_err(|e| CreqError::Nprofile(e.to_string()))?;
+        let transport = Transport::builder()
+            .transport_type(TransportType::Nostr)
+            .target(nprofile)
+            .add_tag(vec!["n".to_string(), "17".to_string()])
+            .build()
+            .map_err(CreqError::Transport)?;
+        let request = PaymentRequestBuilder::default()
+            .payment_id(payment_id)
+            .amount(amount)
+            .unit(unit)
+            .single_use(true)
+            .mints(mints)
+            .add_transport(transport)
+            .build();
+        Ok(request.to_string())
+    }
+
+    /// Parse a claim's `creq` tag value back into a NUT-18 [`PaymentRequest`]. Accepts the
+    /// `creqA…` (CBOR) form emitted by [`build_seller_creq`]; `PaymentRequest::from_str` also
+    /// accepts the NUT-26 `creqB…` bech32 form.
+    pub fn parse_creq(tag_value: &str) -> Result<PaymentRequest, CreqError> {
+        PaymentRequest::from_str(tag_value).map_err(|e| CreqError::Parse(e.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,7 +814,7 @@ mod tests {
     #[test]
     fn claim_and_accept_use_kind_7000_status_tags() {
         assert_eq!(
-            claim_draft("offer", BUYER, SELLER),
+            claim_draft("offer", BUYER, SELLER, "creqAtest"),
             EventDraft::new(
                 JOB_FEEDBACK_KIND,
                 vec![
@@ -708,6 +822,7 @@ mod tests {
                     TagSpec::new(["e", "offer"]),
                     TagSpec::new(["p", BUYER]),
                     TagSpec::new(["p", SELLER]),
+                    TagSpec::new(["creq", "creqAtest"]),
                     TagSpec::new(["t", MOBEE_TAG]),
                     TagSpec::new(["v", PROTOCOL_VERSION]),
                 ],
@@ -932,5 +1047,98 @@ mod tests {
             tag.0.first().map(String::as_str) == Some(name)
                 && tag.0.get(index).map(String::as_str) == Some(value)
         })
+    }
+}
+
+/// PIECE-14 Job C — seller-authored `creq` in the claim. Gated on `wallet` because the
+/// `creq` builder uses cashu's `nut18` types (only linked under that feature).
+#[cfg(all(test, feature = "wallet"))]
+mod creq_tests {
+    use std::str::FromStr;
+
+    use cashu::nuts::nut18::TransportType;
+    use cashu::{Amount, CurrencyUnit, MintUrl};
+
+    use super::creq::{build_seller_creq, parse_creq};
+    use super::{claim_draft, TagSpec};
+
+    const MINT_A: &str = "https://testnut.cashudevkit.org";
+    const MINT_B: &str = "https://mint.example.com";
+
+    fn seller_hex() -> String {
+        nostr_sdk::Keys::generate().public_key().to_hex()
+    }
+
+    /// The claim carries a `creq` tag whose value starts with "creqA".
+    #[test]
+    fn claim_carries_creq() {
+        let seller = seller_hex();
+        let creq =
+            build_seller_creq("job-1", 21, "sat", &[MINT_A.to_string()], &seller).expect("build creq");
+        assert!(creq.starts_with("creqA"), "creq must start with creqA: {creq}");
+
+        let draft = claim_draft("job-1", "buyer-pubkey", &seller, &creq);
+        let creq_tag = draft
+            .tags
+            .iter()
+            .find(|tag| tag.first() == Some("creq"))
+            .expect("claim carries a creq tag");
+        assert_eq!(creq_tag.value(), Some(creq.as_str()));
+        assert!(creq_tag.value().unwrap().starts_with("creqA"));
+    }
+
+    /// Round-trip: `PaymentRequest::from_str(tag)` yields a=offer.amount, u=offer.unit,
+    /// m=accepted_mints (order preserved), one nostr transport to the seller, single-use, no nut10.
+    #[test]
+    fn creq_roundtrip() {
+        let seller = seller_hex();
+        let mints = vec![MINT_A.to_string(), MINT_B.to_string()];
+        let creq = build_seller_creq("attempt-9", 21, "sat", &mints, &seller).expect("build creq");
+
+        let request = parse_creq(&creq).expect("parse creq");
+        assert_eq!(request.payment_id.as_deref(), Some("attempt-9"));
+        assert_eq!(request.amount, Some(Amount::from(21)));
+        assert_eq!(request.unit, Some(CurrencyUnit::Sat));
+        assert_eq!(
+            request.mints,
+            vec![
+                MintUrl::from_str(MINT_A).unwrap(),
+                MintUrl::from_str(MINT_B).unwrap(),
+            ]
+        );
+        assert_eq!(request.single_use, Some(true));
+        assert!(request.nut10.is_none(), "no nut10 locking condition");
+
+        assert_eq!(request.transports.len(), 1, "exactly one transport");
+        let transport = &request.transports[0];
+        assert_eq!(transport._type, TransportType::Nostr);
+        assert!(
+            transport.target.starts_with("nprofile1"),
+            "transport target is the seller nprofile: {}",
+            transport.target
+        );
+        assert_eq!(
+            transport.tags,
+            vec![vec!["n".to_string(), "17".to_string()]],
+            "NIP-17 transport tag",
+        );
+    }
+
+    /// The `creq` tag is a stable round-trip through the claim draft: the exact string the
+    /// seller authored is what a buyer parses off the claim.
+    #[test]
+    fn claim_creq_tag_parses_back() {
+        let seller = seller_hex();
+        let creq =
+            build_seller_creq("job-7", 5, "sat", &[MINT_A.to_string()], &seller).expect("build creq");
+        let draft = claim_draft("job-7", "buyer", &seller, &creq);
+        let tag: &TagSpec = draft
+            .tags
+            .iter()
+            .find(|tag| tag.first() == Some("creq"))
+            .expect("creq tag");
+        let request = parse_creq(tag.value().unwrap()).expect("parse creq off claim");
+        assert_eq!(request.amount, Some(Amount::from(5)));
+        assert_eq!(request.mints, vec![MintUrl::from_str(MINT_A).unwrap()]);
     }
 }
