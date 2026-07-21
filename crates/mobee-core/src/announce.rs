@@ -51,8 +51,6 @@ pub struct AnnounceEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub claim_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub amount: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amount_received: Option<u64>,
@@ -62,10 +60,6 @@ pub struct AnnounceEvent {
     pub deadline_unix: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub git_remote: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,14 +85,11 @@ impl AnnounceEvent {
             job_id: None,
             buyer_pubkey: None,
             result_id: None,
-            claim_id: None,
             amount: None,
             amount_received: None,
             expected: None,
             deadline_unix: None,
             commit: None,
-            git_remote: None,
-            branch: None,
             mint: None,
             relay: None,
             nip42: None,
@@ -125,14 +116,12 @@ impl AnnounceEvent {
         job_id: &str,
         buyer_pubkey: &str,
         amount: u64,
-        claim_id: &str,
         deadline_unix: u64,
     ) -> Self {
         let mut event = Self::base("claimed", ts, seller_pubkey);
         event.job_id = Some(job_id.to_owned());
         event.buyer_pubkey = Some(buyer_pubkey.to_owned());
         event.amount = Some(amount);
-        event.claim_id = Some(claim_id.to_owned());
         event.deadline_unix = Some(deadline_unix);
         event
     }
@@ -144,16 +133,12 @@ impl AnnounceEvent {
         job_id: &str,
         result_id: &str,
         commit: &str,
-        git_remote: &str,
-        branch: &str,
         amount: u64,
     ) -> Self {
         let mut event = Self::base("delivered", ts, seller_pubkey);
         event.job_id = Some(job_id.to_owned());
         event.result_id = Some(result_id.to_owned());
         event.commit = Some(commit.to_owned());
-        event.git_remote = Some(git_remote.to_owned());
-        event.branch = Some(branch.to_owned());
         event.amount = Some(amount);
         event
     }
@@ -323,12 +308,11 @@ mod tests {
 
     #[test]
     fn claimed_carries_the_claim_facts() {
-        let v = parse(&AnnounceEvent::claimed(10, "sk", "job1", "buyer1", 42, "claim1", 999).to_json());
+        let v = parse(&AnnounceEvent::claimed(10, "sk", "job1", "buyer1", 42, 999).to_json());
         assert_eq!(v["event"], "claimed");
         assert_eq!(v["job_id"], "job1");
         assert_eq!(v["buyer_pubkey"], "buyer1");
         assert_eq!(v["amount"], 42);
-        assert_eq!(v["claim_id"], "claim1");
         assert_eq!(v["deadline_unix"], 999);
         // Fields owned by other transitions are absent (not null-filled).
         assert!(v.get("result_id").is_none());
@@ -337,15 +321,10 @@ mod tests {
 
     #[test]
     fn delivered_carries_the_delivery_facts() {
-        let v = parse(
-            &AnnounceEvent::delivered(11, "sk", "job1", "res1", "abc123", "https://g/r.git", "mobee/ab", 42)
-                .to_json(),
-        );
+        let v = parse(&AnnounceEvent::delivered(11, "sk", "job1", "res1", "abc123", 42).to_json());
         assert_eq!(v["event"], "delivered");
         assert_eq!(v["result_id"], "res1");
         assert_eq!(v["commit"], "abc123");
-        assert_eq!(v["git_remote"], "https://g/r.git");
-        assert_eq!(v["branch"], "mobee/ab");
         assert_eq!(v["amount"], 42);
     }
 
@@ -400,8 +379,8 @@ mod tests {
         let out = unique_tmp("capture");
         let command = vec!["tee".to_owned(), "-a".to_owned(), out.display().to_string()];
         let timeout = Duration::from_secs(5);
-        dispatch(&command, timeout, &AnnounceEvent::claimed(1, "sk", "j1", "b1", 5, "c1", 100));
-        dispatch(&command, timeout, &AnnounceEvent::delivered(2, "sk", "j1", "r1", "oid", "rem", "br", 5));
+        dispatch(&command, timeout, &AnnounceEvent::claimed(1, "sk", "j1", "b1", 5, 100));
+        dispatch(&command, timeout, &AnnounceEvent::delivered(2, "sk", "j1", "r1", "oid", 5));
         dispatch(&command, timeout, &AnnounceEvent::refused(3, "sk", "j2", "RateGate", "too cheap", Some(1)));
 
         // Wait (bounded) for all three detached sinks to land their line.
