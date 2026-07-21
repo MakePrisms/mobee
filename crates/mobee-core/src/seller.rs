@@ -1,10 +1,10 @@
-//! Seller daemon primitives: rate-gate, journal (pay-once), ★1059 unwrap, pay bind.
+//! Seller daemon primitives: rate-gate, journal (pay-once), gift-wrap (kind-1059) unwrap, pay bind.
 //!
-//! Shape-locked (Scribe SoT + Temper B1/B2):
+//! Invariants:
 //! - `rate_sats` is CLAIM-FLOOR only (`offer.amount ≥ rate_sats`)
-//! - receive asserts `Amount == offer.amount` via lifted `terms_for_offer`
+//! - receive asserts `Amount == offer.amount` via `terms_for_offer`
 //! - bind `job_id`(+`result_id`) before journaling; wrong-job → refuse
-//! - ★1059: unwrap ONLY `p-tag==self`, exactly ONE decode site, never log plaintext
+//! - gift-wrap (kind-1059): unwrap ONLY `p-tag==self`, exactly ONE decode site, never log plaintext
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -74,7 +74,7 @@ pub fn require_seller_config(home: &MobeeHome) -> Result<&SellerConfig, SellerEr
     Ok(seller)
 }
 
-/// B1 claim-floor: targeted-to-self AND `offer.amount ≥ rate_sats`.
+/// Claim-floor: targeted-to-self AND `offer.amount ≥ rate_sats`.
 ///
 /// Untargeted/open offers refuse by default. Pass `claim_open_pool = true` (explicit
 /// seller opt-in) to allow untargeted offers that still clear the rate floor.
@@ -363,7 +363,7 @@ impl SellerJournal {
         })
     }
 
-    /// B2: bind payload job_id(+result_id) to the local claim/result BEFORE journaling.
+    /// Bind payload job_id(+result_id) to the local claim/result BEFORE journaling.
     pub fn append_receipt(
         &self,
         local_job_id: &str,
@@ -510,7 +510,7 @@ pub fn sign_receipt_hash(
         .to_string())
 }
 
-/// ★1059 ONE decode site: unwrap gift-wrap ONLY when `p-tag==self`.
+/// Kind-1059 gift-wrap: the ONE decode site — unwrap ONLY when `p-tag==self`.
 ///
 /// Returns `Ok(None)` when the wrap is not addressed to us or fails decrypt (not an error —
 /// other parties' envelopes stay dark). Decrypted contents are NEVER logged.
@@ -525,7 +525,7 @@ pub async fn unwrap_own_payment_gift_wrap(
         return Ok(None);
     }
     let self_pk = keys.public_key();
-    // ★1059 condition: p-tag == self only (exact ONE decode site below).
+    // Kind-1059 condition: p-tag == self only (exact ONE decode site below).
     let addressed_to_self = event.tags.iter().any(|tag| {
         let slice = tag.as_slice();
         slice.first().map(String::as_str) == Some("p")

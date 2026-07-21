@@ -15,7 +15,7 @@
 //!
 //! The cap check itself is **check-then-append** across processes: two buyers that
 //! fold-then-append in a tight interleave can each pass a check that their combined
-//! spend would exceed. This benign TOCTOU is accepted for now — the wallet balance is
+//! spend would exceed. This benign TOCTOU is acceptable — the wallet balance is
 //! the hard resource bound; the ledger is an accounting record, not the spend guard.
 //!
 //! When keyed by `attempt_id`, spent is **idempotent**: a reconciled retry of the

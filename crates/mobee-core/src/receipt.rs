@@ -174,7 +174,7 @@ mod tests {
 
         assert_eq!(base.digest_hex().len(), 64);
         assert_ne!(base.digest_hex(), other_hash.digest_hex());
-        // Same 40-hex, different kind ⇒ different signed digest (D4 non-forgeable path).
+        // Same 40-hex, different kind ⇒ different signed digest (kind is bound in, so non-forgeable).
         assert_ne!(base.digest_hex(), other_kind.digest_hex());
     }
 

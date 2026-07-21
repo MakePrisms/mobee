@@ -529,7 +529,7 @@ pub fn creq_hash_hex(creq: &str) -> String {
 
 /// Buyer-authored kind-3400 receipt draft. Fixed tag order + a pinned `created_at` at the
 /// event-build site give a deterministic event id (idempotent republish). `delivery` adds
-/// the D4 binding tags; `exec_metadata` appends the buyer's filtered echo (may be empty —
+/// the delivery binding tags; `exec_metadata` appends the buyer's filtered echo (may be empty —
 /// seller-claimed, NOT covered by the co-signatures). `creq_hash` is the seller-authored
 /// request hash bound into the co-signed preimage; `None` for a claim that carries no `creq`.
 pub fn receipt_draft(
@@ -928,7 +928,7 @@ mod tests {
         );
         assert!(has_tag_value_at(&receipt.tags, "sig", 1, "seller"));
         assert!(has_tag_value_at(&receipt.tags, "sig", 1, "buyer"));
-        // No delivery binding requested ⇒ absent (legacy-shaped receipt).
+        // No delivery binding requested ⇒ the binding tags are absent from the receipt.
         assert!(first_tag(&receipt.tags, "delivery_integrity_hash").is_none());
     }
 
@@ -959,7 +959,7 @@ mod tests {
         );
         // A bound creq surfaces as a `creq-hash` tag on the receipt event.
         assert!(has_tag_value(&receipt.tags, "creq-hash", &"cc".repeat(32)));
-        // D4 delivery binding present and typed.
+        // Delivery binding present and typed.
         assert!(has_tag_value(
             &receipt.tags,
             "delivery_integrity_hash",
