@@ -202,6 +202,49 @@ pub fn default_announce_timeout_ms() -> u64 {
     2000
 }
 
+/// `[seller_heartbeat]` — cadence + enablement for the addressable kind-30340 liveness event
+/// (PIECE-14 § Heartbeat). **Feature ON by default**: a running seller advertises liveness every
+/// [`interval_secs`](SellerHeartbeatConfig::interval_secs) seconds. The heartbeat is
+/// diagnostic/discovery context only — publish failures log-and-continue and it never blocks the
+/// job loop, feeds the pay gate, or binds a receipt. Tests can override the cadence/enablement
+/// via [`crate::heartbeat::HEARTBEAT_INTERVAL_ENV`] / [`crate::heartbeat::HEARTBEAT_ENABLED_ENV`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SellerHeartbeatConfig {
+    /// Publish heartbeats while the daemon runs. Default **true**.
+    #[serde(default = "default_heartbeat_enabled")]
+    pub enabled: bool,
+    /// Cadence in seconds. Default **300** (~5 min).
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for SellerHeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_heartbeat_enabled(),
+            interval_secs: default_heartbeat_interval_secs(),
+        }
+    }
+}
+
+impl SellerHeartbeatConfig {
+    /// True when every field is at its shipped default (so config.toml stays clean — the section
+    /// only serializes once an operator sets a non-default knob).
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// serde default for [`SellerHeartbeatConfig::enabled`] — heartbeats ON.
+pub fn default_heartbeat_enabled() -> bool {
+    true
+}
+
+/// serde default for [`SellerHeartbeatConfig::interval_secs`] — 300s (~5 min).
+pub fn default_heartbeat_interval_secs() -> u64 {
+    300
+}
+
 impl SellerMemoryConfig {
     /// True when every field is at its shipped default (so config.toml stays clean — the section
     /// is only serialized once an operator sets a non-default knob).
@@ -349,6 +392,9 @@ pub struct MobeeConfig {
     /// `[seller_announce]` lifecycle-event sink config. Defaults (feature OFF) when absent.
     #[serde(default, skip_serializing_if = "SellerAnnounceConfig::is_default")]
     pub seller_announce: SellerAnnounceConfig,
+    /// `[seller_heartbeat]` addressable kind-30340 liveness config. Defaults (ON, 300s) when absent.
+    #[serde(default, skip_serializing_if = "SellerHeartbeatConfig::is_default")]
+    pub seller_heartbeat: SellerHeartbeatConfig,
     /// Optional buyer-side piece-10 contribution content policy (the MUST-5 policy hook). Absent
     /// ⇒ the FLOOR (refuse only empty diffs). Present ⇒ tighten pre-pay with a path allowlist /
     /// forbidden paths / max diff size.
@@ -404,6 +450,7 @@ impl Default for MobeeConfig {
             agents: BTreeMap::new(),
             seller_memory: SellerMemoryConfig::default(),
             seller_announce: SellerAnnounceConfig::default(),
+            seller_heartbeat: SellerHeartbeatConfig::default(),
             contribution: None,
         }
     }
