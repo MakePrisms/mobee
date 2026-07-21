@@ -111,19 +111,29 @@ pub struct ContributionBase {
 }
 
 impl ContributionBase {
-    /// Validate: branch non-empty (no leading `-` / control bytes), `oid` a full 40/64-hex git oid.
+    /// Validate: branch non-empty (no leading `-` / control bytes), `base_oid` EXACTLY 40 lowercase
+    /// hex chars — a canonical git sha1 commit oid (issue #54).
+    ///
+    /// Strict and canonical, refusing fail-closed: mobee repos are sha1 (40-hex), so a 64-hex
+    /// (sha256) oid can never resolve — accepting one lets a seller claim an offer it can only fail
+    /// at checkout (the #54 bug). Uppercase is refused rather than silently normalized so the oid
+    /// published on the wire is byte-identical to what the seller's `rev-parse`/verify produces.
     pub fn new(branch: impl Into<String>, oid: impl Into<String>) -> Result<Self, ContributionError> {
         let branch = branch.into().trim().to_owned();
-        let oid = oid.into().trim().to_ascii_lowercase();
+        let oid = oid.into().trim().to_owned();
         if branch.is_empty()
             || branch.starts_with('-')
             || branch.bytes().any(|b| b.is_ascii_control())
         {
             return Err(ContributionError::MalformedBase("base branch is invalid".into()));
         }
-        if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let is_canonical_sha1 = oid.len() == 40
+            && oid
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !is_canonical_sha1 {
             return Err(ContributionError::MalformedBase(
-                "base oid must be 40 or 64 hex chars".into(),
+                "base_oid must be exactly 40 lowercase hex chars (a git sha1 commit oid)".into(),
             ));
         }
         Ok(Self { branch, oid })
@@ -578,7 +588,31 @@ mod tests {
         assert!(ContributionBase::new("main", "abc").is_err());
         assert!(ContributionBase::new("main", "z".repeat(40)).is_err());
         assert!(ContributionBase::new("-x", "a".repeat(40)).is_err());
-        assert!(ContributionBase::new("main", "A".repeat(40)).is_ok());
+        assert!(ContributionBase::new("main", "a".repeat(40)).is_ok());
+    }
+
+    // Issue #54: base_oid must be EXACTLY 40 lowercase hex — refuse the malformed shapes that let a
+    // seller claim an offer it can only fail at checkout (a 64-hex sha256 oid, a short oid), and
+    // refuse uppercase rather than normalizing it (the wire oid must match the seller's rev-parse).
+    #[test]
+    fn base_oid_requires_exactly_40_lowercase_hex() {
+        // 64-hex (sha256) refused — mobee repos are sha1, so it can never resolve.
+        let err = ContributionBase::new("main", "a".repeat(64)).expect_err("64-hex must refuse");
+        assert!(
+            matches!(&err, ContributionError::MalformedBase(m) if m.contains("base_oid")),
+            "refusal must name the base_oid field: {err:?}"
+        );
+        // 39-hex (short) refused.
+        assert!(ContributionBase::new("main", "a".repeat(39)).is_err());
+        // 41-hex (long) refused.
+        assert!(ContributionBase::new("main", "a".repeat(41)).is_err());
+        // Uppercase refused (not silently lowercased).
+        assert!(ContributionBase::new("main", "A".repeat(40)).is_err());
+        assert!(ContributionBase::new("main", "deadBEEF".to_owned() + &"a".repeat(32)).is_err());
+        // Valid canonical 40 lowercase hex passes, unchanged on the way through.
+        let ok = ContributionBase::new("main", "0123456789abcdef".to_owned() + &"a".repeat(24))
+            .expect("canonical 40 lowercase hex must pass");
+        assert_eq!(ok.oid().len(), 40);
     }
 
     #[test]

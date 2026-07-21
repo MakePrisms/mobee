@@ -229,7 +229,7 @@ fn tools() -> Value {
                     },
                     "base_oid": {
                         "type": "string",
-                        "description": "Contribution mode: exact base commit oid (40 or 64 hex) the contribution must descend from. Requires target_repo_owner + target_repo_url + base_branch."
+                        "description": "Contribution mode: exact base commit oid (40 lowercase hex, a git sha1 commit oid) the contribution must descend from. Requires target_repo_owner + target_repo_url + base_branch."
                     },
                     "accepts": {
                         "type": "array",
