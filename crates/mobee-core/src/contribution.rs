@@ -6,7 +6,7 @@
 //! **descend** from `base_oid`. The buyer verify-path (ALL pre-pay, ALL against buyer-controlled
 //! inputs) fetches the fork tip into custody, resolves `base_oid` **from the PIN** (never the
 //! seller echo), and asserts descendant + tip-match + **seller-signed tuple authorship** +
-//! content-gate + echo-equality *before* the existing `Delivery::Commit` money bind pays the
+//! content-gate + echo-equality *before* the existing fork-tip commit money bind pays the
 //! fork-tip `commit_oid`. Then the buyer merges the **custodied local oid** (custody-retention: a
 //! fork moved/deleted post-accept cannot strand the buyer).
 //!
@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 /// `job-class` tag value marking a contribution offer. Absent ⇒ from-scratch (back-compat).
 pub const JOB_CLASS_CONTRIBUTION: &str = "contribution";
 
-/// Only seller path shipped in v1 (`accepts=fork`; `Delivery::Commit`). Patch = deferred `Tree`.
+/// Only seller path shipped in v1 (`accepts=fork`).
 pub const ACCEPTS_FORK: &str = "fork";
 
 /// Domain separator for the seller's signed-result authorship tuple. DISTINCT from the
@@ -155,7 +155,7 @@ impl ContributionBase {
 
 /// The seller's fork **repo + branch** in the seller's own relay-git namespace (what the buyer
 /// custody-fetches and later merges). The fork tip `commit_oid` rides the existing result
-/// `commit` tag / `Delivery::Commit`.
+/// `commit` tag.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForkRef {
     repo: String,
@@ -186,7 +186,7 @@ impl ForkRef {
         &self.branch
     }
 
-    /// A per-job unique custody/push ref carrying the **FULL** `job_id` (MUST-6). The
+    /// A per-job unique custody/push ref carrying the **FULL** `job_id`. The
     /// `mobee/<job_id[:8]>` prefix collides — a real field collision already occurred between two
     /// sellers sharing a remote — so the full id + owner-scoped namespaces is the shape.
     pub fn unique_branch(job_id: &str) -> String {
@@ -204,13 +204,13 @@ pub struct ContributionOffer {
 }
 
 impl ContributionOffer {
-    /// True when the offer accepts the fork (`Delivery::Commit`) path.
+    /// True when the offer accepts the fork path.
     pub fn accepts_fork(&self) -> bool {
         self.accepts.iter().any(|a| a == ACCEPTS_FORK)
     }
 }
 
-/// The tuple the seller commits to in its schnorr-signed result-kind result (MUST-3). The seller's
+/// The tuple the seller commits to in its schnorr-signed result-kind result. The seller's
 /// own signature cryptographically ties `seller_pubkey → this job_id → this exact commit_oid`
 /// against the pinned target + base + fork, so it **cannot be paid for a third party's commit**.
 /// A git commit trailer is optional provenance only — NEVER this bind.
@@ -377,7 +377,7 @@ pub enum ContributionError {
     /// Result echoed a `{target_repo|base_oid|fork_ref}` that disagrees with the buyer's signed
     /// offer / accept-bind (MUST-4 equality-check; cross-check input, never authority).
     EchoMismatch(String),
-    /// The seller-signed authorship tuple signature did not verify (MUST-3).
+    /// The seller-signed authorship tuple signature did not verify.
     Authorship(String),
     /// The seller-signed tuple was absent on a contribution result.
     MissingAuthorship,
@@ -534,7 +534,7 @@ mod schnorr {
     use nostr_sdk::{Keys, PublicKey as NostrPublicKey};
 
     /// Seller-side: schnorr-sign the authorship tuple digest with the seller key (hex). This is the
-    /// `sig/seller-contribution` value; the buyer verifies it at the pre-pay seam (MUST-3).
+    /// `sig/seller-contribution` value; the buyer verifies it at the pre-pay seam.
     pub fn sign_authorship_tuple(keys: &Keys, tuple: &AuthorshipTuple) -> String {
         keys.sign_schnorr(&Message::from_digest(tuple.digest_bytes()))
             .to_string()

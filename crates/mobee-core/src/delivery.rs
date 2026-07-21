@@ -138,7 +138,7 @@ pub enum DeliveryError {
         actual: CommitOid,
     },
     MissingCommitObject,
-    /// Contribution (piece-10): `base_oid` is not present in the PINNED target (base-from-pin
+    /// Contribution: `base_oid` is not present in the PINNED target (base-from-pin
     /// fetch produced no such object). Fail-closed — the buyer never bases against a value it
     /// could not resolve from its own signed offer's target.
     MissingBaseObject,

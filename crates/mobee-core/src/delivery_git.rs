@@ -117,10 +117,10 @@ impl GitDeliveryVerifier {
             .map_err(|_| DeliveryError::MissingCommitObject)
     }
 
-    /// Contribution (MUST-2): fetch `base_oid` from the **pinned target** clone URL into the SAME
+    /// Contribution: fetch `base_oid` from the **pinned target** clone URL into the SAME
     /// custody odb, then prove `base_oid` is present in that target — fail-closed if absent.
     ///
-    /// FETCH DEPTH (build-item i): this is a FULL fetch of the base branch (no depth limit), so
+    /// FETCH DEPTH: this is a FULL fetch of the base branch (no depth limit), so
     /// `base_oid` and the ancestry chain up to the fork tip are all in custody. A shallow / tip-only
     /// fetch would make the later descendant gate FALSE-REFUSE an honest deep contribution.
     fn fetch_base(
@@ -142,7 +142,7 @@ impl GitDeliveryVerifier {
             .map_err(|_| DeliveryError::MissingBaseObject)
     }
 
-    /// Contribution (MUST-2): refuse unless `commit_oid` descends from `base_oid`, in-process via
+    /// Contribution: refuse unless `commit_oid` descends from `base_oid`, in-process via
     /// `graph_descendant_of`. Equal oids count as ancestor (parity with `merge-base --is-ancestor`,
     /// exit 0) — the empty diff is then refused by the content gate. Both oids must be in custody.
     fn assert_descendant(
@@ -166,7 +166,7 @@ impl GitDeliveryVerifier {
         }
     }
 
-    /// Contribution (MUST-5): the changed paths of the fork-vs-base diff, computed by the BUYER in
+    /// Contribution: the changed paths of the fork-vs-base diff, computed by the BUYER in
     /// custody (never trusted from the seller). `bytes` per path is the numstat churn
     /// (added+deleted lines; binary files count as 1) — a deterministic size proxy for the policy
     /// cap. An empty result means an empty diff (the content-gate floor refuses it).
@@ -265,7 +265,7 @@ fn Reference_is_valid_branch(branch: &str) -> bool {
 
 /// Proof that a contribution fork tip is in buyer custody AND descends from the pinned base, with
 /// the content gate satisfied. Carries the LOCAL custody ref so the merge step operates on the
-/// custodied oid, never the live fork branch (custody-retention, MUST-6).
+/// custodied oid, never the live fork branch (custody-retention).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedContribution {
     verified: VerifiedDelivery,
@@ -327,15 +327,15 @@ impl PayPathDeliveryVerifier {
         self.inner.inner().repository()
     }
 
-    /// The buyer-controlled custody ref a fork tip is retained under (MUST-6 custody-retention).
+    /// The buyer-controlled custody ref a fork tip is retained under (custody-retention).
     pub fn custody_ref_for(commit_oid: &str) -> String {
         format!("refs/mobee/deliveries/{commit_oid}")
     }
 
-    /// Contribution (piece-10) buyer verify-path — the ONE state machine, ALL pre-pay, ALL against
+    /// Contribution buyer verify-path — the ONE state machine, ALL pre-pay, ALL against
     /// BUYER-CONTROLLED inputs (`fork` = the delivered object; `base_*` come from the buyer's
     /// SIGNED offer pin, NEVER the seller echo). In order:
-    ///   1. custody fetch the fork tip + tip-match (existing `Delivery::Commit` verify, allowlisted);
+    ///   1. custody fetch the fork tip + tip-match (allowlisted);
     ///   2. base-from-pin: fetch `base_oid` from the PINNED target clone URL into the same custody
     ///      odb (allowlisted) — fail-closed if absent from the pinned target;
     ///   3. descendant gate: `commit_oid` must descend from `base_oid`;

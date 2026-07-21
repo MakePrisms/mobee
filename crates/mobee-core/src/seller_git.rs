@@ -155,9 +155,9 @@ fn init_repo_with_identity(
     Ok(repo)
 }
 
-/// Contribution (piece-10) fork-from-base: initialise `workdir` as a working clone of the PINNED
+/// Contribution fork-from-base: initialise `workdir` as a working clone of the PINNED
 /// target `base_clone_url` at `base_oid`, on a per-job unique `branch` carrying the FULL job_id
-/// (MUST-6). The agent then commits its work on top; the daemon pushes `branch` to the seller's OWN
+///. The agent then commits its work on top; the daemon pushes `branch` to the seller's OWN
 /// relay-git namespace. Transport-allowlisted (https + relay-git; `ext::`/file/ssh refused).
 ///
 /// FULL-depth fetch (no depth limit) so the fork carries `base_oid` + ancestry — a shallow fork
@@ -230,7 +230,7 @@ pub fn point_branch_at_head(workdir: &Path, branch: &str) -> Result<(), SellerGi
     Ok(())
 }
 
-/// Contribution authorship gate (piece-10): deliver IFF every commit in `base_oid..HEAD` is
+/// Contribution authorship gate: deliver IFF every commit in `base_oid..HEAD` is
 /// agent-authored, HEAD advanced past `base_oid`, and the HEAD tree is non-empty. Returns the HEAD
 /// oid on success.
 pub fn require_agent_authored_contribution(
@@ -811,7 +811,7 @@ mod tests {
         let _ = fs::remove_dir_all(&workdir);
     }
 
-    // ── Piece-10 fork-from-base: allowlist + range-scoped authorship gate ──────────────────────
+    // ── Fork-from-base: allowlist + range-scoped authorship gate ──────────────────────
     fn commit_as(dir: &Path, name: &str, email: &str, path: &str, content: &str, msg: &str) -> String {
         let full = dir.join(path);
         if let Some(parent) = full.parent() {
@@ -911,9 +911,8 @@ mod tests {
 
     #[test]
     fn checkout_base_branch_from_oid_creates_fork_tip() {
-        // Bug-1 regression: `git checkout -B <branch> <oid>` must NOT pass `--` before the
-        // oid (that turns the oid into a pathspec → "not a commit ... cannot be created").
-        // RED at 8253b70 (with the `--`); GREEN after removal.
+        // `git checkout -B <branch> <oid>` must NOT pass `--` before the oid (that turns the
+        // oid into a pathspec → "not a commit ... cannot be created").
         let root = temp("checkout-base");
         let _ = fs::remove_dir_all(&root);
         init_repo(&root); // leaves a commit whose oid is present in root's object db

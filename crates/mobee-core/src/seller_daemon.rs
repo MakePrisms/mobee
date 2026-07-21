@@ -37,9 +37,9 @@ use crate::seller::{
 };
 use crate::seller_git::{self, SellerGitError};
 
-/// In-flight single-flight lock for v1 (one job in the PROCESSING phase per process).
+/// In-flight single-flight lock (one job in the PROCESSING phase per process).
 /// Held from claim through delivery (result-kind), then released — a delivered-but-unpaid
-/// job awaiting payment does NOT hold this lock (piece-11 #15 fix).
+/// job awaiting payment does NOT hold this lock.
 static FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Upper bound on delivered-but-unpaid jobs tracked concurrently (bounded memory).
@@ -184,16 +184,16 @@ pub struct ActiveJob {
     pub result_id: Option<String>,
     pub deadline_unix: u64,
     pub workdir: PathBuf,
-    /// Piece-10: the parsed contribution offer (target pin + base + accepts) when this is a
+    /// The parsed contribution offer (target pin + base + accepts) when this is a
     /// contribution job; `None` ⇒ from-scratch (empty-base delivery).
     pub contribution: Option<ContributionOffer>,
-    /// Piece-13: delivery facts captured at successful result-kind publish, carried through
+    /// Delivery facts captured at successful result-kind publish, carried through
     /// `mark_delivered` so the terminal episode (paid at receipt, or unpaid at eviction) is a
     /// single complete append. `None` until the job delivers. Diagnostic only — never money state.
     pub delivery: Option<DeliveryRecord>,
 }
 
-/// Piece-13: the delivery-time facts an [`Episode`] needs, captured once at result-kind publish.
+/// The delivery-time facts an [`Episode`] needs, captured once at result-kind publish.
 /// Stashed on the [`ActiveJob`] so the (possibly later) paid/unpaid terminal writes one complete
 /// episode without re-deriving anything on the money path.
 #[derive(Debug, Clone)]
@@ -255,12 +255,12 @@ pub struct ClaimIntent {
     pub buyer_pubkey: String,
     pub offer: ParsedOffer,
     pub deadline_unix: u64,
-    /// Piece-10 parsed contribution offer, threaded into the active job.
+    /// Parsed contribution offer, threaded into the active job.
     pub contribution: Option<ContributionOffer>,
 }
 
 /// Enumerated reasons an offer is not claimed. Every variant maps to a logged reason —
-/// there is no silent-drop path (piece-11 #15).
+/// there is no silent-drop path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OfferSkip {
     /// Event is not a offer-kind offer.
@@ -282,17 +282,17 @@ pub enum OfferSkip {
     ProcessingBusy { job_id: String },
     /// Too many delivered-but-unpaid jobs pending payment (bounded-memory back-pressure).
     AwaitingPaymentFull { capacity: usize },
-    /// Piece-10: a `job-class=contribution` offer arrived but this seller has contribution support
+    /// A `job-class=contribution` offer arrived but this seller has contribution support
     /// disabled (`contribution_enabled=false`). Emits a feedback-kind error (interop courtesy) instead
     /// of running it as from-scratch.
     ContributionUnsupported,
-    /// Piece-10: a `job-class=contribution` offer whose target-repo/base pins are malformed —
+    /// A `job-class=contribution` offer whose target-repo/base pins are malformed —
     /// refused (fail-closed; never run as from-scratch). Emits a feedback-kind error.
     ContributionMalformed { reason: String },
 }
 
 impl OfferSkip {
-    /// Machine-mappable variant name (piece-13 `refusal_reason_code`). Stable enumerated set.
+    /// Machine-mappable variant name (`refusal_reason_code`). Stable enumerated set.
     pub fn code(&self) -> &'static str {
         match self {
             Self::NotAnOffer { .. } => "NotAnOffer",
@@ -448,7 +448,7 @@ impl SellerDaemon {
         let intent = match self.classify_offer(event, now)? {
             OfferDisposition::Skip(skip) => {
                 eprintln!("seller skip offer {}: {}", event.id.to_hex(), skip.reason());
-                // Piece-13: durable refusal capture (previously eprintln-only). Best-effort —
+                // Durable refusal capture (previously eprintln-only). Best-effort —
                 // an episode write never affects the skip decision or the money path.
                 self.record_refused_episode(event, &skip);
                 // Announce the refusal (with its machine-readable reason code). Skip the same two
@@ -474,7 +474,7 @@ impl SellerDaemon {
                 if let OfferSkip::RateGate { reason } = &skip {
                     self.publish_under_rate_error_if_targeted(event, reason).await;
                 }
-                // Piece-10 interop courtesy: a seller that cannot/​will not handle a contribution
+                // Interop courtesy: a seller that cannot/​will not handle a contribution
                 // offer emits a feedback-kind `status=error` so the buyer does not wait on a delivery
                 // that will never come. NOT a security control — buyer refusal is the boundary.
                 if matches!(
@@ -504,7 +504,7 @@ impl SellerDaemon {
             return Ok(None);
         }
 
-        // PIECE-14 Job C: the seller authors the claim's payment terms as a NUT-18 payment
+        // The seller authors the claim's payment terms as a NUT-18 payment
         // request (`creq…`) — accepted mints from its OWN config (not the offer), amount/unit
         // copied from the offer, single-use, addressed to the seller's key. The claim is the
         // invoice; the buyer satisfies this `creq`.
@@ -535,7 +535,7 @@ impl SellerDaemon {
             }
         };
         // Journal the CLAIMED transition WITH the deadline/claim_id/buyer so a restart can
-        // reconcile this claim without the relay (piece-11 restart-reconcile).
+        // reconcile this claim without the relay (restart-reconcile).
         if let Err(error) = self.journal.append_claim(
             &intent.job_id,
             &claim_id,
@@ -588,7 +588,7 @@ impl SellerDaemon {
     ///
     /// `now` is injected so the deadline is a pure function of inputs. Single-flight is
     /// enforced ONLY for the PROCESSING slot (`self.active`): a delivered-but-unpaid job
-    /// in `awaiting_payment` does not block (piece-11 #15 silent-drop fix).
+    /// in `awaiting_payment` does not block (silent-drop fix).
     fn classify_offer(
         &self,
         event: &nostr_sdk::Event,
@@ -604,7 +604,7 @@ impl SellerDaemon {
             Ok(offer) => offer,
             Err(_) => return Ok(OfferDisposition::Skip(OfferSkip::Unparseable)),
         };
-        // PIECE-14 Job B: the offer no longer names a mint that the seller must match — the
+        // The offer no longer names a mint that the seller must match — the
         // seller's `accepted_mints` are asserted later against the *paid* token (redeem guard),
         // so there is nothing to gate here. (`offer.mint_url` stays present and readable until
         // Jobs D/E re-point the remaining reads.)
@@ -625,7 +625,7 @@ impl SellerDaemon {
             }));
         }
         let seller_cfg = require_seller_config(&self.home)?;
-        // Piece-10: parse the contribution class. A malformed contribution offer is REFUSED
+        // Parse the contribution class. A malformed contribution offer is REFUSED
         // (fail-closed, never run from-scratch); a contribution offer to a seller with support
         // disabled is refused as an interop courtesy. Both emit a feedback-kind in `on_offer_event`.
         let contribution = match crate::contribution::parse_contribution_offer(&draft.tags) {
@@ -808,7 +808,7 @@ impl SellerDaemon {
                     "seller drop awaiting-payment job_id={} (backlog cap {AWAITING_PAYMENT_CAP})",
                     dropped.job_id
                 );
-                // Piece-13: delivered-but-UNPAID terminal (backpressure eviction). Best-effort.
+                // Delivered-but-UNPAID terminal (backpressure eviction). Best-effort.
                 self.record_delivered_unpaid_episode(&dropped);
             }
         }
@@ -1153,7 +1153,7 @@ impl SellerDaemon {
             .expect("awaiting-payment job always carries a result_id");
         let expected_amount = job.offer.amount;
         let offer = job.offer.clone();
-        // PIECE-14 Job E: the redeem terms + all money-path records (redeem log / journal receipt /
+        // The redeem terms + all money-path records (redeem log / journal receipt /
         // announce) key off the REALIZED mint the buyer actually paid at (the NUT-18 payload's
         // `mint`), not the seller default. The redeem guard below refuses unless that mint is one
         // the seller advertised in its creq.
@@ -1170,7 +1170,7 @@ impl SellerDaemon {
         }
 
         let buyer = received.buyer_pubkey.to_hex();
-        // PIECE-14 Job E redeem guard: the paid token's mint must be one the seller advertised
+        // Redeem guard: the paid token's mint must be one the seller advertised
         // (`∈ accepted_mints`) AND equal the payload's declared mint. Build the accepted set from
         // the seller's OWN config (the same list authored into the creq `m`), pin the terms to the
         // realized mint, and hand both to the receive guard.
@@ -1218,7 +1218,7 @@ impl SellerDaemon {
             true,
         )?;
 
-        // Piece-13: capture the delivered-PAID terminal episode. Best-effort — written AFTER the
+        // Capture the delivered-PAID terminal episode. Best-effort — written AFTER the
         // authoritative receipt above and can never fail or alter it. Seeds the retro (§ Retro).
         self.record_paid_episode(&job, amount_received, expected_amount);
         // COLLECTED announce: sats redeemed at the mint + receipt journaled. Emitted AFTER the
@@ -1261,8 +1261,8 @@ impl SellerDaemon {
         // harness commit). Deliver only if every commit is agent-authored + non-empty tree.
         // Do NOT capture before-OID on empty / require advancement — dogfood is agent-from-empty.
         let identity = seller_git::DeliveryAgentIdentity::for_seller(&self.seller_pubkey);
-        // Piece-10: a contribution job forks the PINNED target at base_oid onto a per-job unique
-        // branch carrying the FULL job_id (MUST-6); a from-scratch job uses the empty-base workdir.
+        // A contribution job forks the PINNED target at base_oid onto a per-job unique
+        // branch carrying the FULL job_id; a from-scratch job uses the empty-base workdir.
         let branch = match &active.contribution {
             Some(_) => crate::contribution::ForkRef::unique_branch(&active.job_id),
             None => format!("mobee/{}", &active.job_id[..8.min(active.job_id.len())]),
@@ -1301,7 +1301,7 @@ impl SellerDaemon {
         let run_started = std::time::Instant::now();
         // Item #16(e): the daemon OWNS delivery — append explicit, secret-free instructions so
         // the agent commits its deliverable to git (the daemon pushes it) instead of guessing.
-        // Piece-13 read-on-start: inline the MEMORY.md index when memory is enabled (byte-identical
+        // Read-on-start: inline the MEMORY.md index when memory is enabled (byte-identical
         // prompt when disabled).
         let memory_section = self.read_on_start_section();
         let prompt = compose_agent_prompt(
@@ -1391,25 +1391,20 @@ impl SellerDaemon {
         drop(push_auth);
 
         let job_hash = job_hash_for_offer(&active.job_id, &active.offer.task, active.offer.amount);
-        // Piece-9 Item 1: the seller signs the RECEIPT PREIMAGE (binds the trade + the
+        // The seller signs the RECEIPT PREIMAGE (binds the trade + the
         // delivered git object, D4) — not the bare job-hash. The buyer reconstructs this
         // exact preimage and co-signs it. `exec_metadata_commitment` is the empty marker:
         // exec-metadata is NOT covered by the co-signature (Item 2, seller-claimed).
         // Derive the delivery discriminator from the SAME typed `Delivery` the buyer's pay path
         // uses (was a `DeliveryKind::Fork` hardcode) so both sides agree by construction ("fork").
         let delivery_kind = seller_delivery_kind(&seller_cfg.git_remote, &branch, &commit)?;
-        // PIECE-14 Job E: bind the seller-authored `creq` into the receipt so BOTH co-signatures
+        // Bind the seller-authored `creq` into the receipt so BOTH co-signatures
         // commit to the payment terms the seller published. The creq is reconstructed from the
         // SAME inputs used at claim time (`build_seller_creq` is pure over job id / amount / unit /
         // accepted_mints / seller key), so its hash equals the one the buyer read off the claim
         // and threaded through its pay path — the co-signatures agree by construction. The mint is
         // the realized mint the buyer pays at (the seller's default accepted mint), normalized as a
         // `MintUrl` exactly as the buyer builds it, so the two receipt bytes cannot drift.
-        // TEMPORARY (multi-mint TODO): this pins the seller receipt mint to the DEFAULT accepted
-        // mint while the buyer binds its resolved realized mint; they agree ONLY because v2 is
-        // single-mint (both == DEFAULT_MINT_URL). Under multi-mint enablement a buyer paying at a
-        // non-default listed mint would silently diverge from this — the realized mint must then be
-        // reconciled onto the actual payload mint before signing.
         let authored_creq = gateway::creq::build_seller_creq(
             &active.job_id,
             active.offer.amount,
@@ -1433,7 +1428,7 @@ impl SellerDaemon {
             creq_hash: Some(gateway::creq_hash_hex(&authored_creq)),
         };
         let seller_sig = sign_receipt_hash(&self.keys, &preimage.digest_hex())?;
-        // Piece-9 Item 2: harness-generic PUBLIC seller-claimed usage block (opportunistic;
+        // Harness-generic PUBLIC seller-claimed usage block (opportunistic;
         // absent fields stay absent). `usage` carries the ACP-native token/model/cost the driver
         // surfaced this run — `None` when the harness exposed nothing.
         let exec_metadata = seller_exec_metadata(
@@ -1454,9 +1449,9 @@ impl SellerDaemon {
             format!("delivery commit {commit}"),
             &exec_metadata,
         );
-        // Piece-10: on a contribution, echo the pinned target + base + accepts and append the
+        // On a contribution, echo the pinned target + base + accepts and append the
         // seller's schnorr signature over the authorship tuple {job_id, seller_pubkey, target_repo,
-        // base_oid, fork_ref, commit_oid} (MUST-3). The fork_ref is (this seller's git_remote, the
+        // base_oid, fork_ref, commit_oid}. The fork_ref is (this seller's git_remote, the
         // per-job unique branch); the fork tip is `commit`. The buyer verifies this sig at the
         // pre-pay seam and equality-checks the echo against its signed offer.
         if let Some(contribution) = &active.contribution {
@@ -1492,7 +1487,7 @@ impl SellerDaemon {
         };
         if let Some(slot) = self.active.as_mut() {
             slot.result_id = Some(result_id.clone());
-            // Piece-13: stash the delivery facts so the terminal episode (paid at receipt, or
+            // Stash the delivery facts so the terminal episode (paid at receipt, or
             // unpaid at eviction) is one complete append. `transcript_ref` is a POINTER to the
             // already-durable per-job transcript (`run_agent_job` wrote it); never a copy.
             let (harness, _) =
@@ -1531,7 +1526,7 @@ impl SellerDaemon {
     ) -> Result<(), DaemonError> {
         if let Some(active) = self.active.take() {
             let reason = seller_error_content(code, human_reason);
-            // Piece-13: capture the ERRORED terminal, threading `reason` (previously discarded)
+            // Capture the ERRORED terminal, threading `reason` (previously discarded)
             // into `error_reason`. Best-effort; the feedback-kind below is the buyer-facing surface.
             self.record_errored_episode(&active, &reason);
             // JOB-FAILED announce (with the machine reason). Diagnostic; the feedback-kind stays the
@@ -1554,7 +1549,7 @@ impl SellerDaemon {
         Ok(())
     }
 
-    /// Piece-13 read-on-start: the rendered `MEMORY.md` section to inline into the job prompt, or
+    /// Read-on-start: the rendered `MEMORY.md` section to inline into the job prompt, or
     /// `None` when memory is disabled or there is no non-empty index. Ensures the memory dir on
     /// first use (seeding operator-notes.md + a non-empty index). Best-effort: any error degrades
     /// to `None` (no memory), never blocks the job.
@@ -1580,7 +1575,7 @@ impl SellerDaemon {
         }
     }
 
-    /// Piece-13 retro: resolve the plan for a delivered-PAID job, or `None` to skip. `None` when
+    /// Retro: resolve the plan for a delivered-PAID job, or `None` to skip. `None` when
     /// retro is disabled, the memory dir can't be prepared, or no `delivered_paid` episode exists
     /// for `job_id` (retro fires on delivered-paid ONLY — refusals/errors never reach here).
     /// Driver-free so it is testable without the `acp` feature.
@@ -1626,13 +1621,13 @@ impl SellerDaemon {
         })
     }
 
-    /// Piece-13 retro trigger: after a delivered-PAID receipt, run ONE best-effort agent turn to
+    /// Retro trigger: after a delivered-PAID receipt, run ONE best-effort agent turn to
     /// update memory. **Fully detached** — it MUST NOT run in the seller event loop: a retro is a
     /// whole agent turn (up to the job timeout, or a hang) and the loop is single-tasked, so an
     /// inline retro would stop the daemon from collecting kind-1059 payments (the money path) and
     /// from claiming offers until the retro finished (regression: "wraps parked, never collected").
     /// So it runs on its OWN OS thread with its OWN runtime and this call returns immediately;
-    /// the money path never waits on retro (PIECE-13 § Retro). No-op without the `acp` feature.
+    /// the money path never waits on retro. No-op without the `acp` feature.
     #[cfg(feature = "acp")]
     fn maybe_run_retro(&self, job_id: &str) {
         let Some(plan) = self.retro_context(job_id) else {
@@ -1728,7 +1723,7 @@ impl SellerDaemon {
         );
     }
 
-    /// Piece-13 refused terminal. Best-effort re-parse of the offer for its facts (classify does
+    /// Refused terminal. Best-effort re-parse of the offer for its facts (classify does
     /// not hand them back). No episode for a non-offer, a dedup re-see, or an unparseable event —
     /// those are not freshly-classified jobs.
     fn record_refused_episode(&self, event: &nostr_sdk::Event, skip: &OfferSkip) {
@@ -1765,7 +1760,7 @@ impl SellerDaemon {
         self.write_episode(&episode);
     }
 
-    /// Piece-13 errored terminal (claimed job that failed before or during delivery).
+    /// Errored terminal (claimed job that failed before or during delivery).
     fn record_errored_episode(&self, active: &ActiveJob, reason: &str) {
         let rate = require_seller_config(&self.home)
             .map(|cfg| cfg.rate_sats)
@@ -1794,7 +1789,7 @@ impl SellerDaemon {
         self.write_episode(&episode);
     }
 
-    /// Piece-13 delivered-PAID terminal. Complete episode: offer + claim + delivery + payment.
+    /// Delivered-PAID terminal. Complete episode: offer + claim + delivery + payment.
     fn record_paid_episode(&self, job: &ActiveJob, amount_received: u64, expected_amount: u64) {
         let rate = require_seller_config(&self.home)
             .map(|cfg| cfg.rate_sats)
@@ -1826,7 +1821,7 @@ impl SellerDaemon {
         self.write_episode(&episode);
     }
 
-    /// Piece-13 delivered-but-UNPAID terminal (awaiting-payment backpressure eviction).
+    /// Delivered-but-UNPAID terminal (awaiting-payment backpressure eviction).
     fn record_delivered_unpaid_episode(&self, job: &ActiveJob) {
         let rate = require_seller_config(&self.home)
             .map(|cfg| cfg.rate_sats)
@@ -1869,7 +1864,7 @@ fn mint_url(raw: &str) -> Result<cashu::MintUrl, DaemonError> {
         .map_err(|error| DaemonError::Policy(format!("invalid mint url: {error}")))
 }
 
-/// Piece-13: opportunistic driver usage → serde-friendly episode mirror (absent-stays-absent;
+/// Opportunistic driver usage → serde-friendly episode mirror (absent-stays-absent;
 /// a field the harness did not surface stays `None`, never zero-filled).
 fn usage_record(usage: Option<&UsageMetadata>) -> UsageRecord {
     let Some(usage) = usage else {
@@ -1888,13 +1883,13 @@ fn usage_record(usage: Option<&UsageMetadata>) -> UsageRecord {
     }
 }
 
-/// Piece-13: fill the offer-facts group shared by every episode kind. Pure over its inputs.
+/// Fill the offer-facts group shared by every episode kind. Pure over its inputs.
 fn fill_offer_facts(
     episode: &mut Episode,
     offer: &ParsedOffer,
     buyer_pubkey: &str,
     rate_sats: u64,
-    // PIECE-14 Job B: episode.mint is sourced from the seller's default accepted mint rather
+    // `episode.mint` is sourced from the seller's default accepted mint rather
     // than `offer.mint_url` (consumer re-pointed off the offer). Job E replaces this with the
     // realized mint from the buyer's payment payload.
     mint: &str,
@@ -1919,7 +1914,7 @@ fn fill_offer_facts(
     }
 }
 
-/// Piece-13: fill the delivery-facts group from a captured [`DeliveryRecord`].
+/// Fill the delivery-facts group from a captured [`DeliveryRecord`].
 fn fill_delivery_facts(episode: &mut Episode, delivery: &DeliveryRecord) {
     episode.result_id = Some(delivery.result_id.clone());
     episode.commit_oid = Some(delivery.commit_oid.clone());
@@ -1953,11 +1948,11 @@ fn seller_delivery_kind(
     Ok(delivery.delivery_kind())
 }
 
-/// Build the piece-9 Item-2 seller-claimed PUBLIC usage block for a result-kind result.
+/// Build the seller-claimed PUBLIC usage block for a result-kind result.
 ///
-/// Per gudnuf's Q2 ruling this block is PUBLIC and harness-generic. It is **opportunistic**:
+/// This block is PUBLIC and harness-generic. It is **opportunistic**:
 /// emit only fields the seller can source. `harness` is resolved from the configured preset
-/// label (else the agent command — USAGE-MATRIX checkpoint-b), `wall_time` is measured, and
+/// label (else the agent command), `wall_time` is measured, and
 /// `metadata_trust=seller-claimed` is required whenever any field is present (anchor rule).
 ///
 /// `usage_transport` reflects **reality**: when the ACP driver actually captured usage this
@@ -2030,7 +2025,7 @@ fn seller_exec_metadata(
     tags
 }
 
-/// Best-effort harness id + usage transport (USAGE-MATRIX checkpoint-b).
+/// Best-effort harness id + usage transport.
 ///
 /// The configured **preset label** (`claude`|`cursor`|`codex`, [`SellerConfig::agent`]) is the
 /// authoritative harness/adapter identity and is preferred over argv inspection: presets launch
@@ -2148,9 +2143,9 @@ fn compose_agent_prompt(task: &str, git_remote: &str, memory_section: Option<&st
          your committed branch to the bound git remote ({git_remote}) on your behalf.\n\
          Anything not committed to git will not be delivered."
     );
-    // Piece-13 read-on-start: when memory is enabled the rendered index section is appended.
+    // Read-on-start: when memory is enabled the rendered index section is appended.
     // When `None` (memory_enabled=false, or no non-empty index) the output is byte-IDENTICAL to
-    // the pre-piece-13 prompt (golden invariant).
+    // the memory-disabled prompt (golden invariant).
     match memory_section {
         Some(section) => format!("{base}\n\n{section}"),
         None => base,
@@ -2386,7 +2381,7 @@ fn short_hash(input: &str) -> String {
     hex::encode(&digest[..8])
 }
 
-/// Piece-13: everything a retro turn needs, resolved WITHOUT a driver so it is testable and works
+/// Everything a retro turn needs, resolved WITHOUT a driver so it is testable and works
 /// under `--no-default-features` (no `acp`). `None` from [`SellerDaemon::retro_context`] means "do
 /// not run a retro" (disabled, or no paid episode to distill).
 #[derive(Debug, Clone)]
@@ -2397,7 +2392,7 @@ struct RetroPlan {
     agent_command: Vec<String>,
 }
 
-/// Piece-13 retro write-back: run ONE best-effort agent turn whose session cwd is the memory dir
+/// Retro write-back: run ONE best-effort agent turn whose session cwd is the memory dir
 /// (so the agent can read/write `MEMORY.md` and topic files by relative path), seeded with the
 /// retro prompt. Merge-not-clobber is enforced at RUNTIME here, not by prompt prose: operator-owned
 /// files are snapshotted before the turn and byte-restored after — regardless of what the agent
@@ -2721,9 +2716,9 @@ fn offer_subscription_filters(
 ) -> Vec<nostr_sdk::Filter> {
     use nostr_sdk::prelude::{Filter, Kind, Timestamp};
 
-    // TARGETED (`#p == self`): ORIGINAL shape, untouched by the window knob. PIECE-14 A′: the
-    // `#t=mobee` namespace guard is required so a foreign event squatting the offer kind is never
-    // even delivered.
+    // TARGETED (`#p == self`): ORIGINAL shape, untouched by the window knob. The `#t=mobee`
+    // namespace guard is required so a foreign event squatting the offer kind is never even
+    // delivered.
     let mut filters = vec![Filter::new()
         .kind(Kind::Custom(JOB_OFFER_KIND))
         .hashtag(gateway::MOBEE_TAG)
@@ -3158,7 +3153,7 @@ pub(crate) async fn run_forever_hooked(
     let mut offer_fallback_done = false;
     // `notifications` was created up front (before the REQs) so no backfilled event is dropped.
 
-    // Heartbeat cadence (PIECE-14 § Heartbeat). Env overrides config for tests. `interval()`'s
+    // Heartbeat cadence. Env overrides config for tests. `interval()`'s
     // first `tick()` completes immediately, so an enabled seller advertises liveness right after
     // going online, then every `interval_secs`.
     let heartbeat_enabled =
@@ -3242,7 +3237,7 @@ pub(crate) async fn run_forever_hooked(
                                 "seller receipt job_id={} result_id={} amount_received={}",
                                 receipt.job_id, receipt.result_id, receipt.amount_received
                             );
-                            // Piece-13: delivered-PAID ⇒ best-effort retro. Detached (own thread);
+                            // Delivered-PAID ⇒ best-effort retro. Detached (own thread);
                             // returns immediately so wrap collection is never blocked.
                             daemon.maybe_run_retro(&receipt.job_id);
                         }
@@ -3285,7 +3280,7 @@ pub(crate) async fn run_forever_hooked(
                                                 "seller receipt (reconcile) job_id={} amount_received={}",
                                                 receipt.job_id, receipt.amount_received
                                             );
-                                            // Piece-13: delivered-PAID ⇒ detached best-effort retro.
+                                            // Delivered-PAID ⇒ detached best-effort retro.
                                             daemon.maybe_run_retro(&receipt.job_id);
                                         }
                                         Ok(None) => {}
@@ -3423,9 +3418,8 @@ mod tests {
         }
     }
 
-    // RIDER: the seller-side receipt-preimage delivery discriminator is DERIVED from the typed
-    // `Delivery` (Commit → "fork"), not a hardcoded label — buyer and seller now agree by
-    // construction. Behavior-identical ("fork"), byte-identical to the former hardcode.
+    // The seller-side receipt-preimage delivery discriminator is DERIVED from the typed
+    // `GitDelivery` ("fork"), not a hardcoded label — buyer and seller agree by construction.
     #[test]
     fn seller_delivery_kind_derives_fork_from_typed_delivery() {
         let kind = seller_delivery_kind(
@@ -4240,7 +4234,7 @@ mod tests {
         crate::contribution::contribution_offer_tags(&c)
     }
 
-    // Piece-10: the daemon RECOGNISES a contribution offer, threads the pins into the claim intent.
+    // The daemon RECOGNISES a contribution offer, threads the pins into the claim intent.
     #[test]
     fn classify_admits_contribution_offer_and_threads_pins() {
         let (root, daemon) = test_daemon("contrib-admit");
@@ -4260,7 +4254,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Piece-10: a seller with contribution support DISABLED refuses (interop feedback-kind skip).
+    // A seller with contribution support DISABLED refuses (interop feedback-kind skip).
     #[test]
     fn classify_refuses_contribution_when_disabled() {
         let (root, mut daemon) = test_daemon("contrib-disabled");
@@ -4278,7 +4272,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Piece-10: a malformed contribution offer is REFUSED (fail-closed) — never run from-scratch.
+    // A malformed contribution offer is REFUSED (fail-closed) — never run from-scratch.
     #[test]
     fn classify_refuses_malformed_contribution_offer() {
         let (root, daemon) = test_daemon("contrib-malformed");
@@ -4907,7 +4901,7 @@ mod tests {
         assert!(err.to_string().contains("acp"));
     }
 
-    // ── Piece-13 Layer-0 episode capture ────────────────────────────────────────────────────
+    // ── Layer-0 episode capture ────────────────────────────────────────────────────
 
     /// Acceptance (piece A): a delivered→paid job appends exactly ONE episode line with
     /// `outcome=delivered_paid`, populated `result_id`/`commit_oid`/`amount_received` and a
@@ -5014,11 +5008,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ── Piece-13 Layer-1 read-on-start ──────────────────────────────────────────────────────
+    // ── Layer-1 read-on-start ──────────────────────────────────────────────────────
 
-    /// Acceptance (piece B): with memory DISABLED the composed prompt is byte-identical to the
-    /// pre-piece-13 output. The expected string is a hardcoded literal (NOT recomputed from the
-    /// function under test), so any drift in the disabled path fails this golden.
+    /// With memory DISABLED the composed prompt is byte-identical to the memory-disabled
+    /// golden. The expected string is a hardcoded literal (NOT recomputed from the function
+    /// under test), so any drift in the disabled path fails this golden.
     #[test]
     fn composed_prompt_disabled_memory_is_byte_identical_golden() {
         let remote = "https://relay.example/git/abc.git";
@@ -5104,7 +5098,7 @@ Anything not committed to git will not be delivered.";
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // ── Piece-13 retro write-back ───────────────────────────────────────────────────────────
+    // ── Retro write-back ───────────────────────────────────────────────────────────
 
     /// A test Driver that simulates a misbehaving retro agent: on the prompt turn it CLOBBERS a
     /// target (operator) file, then completes. Proves merge-not-clobber is enforced at runtime
@@ -6346,7 +6340,7 @@ mod local_relay_it {
         relay.shutdown();
     }
 
-    /// Publish a TARGETED piece-10 contribution offer (job-class + target-repo pin + base + accepts)
+    /// Publish a TARGETED contribution offer (job-class + target-repo pin + base + accepts)
     /// signed by `buyer`, returning its event id.
     async fn publish_contribution_offer(
         client: &Client,
@@ -6382,7 +6376,7 @@ mod local_relay_it {
         id
     }
 
-    // ── Piece-10: a CONTRIBUTION offer round-trips over a real relay and the seller recognises it,
+    // ── A CONTRIBUTION offer round-trips over a real relay and the seller recognises it,
     //    claiming it (claim-kind processing) — the offer→claim leg of the ONE state machine live. ──
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn contribution_offer_round_trips_to_claim_over_local_relay() {
