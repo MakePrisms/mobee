@@ -23,6 +23,84 @@ pub struct Readiness {
     pub protocol_version: u32,
 }
 
+/// Where a run's usage numbers were actually captured (piece-9 Item-2 `usage_transport`).
+/// This reflects reality — the surface the value came off — not a harness-declared guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageTransport {
+    /// Carried over the ACP wire (the `session/prompt` JSON-RPC result).
+    AcpNative,
+    /// Read off a non-ACP sibling surface (e.g. a `--print` stream).
+    SideChannel,
+}
+
+impl UsageTransport {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AcpNative => "acp-native",
+            Self::SideChannel => "side-channel",
+        }
+    }
+}
+
+/// A real monetary cost with its accounting basis (piece-9 Item-2 `cost` tag).
+/// `amount` is the exact string as reported by the harness (kept as text so it is
+/// byte-exact and never zero/float-mangled); `basis` ∈ {harness-reported-usd,
+/// harness-reported-notional}. Unit is locked to USD.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageCost {
+    pub amount: String,
+    pub basis: String,
+}
+
+/// Per-run execution usage a driver surfaced for a job (piece-9 Item-2, seller-claimed).
+///
+/// Every field is OPTIONAL so **absent-stays-absent** is representable end to end: a field
+/// the harness did not report is `None` and is NEVER zero-filled downstream. `total_tokens`
+/// is intentionally NOT stored — it is DERIVED (`input + output + reasoning`) at tag-emission
+/// so a partial capture can never masquerade as a complete total.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UsageMetadata {
+    pub model: Option<String>,
+    /// Non-cached input tokens.
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    /// Reasoning tokens — absent means UNKNOWN (not zero).
+    pub reasoning_tokens: Option<u64>,
+    /// Cache-read sibling — evidence only, NEVER summed into the total.
+    pub cache_read_tokens: Option<u64>,
+    /// Cache-write/creation sibling — evidence only, NEVER summed into the total.
+    pub cache_write_tokens: Option<u64>,
+    pub cost: Option<UsageCost>,
+    pub transport: Option<UsageTransport>,
+}
+
+impl UsageMetadata {
+    /// True when no field carries a value — nothing real was captured.
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none()
+            && self.input_tokens.is_none()
+            && self.output_tokens.is_none()
+            && self.reasoning_tokens.is_none()
+            && self.cache_read_tokens.is_none()
+            && self.cache_write_tokens.is_none()
+            && self.cost.is_none()
+            && self.transport.is_none()
+    }
+
+    /// Derived `total_tokens = input + output + reasoning` per the locked USAGE-MATRIX
+    /// checkpoint-a rule. Returns `None` unless BOTH `input` and `output` are present (a
+    /// partial capture must never be reported as a total); `reasoning` is added when present
+    /// and treated as unknown-not-zero when absent. Cache siblings are never folded in.
+    pub fn total_tokens(&self) -> Option<u64> {
+        match (self.input_tokens, self.output_tokens) {
+            (Some(input), Some(output)) => {
+                Some(input + output + self.reasoning_tokens.unwrap_or(0))
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DriverError {
     NotReady,
@@ -60,4 +138,11 @@ pub trait Driver {
     async fn artifacts(&self, session_id: &SessionId) -> Result<Vec<Artifact>, DriverError>;
     async fn cancel(&mut self, session_id: &SessionId) -> Result<(), DriverError>;
     async fn shutdown(&mut self) -> Result<(), DriverError>;
+
+    /// Execution usage captured from the most recent prompt, if the harness surfaced any
+    /// (piece-9 Item-2). Default `None` keeps **absent-stays-absent** for drivers that expose
+    /// nothing — only a driver that actually reads usage overrides this.
+    fn usage(&self) -> Option<UsageMetadata> {
+        None
+    }
 }

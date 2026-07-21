@@ -2,86 +2,109 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// Buyer's NUT-18 payment reply plus the mobee routing it rides with.
+///
+/// PIECE-14 Job E: the wire form is the cashu [`PaymentRequestPayload`] (NUT-18: `id`, `memo`,
+/// `mint`, `unit`, `proofs`) — the buyer emits exactly the object that satisfies the
+/// seller-authored `creq`. `id` echoes the request's `i` (Job C sets `i` to the job id), `mint`
+/// is the *realized* mint the token came from, and `proofs` carry the P2PK-locked ecash. The
+/// previous hand-rolled `PaymentEnvelope` (a bespoke canonical-JSON blob carrying a
+/// buyer-declared `mint_url`) is gone.
+///
+/// `seller_pubkey` is the NIP-17 gift-wrap recipient — routing only, NEVER serialized into the
+/// payload JSON. The buyer is authenticated by the NIP-17 seal, so the payload carries no
+/// self-declared buyer pubkey to cross-check.
+#[cfg(feature = "wallet")]
 #[derive(Clone, PartialEq, Eq)]
 pub struct PaymentPayload {
-    pub job_id: String,
-    pub result_id: String,
-    pub mint_url: String,
-    pub amount: u64,
-    pub unit: String,
-    #[cfg(feature = "wallet")]
-    pub token: cashu::Token,
+    /// NIP-17 gift-wrap recipient (the seller, hex). Routing only; empty on the receive side
+    /// (the recipient does not re-address a payment it already received).
     pub seller_pubkey: String,
+    /// The NUT-18 payment reply carried inside the encrypted NIP-17 rumor.
+    pub payload: cashu::nuts::nut18::PaymentRequestPayload,
 }
 
+#[cfg(feature = "wallet")]
 impl fmt::Debug for PaymentPayload {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The payload carries proof secrets (bearer ecash) — never Debug-print them.
         formatter.write_str("PaymentPayload(<redacted>)")
     }
 }
 
+#[cfg(feature = "wallet")]
 impl PaymentPayload {
-    #[cfg(all(any(test, feature = "gateway"), feature = "wallet"))]
-    fn canonical_json(&self, buyer_pubkey: &str) -> String {
-        use serde::ser::{SerializeMap, Serializer};
+    /// The job id this payment settles (NUT-18 `id`, == the seller's request `i`).
+    pub fn job_id(&self) -> &str {
+        self.payload.id.as_deref().unwrap_or_default()
+    }
 
-        let mut json = Vec::new();
-        let mut serializer = serde_json::Serializer::new(&mut json);
-        let mut map = serializer
-            .serialize_map(Some(8))
-            .expect("payment payload starts a JSON map");
-        map.serialize_entry("job_id", &self.job_id)
-            .expect("job id is JSON-serializable");
-        map.serialize_entry("result_id", &self.result_id)
-            .expect("result id is JSON-serializable");
-        map.serialize_entry("mint_url", &self.mint_url)
-            .expect("mint URL is JSON-serializable");
-        map.serialize_entry("amount", &self.amount)
-            .expect("amount is JSON-serializable");
-        map.serialize_entry("unit", &self.unit)
-            .expect("unit is JSON-serializable");
-        map.serialize_entry("token", &self.token.to_string())
-            .expect("token is JSON-serializable");
-        map.serialize_entry("buyer_pubkey", buyer_pubkey)
-            .expect("buyer pubkey is JSON-serializable");
-        map.serialize_entry("seller_pubkey", &self.seller_pubkey)
-            .expect("seller pubkey is JSON-serializable");
-        map.end().expect("payment payload closes its JSON map");
+    /// The realized mint the token came from (NUT-18 `mint`).
+    pub fn mint(&self) -> &cashu::MintUrl {
+        &self.payload.mint
+    }
 
-        String::from_utf8(json).expect("JSON serializer emits UTF-8")
+    /// The payment unit (NUT-18 `unit`).
+    pub fn unit(&self) -> &cashu::CurrencyUnit {
+        &self.payload.unit
+    }
+
+    /// Reconstruct the bearer [`cashu::Token`] from the NUT-18 proofs. Proofs are self-contained
+    /// (keyset id embedded), so no mint keyset lookup is needed to rebuild the token here — the
+    /// seller redeems it against its own mint.
+    pub fn to_token(&self) -> cashu::Token {
+        cashu::Token::new(
+            self.payload.mint.clone(),
+            self.payload.proofs.clone(),
+            self.payload.memo.clone(),
+            self.payload.unit.clone(),
+        )
+    }
+
+    /// The NUT-18 payload JSON that rides inside the encrypted NIP-17 rumor.
+    fn wire_json(&self) -> Result<String, PaymentSendError> {
+        serde_json::to_string(&self.payload).map_err(|error| {
+            PaymentSendError::Transport(format!("failed to encode NUT-18 payment payload: {error}"))
+        })
     }
 }
 
 #[cfg(all(feature = "gateway", feature = "wallet"))]
 /// A parsed payment bound to its authenticated NIP-17 sender.
 pub struct ReceivedPayment {
-    /// The typed payment payload.
+    /// The typed NUT-18 payment payload.
     pub payload: PaymentPayload,
     /// The buyer authenticated by the NIP-17 seal.
     pub buyer_pubkey: nostr_sdk::prelude::PublicKey,
 }
 
 #[cfg(all(feature = "gateway", feature = "wallet"))]
-/// Parses a payment and requires its claimed buyer to match the seal sender.
+/// Parses a NUT-18 payment payload and binds it to its authenticated NIP-17 seal sender.
+///
+/// The buyer is authenticated solely by the seal: NUT-18 carries no self-declared buyer pubkey,
+/// so there is no redundant field to spoof or cross-check — the seal sender IS the buyer.
 pub fn parse_nip17_payment_payload(
     json: &str,
     seal_sender: nostr_sdk::prelude::PublicKey,
 ) -> Result<ReceivedPayment, PaymentSendError> {
-    let envelope: PaymentEnvelope = serde_json::from_str(json).map_err(|error| {
-        PaymentSendError::Transport(format!("invalid NIP-17 payment payload JSON: {error}"))
-    })?;
-    let buyer_pubkey =
-        nostr_sdk::prelude::PublicKey::parse(&envelope.buyer_pubkey).map_err(|error| {
-            PaymentSendError::Transport(format!("invalid buyer pubkey in NIP-17 payment: {error}"))
+    let request_payload: cashu::nuts::nut18::PaymentRequestPayload = serde_json::from_str(json)
+        .map_err(|error| {
+            PaymentSendError::Transport(format!(
+                "invalid NIP-17 NUT-18 payment payload JSON: {error}"
+            ))
         })?;
-    if buyer_pubkey != seal_sender {
+    if request_payload.id.as_deref().unwrap_or_default().is_empty() {
         return Err(PaymentSendError::Transport(
-            "NIP-17 seal sender does not match payment envelope buyer".into(),
+            "NUT-18 payment payload is missing its `id` (job correlation)".into(),
         ));
     }
     Ok(ReceivedPayment {
-        payload: envelope.try_into()?,
-        buyer_pubkey,
+        payload: PaymentPayload {
+            // Routing target is irrelevant on the receive side (this seller already holds it).
+            seller_pubkey: String::new(),
+            payload: request_payload,
+        },
+        buyer_pubkey: seal_sender,
     })
 }
 
@@ -113,6 +136,7 @@ impl fmt::Display for PaymentSendError {
 
 impl std::error::Error for PaymentSendError {}
 
+#[cfg(feature = "wallet")]
 #[allow(async_fn_in_trait)]
 pub trait PaymentSend {
     async fn send_payment(
@@ -121,14 +145,14 @@ pub trait PaymentSend {
     ) -> Result<PaymentSent, PaymentSendError>;
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(all(any(test, feature = "test-support"), feature = "wallet"))]
 #[derive(Default)]
 pub struct MemoryPaymentSend {
     next_id: u64,
     payments: Vec<PaymentSent>,
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(all(any(test, feature = "test-support"), feature = "wallet"))]
 impl MemoryPaymentSend {
     pub fn payments(&self) -> &[PaymentSent] {
         &self.payments
@@ -149,7 +173,7 @@ impl MemoryPaymentSend {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(all(any(test, feature = "test-support"), feature = "wallet"))]
 impl PaymentSend for MemoryPaymentSend {
     async fn send_payment(
         &mut self,
@@ -191,10 +215,7 @@ impl PaymentSend for NostrPaymentSend {
                 "invalid seller pubkey for NIP-17 payment send: {error}"
             ))
         })?;
-        let buyer_pubkey = self.keys.public_key().to_hex();
-        let gift_wrap =
-            payment_send_gift_wrap(&self.keys, receiver, payload.canonical_json(&buyer_pubkey))
-                .await?;
+        let gift_wrap = payment_send_gift_wrap(&self.keys, receiver, payload.wire_json()?).await?;
         let client = Client::new(self.keys.clone());
         client.add_relay(&self.relay).await.map_err(|error| {
             PaymentSendError::Transport(format!("failed to add relay: {error}"))
@@ -287,42 +308,6 @@ async fn payment_send_gift_wrap(
         })
 }
 
-#[cfg(all(any(test, feature = "gateway"), feature = "wallet"))]
-#[derive(Deserialize)]
-struct PaymentEnvelope {
-    job_id: String,
-    result_id: String,
-    mint_url: String,
-    amount: u64,
-    unit: String,
-    #[serde(rename = "token")]
-    serialized_token: String,
-    buyer_pubkey: String,
-    seller_pubkey: String,
-}
-
-#[cfg(all(any(test, feature = "gateway"), feature = "wallet"))]
-impl TryFrom<PaymentEnvelope> for PaymentPayload {
-    type Error = PaymentSendError;
-
-    fn try_from(envelope: PaymentEnvelope) -> Result<Self, Self::Error> {
-        use std::str::FromStr;
-
-        let token = cashu::Token::from_str(&envelope.serialized_token).map_err(|error| {
-            PaymentSendError::Transport(format!("invalid Cashu token in NIP-17 payment: {error}"))
-        })?;
-        Ok(Self {
-            job_id: envelope.job_id,
-            result_id: envelope.result_id,
-            mint_url: envelope.mint_url,
-            amount: envelope.amount,
-            unit: envelope.unit,
-            token,
-            seller_pubkey: envelope.seller_pubkey,
-        })
-    }
-}
-
 #[cfg(feature = "gateway")]
 fn fresh_gift_wrap_created_at() -> nostr_sdk::prelude::Timestamp {
     nostr_sdk::prelude::Timestamp::tweaked(0..GIFT_WRAP_TIMESTAMP_TWEAK_MAX_SECS)
@@ -333,21 +318,65 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "wallet")]
-    const VALID_CASHU_TOKEN: &str = "cashuBpGFtdWh0dHA6Ly9sb2NhbGhvc3Q6MzMzOGF1Y3NhdGFkaVRoYW5rIHlvdWF0gaJhaUgArSaMTR9YJmFwgaRhYQFhc3hAOWE2ZGJiODQ3YmQyMzJiYTc2ZGIwZGYxOTcyMTZiMjlkM2I4Y2MxNDU1M2NkMjc4MjdmYzFjYzk0MmZlZGI0ZWFjWCEDhhhUP_trhpXfStS6vN6So0qWvc2X3O4NfM-Y1HISZ5JhZPY=";
+    const MINT: &str = "https://testnut.cashu.space";
+    #[cfg(feature = "wallet")]
+    const KEYSET_ID: &str = "009a1f293253e41e";
+    // A recognizable, unique proof secret. The whole point of NIP-17 gift-wrapping is that this
+    // never appears in plaintext on the wire — the leak test below asserts exactly that.
+    #[cfg(feature = "wallet")]
+    const KNOWN_SECRET: &str = "proof-secret-corr-9a6dbb84-do-not-leak";
+
+    #[cfg(feature = "wallet")]
+    fn nut18_payload(job_id: &str) -> cashu::nuts::nut18::PaymentRequestPayload {
+        use std::str::FromStr;
+
+        use cashu::{Amount, CurrencyUnit, Id, MintUrl, Proof, SecretKey};
+        use cashu::secret::Secret;
+
+        let secret = Secret::new(KNOWN_SECRET);
+        // Any valid secp256k1 point works for `C`; the payload codec does not verify it (the
+        // seller's mint does, at redeem). A fresh keypair keeps the proof structurally valid.
+        let c = SecretKey::generate().public_key();
+        let proof = Proof::new(
+            Amount::from(7),
+            Id::from_str(KEYSET_ID).expect("valid keyset id"),
+            secret,
+            c,
+        );
+        cashu::nuts::nut18::PaymentRequestPayload {
+            id: Some(job_id.to_owned()),
+            memo: None,
+            mint: MintUrl::from_str(MINT).expect("valid mint url"),
+            unit: CurrencyUnit::Sat,
+            proofs: vec![proof],
+        }
+    }
+
+    #[cfg(feature = "wallet")]
+    fn payload() -> PaymentPayload {
+        PaymentPayload {
+            seller_pubkey: "seller".into(),
+            payload: nut18_payload("job"),
+        }
+    }
 
     #[cfg(feature = "wallet")]
     #[test]
-    fn payment_send_payload_canonical_json_is_stable() {
+    fn nut18_wire_json_is_the_payment_request_payload() {
         let payload = payload();
+        let wire = payload.wire_json().unwrap();
 
-        assert_eq!(
-            payload.canonical_json("buyer"),
-            format!(
-                "{{\"job_id\":\"job\",\"result_id\":\"result\",\"mint_url\":\"https://testnut.cashu.space\",\"amount\":7,\"unit\":\"sat\",\"token\":\"{VALID_CASHU_TOKEN}\",\"buyer_pubkey\":\"buyer\",\"seller_pubkey\":\"seller\"}}"
-            )
-        );
+        // The wire form is exactly the cashu NUT-18 payload — the buyer-declared `mint_url` of
+        // the old hand-rolled envelope is gone; `mint`/`unit`/`id`/`proofs` are the NUT-18 keys.
+        let parsed: cashu::nuts::nut18::PaymentRequestPayload =
+            serde_json::from_str(&wire).unwrap();
+        assert_eq!(parsed, payload.payload);
+        assert_eq!(parsed.id.as_deref(), Some("job"));
+        assert_eq!(parsed.mint.to_string(), MINT);
+        assert!(!wire.contains("mint_url"));
     }
 
+    #[cfg(feature = "wallet")]
     #[test]
     fn memory_payment_records_metadata_only() {
         let mut delivery = MemoryPaymentSend::default();
@@ -362,21 +391,14 @@ mod tests {
 
     #[cfg(feature = "wallet")]
     #[test]
-    fn payment_payload_debug_redacts_bearer_token_and_proof_secret() {
+    fn payment_payload_debug_redacts_proof_secret() {
         let payload = payload();
-        let token_debug = format!("{:?}", payload.token);
+        let wire = payload.wire_json().unwrap();
         let payload_debug = format!("{payload:?}");
 
-        assert!(
-            token_debug
-                .contains("9a6dbb847bd232ba76db0df197216b29d3b8cc14553cd27827fc1cc942fedb4e"),
-            "negative control lost the known proof secret"
-        );
-        assert!(!payload_debug.contains(VALID_CASHU_TOKEN));
-        assert!(
-            !payload_debug
-                .contains("9a6dbb847bd232ba76db0df197216b29d3b8cc14553cd27827fc1cc942fedb4e")
-        );
+        // Non-vacuous control: the secret really is in the serialized payload we hand in.
+        assert!(wire.contains(KNOWN_SECRET), "test setup lost the known secret");
+        assert!(!payload_debug.contains(KNOWN_SECRET));
         assert_eq!(payload_debug, "PaymentPayload(<redacted>)");
     }
 
@@ -428,106 +450,81 @@ mod tests {
 
     #[cfg(all(feature = "gateway", feature = "wallet"))]
     #[test]
-    fn corrupt_wire_token_fails_closed_before_payload_construction() {
+    fn corrupt_wire_payload_fails_closed() {
         let buyer = nostr_sdk::prelude::Keys::generate().public_key();
-        let json = format!(
-            "{{\"job_id\":\"job\",\"result_id\":\"result\",\"mint_url\":\"https://testnut.cashu.space\",\"amount\":7,\"unit\":\"sat\",\"token\":\"not-a-cashu-token\",\"buyer_pubkey\":\"{}\",\"seller_pubkey\":\"seller\"}}",
-            buyer.to_hex()
-        );
 
-        let result = parse_nip17_payment_payload(&json, buyer);
-
-        assert!(
-            matches!(result, Err(PaymentSendError::Transport(message)) if message.contains("invalid Cashu token in NIP-17 payment"))
-        );
-    }
-
-    #[cfg(all(feature = "gateway", feature = "wallet"))]
-    #[test]
-    fn payment_payload_round_trips_token_identity_at_envelope_boundary() {
-        let payload = payload();
-        let buyer = nostr_sdk::prelude::Keys::generate().public_key();
-        let json = payload.canonical_json(&buyer.to_hex());
-
-        let parsed = parse_nip17_payment_payload(&json, buyer).unwrap();
-
-        assert_eq!(parsed.payload.token, payload.token);
-        assert_eq!(parsed.payload.token.to_string(), VALID_CASHU_TOKEN);
-        assert_eq!(parsed.buyer_pubkey, buyer);
-    }
-
-    #[cfg(all(feature = "gateway", feature = "wallet"))]
-    #[test]
-    fn payment_envelope_buyer_must_match_authenticated_seal_sender() {
-        let payload = payload();
-        let claimed_buyer = nostr_sdk::prelude::Keys::generate().public_key();
-        let seal_sender = nostr_sdk::prelude::Keys::generate().public_key();
-        let json = payload.canonical_json(&claimed_buyer.to_hex());
-
-        let result = parse_nip17_payment_payload(&json, seal_sender);
-
+        // Not a NUT-18 payload at all.
+        let result = parse_nip17_payment_payload("{\"not\":\"a payload\"}", buyer);
         assert!(matches!(
             result,
             Err(PaymentSendError::Transport(message))
-                if message.contains("seal sender does not match payment envelope buyer")
+                if message.contains("invalid NIP-17 NUT-18 payment payload JSON")
+        ));
+
+        // Well-formed NUT-18 shape but missing the job-correlation `id`.
+        let mut no_id = nut18_payload("job");
+        no_id.id = None;
+        let json = serde_json::to_string(&no_id).unwrap();
+        let result = parse_nip17_payment_payload(&json, buyer);
+        assert!(matches!(
+            result,
+            Err(PaymentSendError::Transport(message)) if message.contains("missing its `id`")
         ));
     }
 
     #[cfg(all(feature = "gateway", feature = "wallet"))]
     #[test]
-    fn gift_wrap_never_leaks_token_or_payload_plaintext() {
-        use std::str::FromStr;
+    fn payment_payload_round_trips_through_the_nut18_wire() {
+        let payload = payload();
+        let buyer = nostr_sdk::prelude::Keys::generate().public_key();
+        let json = payload.wire_json().unwrap();
 
+        let parsed = parse_nip17_payment_payload(&json, buyer).unwrap();
+
+        assert_eq!(parsed.payload.payload, payload.payload);
+        assert_eq!(parsed.payload.job_id(), "job");
+        assert_eq!(parsed.payload.to_token(), payload.to_token());
+        assert_eq!(parsed.buyer_pubkey, buyer);
+    }
+
+    #[cfg(all(feature = "gateway", feature = "wallet"))]
+    #[test]
+    fn gift_wrap_never_leaks_proof_secret_or_payload_plaintext() {
         use nostr_sdk::{
             nips::nip59::UnwrappedGift,
             prelude::{JsonUtil, Keys, Kind, PublicKey, Tag},
         };
 
         const SECRET_JOB_ID: &str = "job-secret-corr-42";
-        const SECRET_RESULT_ID: &str = "result-secret-corr-42";
 
         let sender = Keys::generate();
         let receiver = Keys::generate();
 
-        // Secret-class fields ride ONLY inside the encrypted NIP-17 rumor:
-        //   * `token` is bearer ecash / proof material -> the hard money-safety requirement;
-        //     any plaintext leak is a spendable secret on a public relay.
-        //   * job_id / result_id / mint_url / amount / pubkeys travel inside the same
-        //     encrypted payload. Gift-wrap exists to keep that whole envelope private, so we
-        //     assert the entire canonical payload (and the correlation ids) are absent too.
+        // Secret-class material rides ONLY inside the encrypted NIP-17 rumor: the proof secret is
+        // bearer ecash (a spendable secret on a public relay if leaked); the whole NUT-18 payload
+        // and the job correlation id travel inside the same encrypted envelope.
         let payload = PaymentPayload {
-            job_id: SECRET_JOB_ID.into(),
-            result_id: SECRET_RESULT_ID.into(),
-            mint_url: "https://testnut.cashu.space".into(),
-            amount: 7,
-            unit: "sat".into(),
-            token: cashu::Token::from_str(VALID_CASHU_TOKEN).unwrap(),
             seller_pubkey: receiver.public_key().to_hex(),
+            payload: nut18_payload(SECRET_JOB_ID),
         };
-        let plaintext = payload.canonical_json(&sender.public_key().to_hex());
+        let plaintext = payload.wire_json().unwrap();
 
-        // Non-vacuous guard: the token really is present in the plaintext we hand in, so its
-        // absence from the wire artifact below is a meaningful result, not a typo.
+        // Non-vacuous guard: the secret really is present in the plaintext we hand in.
         assert!(
-            plaintext.contains(VALID_CASHU_TOKEN),
-            "test setup broken: token missing from canonical payload"
+            plaintext.contains(KNOWN_SECRET),
+            "test setup broken: proof secret missing from NUT-18 payload"
         );
 
         let recipient = PublicKey::parse(&payload.seller_pubkey).expect("valid recipient pubkey");
-        let gift_wrap = block_on(payment_send_gift_wrap(
-            &sender,
-            recipient,
-            plaintext.clone(),
-        ))
-        .expect("gift wrap builds without network");
+        let gift_wrap =
+            block_on(payment_send_gift_wrap(&sender, recipient, plaintext.clone()))
+                .expect("gift wrap builds without network");
 
-        // The publishable artifact is a NIP-59 gift wrap.
         assert_eq!(gift_wrap.kind, Kind::GiftWrap);
         assert_eq!(gift_wrap.kind.as_u16(), 1059);
 
-        // Unwrap the exact publishable artifact as the recipient does. This proves the
-        // encrypted rumor is a decryptable kind-14 DM addressed to the seller, rather than
-        // merely checking that the outer event looks opaque.
+        // Unwrap the exact publishable artifact as the recipient does: proves the encrypted rumor
+        // is a decryptable kind-14 DM addressed to the seller.
         let unwrapped = block_on(UnwrappedGift::from_gift_wrap(&receiver, &gift_wrap))
             .expect("recipient decrypts and authenticates the gift wrap");
         assert_eq!(unwrapped.sender, sender.public_key());
@@ -542,27 +539,22 @@ mod tests {
             "kind-14 rumor is missing its recipient p-tag"
         );
 
-        // Serialize the ENTIRE publishable event (id, tags, content, sig) exactly as it goes
-        // on the wire, and search that whole artifact.
+        // Serialize the ENTIRE publishable event exactly as it goes on the wire and search it.
         let wire = gift_wrap.as_json();
-
-        // Core money-safety property: no proof/token material and no plaintext payload
-        // survives on the wire.
         assert!(
-            !wire.contains(VALID_CASHU_TOKEN),
-            "token/proof material leaked in plaintext on the wire: {wire}"
+            !wire.contains(KNOWN_SECRET),
+            "proof secret leaked in plaintext on the wire: {wire}"
         );
         assert!(
             !wire.contains(&plaintext),
-            "canonical payload leaked in plaintext on the wire: {wire}"
+            "NUT-18 payload leaked in plaintext on the wire: {wire}"
         );
         assert!(
-            !wire.contains(SECRET_JOB_ID) && !wire.contains(SECRET_RESULT_ID),
-            "job/result correlation ids leaked in plaintext on the wire: {wire}"
+            !wire.contains(SECRET_JOB_ID),
+            "job correlation id leaked in plaintext on the wire: {wire}"
         );
 
-        // Non-vacuous guard: there is real ciphertext and it is what got serialized, so the
-        // absence checks above ran against a non-empty artifact.
+        // Non-vacuous guard: there is real ciphertext and it is what got serialized.
         assert!(!gift_wrap.content.is_empty(), "gift wrap content is empty");
         assert!(
             wire.contains(&gift_wrap.content),
@@ -570,15 +562,10 @@ mod tests {
         );
 
         // Negative control: a second wrap of the SAME payload differs on the wire (ephemeral
-        // wrapping key + randomized nip44 nonce). A plaintext or deterministic-passthrough
-        // path would make these byte-identical, so this proves the absence assertions above
-        // are not passing vacuously against a constant or empty artifact.
-        let second = block_on(payment_send_gift_wrap(
-            &sender,
-            recipient,
-            plaintext.clone(),
-        ))
-        .expect("second gift wrap builds without network");
+        // wrapping key + randomized nip44 nonce), proving the absence checks above are not
+        // passing vacuously against a constant or empty artifact.
+        let second = block_on(payment_send_gift_wrap(&sender, recipient, plaintext.clone()))
+            .expect("second gift wrap builds without network");
         assert_ne!(
             wire,
             second.as_json(),
@@ -607,22 +594,6 @@ mod tests {
                 Poll::Ready(output) => return output,
                 Poll::Pending => std::thread::yield_now(),
             }
-        }
-    }
-
-    fn payload() -> PaymentPayload {
-        #[cfg(feature = "wallet")]
-        use std::str::FromStr;
-
-        PaymentPayload {
-            job_id: "job".into(),
-            result_id: "result".into(),
-            mint_url: "https://testnut.cashu.space".into(),
-            amount: 7,
-            unit: "sat".into(),
-            #[cfg(feature = "wallet")]
-            token: cashu::Token::from_str(VALID_CASHU_TOKEN).unwrap(),
-            seller_pubkey: "seller".into(),
         }
     }
 }

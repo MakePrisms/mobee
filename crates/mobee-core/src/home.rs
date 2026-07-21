@@ -1,0 +1,1062 @@
+//! Packaged buyer home under `~/.mobee` (or `MOBEE_HOME`).
+//!
+//! First-run bootstrap writes working defaults: testnut mint, mobee-relay, budget caps,
+//! autogen key (`0600`), and an empty `wallet/` dir. The secret key is never returned.
+
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+/// Open-market demo relay (PROCESS.md).
+pub const DEFAULT_RELAY_URL: &str = "wss://mobee-relay.orveth.dev";
+/// Standing CDK testnut mint — no real funds. Host re-locked 2026-07-15 after
+/// `testnut.cashu.space` died from turtle; class (TESTNUT) is the load-bearing rule.
+pub const DEFAULT_MINT_URL: &str = "https://testnut.cashudevkit.org";
+/// Dead testnut host — bootstrap migrates config.toml away from this.
+pub const DEAD_TESTNUT_MINT_HOST: &str = "testnut.cashu.space";
+/// Conservative per-job spend cap (sats) until config is tuned.
+pub const DEFAULT_PER_JOB_BUDGET_SATS: u64 = 21;
+/// Conservative rolling/session total spend cap (sats).
+pub const DEFAULT_TOTAL_BUDGET_SATS: u64 = 100;
+
+const CONFIG_FILE: &str = "config.toml";
+const KEY_FILE: &str = "key";
+const WALLET_DIR: &str = "wallet";
+
+/// Failure while resolving or bootstrapping the packaged home.
+#[derive(Debug)]
+pub enum HomeError {
+    Io(String),
+    Config(String),
+    Key(String),
+}
+
+impl std::fmt::Display for HomeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(message) => write!(formatter, "home io error: {message}"),
+            Self::Config(message) => write!(formatter, "home config error: {message}"),
+            Self::Key(message) => write!(formatter, "home key error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for HomeError {}
+
+/// Optional buyer identity metadata (`[profile]` in config.toml).
+///
+/// Absent by default — fresh bootstrap does **not** invent a name. Kind-0 names are
+/// untrusted display metadata only; decision paths must key on hex pubkey alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProfileConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+}
+
+/// Default relay-git base (delivery). Live on mobee-relay (`/git/<owner>/<repo>.git`).
+pub const DEFAULT_RELAY_GIT_BASE: &str = "https://mobee-relay.orveth.dev/git";
+/// Legacy shared leaf — NOT used as default (relay name registry is global).
+pub const DEFAULT_RELAY_GIT_REPO: &str = "mobee-seller";
+
+/// Seller daemon config (`[seller]` in config.toml). Key never lives here.
+///
+/// `agent_command` MUST be an argv array — a TOML string/shell value is refused at parse
+/// (no-shell by construction).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SellerConfig {
+    #[serde(deserialize_with = "deserialize_agent_command_argv")]
+    pub agent_command: Vec<String>,
+    pub rate_sats: u64,
+    pub git_remote: String,
+    /// Job deadline override (seconds). Default: offer `deadline_unix`, else ~600s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_timeout_secs: Option<u64>,
+    /// Optional preset label (`claude` | `cursor` | `codex`) for rediscovery / status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Opt-in to claim untargeted/open offers. Default **false** (targeted-only).
+    #[serde(default)]
+    pub claim_open_pool: bool,
+    /// Backfill window (seconds) for the seller's UNTARGETED (open-pool) offer-kind offer
+    /// filter. On (re)subscribe the open-pool filter requests stored offers dated at/after
+    /// `now - this`, so a daemon started AFTER an open-pool offer was posted still SEES it
+    /// (and claims it iff every money-safety guard passes: not deadline-expired, clears the
+    /// rate floor, not already delivered/settled, not live-claimed by another seller).
+    /// Default **1200** (20 min). **`0` = live-only** — byte-identical pre-backfill shape
+    /// (`since(now)` + `limit(0)`): no stored open-pool offers, only ones posted while the
+    /// daemon runs. The TARGETED (`#p==self`) filter is NOT affected by this knob — it keeps
+    /// its original full-history backfill at all values (stored targeted offers are addressed
+    /// to this seller); the classify-level deadline-expiry refusal is the staleness guard on
+    /// both paths.
+    #[serde(default = "default_offer_backfill_secs")]
+    pub offer_backfill_secs: u64,
+    /// Opt-in to the piece-10 contribution (freelance-PR fork) path. Default **true**. When
+    /// **false** the daemon behaves as a seller WITHOUT contribution support: it feedback-kind
+    /// `status=error`s a `job-class=contribution` offer instead of running it as from-scratch
+    /// (interop courtesy — NOT a security control; buyer refusal is the boundary).
+    #[serde(default = "default_contribution_enabled")]
+    pub contribution_enabled: bool,
+}
+
+/// Piece-13 persistent-seller-memory config (`[seller_memory]` section). The read-on-start +
+/// retro-write-back knobs and the two plugin seams (prompt template paths). Every field has a
+/// serde default so a config written before this section existed parses to the shipped defaults
+/// (back-compat).
+///
+/// NOTE (build judgment call): the PIECE-13 spec names this section `[seller.memory]` (nested in
+/// `[seller]`). Nesting it inside `SellerConfig` would force adding a required field to that
+/// struct, whose literal is constructed in `seller.rs` — a file the piece-13 build is forbidden
+/// to touch (money-path boundary; money-files diff must stay empty). Placing it top-level as
+/// `[seller_memory]` on `MobeeConfig` (built only via `Default`) delivers the identical knobs and
+/// seams without touching any money-path file. The nesting is cosmetic; behaviour is unchanged.
+///
+/// This is **diagnostic/economic** context only. Nothing here ever feeds the pay gate, the
+/// journal, or the receipt bind (see PIECE-13 § Threat & integrity).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SellerMemoryConfig {
+    /// Inline the distilled `MEMORY.md` index into the agent's job prompt at start. Default
+    /// **on**; when **false** the composed prompt is byte-identical to the pre-piece-13 output.
+    #[serde(default = "default_memory_enabled")]
+    pub memory_enabled: bool,
+    /// Run one best-effort retro agent turn after a delivered-**paid** job to update memory.
+    /// Default **on**; gated separately from `memory_enabled` (the read path is cheap, the retro
+    /// turn costs a model call). Never blocks or affects the money path.
+    #[serde(default = "default_retro_enabled")]
+    pub retro_enabled: bool,
+    /// Plugin seam: template for the retro/distiller prompt. Unset ⇒ the in-repo default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retro_prompt_path: Option<PathBuf>,
+    /// Plugin seam: template framing how `MEMORY.md` is inlined at job start. Unset ⇒ in-repo
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_on_start_template_path: Option<PathBuf>,
+}
+
+impl Default for SellerMemoryConfig {
+    fn default() -> Self {
+        Self {
+            memory_enabled: default_memory_enabled(),
+            retro_enabled: default_retro_enabled(),
+            retro_prompt_path: None,
+            read_on_start_template_path: None,
+        }
+    }
+}
+
+/// Seller lifecycle **announce** config (`[seller_announce]` section). Wires the daemon's
+/// structured lifecycle events (online/claimed/delivered/collected/refused/reconcile-released/
+/// job-failed) to a pluggable external sink command that receives one JSON event on stdin.
+///
+/// NOTE (same build judgment call as [`SellerMemoryConfig`]): the natural spelling would nest
+/// this under `[seller]`, but `SellerConfig`'s literal is constructed in `seller.rs` — a money-
+/// path file the gateway build must not touch. Placing it top-level as `[seller_announce]` on
+/// `MobeeConfig` (built only via `Default`) delivers the identical knob without touching any
+/// money file. Cosmetic nesting only; behavior is unchanged.
+///
+/// **Feature OFF by default**: an absent section (or an empty `command`) means the daemon emits
+/// nothing and spawns no process — byte-identical behavior to before the feature existed. This is
+/// diagnostic/observability context only; nothing here ever feeds the pay gate, journal, or
+/// receipt bind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SellerAnnounceConfig {
+    /// Sink command as an argv array (no-shell by construction, like `agent_command`). Empty ⇒
+    /// feature OFF. Each lifecycle event spawns this command with the event JSON on stdin.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Upper bound (ms) the daemon waits for one sink invocation before killing it. Emission is
+    /// always off the event loop (its own detached thread), so this bounds only that thread — the
+    /// seller loop is never blocked regardless. Default **2000**.
+    #[serde(default = "default_announce_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for SellerAnnounceConfig {
+    fn default() -> Self {
+        Self {
+            command: Vec::new(),
+            timeout_ms: default_announce_timeout_ms(),
+        }
+    }
+}
+
+impl SellerAnnounceConfig {
+    /// True when every field is at its shipped default (so config.toml stays clean — the section
+    /// only serializes once an operator sets a sink command or a non-default bound).
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// True when a sink command is configured (feature ON).
+    pub fn is_enabled(&self) -> bool {
+        !self.command.is_empty()
+    }
+}
+
+/// serde default for [`SellerAnnounceConfig::timeout_ms`] — a 2s bound on one sink invocation.
+pub fn default_announce_timeout_ms() -> u64 {
+    2000
+}
+
+/// Seller **brain/episode telemetry** config (`[telemetry]` section). Wires every captured
+/// [`Episode`](crate::episode::Episode) — the per-job reasoning + economics record already written
+/// to `episodes.jsonl` — to a live stream so an operator can watch what is going on inside a
+/// mobee's brain: a pluggable sink command (one JSON event on stdin, same exec/timeout contract as
+/// [`SellerAnnounceConfig`]) and/or an append-only JSONL mirror file. See [`crate::telemetry`].
+///
+/// **Feature ON by default** (`enabled = true`): the channel is armed. It only produces output
+/// once a `command` and/or `mirror_file` is configured — with both unset, `enabled` alone emits
+/// nowhere (and `episodes.jsonl` is unaffected either way). This is deliberate: telemetry is the
+/// live wire over the top of the on-disk episode log, not a second copy of it — so the default
+/// does not silently duplicate `episodes.jsonl` to a new file.
+///
+/// NOTE (same money-path build boundary as [`SellerMemoryConfig`] / [`SellerAnnounceConfig`]):
+/// top-level on `MobeeConfig` (built only via `Default`) so no money-path file is touched.
+///
+/// Diagnostic/observability only, sharing the episode's guarantees: an event NEVER carries a
+/// token/key/proof-secret (it wraps an `Episode`, which holds none — see `episode.rs`), emission is
+/// best-effort off the hot path, and a sink/mirror failure never blocks or loses the
+/// `episodes.jsonl` append (the caller performs that FIRST). Nothing here ever feeds the pay gate,
+/// journal, or receipt bind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryConfig {
+    /// Arm the telemetry channel. Default **true**. When false, no event is emitted or mirrored
+    /// (episodes.jsonl is unaffected).
+    #[serde(default = "default_telemetry_enabled")]
+    pub enabled: bool,
+    /// Sink command as an argv array (no-shell by construction, like `agent_command`). Empty ⇒ no
+    /// sink process is spawned. Each episode spawns this command with the event JSON on stdin.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Upper bound (ms) the emitter waits for one sink invocation before killing it. Emission is
+    /// off the hot path (its own detached thread), so this bounds only that thread — the seller
+    /// loop and the episode append are never blocked regardless. Default **2000**.
+    #[serde(default = "default_telemetry_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Optional append-only JSONL mirror path. Unset ⇒ no mirror. When set, each event is durably
+    /// appended to this file in addition to (or instead of) the sink command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_file: Option<PathBuf>,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_telemetry_enabled(),
+            command: Vec::new(),
+            timeout_ms: default_telemetry_timeout_ms(),
+            mirror_file: None,
+        }
+    }
+}
+
+impl TelemetryConfig {
+    /// True when every field is at its shipped default (so config.toml stays clean — the section
+    /// only serializes once an operator points it somewhere or changes the bound/enablement).
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// True when the channel is armed AND has somewhere to emit (a sink command or a mirror file).
+    /// `enabled` alone (no command, no mirror) is armed-but-unpointed and emits nowhere.
+    pub fn is_active(&self) -> bool {
+        self.enabled && (!self.command.is_empty() || self.mirror_file.is_some())
+    }
+}
+
+/// serde default for [`TelemetryConfig::enabled`] — the brain-telemetry channel is ON by default.
+pub fn default_telemetry_enabled() -> bool {
+    true
+}
+
+/// serde default for [`TelemetryConfig::timeout_ms`] — a 2s bound on one sink invocation.
+pub fn default_telemetry_timeout_ms() -> u64 {
+    2000
+}
+
+/// `[seller_heartbeat]` — cadence + enablement for the addressable kind-30340 liveness event
+/// (PIECE-14 § Heartbeat). **Feature ON by default**: a running seller advertises liveness every
+/// [`interval_secs`](SellerHeartbeatConfig::interval_secs) seconds. The heartbeat is
+/// diagnostic/discovery context only — publish failures log-and-continue and it never blocks the
+/// job loop, feeds the pay gate, or binds a receipt. Tests can override the cadence/enablement
+/// via [`crate::heartbeat::HEARTBEAT_INTERVAL_ENV`] / [`crate::heartbeat::HEARTBEAT_ENABLED_ENV`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SellerHeartbeatConfig {
+    /// Publish heartbeats while the daemon runs. Default **true**.
+    #[serde(default = "default_heartbeat_enabled")]
+    pub enabled: bool,
+    /// Cadence in seconds. Default **300** (~5 min).
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for SellerHeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_heartbeat_enabled(),
+            interval_secs: default_heartbeat_interval_secs(),
+        }
+    }
+}
+
+impl SellerHeartbeatConfig {
+    /// True when every field is at its shipped default (so config.toml stays clean — the section
+    /// only serializes once an operator sets a non-default knob).
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// serde default for [`SellerHeartbeatConfig::enabled`] — heartbeats ON.
+pub fn default_heartbeat_enabled() -> bool {
+    true
+}
+
+/// serde default for [`SellerHeartbeatConfig::interval_secs`] — 300s (~5 min).
+pub fn default_heartbeat_interval_secs() -> u64 {
+    300
+}
+
+/// Boot-time push-preflight config (`[seller_preflight]` section). Gates the seller daemon's
+/// one-shot WRITE-auth probe at startup (a `git push --dry-run` against the seller's relay-git
+/// canonical repo) so environment breakage — most notably git < 2.54 silently dropping the
+/// Authorization credential on the git-receive-pack POST (reads work, pushes 401) — surfaces at
+/// BOOT instead of mid-job.
+///
+/// NOTE (same money-path build boundary as [`SellerMemoryConfig`] / [`SellerAnnounceConfig`]): the
+/// natural spelling would nest this under `[seller]`, but `SellerConfig`'s literal is constructed
+/// in `seller.rs` — a money-path file this change must not touch. A new required field there would
+/// force editing that literal. Placing it top-level as `[seller_preflight]` on `MobeeConfig` (built
+/// only via `Default`) delivers the identical knob without touching any money file. Cosmetic only;
+/// the probe is diagnostic — it NEVER feeds the pay gate, journal, or receipt bind, and NEVER
+/// refuses boot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SellerPreflightConfig {
+    /// Run the boot-time dry-run push probe. Default **true**. Set false (or the env override
+    /// `MOBEE_SELLER_BOOT_PUSH_PREFLIGHT=0`) to skip — e.g. tests, or air-gapped first boots.
+    #[serde(default = "default_boot_push_preflight")]
+    pub boot_push_preflight: bool,
+}
+
+impl Default for SellerPreflightConfig {
+    fn default() -> Self {
+        Self {
+            boot_push_preflight: default_boot_push_preflight(),
+        }
+    }
+}
+
+impl SellerPreflightConfig {
+    /// True when every field is at its shipped default (so config.toml stays clean — the section is
+    /// only serialized once an operator sets a non-default knob).
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// serde default for [`SellerPreflightConfig::boot_push_preflight`] — probe ON.
+pub fn default_boot_push_preflight() -> bool {
+    true
+}
+
+// NOTE (issue #55): the former `[seller_git] inprocess_push` knob and its system-git fallback are
+// GONE. All seller/buyer git legs are unconditionally in-process libgit2 (see `crate::git_transport`),
+// so there is no path to select and no config to carry.
+
+impl SellerMemoryConfig {
+    /// True when every field is at its shipped default (so config.toml stays clean — the section
+    /// is only serialized once an operator sets a non-default knob).
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// serde default for [`SellerMemoryConfig::memory_enabled`] — read-on-start ON.
+pub fn default_memory_enabled() -> bool {
+    true
+}
+
+/// serde default for [`SellerMemoryConfig::retro_enabled`] — retro write-back ON.
+pub fn default_retro_enabled() -> bool {
+    true
+}
+
+/// Default for [`SellerConfig::contribution_enabled`] — contribution support ON.
+pub fn default_contribution_enabled() -> bool {
+    true
+}
+
+/// serde default for [`SellerConfig::offer_backfill_secs`]: 1200s (20 min). A `[seller]` block
+/// written before this field existed parses to this default; `0` must be set explicitly.
+pub fn default_offer_backfill_secs() -> u64 {
+    1200
+}
+
+/// Per-seller NIP-34 `d` / path leaf. Relay `.names/` registry is GLOBAL across
+/// owners — a shared constant like `mobee-seller` collides and seeds fail silently.
+pub fn default_relay_git_repo_id(seller_pubkey_hex: &str) -> String {
+    let pk = seller_pubkey_hex.trim().to_ascii_lowercase();
+    let short = &pk[..16.min(pk.len())];
+    format!("m{short}")
+}
+
+/// Build the default relay-git remote for a seller pubkey (self-owned namespace).
+pub fn default_relay_git_remote(seller_pubkey_hex: &str) -> String {
+    let pk = seller_pubkey_hex.trim().to_ascii_lowercase();
+    let repo = default_relay_git_repo_id(&pk);
+    format!("{DEFAULT_RELAY_GIT_BASE}/{pk}/{repo}.git")
+}
+
+/// Repo `d`-tag / path leaf for a relay-git remote (`…/git/<owner>/<repo>[.git]`).
+pub fn relay_git_repo_id(remote_url: &str) -> Option<String> {
+    let lower = remote_url.trim().to_ascii_lowercase();
+    let idx = lower.find("/git/")?;
+    let prefix_len = "/git/".len();
+    let rest = remote_url.trim().get(idx + prefix_len..)?;
+    let mut parts = rest.split('/').filter(|p| !p.is_empty());
+    let _owner = parts.next()?;
+    let mut repo = parts.next()?.to_owned();
+    if let Some(stripped) = repo.strip_suffix(".git") {
+        repo = stripped.to_owned();
+    }
+    if repo.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(repo)
+}
+
+fn deserialize_agent_command_argv<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct ArgvVisitor;
+
+    impl<'de> Visitor<'de> for ArgvVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("argv array (not a shell string)")
+        }
+
+        fn visit_str<E: de::Error>(self, _value: &str) -> Result<Self::Value, E> {
+            Err(E::custom(
+                "agent_command must be an argv array, not a string/shell value",
+            ))
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+            self.visit_str(&value)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                out.push(item);
+            }
+            if out.is_empty() {
+                return Err(de::Error::custom("agent_command argv must be non-empty"));
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_any(ArgvVisitor)
+}
+
+/// One custom agent preset (`[agents.<name>] argv = [...]`). The argv is a launch command
+/// for the seller ACP driver — same no-shell argv-array rule as `agent_command`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPresetConfig {
+    #[serde(deserialize_with = "deserialize_agent_command_argv")]
+    pub argv: Vec<String>,
+}
+
+/// Buyer-facing packaged config (`~/.mobee/config.toml`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobeeConfig {
+    pub relay_url: String,
+    /// Seller-side accept policy: the mints this seller will accept payment at. The first
+    /// entry is the mint the seller advertises first and also the buyer-side wallet default
+    /// mint (read via [`MobeeConfig::default_mint`]). Defaults to `[DEFAULT_MINT_URL]`.
+    ///
+    /// NOTE: distinct from `extra_mints`. `accepted_mints` is the SELLER accept-policy list;
+    /// `extra_mints` is the BUYER wallet's *additional allowed* mints. They are separate
+    /// fields with separate meanings and are never merged or repurposed for one another.
+    #[serde(default = "default_accepted_mints")]
+    pub accepted_mints: Vec<String>,
+    pub per_job_budget_sats: u64,
+    pub total_budget_sats: u64,
+    /// Opt-in additional mints for the BUYER wallet (`mobee wallet mints add`). The buyer's
+    /// default mint stays the first `accepted_mints` entry ([`MobeeConfig::default_mint`]);
+    /// never invents spendable credit by itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_mints: Vec<String>,
+    /// REAL-MONEY SWITCH (issue #49). When `false` (default — the safety posture) the seller
+    /// `accepted_mints` boot fence and the buyer pay-path mint resolution admit ONLY the
+    /// testnut/dev allow-list ([`DEFAULT_MINT_URL`]); a real mint is refused fail-closed. When
+    /// `true` (deliberate operator opt-in, gudnuf-authorized) any well-formed `https://` mint URL
+    /// is admitted — this is the switch that lets real sats move. It flips ONLY the allow-list
+    /// check; every other money gate (creq membership, redeem guard token==payload mint, dust
+    /// guard, budget caps, co-signatures) is unchanged.
+    #[serde(default)]
+    pub allow_real_mints: bool,
+    /// Optional `[profile] name / about`. Skipped when absent so fresh homes stay unnamed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ProfileConfig>,
+    /// Optional `[seller]` daemon config. Absent until `mobee sell` setup writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seller: Option<SellerConfig>,
+    /// Optional `[agents]` table of custom presets: name -> `{ argv = [...] }`. A custom
+    /// entry named after a built-in preset (claude|cursor|codex) OVERRIDES that built-in.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, AgentPresetConfig>,
+    /// Piece-13 `[seller_memory]` config (read-on-start + retro seams). Defaults when absent.
+    #[serde(default, skip_serializing_if = "SellerMemoryConfig::is_default")]
+    pub seller_memory: SellerMemoryConfig,
+    /// `[seller_announce]` lifecycle-event sink config. Defaults (feature OFF) when absent.
+    #[serde(default, skip_serializing_if = "SellerAnnounceConfig::is_default")]
+    pub seller_announce: SellerAnnounceConfig,
+    /// `[telemetry]` brain/episode stream config. Defaults (armed, no sink/mirror) when absent.
+    #[serde(default, skip_serializing_if = "TelemetryConfig::is_default")]
+    pub telemetry: TelemetryConfig,
+    /// `[seller_heartbeat]` addressable kind-30340 liveness config. Defaults (ON, 300s) when absent.
+    #[serde(default, skip_serializing_if = "SellerHeartbeatConfig::is_default")]
+    pub seller_heartbeat: SellerHeartbeatConfig,
+    /// `[seller_preflight]` boot push-probe config. Defaults (probe ON) when absent.
+    #[serde(default, skip_serializing_if = "SellerPreflightConfig::is_default")]
+    pub seller_preflight: SellerPreflightConfig,
+    /// Optional buyer-side piece-10 contribution content policy (the MUST-5 policy hook). Absent
+    /// ⇒ the FLOOR (refuse only empty diffs). Present ⇒ tighten pre-pay with a path allowlist /
+    /// forbidden paths / max diff size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contribution: Option<ContributionPolicyConfig>,
+}
+
+/// Buyer-side content policy for piece-10 contribution verify (the MUST-5 policy hook). Maps 1:1
+/// to `contribution::ContentPolicy`; kept as a plain config type so `home` need not depend on the
+/// git-delivery feature. All fields default to the floor (allow all, forbid none, no cap).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ContributionPolicyConfig {
+    /// Non-empty ⇒ every changed path MUST lie under one of these prefixes (out-of-scope refuse).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_paths: Vec<String>,
+    /// A changed path under any of these prefixes is refused (checked before the allowlist).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbidden_paths: Vec<String>,
+    /// Refuse when summed churn exceeds this many units. `None` ⇒ no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_diff_bytes: Option<u64>,
+}
+
+/// Serde/default seed for [`MobeeConfig::accepted_mints`]: exactly the current testnut
+/// default, so an operator who configures nothing behaves identically to today.
+fn default_accepted_mints() -> Vec<String> {
+    vec![DEFAULT_MINT_URL.to_owned()]
+}
+
+/// The single real-mint fence predicate (issue #49), shared by the seller `accepted_mints` boot
+/// check and the buyer pay-path mint resolution so both sides gate on the SAME rule.
+///
+/// - `allow_real_mints == false` (default safety posture): only the testnut/dev allow-list — today
+///   that is exactly [`DEFAULT_MINT_URL`].
+/// - `allow_real_mints == true` (operator opt-in real-money switch): any well-formed `https://`
+///   mint URL. Full URL validity is re-checked downstream (`MintUrl::from_str` / `Wallet::new`);
+///   this predicate only decides the POLICY (testnut-only vs any-https).
+pub fn mint_allowed(mint_url: &str, allow_real_mints: bool) -> bool {
+    if allow_real_mints {
+        mint_url
+            .strip_prefix("https://")
+            .is_some_and(|host| !host.is_empty())
+    } else {
+        mint_url == DEFAULT_MINT_URL
+    }
+}
+
+impl MobeeConfig {
+    /// Buyer-side default mint: the first accepted mint. Falls back to [`DEFAULT_MINT_URL`]
+    /// only if the list is empty (boot validation refuses an empty list for sellers). Buyer
+    /// wallet ops read a single default mint through this accessor; the seller accept policy
+    /// is the full `accepted_mints` list.
+    pub fn default_mint(&self) -> &str {
+        self.accepted_mints
+            .first()
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_MINT_URL)
+    }
+}
+
+impl Default for MobeeConfig {
+    fn default() -> Self {
+        Self {
+            relay_url: DEFAULT_RELAY_URL.to_owned(),
+            accepted_mints: default_accepted_mints(),
+            per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,
+            total_budget_sats: DEFAULT_TOTAL_BUDGET_SATS,
+            extra_mints: Vec::new(),
+            allow_real_mints: false,
+            profile: None,
+            seller: None,
+            agents: BTreeMap::new(),
+            seller_memory: SellerMemoryConfig::default(),
+            seller_announce: SellerAnnounceConfig::default(),
+            telemetry: TelemetryConfig::default(),
+            seller_heartbeat: SellerHeartbeatConfig::default(),
+            seller_preflight: SellerPreflightConfig::default(),
+            contribution: None,
+        }
+    }
+}
+
+/// Resolved packaged home after bootstrap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MobeeHome {
+    pub root: PathBuf,
+    pub config: MobeeConfig,
+    pub key_path: PathBuf,
+    pub wallet_dir: PathBuf,
+    /// True when this bootstrap call created the key file.
+    pub key_created: bool,
+}
+
+/// Default home root: `MOBEE_HOME` if set, else `~/.mobee`.
+pub fn default_home_dir() -> Result<PathBuf, HomeError> {
+    if let Ok(override_dir) = std::env::var("MOBEE_HOME") {
+        let path = PathBuf::from(override_dir);
+        if path.as_os_str().is_empty() {
+            return Err(HomeError::Io("MOBEE_HOME is empty".into()));
+        }
+        return Ok(path);
+    }
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| HomeError::Io("HOME is unset and MOBEE_HOME was not provided".into()))?;
+    Ok(PathBuf::from(home).join(".mobee"))
+}
+
+/// Ensure `root` exists with config, key (`0600`), and `wallet/` dir.
+///
+/// Idempotent: existing config/key are left in place except dead-mint migration
+/// (`testnut.cashu.space` → [`DEFAULT_MINT_URL`]). Never returns the secret key.
+pub fn bootstrap(root: impl AsRef<Path>) -> Result<MobeeHome, HomeError> {
+    let root = root.as_ref().to_path_buf();
+    fs::create_dir_all(&root).map_err(|error| HomeError::Io(error.to_string()))?;
+
+    let config_path = root.join(CONFIG_FILE);
+    let key_path = root.join(KEY_FILE);
+    let wallet_dir = root.join(WALLET_DIR);
+
+    let config = if config_path.exists() {
+        let mut config = load_config(&config_path)?;
+        if migrate_dead_mint_url(&mut config) {
+            write_config(&config_path, &config)?;
+        }
+        config
+    } else {
+        let config = MobeeConfig::default();
+        write_config(&config_path, &config)?;
+        config
+    };
+
+    fs::create_dir_all(&wallet_dir).map_err(|error| HomeError::Io(error.to_string()))?;
+
+    let key_created = if key_path.exists() {
+        validate_existing_key(&key_path)?;
+        false
+    } else {
+        write_new_key(&key_path)?;
+        true
+    };
+
+    Ok(MobeeHome {
+        root,
+        config,
+        key_path,
+        wallet_dir,
+        key_created,
+    })
+}
+
+/// Rewrite dead `.cashu.space` testnut hosts to [`DEFAULT_MINT_URL`] across every
+/// `accepted_mints` entry. Returns true when any entry changed.
+pub fn migrate_dead_mint_url(config: &mut MobeeConfig) -> bool {
+    let mut changed = false;
+    for mint in &mut config.accepted_mints {
+        if mint.to_ascii_lowercase().contains(DEAD_TESTNUT_MINT_HOST) {
+            *mint = DEFAULT_MINT_URL.to_owned();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Back-compat shim: a legacy config carrying only the single top-level `mint_url = "…"`
+/// (pre-`accepted_mints`) folds into `accepted_mints = ["<that value>"]` when the file does
+/// not already carry an `accepted_mints` key. Never silently drops a configured mint. A no-op
+/// once `accepted_mints` is present. Operates on the raw TOML because the removed `mint_url`
+/// field is otherwise ignored on deserialize.
+fn migrate_legacy_mint_url(raw: &str, config: &mut MobeeConfig) -> Result<(), HomeError> {
+    let doc: toml::Value =
+        toml::from_str(raw).map_err(|error| HomeError::Config(error.to_string()))?;
+    let table = match doc.as_table() {
+        Some(table) => table,
+        None => return Ok(()),
+    };
+    if table.contains_key("accepted_mints") {
+        return Ok(());
+    }
+    if let Some(legacy) = table.get("mint_url").and_then(|value| value.as_str()) {
+        config.accepted_mints = vec![legacy.to_owned()];
+    }
+    Ok(())
+}
+
+/// Hex-encode the secp256k1 x-only/public view is deferred; this returns the *public* key
+/// only when a caller supplies a derived pubkey. For bootstrap status we expose whether a
+/// key file exists — use [`read_secret_key_hex`] only inside trusted surfaces that never log it.
+pub fn key_file_present(home: &MobeeHome) -> bool {
+    home.key_path.is_file()
+}
+
+/// Read the secret key hex from disk. Callers must not log, print, or put this in MCP tool output.
+pub fn read_secret_key_hex(home: &MobeeHome) -> Result<String, HomeError> {
+    let mut file =
+        File::open(&home.key_path).map_err(|error| HomeError::Key(error.to_string()))?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|error| HomeError::Key(error.to_string()))?;
+    let secret = contents.trim().to_owned();
+    validate_secret_hex(&secret)?;
+    Ok(secret)
+}
+
+/// Hex-encode the buyer's nostr public key derived from the packaged secret.
+/// Safe to return on MCP surfaces (not secret material).
+#[cfg(feature = "wallet")]
+pub fn public_key_hex(home: &MobeeHome) -> Result<String, HomeError> {
+    let secret = read_secret_key_hex(home)?;
+    let keys = nostr_sdk::Keys::parse(&secret)
+        .map_err(|error| HomeError::Key(format!("key parse for pubkey: {error}")))?;
+    Ok(keys.public_key().to_hex())
+}
+
+fn load_config(path: &Path) -> Result<MobeeConfig, HomeError> {
+    let raw = fs::read_to_string(path).map_err(|error| HomeError::Config(error.to_string()))?;
+    let mut config: MobeeConfig =
+        toml::from_str(&raw).map_err(|error| HomeError::Config(error.to_string()))?;
+    migrate_legacy_mint_url(&raw, &mut config)?;
+    Ok(config)
+}
+
+fn write_config(path: &Path, config: &MobeeConfig) -> Result<(), HomeError> {
+    let raw = toml::to_string_pretty(config)
+        .map_err(|error| HomeError::Config(error.to_string()))?;
+    fs::write(path, raw).map_err(|error| HomeError::Io(error.to_string()))
+}
+
+/// Persist `home.config` to `config.toml` (used by `set_profile` and mint migration).
+pub fn save_config(home: &MobeeHome) -> Result<(), HomeError> {
+    write_config(&home.root.join(CONFIG_FILE), &home.config)
+}
+
+/// Reload `config.toml` into `home.config` without touching the key file.
+pub fn reload_config(home: &mut MobeeHome) -> Result<(), HomeError> {
+    home.config = load_config(&home.root.join(CONFIG_FILE))?;
+    if migrate_dead_mint_url(&mut home.config) {
+        write_config(&home.root.join(CONFIG_FILE), &home.config)?;
+    }
+    Ok(())
+}
+
+fn validate_existing_key(path: &Path) -> Result<(), HomeError> {
+    ensure_key_permissions(path)?;
+    let mut file = File::open(path).map_err(|error| HomeError::Key(error.to_string()))?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|error| HomeError::Key(error.to_string()))?;
+    validate_secret_hex(contents.trim())
+}
+
+/// Existing keys must be `0600`. Too-open modes are re-chmod'd; if that fails, refuse.
+fn ensure_key_permissions(path: &Path) -> Result<(), HomeError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata =
+            fs::metadata(path).map_err(|error| HomeError::Key(error.to_string()))?;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 == 0 {
+            return Ok(());
+        }
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)
+            .map_err(|error| HomeError::Key(format!(
+                "key file permissions too open ({mode:#o}); re-chmod 0600 failed: {error}"
+            )))?;
+        let after = fs::metadata(path)
+            .map_err(|error| HomeError::Key(error.to_string()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if after & 0o077 != 0 {
+            return Err(HomeError::Key(format!(
+                "key file permissions too open ({mode:#o}); refused to leave open (still {after:#o})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_secret_hex(secret: &str) -> Result<(), HomeError> {
+    if secret.len() != 64 {
+        return Err(HomeError::Key(format!(
+            "secret key must be 64 hex chars, got {}",
+            secret.len()
+        )));
+    }
+    if !secret.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(HomeError::Key("secret key must be hex".into()));
+    }
+    if secret.chars().all(|ch| ch == '0') {
+        return Err(HomeError::Key("secret key must be non-zero".into()));
+    }
+    Ok(())
+}
+
+fn write_new_key(path: &Path) -> Result<(), HomeError> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| HomeError::Key(error.to_string()))?;
+    if bytes.iter().all(|&byte| byte == 0) {
+        return Err(HomeError::Key("generated an all-zero key".into()));
+    }
+    let secret = hex::encode(bytes);
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| HomeError::Key(error.to_string()))?;
+    file.write_all(secret.as_bytes())
+        .map_err(|error| HomeError::Key(error.to_string()))?;
+    file.write_all(b"\n")
+        .map_err(|error| HomeError::Key(error.to_string()))?;
+    file.sync_all()
+        .map_err(|error| HomeError::Key(error.to_string()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_home(label: &str) -> PathBuf {
+        let id = NEXT.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "mobee-home-{label}-{}-{id}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn agents_table_parses_round_trips_and_refuses_string_argv() {
+        let raw = "relay_url = 'r'\nmint_url = 'm'\n\
+                   per_job_budget_sats = 1\ntotal_budget_sats = 2\n\
+                   [agents.grok]\nargv = ['grok', 'agent', 'stdio']\n";
+        let config: MobeeConfig = toml::from_str(raw).expect("parse [agents]");
+        assert_eq!(
+            config.agents.get("grok").map(|p| p.argv.clone()),
+            Some(vec!["grok".into(), "agent".into(), "stdio".into()])
+        );
+
+        let serialized = toml::to_string_pretty(&config).expect("serialize");
+        let reloaded: MobeeConfig = toml::from_str(&serialized).expect("reparse");
+        assert_eq!(reloaded, config);
+
+        // Same no-shell rule as `agent_command`: a string argv is refused at parse.
+        let shelly = "relay_url = 'r'\nmint_url = 'm'\n\
+                      per_job_budget_sats = 1\ntotal_budget_sats = 2\n\
+                      [agents.grok]\nargv = 'grok agent stdio'\n";
+        assert!(toml::from_str::<MobeeConfig>(shelly).is_err());
+
+        // Absent table stays absent (config.toml stays clean).
+        let bare: MobeeConfig = toml::from_str(
+            "relay_url = 'r'\nmint_url = 'm'\nper_job_budget_sats = 1\ntotal_budget_sats = 2\n",
+        )
+        .expect("parse bare");
+        assert!(bare.agents.is_empty());
+        assert!(!toml::to_string_pretty(&bare).expect("ser").contains("[agents"));
+    }
+
+    #[test]
+    fn bootstrap_writes_defaults_key_and_wallet_dir() {
+        let root = temp_home("fresh");
+        let _ = fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        assert!(home.key_created);
+        assert_eq!(home.config, MobeeConfig::default());
+        assert!(home.root.join(CONFIG_FILE).is_file());
+        assert!(home.key_path.is_file());
+        assert!(home.wallet_dir.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&home.key_path)
+                .expect("key metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let secret = read_secret_key_hex(&home).expect("read key");
+        assert_eq!(secret.len(), 64);
+    }
+
+    #[test]
+    fn bootstrap_is_idempotent_and_preserves_key() {
+        let root = temp_home("idempotent");
+        let _ = fs::remove_dir_all(&root);
+        let first = bootstrap(&root).expect("first");
+        let secret = read_secret_key_hex(&first).expect("secret");
+        let second = bootstrap(&root).expect("second");
+        assert!(!second.key_created);
+        assert_eq!(read_secret_key_hex(&second).expect("secret again"), secret);
+        assert_eq!(second.config, first.config);
+    }
+
+    #[test]
+    fn default_home_dir_honors_mobee_home() {
+        let root = temp_home("env");
+        // Safety: test process isolation — restore after.
+        let previous = std::env::var_os("MOBEE_HOME");
+        unsafe { std::env::set_var("MOBEE_HOME", &root) };
+        let resolved = default_home_dir().expect("resolve");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("MOBEE_HOME", value) },
+            None => unsafe { std::env::remove_var("MOBEE_HOME") },
+        }
+        assert_eq!(resolved, root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_rechmods_too_open_existing_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_home("open-key");
+        let _ = fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let secret = read_secret_key_hex(&home).expect("secret");
+
+        let mut permissions = fs::metadata(&home.key_path)
+            .expect("meta")
+            .permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&home.key_path, permissions).expect("chmod 644");
+
+        let again = bootstrap(&root).expect("re-bootstrap must re-chmod or refuse");
+        let mode = fs::metadata(&again.key_path)
+            .expect("meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(read_secret_key_hex(&again).expect("secret again"), secret);
+    }
+
+    #[test]
+    fn bootstrap_migrates_dead_cashu_space_mint() {
+        let root = temp_home("dead-mint");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        let config_path = root.join(CONFIG_FILE);
+        let stale = MobeeConfig {
+            accepted_mints: vec![format!("https://{DEAD_TESTNUT_MINT_HOST}")],
+            ..MobeeConfig::default()
+        };
+        write_config(&config_path, &stale).expect("write stale");
+        let home = bootstrap(&root).expect("bootstrap migrates");
+        assert_eq!(home.config.accepted_mints, vec![DEFAULT_MINT_URL.to_owned()]);
+        let reloaded = load_config(&config_path).expect("reload");
+        assert_eq!(reloaded.accepted_mints, vec![DEFAULT_MINT_URL.to_owned()]);
+    }
+
+    #[test]
+    fn accepted_mints_default() {
+        // A config that names no mint at all yields accepted_mints == [DEFAULT_MINT_URL].
+        let config: MobeeConfig = toml::from_str(
+            "relay_url = 'r'\nper_job_budget_sats = 1\ntotal_budget_sats = 2\n",
+        )
+        .expect("parse mint-less config");
+        assert_eq!(config.accepted_mints, vec![DEFAULT_MINT_URL.to_owned()]);
+        assert_eq!(
+            MobeeConfig::default().accepted_mints,
+            vec![DEFAULT_MINT_URL.to_owned()]
+        );
+    }
+
+    #[test]
+    fn legacy_mint_url_migrates() {
+        // A legacy config carrying only the single `mint_url` loads as accepted_mints=[value].
+        let root = temp_home("legacy-mint");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        let config_path = root.join(CONFIG_FILE);
+        fs::write(
+            &config_path,
+            "relay_url = 'r'\nmint_url = 'https://legacy.example'\n\
+             per_job_budget_sats = 1\ntotal_budget_sats = 2\n",
+        )
+        .expect("write legacy");
+        let config = load_config(&config_path).expect("load legacy");
+        assert_eq!(
+            config.accepted_mints,
+            vec!["https://legacy.example".to_owned()]
+        );
+    }
+
+    #[test]
+    fn bootstrap_does_not_invent_profile() {
+        let root = temp_home("no-profile");
+        let _ = fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        assert!(home.config.profile.is_none());
+        let raw = fs::read_to_string(home.root.join(CONFIG_FILE)).expect("read");
+        assert!(
+            !raw.contains("[profile]"),
+            "fresh bootstrap must not invent [profile]: {raw}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_and_reload_profile_round_trip() {
+        let root = temp_home("profile-rt");
+        let _ = fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        home.config.profile = Some(ProfileConfig {
+            name: Some("anvil-buyer".into()),
+            about: Some("testnut only".into()),
+        });
+        save_config(&home).expect("save");
+        home.config.profile = None;
+        reload_config(&mut home).expect("reload");
+        let profile = home.config.profile.expect("profile present");
+        assert_eq!(profile.name.as_deref(), Some("anvil-buyer"));
+        assert_eq!(profile.about.as_deref(), Some("testnut only"));
+        let _ = fs::remove_dir_all(&root);
+    }
+}

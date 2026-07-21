@@ -20,15 +20,6 @@ pub struct Replay {
     pub error: Option<ReadError>,
 }
 
-impl Replay {
-    pub fn into_result(self) -> Result<Vec<Envelope>, ReadError> {
-        match self.error {
-            Some(error) => Err(error),
-            None => Ok(self.envelopes),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum LogError {
     Io(io::Error),

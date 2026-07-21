@@ -21,27 +21,37 @@
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          default = pkgs.runCommand "mobee-0.1.0" {
-            nativeBuildInputs = [
-              pkgs.cargo
-              pkgs.rustc
-              pkgs.stdenv.cc
-            ];
+          default = pkgs.rustPlatform.buildRustPackage {
+            pname = "mobee";
+            version = "0.1.0";
             src = self;
+
+            # Vendor all dependencies hermetically from the committed
+            # Cargo.lock. No network access is needed at build time.
+            cargoLock.lockFile = ./Cargo.lock;
+
+            # Workspace repo: build/install only the `mobee` binary crate.
+            cargoBuildFlags = [
+              "-p"
+              "mobee"
+            ];
+
+            # Enable the `acp` feature (off by default) so the acp-gated
+            # `run` subcommand is compiled in. Default features (wallet)
+            # are kept.
+            buildFeatures = [ "acp" ];
+
+            # The flake's job is packaging the runnable binary, not running
+            # the test suite (some tests are heavy / touch the network).
+            doCheck = false;
+
+            nativeBuildInputs = [ pkgs.pkg-config ];
 
             meta = {
               description = "Mobee";
               mainProgram = "mobee";
             };
-          } ''
-            cp -r "$src" source
-            chmod -R u+w source
-            cd source
-            export CARGO_HOME="$TMPDIR/cargo-home"
-            cargo build --release --locked --offline
-            mkdir -p "$out/bin"
-            cp target/release/mobee "$out/bin/"
-          '';
+          };
         }
       );
 

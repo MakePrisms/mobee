@@ -2,13 +2,20 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub const MOBEE_TAG: &str = "mobee";
-pub const PROTOCOL_VERSION: &str = "1";
+use crate::delivery::{CommitOid, DeliveryError, GitDelivery};
 
-pub const JOB_OFFER_KIND: u16 = 5109;
-pub const JOB_RESULT_KIND: u16 = 6109;
-pub const JOB_FEEDBACK_KIND: u16 = 7000;
-pub const JOB_RECEIPT_KIND: u16 = 3400;
+pub const MOBEE_TAG: &str = "mobee";
+// PIECE-14 A′: v2 protocol version. The kind renumber (v1 offer/result/feedback → the mobee 3400-block)
+// is the compatibility break — a v2 parser never matches a v1 event, so there is no dual-version
+// window to support.
+pub const PROTOCOL_VERSION: &str = "2";
+
+// All kind NUMBERS live in `crate::kinds` (the one registry); re-exported here so the historical
+// `gateway::JOB_*_KIND` paths keep resolving.
+pub use crate::kinds::{
+    JOB_AWARD_KIND, JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RECEIPT_KIND,
+    JOB_RESULT_KIND,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TagSpec(pub Vec<String>);
@@ -50,7 +57,6 @@ pub struct OfferDraft {
     pub output: String,
     pub amount_sats: u64,
     pub deadline_unix: u64,
-    pub mint_url: String,
     pub seller_pubkey: Option<String>,
 }
 
@@ -60,7 +66,6 @@ impl OfferDraft {
         output: impl Into<String>,
         amount_sats: u64,
         deadline_unix: u64,
-        mint_url: impl Into<String>,
         seller_pubkey: impl Into<String>,
     ) -> Self {
         Self {
@@ -68,7 +73,6 @@ impl OfferDraft {
             output: output.into(),
             amount_sats,
             deadline_unix,
-            mint_url: mint_url.into(),
             seller_pubkey: Some(seller_pubkey.into()),
         }
     }
@@ -78,25 +82,24 @@ impl OfferDraft {
         output: impl Into<String>,
         amount_sats: u64,
         deadline_unix: u64,
-        mint_url: impl Into<String>,
     ) -> Self {
         Self {
             task: task.into(),
             output: output.into(),
             amount_sats,
             deadline_unix,
-            mint_url: mint_url.into(),
             seller_pubkey: None,
         }
     }
 
     pub fn to_event_draft(&self) -> EventDraft {
+        // PIECE-14 A′: the offer no longer names a mint — the seller authors the accepted mint(s)
+        // in its claim `creq`, so there is no `["mint", …]` tag here.
         let mut tags = vec![
             TagSpec::new(["i", &self.task]),
             TagSpec::new(["output", &self.output]),
             TagSpec::new(["amount", &self.amount_sats.to_string(), "sat"]),
             TagSpec::new(["param", "deadline", &self.deadline_unix.to_string()]),
-            TagSpec::new(["mint", &self.mint_url]),
         ];
         if let Some(seller_pubkey) = &self.seller_pubkey {
             tags.push(TagSpec::new(["p", seller_pubkey]));
@@ -115,7 +118,6 @@ pub struct ParsedOffer {
     pub amount: u64,
     pub unit: String,
     pub deadline_unix: u64,
-    pub mint_url: String,
     pub seller_pubkey: Option<String>,
 }
 
@@ -181,6 +183,59 @@ pub enum OfferParseError {
     UnsupportedVersion(String),
     MissingMobeeTag,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitResultParseError {
+    WrongKind(u16),
+    MissingTag(&'static str),
+    /// PIECE-14 A′ namespace guard: a result event without the `["t","mobee"]` tag.
+    MissingMobeeTag,
+    UnsupportedDelivery(String),
+    InvalidDelivery(DeliveryError),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoundGitDeliveryError {
+    WrongOfferKind(u16),
+    MissingOfferTag(&'static str),
+    UnsupportedOfferDelivery(String),
+    Result(GitResultParseError),
+    TargetMismatch,
+}
+
+impl fmt::Display for BoundGitDeliveryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongOfferKind(kind) => write!(f, "expected kind {JOB_OFFER_KIND}, got {kind}"),
+            Self::MissingOfferTag(tag) => write!(f, "missing required git offer tag {tag}"),
+            Self::UnsupportedOfferDelivery(delivery) => {
+                write!(f, "unsupported offer delivery {delivery:?}")
+            }
+            Self::Result(error) => error.fmt(f),
+            Self::TargetMismatch => {
+                f.write_str("git result repository or branch does not match the offer")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BoundGitDeliveryError {}
+
+impl fmt::Display for GitResultParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongKind(kind) => write!(f, "expected kind {JOB_RESULT_KIND}, got {kind}"),
+            Self::MissingTag(tag) => write!(f, "missing required git result tag {tag}"),
+            Self::MissingMobeeTag => write!(f, "missing t=mobee tag"),
+            Self::UnsupportedDelivery(delivery) => {
+                write!(f, "unsupported result delivery {delivery:?}")
+            }
+            Self::InvalidDelivery(error) => write!(f, "invalid git result delivery: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for GitResultParseError {}
 
 impl fmt::Display for OfferParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -250,31 +305,96 @@ pub fn parse_offer(event: &EventDraft) -> Result<ParsedOffer, OfferParseError> {
         amount,
         unit: unit.clone(),
         deadline_unix,
-        mint_url: first_tag_value(&event.tags, "mint")
-            .ok_or(OfferParseError::MissingTag("mint"))?
-            .to_owned(),
         seller_pubkey: first_tag_value(&event.tags, "p").map(str::to_owned),
     })
 }
 
-pub fn claim_draft(offer_id: &str, buyer_pubkey: &str, seller_pubkey: &str) -> EventDraft {
-    feedback_draft(
+/// Parses the buyer-visible git delivery fields carried by a result event.
+pub fn parse_git_result_delivery(event: &EventDraft) -> Result<GitDelivery, GitResultParseError> {
+    if event.kind != JOB_RESULT_KIND {
+        return Err(GitResultParseError::WrongKind(event.kind));
+    }
+    // PIECE-14 A′ namespace guard: reject a foreign event squatting the result kind before reading
+    // any delivery field.
+    if !has_tag_value(&event.tags, "t", MOBEE_TAG) {
+        return Err(GitResultParseError::MissingMobeeTag);
+    }
+    let delivery = first_tag_value(&event.tags, "delivery")
+        .ok_or(GitResultParseError::MissingTag("delivery"))?;
+    if delivery != "git" {
+        return Err(GitResultParseError::UnsupportedDelivery(
+            delivery.to_owned(),
+        ));
+    }
+    let repo =
+        first_tag_value(&event.tags, "repo").ok_or(GitResultParseError::MissingTag("repo"))?;
+    let branch =
+        first_tag_value(&event.tags, "branch").ok_or(GitResultParseError::MissingTag("branch"))?;
+    let commit =
+        first_tag_value(&event.tags, "commit").ok_or(GitResultParseError::MissingTag("commit"))?;
+    let commit_oid = CommitOid::parse(commit).map_err(GitResultParseError::InvalidDelivery)?;
+    GitDelivery::new(repo, branch, commit_oid).map_err(GitResultParseError::InvalidDelivery)
+}
+
+/// Parses a result only when it targets the repository and branch named by the offer.
+pub fn parse_bound_git_delivery(
+    offer: &EventDraft,
+    result: &EventDraft,
+) -> Result<GitDelivery, BoundGitDeliveryError> {
+    if offer.kind != JOB_OFFER_KIND {
+        return Err(BoundGitDeliveryError::WrongOfferKind(offer.kind));
+    }
+    let delivery = first_tag_value(&offer.tags, "delivery")
+        .ok_or(BoundGitDeliveryError::MissingOfferTag("delivery"))?;
+    if delivery != "git" {
+        return Err(BoundGitDeliveryError::UnsupportedOfferDelivery(
+            delivery.to_owned(),
+        ));
+    }
+    let offer_repo = first_tag_value(&offer.tags, "repo")
+        .ok_or(BoundGitDeliveryError::MissingOfferTag("repo"))?;
+    let offer_branch = first_tag_value(&offer.tags, "branch")
+        .ok_or(BoundGitDeliveryError::MissingOfferTag("branch"))?;
+    let delivery = parse_git_result_delivery(result).map_err(BoundGitDeliveryError::Result)?;
+    if delivery.repo() != offer_repo || delivery.branch() != offer_branch {
+        return Err(BoundGitDeliveryError::TargetMismatch);
+    }
+    Ok(delivery)
+}
+
+/// Kind-claim CLAIM draft (`status=processing`). PIECE-14 Job C: the claim carries the
+/// seller-authored NUT-18 payment request as a `["creq", "creqA…"]` tag — the claim *is*
+/// the invoice. Build `creq` with [`creq::build_seller_creq`]; buyers read it back with
+/// [`creq::parse_creq`].
+pub fn claim_draft(
+    offer_id: &str,
+    buyer_pubkey: &str,
+    seller_pubkey: &str,
+    creq: &str,
+) -> EventDraft {
+    status_draft(
+        JOB_CLAIM_KIND,
         "processing",
         vec![
             TagSpec::new(["e", offer_id]),
             TagSpec::new(["p", buyer_pubkey]),
             TagSpec::new(["p", seller_pubkey]),
+            TagSpec::new(["creq", creq]),
         ],
     )
 }
 
+/// Kind-award AWARD draft (`status=accepted`). Buyer-authored selection of a claim — e-tags the
+/// offer (root) + the winning claim. PIECE-14 A′ moved this off the shared v1 `feedback` onto the
+/// buyer-authored award kind (a buyer selection must not ride the seller's feedback kind).
 pub fn accept_draft(
     offer_id: &str,
     claim_id: &str,
     buyer_pubkey: &str,
     seller_pubkey: &str,
 ) -> EventDraft {
-    feedback_draft(
+    status_draft(
+        JOB_AWARD_KIND,
         "accepted",
         vec![
             TagSpec::new(["e", offer_id, "", "root"]),
@@ -285,6 +405,16 @@ pub fn accept_draft(
     )
 }
 
+/// Optional git delivery tags on a result-kind result (`delivery=git` + repo/branch/commit).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitResultTags<'a> {
+    pub repo: &'a str,
+    pub branch: &'a str,
+    pub commit_sha: &'a str,
+}
+
+/// Kind-result draft. Pass `Some(git)` to attach delivery/repo/branch/commit tags;
+/// `exec_metadata` appends the piece-9 Item-2 seller-claimed usage block (may be empty).
 pub fn result_draft(
     offer_id: &str,
     buyer_pubkey: &str,
@@ -293,58 +423,167 @@ pub fn result_draft(
     job_hash: &str,
     seller_signature: &str,
     content: impl Into<String>,
+    git: Option<GitResultTags<'_>>,
+    exec_metadata: &[TagSpec],
 ) -> EventDraft {
-    EventDraft::new(
-        JOB_RESULT_KIND,
-        vec![
-            TagSpec::new(["e", offer_id, "", "root"]),
-            TagSpec::new(["p", buyer_pubkey]),
-            TagSpec::new(["output", output]),
-            TagSpec::new(["amount", &amount_sats.to_string(), "sat"]),
-            TagSpec::new(["job-hash", job_hash]),
-            TagSpec::new(["sig", "seller", seller_signature]),
-            mobee_tag(),
-            version_tag(),
-        ],
+    let mut tags = vec![
+        TagSpec::new(["e", offer_id, "", "root"]),
+        TagSpec::new(["p", buyer_pubkey]),
+    ];
+    if let Some(git) = git {
+        tags.push(TagSpec::new(["delivery", "git"]));
+        tags.push(TagSpec::new(["output", output]));
+        tags.push(TagSpec::new(["commit", git.commit_sha]));
+        tags.push(TagSpec::new(["repo", git.repo]));
+        tags.push(TagSpec::new(["branch", git.branch]));
+    } else {
+        tags.push(TagSpec::new(["output", output]));
+    }
+    tags.push(TagSpec::new(["amount", &amount_sats.to_string(), "sat"]));
+    tags.push(TagSpec::new(["job-hash", job_hash]));
+    tags.push(TagSpec::new(["sig", "seller", seller_signature]));
+    // Item-2 exec-metadata (seller-claimed, unsigned — sig/seller does NOT cover it).
+    tags.extend(exec_metadata.iter().cloned());
+    tags.push(mobee_tag());
+    tags.push(version_tag());
+    EventDraft::new(JOB_RESULT_KIND, tags, content)
+}
+
+/// Thin wrapper: result-kind git delivery via [`result_draft`] + [`GitResultTags`].
+/// `exec_metadata` is the optional seller-claimed usage block (may be empty).
+pub fn git_result_draft(
+    offer_id: &str,
+    buyer_pubkey: &str,
+    repo: &str,
+    branch: &str,
+    commit_sha: &str,
+    amount_sats: u64,
+    job_hash: &str,
+    seller_signature: &str,
+    content: impl Into<String>,
+    exec_metadata: &[TagSpec],
+) -> EventDraft {
+    result_draft(
+        offer_id,
+        buyer_pubkey,
+        "text/plain",
+        amount_sats,
+        job_hash,
+        seller_signature,
         content,
+        Some(GitResultTags {
+            repo,
+            branch,
+            commit_sha,
+        }),
+        exec_metadata,
     )
 }
 
+/// Kind-feedback FEEDBACK draft (`status=error`; timeout / push-fail / refuse paths).
+///
+/// `content` carries a machine-readable reason when one is available (e.g. rate-gate
+/// refusal); empty string preserves the historical empty-content callers.
+pub fn error_draft(
+    offer_id: &str,
+    buyer_pubkey: &str,
+    seller_pubkey: &str,
+    content: impl Into<String>,
+) -> EventDraft {
+    let mut draft = status_draft(
+        JOB_FEEDBACK_KIND,
+        "error",
+        vec![
+            TagSpec::new(["e", offer_id]),
+            TagSpec::new(["p", buyer_pubkey]),
+            TagSpec::new(["p", seller_pubkey]),
+        ],
+    );
+    draft.content = content.into();
+    draft
+}
+
+/// Delivery binding (piece-9 D4) echoed into a kind-3400 receipt. Both fields are in the
+/// co-signed preimage, so the settled receipt attests which git object was paid for and
+/// its kind (commit vs tree) is not forgeable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiptDelivery<'a> {
+    /// Full lowercase git oid of the delivered object.
+    pub integrity_hash: &'a str,
+    /// `fork` | `patch`.
+    pub kind: &'a str,
+}
+
+/// SHA-256 hex of a seller-authored NUT-18 payment request string (piece-14).
+///
+/// The bind is over the FULL `creq` tag-value string (the `creqA…` base64url-CBOR string) as
+/// UTF-8 bytes — never a re-decoded/re-encoded form — so buyer and seller hash byte-identical
+/// input. Both the attempt id ([`crate::payment::PaymentKey`]) and the co-signed receipt preimage
+/// ([`crate::receipt::ReceiptPreimage`]) bind this hash, and the receipt event carries it as a
+/// `["creq-hash", <hex>]` tag.
+pub fn creq_hash_hex(creq: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(creq.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Buyer-authored kind-3400 receipt draft. Fixed tag order + a pinned `created_at` at the
+/// event-build site give a deterministic event id (idempotent republish). `delivery` adds
+/// the D4 binding tags; `exec_metadata` appends the buyer's filtered echo (may be empty —
+/// seller-claimed, NOT covered by the co-signatures). `creq_hash` (piece-14) is the
+/// seller-authored request hash bound into the co-signed preimage; `None` for a v1 claim.
 pub fn receipt_draft(
     offer_id: &str,
     result_id: &str,
     buyer_pubkey: &str,
     seller_pubkey: &str,
-    mint_url: &str,
+    mint: &str,
     amount_sats: u64,
     job_hash: &str,
     seller_signature: &str,
     buyer_signature: &str,
+    creq_hash: Option<&str>,
+    delivery: Option<ReceiptDelivery<'_>>,
+    exec_metadata: &[TagSpec],
 ) -> EventDraft {
-    EventDraft::new(
-        JOB_RECEIPT_KIND,
-        vec![
-            TagSpec::new(["job-hash", job_hash]),
-            TagSpec::new(["amount", &amount_sats.to_string(), "sat"]),
-            TagSpec::new(["e", offer_id, "", "root"]),
-            TagSpec::new(["e", result_id, "", "reply"]),
-            TagSpec::new(["p", buyer_pubkey]),
-            TagSpec::new(["p", seller_pubkey]),
-            TagSpec::new(["mint", mint_url]),
-            TagSpec::new(["sig", "seller", seller_signature]),
-            TagSpec::new(["sig", "buyer", buyer_signature]),
-            mobee_tag(),
-            version_tag(),
-        ],
-        "",
-    )
+    let mut tags = vec![
+        TagSpec::new(["job-hash", job_hash]),
+        TagSpec::new(["amount", &amount_sats.to_string(), "sat"]),
+        TagSpec::new(["e", offer_id, "", "root"]),
+        TagSpec::new(["e", result_id, "", "reply"]),
+        TagSpec::new(["p", buyer_pubkey]),
+        TagSpec::new(["p", seller_pubkey]),
+        TagSpec::new(["mint", mint]),
+        TagSpec::new(["sig", "seller", seller_signature]),
+        TagSpec::new(["sig", "buyer", buyer_signature]),
+    ];
+    // Piece-14: emit the seller-authored request hash alongside the mint/job-hash tags when the
+    // trade bound one (v2 claim). A v1 trade (no creq) omits the tag entirely.
+    if let Some(creq_hash) = creq_hash {
+        tags.push(TagSpec::new(["creq-hash", creq_hash]));
+    }
+    if let Some(delivery) = delivery {
+        tags.push(TagSpec::new([
+            "delivery_integrity_hash",
+            delivery.integrity_hash,
+        ]));
+        tags.push(TagSpec::new(["delivery_kind", delivery.kind]));
+    }
+    tags.extend(exec_metadata.iter().cloned());
+    tags.push(mobee_tag());
+    tags.push(version_tag());
+    EventDraft::new(JOB_RECEIPT_KIND, tags, "")
 }
 
-fn feedback_draft(status: &str, mut tags: Vec<TagSpec>) -> EventDraft {
+/// Build a `status`-tagged draft of the given kind (claim `claim`, award `award`, feedback `feedback`).
+/// PIECE-14 A′ split the v1 shared `feedback` into distinct kinds; the `status` tag is retained so
+/// existing status-based view logic is unchanged.
+fn status_draft(kind: u16, status: &str, mut tags: Vec<TagSpec>) -> EventDraft {
     tags.insert(0, TagSpec::new(["status", status]));
     tags.push(mobee_tag());
     tags.push(version_tag());
-    EventDraft::new(JOB_FEEDBACK_KIND, tags, "")
+    EventDraft::new(kind, tags, "")
 }
 
 fn first_tag<'a>(tags: &'a [TagSpec], name: &str) -> Option<&'a TagSpec> {
@@ -393,6 +632,110 @@ pub mod nostr {
     }
 }
 
+/// PIECE-14 Job C — the seller-authored NUT-18 payment request (`creq…`).
+///
+/// The party getting paid authors the payment terms: at claim time the seller builds a
+/// NUT-18 [`PaymentRequest`] (amount `a`, unit `u`, accepted mints `m`, a nostr transport
+/// to its own key, single-use `s`, no `nut10` locking condition) using the cashu crate's
+/// shipped `nut18` types, and attaches its `creqA…` `Display` as the claim's `["creq", …]`
+/// tag (see [`claim_draft`]). Buyers read it back with [`parse_creq`]. The encoding is never
+/// hand-rolled — CBOR/base64 and the `creqA` prefix come from cashu's `PaymentRequest`.
+#[cfg(feature = "wallet")]
+pub mod creq {
+    use std::fmt;
+    use std::str::FromStr;
+
+    use cashu::nuts::nut18::{PaymentRequest, PaymentRequestBuilder, Transport, TransportType};
+    use cashu::{CurrencyUnit, MintUrl};
+    use nostr_sdk::prelude::{Nip19Profile, ToBech32};
+    use nostr_sdk::PublicKey;
+
+    /// Failure building or parsing a claim `creq`.
+    #[derive(Debug)]
+    pub enum CreqError {
+        /// An `accepted_mints` entry is not a well-formed mint URL.
+        Mint(String),
+        /// The seller pubkey is not valid hex / not a valid key.
+        SellerKey(String),
+        /// Encoding the seller nprofile failed.
+        Nprofile(String),
+        /// Building the NUT-18 transport failed (missing required field).
+        Transport(&'static str),
+        /// The `creq` string did not parse as a NUT-18 payment request.
+        Parse(String),
+    }
+
+    impl fmt::Display for CreqError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Mint(m) => write!(f, "creq: invalid accepted mint url: {m}"),
+                Self::SellerKey(e) => write!(f, "creq: invalid seller pubkey: {e}"),
+                Self::Nprofile(e) => write!(f, "creq: nprofile encode failed: {e}"),
+                Self::Transport(e) => write!(f, "creq: transport build failed: {e}"),
+                Self::Parse(e) => write!(f, "creq: parse failed: {e}"),
+            }
+        }
+    }
+
+    impl std::error::Error for CreqError {}
+
+    /// Build the seller-authored NUT-18 payment request for a claim and return its `creqA…`
+    /// encoding for the claim's `["creq", …]` tag.
+    ///
+    /// - `payment_id` → NUT-18 `i` (the job/attempt id).
+    /// - `amount`/`unit` → `a`/`u`, copied from the offer.
+    /// - `accepted_mints` → `m`, the seller's own accepted-mint list (order preserved; the
+    ///   first entry is the seller's advertised default).
+    /// - `seller_pubkey_hex` → one nostr [`Transport`] whose target is the seller's `nprofile`
+    ///   with a `[["n","17"]]` NIP-17 tag.
+    ///
+    /// `s = true` (single-use: one claim, one payment) and no `nut10` locking condition is set
+    /// (payment is not coupled to a delivery/attestation condition — PIECE-14 § Metadata trust).
+    pub fn build_seller_creq(
+        payment_id: &str,
+        amount: u64,
+        unit: &str,
+        accepted_mints: &[String],
+        seller_pubkey_hex: &str,
+    ) -> Result<String, CreqError> {
+        // CurrencyUnit::from_str is infallible (unknown units fall back to Custom), so an
+        // offer unit always maps to a NUT-18 unit.
+        let unit = CurrencyUnit::from_str(unit).unwrap_or(CurrencyUnit::Custom(unit.to_owned()));
+        let mints = accepted_mints
+            .iter()
+            .map(|m| MintUrl::from_str(m).map_err(|e| CreqError::Mint(format!("{m}: {e}"))))
+            .collect::<Result<Vec<_>, _>>()?;
+        let seller_key =
+            PublicKey::from_hex(seller_pubkey_hex).map_err(|e| CreqError::SellerKey(e.to_string()))?;
+        // Empty relay list: the transport addresses the seller's key; relay hints are optional.
+        let nprofile = Nip19Profile::new(seller_key, [])
+            .to_bech32()
+            .map_err(|e| CreqError::Nprofile(e.to_string()))?;
+        let transport = Transport::builder()
+            .transport_type(TransportType::Nostr)
+            .target(nprofile)
+            .add_tag(vec!["n".to_string(), "17".to_string()])
+            .build()
+            .map_err(CreqError::Transport)?;
+        let request = PaymentRequestBuilder::default()
+            .payment_id(payment_id)
+            .amount(amount)
+            .unit(unit)
+            .single_use(true)
+            .mints(mints)
+            .add_transport(transport)
+            .build();
+        Ok(request.to_string())
+    }
+
+    /// Parse a claim's `creq` tag value back into a NUT-18 [`PaymentRequest`]. Accepts the
+    /// `creqA…` (CBOR) form emitted by [`build_seller_creq`]; `PaymentRequest::from_str` also
+    /// accepts the NUT-26 `creqB…` bech32 form.
+    pub fn parse_creq(tag_value: &str) -> Result<PaymentRequest, CreqError> {
+        PaymentRequest::from_str(tag_value).map_err(|e| CreqError::Parse(e.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,7 +752,6 @@ mod tests {
             "text/plain",
             7,
             1_800_000_000,
-            TESTNUT_MINT_URL,
             SELLER,
         )
         .to_event_draft();
@@ -423,7 +765,6 @@ mod tests {
                 TagSpec::new(["output", "text/plain"]),
                 TagSpec::new(["amount", "7", "sat"]),
                 TagSpec::new(["param", "deadline", "1800000000"]),
-                TagSpec::new(["mint", TESTNUT_MINT_URL]),
                 TagSpec::new(["p", SELLER]),
                 TagSpec::new(["t", MOBEE_TAG]),
                 TagSpec::new(["v", PROTOCOL_VERSION]),
@@ -438,7 +779,6 @@ mod tests {
             "text/plain",
             7,
             1_800_000_000,
-            TESTNUT_MINT_URL,
         )
         .to_event_draft();
 
@@ -457,7 +797,6 @@ mod tests {
             "application/json",
             3,
             1_800_000_001,
-            TESTNUT_MINT_URL,
             SELLER,
         )
         .to_event_draft();
@@ -470,7 +809,6 @@ mod tests {
                 amount: 3,
                 unit: "sat".into(),
                 deadline_unix: 1_800_000_001,
-                mint_url: TESTNUT_MINT_URL.into(),
                 seller_pubkey: Some(SELLER.into()),
             }
         );
@@ -479,11 +817,11 @@ mod tests {
     #[test]
     fn targeting_helpers_fail_closed_for_targeted_offers() {
         let targeted = parse_offer(
-            &OfferDraft::new("task", "text/plain", 1, 2, TESTNUT_MINT_URL, SELLER).to_event_draft(),
+            &OfferDraft::new("task", "text/plain", 1, 2, SELLER).to_event_draft(),
         )
         .expect("targeted offer");
         let untargeted = parse_offer(
-            &OfferDraft::untargeted("task", "text/plain", 1, 2, TESTNUT_MINT_URL).to_event_draft(),
+            &OfferDraft::untargeted("task", "text/plain", 1, 2).to_event_draft(),
         )
         .expect("untargeted offer");
 
@@ -504,16 +842,19 @@ mod tests {
     }
 
     #[test]
-    fn claim_and_accept_use_kind_7000_status_tags() {
+    fn claim_and_accept_use_split_mobee_kinds() {
+        // PIECE-14 A′: the claim (processing) is its own kind claim, and the buyer-authored accept
+        // (award) is kind award — no longer the shared v1 feedback kind.
         assert_eq!(
-            claim_draft("offer", BUYER, SELLER),
+            claim_draft("offer", BUYER, SELLER, "creqAtest"),
             EventDraft::new(
-                JOB_FEEDBACK_KIND,
+                JOB_CLAIM_KIND,
                 vec![
                     TagSpec::new(["status", "processing"]),
                     TagSpec::new(["e", "offer"]),
                     TagSpec::new(["p", BUYER]),
                     TagSpec::new(["p", SELLER]),
+                    TagSpec::new(["creq", "creqAtest"]),
                     TagSpec::new(["t", MOBEE_TAG]),
                     TagSpec::new(["v", PROTOCOL_VERSION]),
                 ],
@@ -524,7 +865,7 @@ mod tests {
         assert_eq!(
             accept_draft("offer", "claim", BUYER, SELLER),
             EventDraft::new(
-                JOB_FEEDBACK_KIND,
+                JOB_AWARD_KIND,
                 vec![
                     TagSpec::new(["status", "accepted"]),
                     TagSpec::new(["e", "offer", "", "root"]),
@@ -549,6 +890,8 @@ mod tests {
             "hash",
             "seller-sig",
             "done",
+            None,
+            &[],
         );
         assert_eq!(result.kind, JOB_RESULT_KIND);
         assert_eq!(result.content, "done");
@@ -566,9 +909,14 @@ mod tests {
             "hash",
             "seller-sig",
             "buyer-sig",
+            None,
+            None,
+            &[],
         );
         assert_eq!(receipt.kind, JOB_RECEIPT_KIND);
         assert!(has_tag_value(&receipt.tags, "mint", TESTNUT_MINT_URL));
+        // Piece-14: no creq bound ⇒ no creq-hash tag (v1-shaped receipt).
+        assert!(first_tag(&receipt.tags, "creq-hash").is_none());
         assert!(has_tag_value_at(&receipt.tags, "e", 1, "result"));
         assert!(has_tag_value_at(&receipt.tags, "e", 3, "reply"));
         assert_eq!(
@@ -581,6 +929,158 @@ mod tests {
         );
         assert!(has_tag_value_at(&receipt.tags, "sig", 1, "seller"));
         assert!(has_tag_value_at(&receipt.tags, "sig", 1, "buyer"));
+        // No delivery binding requested ⇒ absent (legacy-shaped receipt).
+        assert!(first_tag(&receipt.tags, "delivery_integrity_hash").is_none());
+    }
+
+    #[test]
+    fn receipt_draft_binds_delivery_and_echoes_exec_metadata() {
+        let exec = vec![
+            TagSpec::new(["harness", "claude-agent-acp"]),
+            TagSpec::new(["usage_transport", "side-channel"]),
+            TagSpec::new(["metadata_trust", "seller-claimed"]),
+            TagSpec::new(["wall_time", "1234", "ms"]),
+        ];
+        let receipt = receipt_draft(
+            "offer",
+            "result",
+            BUYER,
+            SELLER,
+            TESTNUT_MINT_URL,
+            7,
+            "hash",
+            "seller-sig",
+            "buyer-sig",
+            Some(&"cc".repeat(32)),
+            Some(ReceiptDelivery {
+                integrity_hash: &"a".repeat(40),
+                kind: "fork",
+            }),
+            &exec,
+        );
+        // Piece-14: a bound creq surfaces as a `creq-hash` tag on the receipt event.
+        assert!(has_tag_value(&receipt.tags, "creq-hash", &"cc".repeat(32)));
+        // D4 delivery binding present and typed.
+        assert!(has_tag_value(
+            &receipt.tags,
+            "delivery_integrity_hash",
+            &"a".repeat(40)
+        ));
+        assert!(has_tag_value(&receipt.tags, "delivery_kind", "fork"));
+        // Filtered echo carried through, with its required provenance marker.
+        assert!(has_tag_value(&receipt.tags, "harness", "claude-agent-acp"));
+        assert!(has_tag_value(&receipt.tags, "metadata_trust", "seller-claimed"));
+        // t/v markers stay last.
+        assert_eq!(receipt.tags[receipt.tags.len() - 2], mobee_tag());
+        assert_eq!(receipt.tags[receipt.tags.len() - 1], version_tag());
+    }
+
+    #[test]
+    fn result_draft_carries_seller_claimed_exec_metadata_after_sig() {
+        let exec = vec![
+            TagSpec::new(["harness", "codex-acp-ng"]),
+            TagSpec::new(["usage_transport", "acp-native"]),
+            TagSpec::new(["metadata_trust", "seller-claimed"]),
+            TagSpec::new(["tokens", "3172", "total"]),
+        ];
+        let result = git_result_draft(
+            "offer",
+            BUYER,
+            "https://example.invalid/repo.git",
+            "mobee/job",
+            &"a".repeat(40),
+            7,
+            "hash",
+            "seller-sig",
+            "commit",
+            &exec,
+        );
+        assert!(has_tag_value(&result.tags, "harness", "codex-acp-ng"));
+        assert!(has_tag_value(&result.tags, "usage_transport", "acp-native"));
+        assert!(has_tag_value(&result.tags, "metadata_trust", "seller-claimed"));
+        // exec-metadata sits after the seller signature, before the protocol markers.
+        let sig_at = result
+            .tags
+            .iter()
+            .position(|tag| tag.first() == Some("sig"))
+            .unwrap();
+        let harness_at = result
+            .tags
+            .iter()
+            .position(|tag| tag.first() == Some("harness"))
+            .unwrap();
+        assert!(harness_at > sig_at);
+    }
+
+    #[test]
+    fn git_result_parses_repo_branch_and_full_commit_oid() {
+        let result = EventDraft::new(
+            JOB_RESULT_KIND,
+            vec![
+                TagSpec::new(["delivery", "git"]),
+                TagSpec::new(["repo", "https://example.invalid/repo.git"]),
+                TagSpec::new(["branch", "mobee/job"]),
+                TagSpec::new(["commit", &"a".repeat(40)]),
+                TagSpec::new(["t", MOBEE_TAG]),
+            ],
+            "",
+        );
+
+        let delivery = parse_git_result_delivery(&result).expect("parse git delivery");
+        assert_eq!(delivery.repo(), "https://example.invalid/repo.git");
+        assert_eq!(delivery.branch(), "mobee/job");
+        assert_eq!(delivery.commit_oid().as_str(), "a".repeat(40));
+    }
+
+    #[test]
+    fn git_result_refuses_an_abbreviated_commit_oid() {
+        let result = EventDraft::new(
+            JOB_RESULT_KIND,
+            vec![
+                TagSpec::new(["delivery", "git"]),
+                TagSpec::new(["repo", "repo"]),
+                TagSpec::new(["branch", "work"]),
+                TagSpec::new(["commit", "abc123"]),
+                TagSpec::new(["t", MOBEE_TAG]),
+            ],
+            "",
+        );
+
+        assert_eq!(
+            parse_git_result_delivery(&result),
+            Err(GitResultParseError::InvalidDelivery(
+                DeliveryError::InvalidCommitOid
+            ))
+        );
+    }
+
+    #[test]
+    fn git_result_cannot_redirect_away_from_the_offered_repo_or_branch() {
+        let offer = EventDraft::new(
+            JOB_OFFER_KIND,
+            vec![
+                TagSpec::new(["delivery", "git"]),
+                TagSpec::new(["repo", "https://example.invalid/offered.git"]),
+                TagSpec::new(["branch", "mobee/job"]),
+            ],
+            "",
+        );
+        let redirected = EventDraft::new(
+            JOB_RESULT_KIND,
+            vec![
+                TagSpec::new(["delivery", "git"]),
+                TagSpec::new(["repo", "https://attacker.invalid/other.git"]),
+                TagSpec::new(["branch", "mobee/job"]),
+                TagSpec::new(["commit", &"a".repeat(40)]),
+                TagSpec::new(["t", MOBEE_TAG]),
+            ],
+            "",
+        );
+
+        assert_eq!(
+            parse_bound_git_delivery(&offer, &redirected),
+            Err(BoundGitDeliveryError::TargetMismatch)
+        );
     }
 
     fn has_tag_value_at(tags: &[TagSpec], name: &str, index: usize, value: &str) -> bool {
@@ -588,5 +1088,98 @@ mod tests {
             tag.0.first().map(String::as_str) == Some(name)
                 && tag.0.get(index).map(String::as_str) == Some(value)
         })
+    }
+}
+
+/// PIECE-14 Job C — seller-authored `creq` in the claim. Gated on `wallet` because the
+/// `creq` builder uses cashu's `nut18` types (only linked under that feature).
+#[cfg(all(test, feature = "wallet"))]
+mod creq_tests {
+    use std::str::FromStr;
+
+    use cashu::nuts::nut18::TransportType;
+    use cashu::{Amount, CurrencyUnit, MintUrl};
+
+    use super::creq::{build_seller_creq, parse_creq};
+    use super::{claim_draft, TagSpec};
+
+    const MINT_A: &str = "https://testnut.cashudevkit.org";
+    const MINT_B: &str = "https://mint.example.com";
+
+    fn seller_hex() -> String {
+        nostr_sdk::Keys::generate().public_key().to_hex()
+    }
+
+    /// The claim carries a `creq` tag whose value starts with "creqA".
+    #[test]
+    fn claim_carries_creq() {
+        let seller = seller_hex();
+        let creq =
+            build_seller_creq("job-1", 21, "sat", &[MINT_A.to_string()], &seller).expect("build creq");
+        assert!(creq.starts_with("creqA"), "creq must start with creqA: {creq}");
+
+        let draft = claim_draft("job-1", "buyer-pubkey", &seller, &creq);
+        let creq_tag = draft
+            .tags
+            .iter()
+            .find(|tag| tag.first() == Some("creq"))
+            .expect("claim carries a creq tag");
+        assert_eq!(creq_tag.value(), Some(creq.as_str()));
+        assert!(creq_tag.value().unwrap().starts_with("creqA"));
+    }
+
+    /// Round-trip: `PaymentRequest::from_str(tag)` yields a=offer.amount, u=offer.unit,
+    /// m=accepted_mints (order preserved), one nostr transport to the seller, single-use, no nut10.
+    #[test]
+    fn creq_roundtrip() {
+        let seller = seller_hex();
+        let mints = vec![MINT_A.to_string(), MINT_B.to_string()];
+        let creq = build_seller_creq("attempt-9", 21, "sat", &mints, &seller).expect("build creq");
+
+        let request = parse_creq(&creq).expect("parse creq");
+        assert_eq!(request.payment_id.as_deref(), Some("attempt-9"));
+        assert_eq!(request.amount, Some(Amount::from(21)));
+        assert_eq!(request.unit, Some(CurrencyUnit::Sat));
+        assert_eq!(
+            request.mints,
+            vec![
+                MintUrl::from_str(MINT_A).unwrap(),
+                MintUrl::from_str(MINT_B).unwrap(),
+            ]
+        );
+        assert_eq!(request.single_use, Some(true));
+        assert!(request.nut10.is_none(), "no nut10 locking condition");
+
+        assert_eq!(request.transports.len(), 1, "exactly one transport");
+        let transport = &request.transports[0];
+        assert_eq!(transport._type, TransportType::Nostr);
+        assert!(
+            transport.target.starts_with("nprofile1"),
+            "transport target is the seller nprofile: {}",
+            transport.target
+        );
+        assert_eq!(
+            transport.tags,
+            vec![vec!["n".to_string(), "17".to_string()]],
+            "NIP-17 transport tag",
+        );
+    }
+
+    /// The `creq` tag is a stable round-trip through the claim draft: the exact string the
+    /// seller authored is what a buyer parses off the claim.
+    #[test]
+    fn claim_creq_tag_parses_back() {
+        let seller = seller_hex();
+        let creq =
+            build_seller_creq("job-7", 5, "sat", &[MINT_A.to_string()], &seller).expect("build creq");
+        let draft = claim_draft("job-7", "buyer", &seller, &creq);
+        let tag: &TagSpec = draft
+            .tags
+            .iter()
+            .find(|tag| tag.first() == Some("creq"))
+            .expect("creq tag");
+        let request = parse_creq(tag.value().unwrap()).expect("parse creq off claim");
+        assert_eq!(request.amount, Some(Amount::from(5)));
+        assert_eq!(request.mints, vec![MintUrl::from_str(MINT_A).unwrap()]);
     }
 }
