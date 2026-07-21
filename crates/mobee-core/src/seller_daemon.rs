@@ -397,6 +397,18 @@ impl SellerDaemon {
         &self.home
     }
 
+    /// Build the seller heartbeat for the current daemon state, or `None` when there is no
+    /// `[seller]` config (no advertised rate to publish). `accepting` is `n` while the
+    /// single-flight slot is held (the seller is busy on a job); `queue_depth` is that in-flight
+    /// count. Reads state only — never publishes.
+    fn heartbeat_draft(&self) -> Option<crate::heartbeat::HeartbeatDraft> {
+        let cfg = require_seller_config(&self.home).ok()?;
+        Some(crate::heartbeat::heartbeat_for_state(
+            self.active.is_some(),
+            cfg.rate_sats,
+        ))
+    }
+
     /// Try to take the single-flight slot.
     pub fn try_begin_flight() -> bool {
         FLIGHT
@@ -1982,6 +1994,28 @@ async fn publish_draft(
     Ok(output.val.to_hex())
 }
 
+/// Publish one addressable kind-30340 heartbeat off the daemon loop's tick. This is best-effort
+/// liveness/discovery signal: it MUST never crash or wedge the loop, so a publish failure or a
+/// hung relay is bounded by a timeout and log-and-continue (the loop keeps serving offers and
+/// collecting payments regardless). No-op when there is no `[seller]` config.
+async fn publish_heartbeat(daemon: &SellerDaemon) {
+    let Some(draft) = daemon.heartbeat_draft() else {
+        return;
+    };
+    let event = draft.to_event_draft();
+    let publish = publish_draft(&daemon.home, &daemon.keys, &event);
+    match tokio::time::timeout(std::time::Duration::from_secs(10), publish).await {
+        Ok(Ok(id)) => eprintln!(
+            "seller heartbeat published id={id} accepting={} queue_depth={} rate_sats={}",
+            draft.accepting, draft.queue_depth, draft.rate_sats
+        ),
+        Ok(Err(error)) => {
+            eprintln!("seller heartbeat publish failed (continuing): {error}")
+        }
+        Err(_) => eprintln!("seller heartbeat publish timed out (continuing)"),
+    }
+}
+
 #[cfg(feature = "acp")]
 async fn run_agent_job(
     agent_command: &[String],
@@ -2566,6 +2600,22 @@ pub(crate) async fn run_forever_hooked(
     // Loud-Closed fallback fires at most once (targeted-only is not itself broad-filtered).
     let mut offer_fallback_done = false;
     let mut notifications = client.notifications();
+
+    // Heartbeat cadence (PIECE-14 § Heartbeat). Env overrides config for tests. `interval()`'s
+    // first `tick()` completes immediately, so an enabled seller advertises liveness right after
+    // going online, then every `interval_secs`.
+    let heartbeat_enabled =
+        crate::heartbeat::resolve_enabled(&daemon.home.config.seller_heartbeat);
+    let heartbeat_interval_secs =
+        crate::heartbeat::resolve_interval_secs(&daemon.home.config.seller_heartbeat);
+    let mut heartbeat_interval =
+        tokio::time::interval(Duration::from_secs(heartbeat_interval_secs.max(1)));
+    if heartbeat_enabled {
+        eprintln!(
+            "seller heartbeat enabled: kind-30340 d=mobee-seller every {heartbeat_interval_secs}s"
+        );
+    }
+
     loop {
         // Resilient recv: a broadcast LAG (the loop fell behind while blocked in a long agent
         // turn) must NOT permanently deafen the daemon. tokio's broadcast drops the overflowed
@@ -2573,17 +2623,26 @@ pub(crate) async fn run_forever_hooked(
         // channel ends the loop. Before this a `Lagged` ended `while let Ok(..)` — the seller went
         // silently deaf to all further offers AND kind-1059 payments (wraps parked, never
         // collected) until restart. Missed stored events re-backfill on resubscribe/restart.
-        let notification = match notifications.recv().await {
-            Ok(notification) => notification,
-            Err(error) => match classify_recv_error(&error) {
-                RecvControl::Continue => {
-                    eprintln!(
-                        "seller WARN: notification stream {error}; continuing (NOT going deaf). \
-                         Missed stored offers/payments re-backfill on resubscribe."
-                    );
-                    continue;
-                }
-                RecvControl::Stop => break,
+        let notification = tokio::select! {
+            // The heartbeat tick rides the SAME loop (never a blocking side-thread): publishing is
+            // timeout-bounded + log-and-continue, so it can NEVER wedge or crash offer/payment
+            // handling. Disabled ⇒ the branch is inert and select only waits on the relay stream.
+            _ = heartbeat_interval.tick(), if heartbeat_enabled => {
+                publish_heartbeat(&daemon).await;
+                continue;
+            }
+            recv = notifications.recv() => match recv {
+                Ok(notification) => notification,
+                Err(error) => match classify_recv_error(&error) {
+                    RecvControl::Continue => {
+                        eprintln!(
+                            "seller WARN: notification stream {error}; continuing (NOT going deaf). \
+                             Missed stored offers/payments re-backfill on resubscribe."
+                        );
+                        continue;
+                    }
+                    RecvControl::Stop => break,
+                },
             },
         };
         match notification {

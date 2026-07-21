@@ -17,6 +17,7 @@ pub mod episode;
 pub mod event;
 pub mod format;
 pub mod gateway;
+pub mod heartbeat;
 pub mod home;
 pub mod log;
 #[cfg(feature = "wallet")]
