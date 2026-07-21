@@ -1,4 +1,4 @@
-//! Seller-side git — ALL in-process via libgit2 (issue #55; NO system `git` on any product path).
+//! Seller-side git — ALL in-process via libgit2; no system `git` on any product path.
 //!
 //! Base fetch, fork checkout, and delivery push run through [`crate::git_transport`]'s rustls
 //! smart-HTTP subtransport, which injects the seller's NIP-98 `Authorization` on relay-git requests.
@@ -451,8 +451,8 @@ pub struct PushAuth {
 }
 
 /// Push `branch` from `workdir` to `remote_url` (allowlisted https / relay-git only), with
-/// optional NIP-98 auth for relay-git. Always in-process libgit2 — there is no system-git fallback
-/// (issue #55). Returns the pushed commit OID (full hex). Unauthenticated / prompt-needing remotes
+/// optional NIP-98 auth for relay-git. Always in-process libgit2 — there is no system-git fallback.
+/// Returns the pushed commit OID (full hex). Unauthenticated / prompt-needing remotes
 /// fail closed.
 pub fn push_branch_with_auth(
     workdir: &Path,
@@ -875,7 +875,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// PATH-stripped proof (#55): drive the seller's LOCAL git legs (init, authorship gate,
+    /// PATH-stripped proof: drive the seller's LOCAL git legs (init, authorship gate,
     /// non-empty-tree gate, branch-at-head) with git2 ONLY — the delivery commit is created with
     /// git2, never `Command`. Run with `git` absent from PATH to prove these legs have no shell-out.
     #[test]

@@ -147,7 +147,7 @@ fn authenticated_fetch_base_succeeds_via_fork_path() {
         "upstream tree must be checked out at the fork tip"
     );
 
-    // In-process libgit2 (#55) injects the NIP-98 header on EVERY request up front — there is no
+    // In-process libgit2 injects the NIP-98 header on EVERY request up front — there is no
     // git-credential-protocol unauthenticated probe. So every request (the info/refs advertisement
     // AND the upload-pack POST) must carry Authorization, and pack data must only move authorized.
     let requests = server.requests();

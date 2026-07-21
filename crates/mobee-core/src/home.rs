@@ -413,10 +413,6 @@ pub fn default_boot_push_preflight() -> bool {
     true
 }
 
-// NOTE (issue #55): the former `[seller_git] inprocess_push` knob and its system-git fallback are
-// GONE. All seller/buyer git legs are unconditionally in-process libgit2 (see `crate::git_transport`),
-// so there is no path to select and no config to carry.
-
 impl SellerMemoryConfig {
     /// True when every field is at its shipped default (so config.toml stays clean — the section
     /// is only serialized once an operator sets a non-default knob).
