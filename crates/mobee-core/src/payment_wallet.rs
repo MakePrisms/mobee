@@ -1241,7 +1241,7 @@ mod tests {
         // the seller never advertised is `wrong_mint`.
         let seller = secret_key(1).public_key().to_string();
         let policy = PaymentPolicy::new([mint(MINT)]);
-        let offer = offer(MINT, &seller);
+        let offer = offer(&seller);
 
         let error = policy
             .terms_for_offer(mint(OTHER_MINT), &offer, &seller)
@@ -1261,7 +1261,7 @@ mod tests {
         let policy = PaymentPolicy::new([mint(MINT)]);
 
         let terms = policy
-            .terms_for_offer(mint(MINT), &offer(MINT, &seller), &seller)
+            .terms_for_offer(mint(MINT), &offer(&seller), &seller)
             .unwrap();
 
         assert_eq!(terms.mint, mint(MINT));
@@ -1278,7 +1278,7 @@ mod tests {
     fn policy_rejects_an_unknown_unit_without_defaulting_to_sat() {
         let seller = secret_key(1).public_key().to_string();
         let policy = PaymentPolicy::new([mint(MINT)]);
-        let mut offer = offer(MINT, &seller);
+        let mut offer = offer(&seller);
         offer.unit = "credit".into();
 
         let result = policy.terms_for_offer(mint(MINT), &offer, &seller);
@@ -2714,14 +2714,13 @@ mod tests {
         .unwrap()
     }
 
-    fn offer(mint_url: &str, seller: &str) -> ParsedOffer {
+    fn offer(seller: &str) -> ParsedOffer {
         ParsedOffer {
             task: "task".into(),
             output: "text/plain".into(),
             amount: 7,
             unit: "sat".into(),
             deadline_unix: 1,
-            mint_url: mint_url.into(),
             seller_pubkey: Some(seller.into()),
         }
     }

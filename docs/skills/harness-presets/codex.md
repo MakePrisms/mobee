@@ -73,7 +73,7 @@ grep -q "seller daemon online" "$MOBEE_HOME/sell.log" && grep "nip42=" "$MOBEE_H
 ```
 
 Grounds: preset/argv0 log line `crates/mobee/src/sell.rs:356-363`; online+auth
-`crates/mobee-core/src/seller_daemon.rs:1424-1429`. The kind-6109 usage block tags codex jobs
+`crates/mobee-core/src/seller_daemon.rs:1424-1429`. The kind-3403 usage block tags codex jobs
 `harness=codex-acp-ng`, `usage_transport=acp-native` (`seller_daemon.rs:860-864`).
 
 ## Grounding (source file:line)

@@ -55,7 +55,7 @@ The durable seller journal is an append-only JSONL file at **`$MOBEE_HOME/seller
 
 | `kind` | Meaning | Key fields |
 |--------|---------|-----------|
-| `claim` | An offer was claimed (kind-7000 processing published) | `job_id`, `claim_id`, `buyer_pubkey`, `deadline_unix`, `ts` |
+| `claim` | An offer was claimed (kind-3402 processing published) | `job_id`, `claim_id`, `buyer_pubkey`, `deadline_unix`, `ts` |
 | `receipt` | Payment redeemed — trade CLOSED (paid) | `job_id`, `result_id`, `amount_received`, `mint`, `buyer`, `swap_ok`, `ts` |
 | `release` | Claim given up (orphan reneged on restart / undeliverable) | `job_id`, `reason`, `ts` |
 
@@ -85,7 +85,7 @@ tail -n 10 "$J" 2>/dev/null
 
 ## 4. Pending: delivered-but-unpaid jobs
 
-A **delivered-but-unpaid** job is one the daemon delivered (kind-6109 published) but for which
+A **delivered-but-unpaid** job is one the daemon delivered (kind-3403 published) but for which
 payment has not yet been redeemed. In the journal this is a `claim` line whose `job_id` has **no**
 `receipt` and **no** `release`:
 
@@ -105,7 +105,7 @@ fi
 > **Caveat (grounded limitation):** the delivered-but-unpaid → payment binding lives only in the
 > daemon's **in-memory** `awaiting_payment` list; it is NOT journaled. So the journal alone cannot
 > distinguish "delivered, waiting for pay" from "still processing" from "orphaned". Cross-check the
-> live daemon log (`seller published 6109 result_id=…` means delivered). If the daemon restarted
+> live daemon log (`seller published 3403 result_id=…` means delivered). If the daemon restarted
 > after delivering but before the payment redeemed, that binding is lost and the pending job will
 > be RELEASED on the next startup — see [`seller-diagnose.md`](seller-diagnose.md) "payment arrived
 > but not redeemed after restart". Grounds: in-memory binding

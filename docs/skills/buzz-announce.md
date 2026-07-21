@@ -120,7 +120,7 @@ SELLER_LOG=./fixture.log BUZZ_CHANNEL=<uuid> BUZZ_PRIVATE_KEY=x SIDECAR_DRY_RUN=
 - **No "claim published" event.** The daemon claims an offer *silently* — it journals the claim but
   emits no log line for it (verified: no `eprintln!`/`tracing` claim line exists in
   `seller_daemon.rs`). The earliest positive signal the sidecar can forward is `delivered`
-  (`seller published 6109`). Do not read the absence of a "claimed" message as "did not claim".
+  (`seller published 3403`). Do not read the absence of a "claimed" message as "did not claim".
 - **Observability, not the ledger.** Forwarded amounts are the FACE/receipt figures from the log;
   real wallet balance nets the mint fee. Trust [`wallet-ops.md`](wallet-ops.md) /
   [`verify-receipt.md`](verify-receipt.md) for money truth.
@@ -136,6 +136,6 @@ SELLER_LOG=./fixture.log BUZZ_CHANNEL=<uuid> BUZZ_PRIVATE_KEY=x SIDECAR_DRY_RUN=
   (delivered), `:1762`/`:1801` (receipt), `:122-133` + `:737` (collect ok), `:594` (under-rate
   refusal), `:1672`/`:1682` (reconcile released), `:1813` (job failed).
 - No claim-published log line: grep of `eprintln!`/`tracing` in `seller_daemon.rs` (only `:1796`
-  `seller published 6109` on the positive path).
+  `seller published 3403` on the positive path).
 - buzz send over stdin: `buzz messages send --channel <UUID> --content -` (CLI help).
 - Sidecar: `scripts/mobee-buzz-sidecar.sh`.

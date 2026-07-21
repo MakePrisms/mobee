@@ -51,7 +51,7 @@ ls "$MOBEE_HOME/jobs/" 2>/dev/null        # <job_id>.json per accept_claim
 |--------|---------|
 | `claims[]` empty | Nothing claimed yet (check pricing/targeting — [`buyer-diagnose.md`](buyer-diagnose.md) §B) |
 | claim `status: processing`, `live: true` | Seller working; `live_claim_id` names it |
-| claim `status: error` | Seller failed/released the claim (their kind-7000 error) |
+| claim `status: error` | Seller failed/released the claim (their kind-3404 error) |
 | claim `status: "expired"` | **Derived label, not a relay event**: a `processing` claim past the offer deadline. View-level only — nothing was published to make it so, and it flips purely on `now` vs `deadline_unix`. It is excluded from `live_claim_id` and `accept_claim` refuses it; a late delivery may still appear in `results[]` but is no longer acceptable |
 | `results[]` non-empty | Delivery advertised (repo/branch/commit_oid) — go to [`accept-and-pay.md`](accept-and-pay.md) |
 | `accepted` present | Your local bind (mirrors `jobs/<job_id>.json`) |

@@ -25,7 +25,7 @@ pub const JOB_CLASS_CONTRIBUTION: &str = "contribution";
 /// Only seller path shipped in v1 (`accepts=fork`; `Delivery::Commit`). Patch = deferred `Tree`.
 pub const ACCEPTS_FORK: &str = "fork";
 
-/// Domain separator for the seller's signed-6109 authorship tuple. DISTINCT from the
+/// Domain separator for the seller's signed-result authorship tuple. DISTINCT from the
 /// receipt-preimage domain (`mobee/v1/receipt-preimage`) so the two seller signatures can never
 /// collide — the receipt cosig and the contribution cosig are independent binds at the one seam.
 pub const CONTRIBUTION_TUPLE_DOMAIN: &str = "mobee/v1/contribution-tuple";
@@ -184,7 +184,7 @@ impl ForkRef {
     }
 }
 
-/// A well-formed contribution offer (parsed from a kind-5109 offer's additive tags).
+/// A well-formed contribution offer (parsed from a offer-kind offer's additive tags).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContributionOffer {
     pub target: TargetRepoPin,
@@ -200,7 +200,7 @@ impl ContributionOffer {
     }
 }
 
-/// The tuple the seller commits to in its schnorr-signed kind-6109 result (MUST-3). The seller's
+/// The tuple the seller commits to in its schnorr-signed result-kind result (MUST-3). The seller's
 /// own signature cryptographically ties `seller_pubkey → this job_id → this exact commit_oid`
 /// against the pinned target + base + fork, so it **cannot be paid for a third party's commit**.
 /// A git commit trailer is optional provenance only — NEVER this bind.
@@ -409,7 +409,7 @@ pub fn is_contribution_tags(tags: &[TagSpec]) -> bool {
         == Some(JOB_CLASS_CONTRIBUTION)
 }
 
-/// Additive contribution tags for a kind-5109 offer OR a kind-6109 result echo:
+/// Additive contribution tags for a offer-kind offer OR a result-kind result echo:
 /// `job-class`, `target-repo`, `base`, `accepts…`.
 pub fn contribution_offer_tags(offer: &ContributionOffer) -> Vec<TagSpec> {
     let mut tags = vec![
@@ -507,7 +507,7 @@ pub fn contribution_sig_tag(sig_hex: &str) -> TagSpec {
     TagSpec::new(["sig", SIG_SELLER_CONTRIBUTION, sig_hex])
 }
 
-/// Seller-side: additive contribution echo + authorship-signature tags for a kind-6109 result.
+/// Seller-side: additive contribution echo + authorship-signature tags for a result-kind result.
 /// The seller echoes the offer's `{job-class, target-repo, base, accepts}` and appends its
 /// `sig/seller-contribution` over the authorship tuple. The echo is EQUALITY-CHECKED by the buyer
 /// against its signed offer (MUST-4) — never trusted as authority.

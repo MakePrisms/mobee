@@ -19,6 +19,7 @@ pub mod format;
 pub mod gateway;
 pub mod heartbeat;
 pub mod home;
+pub mod kinds;
 pub mod log;
 #[cfg(feature = "wallet")]
 pub mod buyer_fund;

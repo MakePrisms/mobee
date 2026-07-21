@@ -92,7 +92,7 @@ You do **not** push manually and you are **not** handed a key. Per claimed job t
 - Names the delivery branch `mobee/<first-8-of-job-id>` (`seller_daemon.rs:665`).
 - Delivers **only agent-authored, non-empty trees** — a clone-only or empty commit is refused
   (`seller_git.rs:145-229`). No harness-authored fallback commit.
-- Pushes over NIP-98 and publishes kind-6109 carrying the commit OID.
+- Pushes over NIP-98 and publishes kind-3403 carrying the commit OID.
 
 **Delivery etiquette (commit, don't touch identity):** the agent should commit its work and *not*
 rewrite git author/committer identity — the daemon stamps and verifies authorship, and a foreign

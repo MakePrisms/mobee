@@ -1,9 +1,9 @@
 //! Seller daemon state machine (freeze checklist).
 //!
 //! Loop:
-//! 1. Subscribe **5109 + 1059 from START** (early pay buffered).
-//! 2. On targeted offer passing B1 rate-gate → claim 7000 → journal claim (single-flight).
-//! 3. Run agent (`--features acp` fail-closed) → git push (allowlist+scrub) → 6109.
+//! 1. Subscribe **offers + gift-wraps from START** (early pay buffered).
+//! 2. On targeted offer passing B1 rate-gate → claim feedback → journal claim (single-flight).
+//! 3. Run agent (`--features acp` fail-closed) → git push (allowlist+scrub) → result.
 //! 4. **Reconcile** buffered/already-received 1059 wraps against the new result.
 //! 5. B2 bind job_id(+result_id) → `terms_for_offer` → `CdkSellerReceive::receive`
 //!    (`Amount == offer.amount`) → journal receipt (`amount_received == offer.amount`).
@@ -38,7 +38,7 @@ use crate::seller::{
 use crate::seller_git::{self, SellerGitError};
 
 /// In-flight single-flight lock for v1 (one job in the PROCESSING phase per process).
-/// Held from claim through delivery (kind-6109), then released — a delivered-but-unpaid
+/// Held from claim through delivery (result-kind), then released — a delivered-but-unpaid
 /// job awaiting payment does NOT hold this lock (piece-11 #15 fix).
 static FLIGHT: AtomicBool = AtomicBool::new(false);
 
@@ -172,13 +172,13 @@ pub struct ActiveJob {
     /// Piece-10: the parsed contribution offer (target pin + base + accepts) when this is a
     /// contribution job; `None` ⇒ from-scratch (empty-base delivery).
     pub contribution: Option<ContributionOffer>,
-    /// Piece-13: delivery facts captured at successful kind-6109 publish, carried through
+    /// Piece-13: delivery facts captured at successful result-kind publish, carried through
     /// `mark_delivered` so the terminal episode (paid at receipt, or unpaid at eviction) is a
     /// single complete append. `None` until the job delivers. Diagnostic only — never money state.
     pub delivery: Option<DeliveryRecord>,
 }
 
-/// Piece-13: the delivery-time facts an [`Episode`] needs, captured once at kind-6109 publish.
+/// Piece-13: the delivery-time facts an [`Episode`] needs, captured once at result-kind publish.
 /// Stashed on the [`ActiveJob`] so the (possibly later) paid/unpaid terminal writes one complete
 /// episode without re-deriving anything on the money path.
 #[derive(Debug, Clone)]
@@ -248,7 +248,7 @@ pub struct ClaimIntent {
 /// there is no silent-drop path (piece-11 #15).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OfferSkip {
-    /// Event is not a kind-5109 offer.
+    /// Event is not a offer-kind offer.
     NotAnOffer { kind: u16 },
     /// Offer tags did not parse.
     Unparseable,
@@ -268,11 +268,11 @@ pub enum OfferSkip {
     /// Too many delivered-but-unpaid jobs pending payment (bounded-memory back-pressure).
     AwaitingPaymentFull { capacity: usize },
     /// Piece-10: a `job-class=contribution` offer arrived but this seller has contribution support
-    /// disabled (`contribution_enabled=false`). Emits a kind-7000 error (interop courtesy) instead
+    /// disabled (`contribution_enabled=false`). Emits a feedback-kind error (interop courtesy) instead
     /// of running it as from-scratch.
     ContributionUnsupported,
     /// Piece-10: a `job-class=contribution` offer whose target-repo/base pins are malformed —
-    /// refused (fail-closed; never run as from-scratch). Emits a kind-7000 error.
+    /// refused (fail-closed; never run as from-scratch). Emits a feedback-kind error.
     ContributionMalformed { reason: String },
 }
 
@@ -309,7 +309,7 @@ impl OfferSkip {
                 format!("awaiting-payment backlog full (cap {capacity}); back-pressuring new claims")
             }
             Self::ContributionUnsupported => {
-                "contribution offer refused: seller contribution support is disabled (kind-7000 interop courtesy)".to_string()
+                "contribution offer refused: seller contribution support is disabled (feedback-kind interop courtesy)".to_string()
             }
             Self::ContributionMalformed { reason } => {
                 format!("contribution offer refused (malformed pins, fail-closed): {reason}")
@@ -344,7 +344,7 @@ pub struct SellerDaemon {
     pay_buffer: VecDeque<BufferedPay>,
     /// The PROCESSING-phase job (holds single-flight). `None` when idle or only awaiting pay.
     active: Option<ActiveJob>,
-    /// DELIVERED-but-unpaid jobs (kind-6109 published, payment not yet redeemed). These do
+    /// DELIVERED-but-unpaid jobs (result-kind published, payment not yet redeemed). These do
     /// NOT hold single-flight, so new offers can still be claimed while payment is pending.
     awaiting_payment: Vec<ActiveJob>,
 }
@@ -424,7 +424,7 @@ impl SellerDaemon {
         FLIGHT.load(Ordering::SeqCst)
     }
 
-    /// Handle one kind-5109 offer event. Returns Ok(Some(active)) when claimed.
+    /// Handle one offer-kind offer event. Returns Ok(Some(active)) when claimed.
     ///
     /// Skips are NEVER silent — every non-claim path is logged with its reason
     /// ([`OfferSkip::reason`]). A delivered-but-unpaid job does not block here (its
@@ -456,7 +456,7 @@ impl SellerDaemon {
                     ));
                 }
                 // Bundled buyer-visibility: a TARGETED-to-self under-rate refusal also emits a
-                // kind-7000 `status=error` so the buyer learns why. Open-pool under-rate stays
+                // feedback-kind `status=error` so the buyer learns why. Open-pool under-rate stays
                 // log-only (spam guard). No-op for every other skip reason. Content carries the
                 // same machine-readable rate-gate reason already logged here (buyers distinguish
                 // rate-refusal from a crash).
@@ -464,7 +464,7 @@ impl SellerDaemon {
                     self.publish_under_rate_error_if_targeted(event, reason).await;
                 }
                 // Piece-10 interop courtesy: a seller that cannot/​will not handle a contribution
-                // offer emits a kind-7000 `status=error` so the buyer does not wait on a delivery
+                // offer emits a feedback-kind `status=error` so the buyer does not wait on a delivery
                 // that will never come. NOT a security control — buyer refusal is the boundary.
                 if matches!(
                     skip,
@@ -616,7 +616,7 @@ impl SellerDaemon {
         let seller_cfg = require_seller_config(&self.home)?;
         // Piece-10: parse the contribution class. A malformed contribution offer is REFUSED
         // (fail-closed, never run from-scratch); a contribution offer to a seller with support
-        // disabled is refused as an interop courtesy. Both emit a kind-7000 in `on_offer_event`.
+        // disabled is refused as an interop courtesy. Both emit a feedback-kind in `on_offer_event`.
         let contribution = match crate::contribution::parse_contribution_offer(&draft.tags) {
             Ok(value) => value,
             Err(error) => {
@@ -636,7 +636,7 @@ impl SellerDaemon {
         ) {
             // Prefer the raw policy message (e.g. "offer amount 3 sat below seller rate_sats 5")
             // over Display's "seller policy refused: …" prefix — that string is logged and
-            // plumbed into the kind-7000 content for targeted under-rate refusals.
+            // plumbed into the feedback-kind content for targeted under-rate refusals.
             let reason = match error {
                 SellerError::Policy(message) => message,
                 other => other.to_string(),
@@ -670,14 +670,14 @@ impl SellerDaemon {
     }
 
     /// Backfill pre-claim money-safety check (guards #c/#d) for a BACKFILLED offer — one posted
-    /// before the daemon came online. Reads the job's current relay state (offer + kind-7000
-    /// claims + kind-6109 results, with claim liveness derived against `now`) and returns
+    /// before the daemon came online. Reads the job's current relay state (offer + feedback-kind
+    /// claims + result-kind results, with claim liveness derived against `now`) and returns
     /// `Some(reason)` if the offer must be SKIPPED, `None` to proceed to the normal claim path.
     ///
     /// This is the guard that stops a stored offer from stomping a trade that already moved on
     /// while the daemon was offline:
-    ///  * **#c** any kind-6109 result exists (from ANY seller) ⇒ already delivered/settled;
-    ///  * **#d** a LIVE claim (kind-7000 `processing`, not past the offer deadline) is held by
+    ///  * **#c** any result-kind result exists (from ANY seller) ⇒ already delivered/settled;
+    ///  * **#d** a LIVE claim (feedback-kind `processing`, not past the offer deadline) is held by
     ///    ANOTHER seller ⇒ an in-flight trade — do not stomp it.
     ///
     /// FAIL-CLOSED: if the relay read errors (cannot determine current state) the offer is
@@ -703,10 +703,10 @@ impl SellerDaemon {
                 ));
             }
         };
-        // #c — already delivered/settled by ANY seller (a kind-6109 result exists).
+        // #c — already delivered/settled by ANY seller (a result-kind result exists).
         if let Some(result) = view.results.first() {
             return Some(format!(
-                "already delivered: {} kind-6109 result(s) on relay (newest {} by {}); not re-claiming a settled job",
+                "already delivered: {} result-kind result(s) on relay (newest {} by {}); not re-claiming a settled job",
                 view.results.len(),
                 result.result_id,
                 result.seller_pubkey
@@ -729,9 +729,9 @@ impl SellerDaemon {
     }
 
     /// Bundled buyer-visibility (step 5): when a **targeted-to-self** offer is refused only for
-    /// being below the seller's rate floor, publish a kind-7000 `status=error` so the buyer
+    /// being below the seller's rate floor, publish a feedback-kind `status=error` so the buyer
     /// learns WHY (in addition to the local skip log). OPEN-POOL / untargeted under-rate refusals
-    /// stay LOG-ONLY (a fleet of rate-N sellers each 7000-ing every cheap open offer would spam
+    /// stay LOG-ONLY (a fleet of rate-N sellers each feedback-ing every cheap open offer would spam
     /// the relay). `reason` is the machine-readable rate-gate string (same as the skip log) and
     /// is written into the event content. Publish failure is logged, never fatal. Called only on
     /// a `RateGate` skip.
@@ -755,13 +755,13 @@ impl SellerDaemon {
         );
         match publish_draft(&self.home, &self.keys, &error).await {
             Ok(id) => eprintln!(
-                "seller under-rate refusal surfaced: kind-7000 error={id} offer={} (amount {} < rate_sats {}) reason={reason}",
+                "seller under-rate refusal surfaced: feedback-kind error={id} offer={} (amount {} < rate_sats {}) reason={reason}",
                 event.id.to_hex(),
                 offer.amount,
                 seller_cfg.rate_sats
             ),
             Err(error) => eprintln!(
-                "seller WARN: under-rate refusal kind-7000 publish failed offer={}: {error}",
+                "seller WARN: under-rate refusal feedback-kind publish failed offer={}: {error}",
                 event.id.to_hex()
             ),
         }
@@ -805,7 +805,7 @@ impl SellerDaemon {
         Ok(plan)
     }
 
-    /// Full startup reconcile: durable journal release (above) + best-effort kind-7000
+    /// Full startup reconcile: durable journal release (above) + best-effort feedback-kind
     /// error to surface the dead claim to the buyer. Publish failure is logged, not fatal —
     /// the journal release is the durable guarantee; the buyer view also derives expiry.
     pub async fn reconcile_on_startup(
@@ -836,7 +836,7 @@ impl SellerDaemon {
                     orphan.job_id, orphan.liveness
                 ),
                 Err(error) => eprintln!(
-                    "seller reconcile: released orphaned claim job_id={} liveness={:?} (kind-7000 publish deferred: {error}) reason={reason}",
+                    "seller reconcile: released orphaned claim job_id={} liveness={:?} (feedback-kind publish deferred: {error}) reason={reason}",
                     orphan.job_id, orphan.liveness
                 ),
             }
@@ -853,7 +853,7 @@ impl SellerDaemon {
         ingest_gift_wrap(self, event).await
     }
 
-    /// After publishing 6109: reconcile buffered wraps so early pay still lands (B2).
+    /// After publishing result: reconcile buffered wraps so early pay still lands (B2).
     pub async fn reconcile_payments(&mut self) -> Result<Option<ReceiptOutcome>, DaemonError> {
         reconcile_after_result(self).await
     }
@@ -983,7 +983,7 @@ impl SellerDaemon {
         Ok(Some(outcome))
     }
 
-    /// Run agent → push → publish 6109. On fail/timeout publish 7000 error and clear flight.
+    /// Run agent → push → publish result. On fail/timeout publish feedback error and clear flight.
     pub async fn execute_active_job(&mut self) -> Result<String, DaemonError> {
         let active = self
             .active
@@ -1051,7 +1051,7 @@ impl SellerDaemon {
             memory_section.as_deref(),
         );
         // Item #16(c): retry a transient agent error while the deadline still has room. The
-        // kind-7000 error (fail_active, below) is published only after the attempt budget or
+        // feedback-kind error (fail_active, below) is published only after the attempt budget or
         // the deadline is spent — a transient failure never burns the claim early.
         let run_result = run_agent_with_retry(
             active.deadline_unix,
@@ -1257,7 +1257,7 @@ impl SellerDaemon {
                 deliver_ts: now_unix(),
             });
         }
-        // DELIVERED announce: the kind-6109 result is published and pushed. Diagnostic only.
+        // DELIVERED announce: the result-kind result is published and pushed. Diagnostic only.
         self.announce(crate::announce::AnnounceEvent::delivered(
             now_unix(),
             &self.seller_pubkey,
@@ -1279,9 +1279,9 @@ impl SellerDaemon {
         if let Some(active) = self.active.take() {
             let reason = seller_error_content(code, human_reason);
             // Piece-13: capture the ERRORED terminal, threading `reason` (previously discarded)
-            // into `error_reason`. Best-effort; the kind-7000 below is the buyer-facing surface.
+            // into `error_reason`. Best-effort; the feedback-kind below is the buyer-facing surface.
             self.record_errored_episode(&active, &reason);
-            // JOB-FAILED announce (with the machine reason). Diagnostic; the kind-7000 stays the
+            // JOB-FAILED announce (with the machine reason). Diagnostic; the feedback-kind stays the
             // buyer-facing surface.
             self.announce(crate::announce::AnnounceEvent::job_failed(
                 now_unix(),
@@ -1684,7 +1684,7 @@ fn seller_delivery_kind(
     Ok(delivery.delivery_kind())
 }
 
-/// Build the piece-9 Item-2 seller-claimed PUBLIC usage block for a kind-6109 result.
+/// Build the piece-9 Item-2 seller-claimed PUBLIC usage block for a result-kind result.
 ///
 /// Per gudnuf's Q2 ruling this block is PUBLIC and harness-generic. It is **opportunistic**:
 /// emit only fields the seller can source. `harness` is resolved from the configured preset
@@ -1833,7 +1833,7 @@ fn unified_job_timeout(deadline_unix: u64, now_unix: u64) -> Duration {
 ///
 /// A transient agent error is retried until either the attempt budget (`max_attempts`) is
 /// spent OR the deadline (`deadline_unix`, checked against injected `now`) passes. The error
-/// is surfaced to the caller — which then publishes the kind-7000 error exactly once — ONLY
+/// is surfaced to the caller — which then publishes the feedback-kind error exactly once — ONLY
 /// after one of those limits is reached. This stops a transient failure from immediately
 /// burning the claim while the deadline still has room (job 0867a213 failed where 4d982c54
 /// paid). `run` is invoked with the 1-based attempt number and awaited to completion before
@@ -1854,7 +1854,7 @@ where
         match run(attempt).await {
             Ok(usage) => return Ok(usage),
             // Retry only while BOTH an attempt and the deadline remain; otherwise surface the
-            // error so the caller publishes kind-7000 exactly once (past deadline / exhausted).
+            // error so the caller publishes feedback-kind exactly once (past deadline / exhausted).
             Err(_) if attempt < max_attempts && now() < deadline_unix => continue,
             Err(error) => return Err(error),
         }
@@ -1888,7 +1888,7 @@ fn compose_agent_prompt(task: &str, git_remote: &str, memory_section: Option<&st
     }
 }
 
-/// Kind-7000 `status=error` draft for a targeted under-rate refusal. Content carries the
+/// Kind-feedback `status=error` draft for a targeted under-rate refusal. Content carries the
 /// machine-readable rate-gate reason (same string the skip log already has) so buyers can
 /// distinguish rate-refusal from a crash / empty-content failure.
 fn under_rate_error_draft(
@@ -2222,7 +2222,7 @@ async fn try_apply_or_buffer(
     }
 }
 
-/// Reconcile buffered payments after 6109 publish (B2 early-pay). Applies every buffered
+/// Reconcile buffered payments after result publish (B2 early-pay). Applies every buffered
 /// wrap that now binds a delivered job; leaves the rest buffered. Returns the last receipt.
 pub async fn reconcile_after_result(
     daemon: &mut SellerDaemon,
@@ -2311,7 +2311,7 @@ async fn wait_for_nip42_auth(
     within_window.unwrap_or(Ok(AuthWait::NoChallenge))
 }
 
-/// Cap on the number of STORED offers the UNTARGETED (open-pool) 5109 filter requests on
+/// Cap on the number of STORED offers the UNTARGETED (open-pool) offer filter requests on
 /// (re)subscribe when a backfill window is set — a flood guard on the INITIAL query only.
 /// nostr 0.44 `Filter::limit` is "maximum number of events returned in the initial query"
 /// (`nostr-0.44.4/src/filter.rs`): it bounds the stored-events burst, does NOT affect live
@@ -2320,7 +2320,7 @@ async fn wait_for_nip42_auth(
 /// `limit(0)` (the live-only sentinel: request ZERO stored events).
 const OFFER_BACKFILL_LIMIT: usize = 500;
 
-/// Build the seller's kind-5109 offer subscription filter(s).
+/// Build the seller's offer-kind offer subscription filter(s).
 ///
 /// Always includes the TARGETED filter (`#p` == seller pubkey) in its ORIGINAL shape — no
 /// `since`, no `limit` — at ALL `backfill_secs` values: stored targeted offers are addressed to
@@ -2339,7 +2339,7 @@ const OFFER_BACKFILL_LIMIT: usize = 500;
 /// under the live-only bound:
 ///  * `backfill_secs == 0` → **live-only** (byte-identical pre-backfill shape):
 ///    `since(subscribe_now)` + `limit(0)` (request ZERO stored events). Only open-pool offers
-///    posted WHILE the daemon runs are delivered — no full-history 5109 firehose on startup.
+///    posted WHILE the daemon runs are delivered — no full-history offer firehose on startup.
 ///  * `backfill_secs > 0` → `since(subscribe_now - backfill_secs).limit(OFFER_BACKFILL_LIMIT)`:
 ///    stored open-pool offers within the window backfill (bounded burst); `limit(0)` is DROPPED
 ///    (it would suppress every stored event and defeat the window).
@@ -2351,16 +2351,22 @@ fn offer_subscription_filters(
 ) -> Vec<nostr_sdk::Filter> {
     use nostr_sdk::prelude::{Filter, Kind, Timestamp};
 
-    // TARGETED (`#p == self`): ORIGINAL shape, untouched by the window knob.
+    // TARGETED (`#p == self`): ORIGINAL shape, untouched by the window knob. PIECE-14 A′: the
+    // `#t=mobee` namespace guard is required so a foreign event squatting the offer kind is never
+    // even delivered.
     let mut filters = vec![Filter::new()
         .kind(Kind::Custom(JOB_OFFER_KIND))
+        .hashtag(gateway::MOBEE_TAG)
         .pubkey(seller_pubkey)];
 
     if claim_open_pool {
         // UNtargeted (open-pool): the backfill window applies HERE only. `since` anchor:
         // `now - backfill_secs` (saturating); backfill_secs == 0 ⇒ `since(now)`.
         let since = Timestamp::from(subscribe_now.as_secs().saturating_sub(backfill_secs));
-        let untargeted = Filter::new().kind(Kind::Custom(JOB_OFFER_KIND)).since(since);
+        let untargeted = Filter::new()
+            .kind(Kind::Custom(JOB_OFFER_KIND))
+            .hashtag(gateway::MOBEE_TAG)
+            .since(since);
         let untargeted = if backfill_secs > 0 {
             // Window requested: bounded stored-offer burst (drop the live-only `limit(0)`).
             untargeted.limit(OFFER_BACKFILL_LIMIT)
@@ -2376,7 +2382,7 @@ fn offer_subscription_filters(
 /// The seller's LIVE offer subscription(s), grouped as they are registered on the relay.
 ///
 /// Each element is ONE long-lived subscription — a single NIP-01 `REQ` whose filters the relay
-/// OR-matches. The 5109 offer filters are grouped into ONE subscription: the pinned (`#p` ==
+/// OR-matches. The offer filters are grouped into ONE subscription: the pinned (`#p` ==
 /// self) filter AND — under `claim_open_pool` — the un-pinned open-pool filter ride the SAME
 /// `REQ`. This grouping is load-bearing: an earlier half-fix registered the un-pinned filter as
 /// a SEPARATE second subscription, which delivered stored events (backfill) but no LIVE offers —
@@ -2450,10 +2456,10 @@ impl BoundedSeen {
 
 /// Whether a relay event in the seller loop should be handed to `on_offer_event`.
 ///
-/// True iff the event is a kind-5109 offer not seen before. Routing is by KIND ONLY: a
+/// True iff the event is a offer-kind offer not seen before. Routing is by KIND ONLY: a
 /// non-p-tagged (open-pool) offer routes exactly like a targeted one, so the notification path
 /// never drops untargeted offers. The event-id dedup makes a targeted offer that matched more
-/// than one 5109 filter (or a reconnect re-delivery) reach `on_offer_event` at most once. The
+/// than one offer filter (or a reconnect re-delivery) reach `on_offer_event` at most once. The
 /// set is bounded ([`BoundedSeen`]); forgetting an OLD id is money-safe (durable `has_claim`).
 fn offer_event_should_process(
     event_kind: u16,
@@ -2477,7 +2483,7 @@ pub(crate) struct RunHooks {
     pub auth_wait: Option<std::time::Duration>,
 }
 
-/// Long-running seller loop: NIP-42 AUTH, then subscribe 5109+1059 from START.
+/// Long-running seller loop: NIP-42 AUTH, then subscribe offers+1059 from START.
 pub async fn run_forever(daemon: SellerDaemon) -> Result<(), DaemonError> {
     run_forever_hooked(daemon, RunHooks::default()).await
 }
@@ -2552,7 +2558,7 @@ pub(crate) async fn run_forever_hooked(
 
     // Restart-reconcile: release any orphaned in-flight claims from a prior run BEFORE
     // serving new offers, so a claim left live by a crash never reads "processing" forever
-    // (evidence job 0867a213). Durable via journal; kind-7000 surface is best-effort.
+    // (evidence job 0867a213). Durable via journal; feedback-kind surface is best-effort.
     match daemon.reconcile_on_startup(now_unix()).await {
         Ok(plan) if !plan.is_empty() => {
             eprintln!(
@@ -2594,7 +2600,7 @@ pub(crate) async fn run_forever_hooked(
             .pool()
             .subscribe(filters, SubscribeOptions::default())
             .await
-            .map_err(|error| DaemonError::Relay(format!("subscribe 5109: {error}")))?;
+            .map_err(|error| DaemonError::Relay(format!("subscribe offers: {error}")))?;
         offer_sub_ids.push(output.val);
     }
     let wrap_filter = Filter::new().kind(Kind::GiftWrap).pubkey(seller_pubkey);
@@ -2623,7 +2629,7 @@ pub(crate) async fn run_forever_hooked(
         let _ = ready.send(());
     }
 
-    // Both 5109 filters ride ONE subscription, so the relay delivers each offer once even when
+    // Both offer filters ride ONE subscription, so the relay delivers each offer once even when
     // a targeted offer matches both filters. Keep an event-id dedup as defense-in-depth (e.g.
     // reconnect re-delivery) so each offer id reaches `on_offer_event` at most once. Bounded to
     // the most-recent `SEEN_OFFERS_CAP` ids so it can't leak over the seller's lifetime; an
@@ -2699,7 +2705,7 @@ pub(crate) async fn run_forever_hooked(
                     }
                     continue;
                 }
-                // An offer (kind-5109) routes to `on_offer_event` REGARDLESS of p-tag — open-pool
+                // An offer (offer-kind) routes to `on_offer_event` REGARDLESS of p-tag — open-pool
                 // offers carry none, so a p-tag gate here would silently drop them. Deduped by
                 // event id so each offer is processed once (see `offer_event_should_process`).
                 if offer_event_should_process(event.kind.as_u16(), event.id, &mut seen_offers) {
@@ -2719,7 +2725,7 @@ pub(crate) async fn run_forever_hooked(
                         Ok(Some(_)) => {
                             match daemon.execute_active_job().await {
                                 Ok(result_id) => {
-                                    eprintln!("seller published 6109 result_id={result_id}");
+                                    eprintln!("seller published result_id={result_id}");
                                     // DELIVERED: free the single-flight slot so new offers can
                                     // be claimed while this job awaits payment (#15).
                                     daemon.mark_delivered();
@@ -2751,7 +2757,7 @@ pub(crate) async fn run_forever_hooked(
             // Loud-Closed fallback (hardening #3): the relay CLOSED a subscription. If it's the
             // grouped OFFER subscription (e.g. the relay restricts the broad open-pool filter),
             // the seller would go SILENTLY deaf to offers. LOG IT LOUDLY and degrade to the
-            // TARGETED-only 5109 filter (`#p==self`) — which a relay that only objects to the
+            // TARGETED-only offer filter (`#p==self`) — which a relay that only objects to the
             // broad filter still accepts — so the seller stays targeted-alive with a visible log
             // instead of dying quietly. nostr-sdk removes a CLOSED (error/restricted/blocked) sub
             // and does not re-subscribe it, so this re-subscribe is the recovery path.
@@ -2764,7 +2770,7 @@ pub(crate) async fn run_forever_hooked(
                     offer_fallback_done = true;
                     eprintln!(
                         "seller WARN: relay CLOSED the offer subscription (sub_id={}): \"{}\". \
-                         Falling back to the TARGETED-only 5109 filter (#p==self); open-pool \
+                         Falling back to the TARGETED-only offer filter (#p==self); open-pool \
                          (untargeted) offers will NOT be received until the relay accepts the \
                          grouped subscription again.",
                         subscription_id.as_ref(),
@@ -2907,14 +2913,14 @@ mod tests {
         assert_eq!(unified_job_timeout(1_000, 5_000), Duration::ZERO);
     }
 
-    // Item #16(c): a transient agent error is retried WITHIN the deadline; kind-7000 is
+    // Item #16(c): a transient agent error is retried WITHIN the deadline; feedback-kind is
     // published only after the attempt budget or the deadline is spent.
     #[tokio::test]
     async fn retry_recovers_from_a_transient_error_within_the_deadline() {
         use std::cell::Cell;
         let attempts = Cell::new(0u32);
         // Deadline far away ⇒ never the limiter; a transient first error must be retried,
-        // NOT burn the claim (publish 7000) while the deadline still has room.
+        // NOT burn the claim (publish feedback) while the deadline still has room.
         let out = run_agent_with_retry(u64::MAX, 3, || 0, |attempt| {
             attempts.set(attempt);
             async move {
@@ -2942,7 +2948,7 @@ mod tests {
             }
         })
         .await;
-        assert!(out.is_err(), "exhausted retries ⇒ error so caller publishes kind-7000");
+        assert!(out.is_err(), "exhausted retries ⇒ error so caller publishes feedback-kind");
         assert_eq!(attempts.get(), 3, "bounded to the attempt budget");
     }
 
@@ -2951,7 +2957,7 @@ mod tests {
         use std::cell::Cell;
         let attempts = Cell::new(0u32);
         // `now` (5_000) is already past the deadline (1_000) ⇒ no retry budget at all: one
-        // attempt, then the error surfaces so the caller publishes kind-7000.
+        // attempt, then the error surfaces so the caller publishes feedback-kind.
         let out = run_agent_with_retry(1_000, 3, || 5_000, |attempt| {
             attempts.set(attempt);
             async move {
@@ -2959,7 +2965,7 @@ mod tests {
             }
         })
         .await;
-        assert!(out.is_err(), "past deadline ⇒ error (caller publishes kind-7000)");
+        assert!(out.is_err(), "past deadline ⇒ error (caller publishes feedback-kind)");
         assert_eq!(attempts.get(), 1, "no retry once the deadline has passed");
     }
 
@@ -3109,17 +3115,20 @@ mod tests {
 
         // A TARGETED offer carries a p-tag == seller; an UNtargeted (open-pool) offer has none.
         let targeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
+            .tag(nostr_sdk::prelude::Tag::hashtag(gateway::MOBEE_TAG))
             .tag(Tag::public_key(seller.public_key()))
             .sign_with_keys(&buyer)
             .expect("sign targeted offer");
         // A FRESH untargeted offer (dated after the filter's `since(now)`). Built in the future
         // so it deterministically clears the bound regardless of sub-second test timing.
         let fresh_untargeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
+            .tag(nostr_sdk::prelude::Tag::hashtag(gateway::MOBEE_TAG))
             .custom_created_at(Timestamp::now() + 60u64)
             .sign_with_keys(&buyer)
             .expect("sign fresh untargeted offer");
-        // A STALE untargeted offer (an hour old) — the relay's 5109 history.
+        // A STALE untargeted offer (an hour old) — the relay's offer history.
         let stale_untargeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
+            .tag(nostr_sdk::prelude::Tag::hashtag(gateway::MOBEE_TAG))
             .custom_created_at(Timestamp::from(Timestamp::now().as_secs().saturating_sub(3600)))
             .sign_with_keys(&buyer)
             .expect("sign stale untargeted offer");
@@ -3161,7 +3170,7 @@ mod tests {
             "fresh untargeted offer MUST match under open-pool (the fix)"
         );
         // The un-pinned filter is BOUNDED (`since(now - window)`): an offer OLDER than the window
-        // does NOT match, so a running seller never replays the relay's full 5109 history.
+        // does NOT match, so a running seller never replays the relay's full offer history.
         // RED-ON-REVERT: drop the `.since(..)` bound and this assert fails (the flood returns).
         assert!(
             !matches_any(&open_pool, &stale_untargeted),
@@ -3179,10 +3188,12 @@ mod tests {
         let buyer = Keys::generate();
 
         let targeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
+            .tag(nostr_sdk::prelude::Tag::hashtag(gateway::MOBEE_TAG))
             .tag(Tag::public_key(seller.public_key()))
             .sign_with_keys(&buyer)
             .expect("sign targeted offer");
         let fresh_untargeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
+            .tag(nostr_sdk::prelude::Tag::hashtag(gateway::MOBEE_TAG))
             .custom_created_at(Timestamp::now() + 60u64)
             .sign_with_keys(&buyer)
             .expect("sign fresh untargeted offer");
@@ -3230,19 +3241,20 @@ mod tests {
         use nostr_sdk::prelude::{EventBuilder, Keys, Kind};
 
         let buyer = Keys::generate();
-        // An UNtargeted (open-pool) 5109 offer carries no p-tag.
+        // An UNtargeted (open-pool) offer carries no p-tag.
         let untargeted = EventBuilder::new(Kind::Custom(JOB_OFFER_KIND), "task")
+            .tag(nostr_sdk::prelude::Tag::hashtag(gateway::MOBEE_TAG))
             .sign_with_keys(&buyer)
             .expect("sign untargeted offer");
 
         let mut seen = BoundedSeen::default();
 
-        // A non-p-tagged 5109 offer MUST route to `on_offer_event` on the LIVE push — this rules
-        // out the "notification path drops non-p-tagged 5109" failure mode. RED-ON-REVERT: gate
+        // A non-p-tagged offer MUST route to `on_offer_event` on the LIVE push — this rules
+        // out the "notification path drops non-p-tagged offer" failure mode. RED-ON-REVERT: gate
         // routing on a p-tag and this first assertion fails for the untargeted offer.
         assert!(
             offer_event_should_process(untargeted.kind.as_u16(), untargeted.id, &mut seen),
-            "an untargeted 5109 offer must route to on_offer_event"
+            "an untargeted offer must route to on_offer_event"
         );
         // Dedup by event id: a re-delivered offer id is processed at most once.
         assert!(
@@ -3252,7 +3264,7 @@ mod tests {
         // A non-offer kind (e.g. gift-wrap 1059) does not route as an offer.
         assert!(
             !offer_event_should_process(Kind::GiftWrap.as_u16(), untargeted.id, &mut seen),
-            "non-5109 events must not route to on_offer_event"
+            "non-offer events must not route to on_offer_event"
         );
     }
 
@@ -3426,7 +3438,6 @@ mod tests {
             amount,
             unit: "sat".into(),
             deadline_unix: 2_000_000_000,
-            mint_url: DEFAULT_MINT_URL.into(),
             seller_pubkey: Some(seller.to_owned()),
         }
     }
@@ -3493,7 +3504,6 @@ mod tests {
             "text/plain",
             amount,
             deadline,
-            DEFAULT_MINT_URL,
             seller_pubkey,
         );
         let draft = offer.to_event_draft();
@@ -3508,7 +3518,7 @@ mod tests {
         extra_tags: Vec<TagSpec>,
     ) -> nostr_sdk::Event {
         let offer =
-            crate::gateway::OfferDraft::new("do a task", "text/plain", 5, deadline, DEFAULT_MINT_URL, seller_pubkey);
+            crate::gateway::OfferDraft::new("do a task", "text/plain", 5, deadline, seller_pubkey);
         let mut draft = offer.to_event_draft();
         draft.tags.extend(extra_tags);
         let builder = gateway::nostr::event_builder(&draft).expect("event builder");
@@ -3548,7 +3558,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Piece-10: a seller with contribution support DISABLED refuses (interop kind-7000 skip).
+    // Piece-10: a seller with contribution support DISABLED refuses (interop feedback-kind skip).
     #[test]
     fn classify_refuses_contribution_when_disabled() {
         let (root, mut daemon) = test_daemon("contrib-disabled");
@@ -3714,7 +3724,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // Targeted under-rate refusal: the kind-7000 `status=error` draft CONTENT must carry the
+    // Targeted under-rate refusal: the feedback-kind `status=error` draft CONTENT must carry the
     // same machine-readable rate-gate reason the skip log already has (buyers distinguish
     // rate-refusal from a crash / empty-content failure).
     #[test]
@@ -3724,7 +3734,7 @@ mod tests {
         assert_eq!(draft.kind, gateway::JOB_FEEDBACK_KIND);
         assert_eq!(
             draft.content, reason,
-            "kind-7000 content must carry the rate-gate reason, not stay empty"
+            "feedback-kind content must carry the rate-gate reason, not stay empty"
         );
         assert!(
             draft.tags.iter().any(|t| {
@@ -3771,7 +3781,7 @@ mod tests {
         );
         assert_eq!(
             draft.content, reason,
-            "emitted kind-7000 content must equal the rate-gate reason"
+            "emitted feedback-kind content must equal the rate-gate reason"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4019,7 +4029,6 @@ mod tests {
             "text/plain",
             10,
             now_unix() + 3_600,
-            DEFAULT_MINT_URL,
         )
         .to_event_draft();
         let event = gateway::nostr::event_builder(&draft)
@@ -4493,9 +4502,9 @@ Anything not committed to git will not be delivered.";
 /// NIP-01 relay (`nostr-relay-builder`) and assert on RELAY TRAFFIC + TIMING — never on
 /// stderr/scrollback. They prove the open-pool live-delivery behaviour:
 ///  * **A** — the daemon reaches READY quickly (mpsc readiness hook, not a log scrape);
-///  * **B** — a running seller does NOT replay the relay's 5109 history (bounded startup ingest);
-///  * **C** — a fresh UNtargeted 5109 offer posted to a RUNNING seller is CLAIMED without a
-///    restart (relay receives the seller's kind-7000 `status=processing` tagged `e=<offer id>`) —
+///  * **B** — a running seller does NOT replay the relay's offer history (bounded startup ingest);
+///  * **C** — a fresh UNtargeted offer posted to a RUNNING seller is CLAIMED without a
+///    restart (relay receives the seller's claim-kind `status=processing` tagged `e=<offer id>`) —
 ///    the "untargeted offer → claim without restart" proof that was previously never obtained;
 ///  * **D** — if the relay CLOSES the broad open-pool subscription, the daemon still reaches READY
 ///    and degrades to the TARGETED-only filter, still claiming a fresh targeted offer (the
@@ -4547,7 +4556,7 @@ mod local_relay_it {
             "home mint must be the fail-closed testnut default"
         );
         h.config.seller = Some(SellerConfig {
-            // Stub agent: the CLAIM (kind-7000 processing) is published in `on_offer_event` BEFORE
+            // Stub agent: the CLAIM (claim-kind processing) is published in `on_offer_event` BEFORE
             // execution, so no real ACP agent is needed — execution fails fast after the claim we
             // assert on, releasing single-flight.
             agent_command: vec!["true".into()],
@@ -4590,8 +4599,8 @@ mod local_relay_it {
     /// offer (deadline in the past) for the deadline-expiry money-safety test.
     fn offer_draft_with_deadline(targeted_to: Option<&str>, deadline_unix: u64) -> OfferDraft {
         match targeted_to {
-            Some(pk) => OfferDraft::new("do a task", "text", 10, deadline_unix, DEFAULT_MINT_URL, pk),
-            None => OfferDraft::untargeted("do a task", "text", 10, deadline_unix, DEFAULT_MINT_URL),
+            Some(pk) => OfferDraft::new("do a task", "text", 10, deadline_unix, pk),
+            None => OfferDraft::untargeted("do a task", "text", 10, deadline_unix),
         }
     }
 
@@ -4622,7 +4631,7 @@ mod local_relay_it {
         })
     }
 
-    /// Collect every kind-7000 the seller publishes as `(e-tag, status)`. The receiver is created
+    /// Collect every feedback-kind the seller publishes as `(e-tag, status)`. The receiver is created
     /// before the daemon starts so no startup claim is missed.
     fn spawn_claim_collector(
         client: &Client,
@@ -4634,7 +4643,9 @@ mod local_relay_it {
         tokio::spawn(async move {
             while let Ok(n) = notif.recv().await {
                 if let RelayPoolNotification::Event { event, .. } = n {
-                    if event.kind.as_u16() == gateway::JOB_FEEDBACK_KIND && event.pubkey == seller_pk
+                    let kind = event.kind.as_u16();
+                    if (kind == gateway::JOB_CLAIM_KIND || kind == gateway::JOB_FEEDBACK_KIND)
+                        && event.pubkey == seller_pk
                     {
                         if let Some(e) = tag_value(&event, "e") {
                             let status = tag_value(&event, "status").unwrap_or_default();
@@ -4703,7 +4714,7 @@ mod local_relay_it {
 
         let (relay, relay_url) = start_relay(RelayBuilder::default()).await;
 
-        // Seed the relay's 5109 HISTORY: M offers dated 2 min in the PAST (mix untargeted +
+        // Seed the relay's offer HISTORY: M offers dated 2 min in the PAST (mix untargeted +
         // targeted-foreign), all with the fail-closed testnut mint. A BOUNDED running seller must
         // ingest ~none of these; an unbounded one would fetch them all and claim one.
         let buyer = Keys::generate();
@@ -4727,12 +4738,15 @@ mod local_relay_it {
         let daemon = SellerDaemon::open(home).expect("open seller daemon");
         let seller_pk = PublicKey::parse(daemon.seller_pubkey()).expect("seller pubkey");
 
-        // Observer collects the seller's kind-7000 BEFORE the daemon starts.
+        // Observer collects the seller's feedback-kind BEFORE the daemon starts.
         let observer = connect_client(&relay_url).await;
         observer
             .subscribe(
                 Filter::new()
-                    .kind(Kind::Custom(gateway::JOB_FEEDBACK_KIND))
+                    .kinds([
+                        Kind::Custom(gateway::JOB_CLAIM_KIND),
+                        Kind::Custom(gateway::JOB_FEEDBACK_KIND),
+                    ])
                     .author(seller_pk),
                 None,
             )
@@ -4769,7 +4783,7 @@ mod local_relay_it {
         }
 
         // C. LIVE untargeted delivery (THE goal proof): publish a FRESH untargeted offer to the
-        // RUNNING seller and assert the relay receives its kind-7000 status=processing claim
+        // RUNNING seller and assert the relay receives its feedback-kind status=processing claim
         // (e=<offer id>) within 10s — an untargeted offer claimed WITHOUT a restart.
         let live_id = publish_offer(&seeder, &buyer, &offer_draft(None), None)
             .await
@@ -4780,7 +4794,7 @@ mod local_relay_it {
         .await;
         assert!(
             claimed_live,
-            "C: running open-pool seller must CLAIM a fresh untargeted offer (kind-7000 \
+            "C: running open-pool seller must CLAIM a fresh untargeted offer (feedback-kind \
              processing e={live_id}) within 10s — the live untargeted-delivery proof"
         );
 
@@ -4791,7 +4805,7 @@ mod local_relay_it {
 
     // ── D: relay restricts the broad open-pool filter → seller degrades to targeted ──────────
 
-    /// A [`QueryPolicy`] that rejects a REQ carrying a broad 5109 filter (kind-5109, no authors,
+    /// A [`QueryPolicy`] that rejects a REQ carrying a broad offer filter (offer-kind, no authors,
     /// no `#p`) — i.e. the un-pinned open-pool filter — while allowing the targeted `#p==self`
     /// filter. Models a relay that refuses to serve the open-pool firehose.
     #[derive(Debug)]
@@ -4813,7 +4827,7 @@ mod local_relay_it {
                     .generic_tags
                     .contains_key(&SingleLetterTag::lowercase(Alphabet::P));
                 if is_offer_kind && !has_authors && !has_p_tag {
-                    PolicyResult::Reject("blocked: broad open-pool 5109 filter".to_string())
+                    PolicyResult::Reject("blocked: broad open-pool offer filter".to_string())
                 } else {
                     PolicyResult::Accept
                 }
@@ -4838,7 +4852,10 @@ mod local_relay_it {
         observer
             .subscribe(
                 Filter::new()
-                    .kind(Kind::Custom(gateway::JOB_FEEDBACK_KIND))
+                    .kinds([
+                        Kind::Custom(gateway::JOB_CLAIM_KIND),
+                        Kind::Custom(gateway::JOB_FEEDBACK_KIND),
+                    ])
                     .author(seller_pk),
                 None,
             )
@@ -4874,7 +4891,7 @@ mod local_relay_it {
         assert!(
             claimed,
             "D-2: after the broad-filter CLOSE, the seller must still CLAIM a fresh TARGETED offer \
-             (kind-7000 processing e={targeted_id}) within 10s via the targeted-only fallback"
+             (claim-kind processing e={targeted_id}) within 10s via the targeted-only fallback"
         );
 
         // Quiesce: let execution finish so single-flight is released before the guard drops.
@@ -4884,7 +4901,7 @@ mod local_relay_it {
 
     // ── Backfill window: a daemon started AFTER an offer was posted ──────────────────────────
 
-    /// Publish a kind-7000 `status=processing` claim for `offer_id` signed by `seller` — models
+    /// Publish a claim-kind `status=processing` claim for `offer_id` signed by `seller` — models
     /// a DIFFERENT seller having already claimed the offer. Reuses the daemon's own claim draft.
     async fn publish_claim(
         client: &Client,
@@ -4911,7 +4928,7 @@ mod local_relay_it {
         id
     }
 
-    /// Boot a seller daemon (own thread + readiness hook) with a kind-7000 claim collector.
+    /// Boot a seller daemon (own thread + readiness hook) with a feedback-kind claim collector.
     /// Returns the live observer client (KEEP it bound — dropping it ends the collector task),
     /// the collected-claims handle, and the daemon join handle. Asserts READY within 10s.
     async fn start_collected_seller(
@@ -4932,7 +4949,10 @@ mod local_relay_it {
         observer
             .subscribe(
                 Filter::new()
-                    .kind(Kind::Custom(gateway::JOB_FEEDBACK_KIND))
+                    .kinds([
+                        Kind::Custom(gateway::JOB_CLAIM_KIND),
+                        Kind::Custom(gateway::JOB_FEEDBACK_KIND),
+                    ])
                     .author(seller_pk),
                 None,
             )
@@ -4951,7 +4971,7 @@ mod local_relay_it {
     }
 
     /// THE acceptance fixture: post an OPEN-POOL offer, THEN start the daemon, and the daemon
-    /// BACKFILLS + CLAIMS it (kind-7000 `processing` e=<offer id>) within the poll interval.
+    /// BACKFILLS + CLAIMS it (feedback-kind `processing` e=<offer id>) within the poll interval.
     ///
     /// RED-ON-REVERT (the since-window mechanic): restore `since(now)` / `limit(0)` in
     /// `offer_subscription_filters` (ignore `backfill_secs`) and this fixture goes RED — the
@@ -4984,7 +5004,7 @@ mod local_relay_it {
         .await;
         assert!(
             claimed,
-            "a daemon started AFTER the offer was posted must BACKFILL + CLAIM it (kind-7000 \
+            "a daemon started AFTER the offer was posted must BACKFILL + CLAIM it (feedback-kind \
              processing e={offer_id}) within 10s — the start-after-post delivery proof"
         );
 
@@ -5077,7 +5097,7 @@ mod local_relay_it {
         let offer_id = publish_offer(&seeder, &buyer, &offer_draft(None), Some(recent))
             .await
             .to_hex();
-        // A DIFFERENT seller has already claimed it (live kind-7000 processing).
+        // A DIFFERENT seller has already claimed it (live claim-kind processing).
         let foreign_seller = Keys::generate();
         publish_claim(&seeder, &foreign_seller, &offer_id, &buyer.public_key().to_hex()).await;
 
@@ -5109,7 +5129,6 @@ mod local_relay_it {
             "text/plain",
             10,
             now_unix() + 3_600,
-            DEFAULT_MINT_URL,
             seller_hex,
         );
         let mut draft = offer.to_event_draft();
@@ -5135,7 +5154,7 @@ mod local_relay_it {
     }
 
     // ── Piece-10: a CONTRIBUTION offer round-trips over a real relay and the seller recognises it,
-    //    claiming it (kind-7000 processing) — the offer→claim leg of the ONE state machine live. ──
+    //    claiming it (claim-kind processing) — the offer→claim leg of the ONE state machine live. ──
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn contribution_offer_round_trips_to_claim_over_local_relay() {
         let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -5151,7 +5170,10 @@ mod local_relay_it {
         observer
             .subscribe(
                 Filter::new()
-                    .kind(Kind::Custom(gateway::JOB_FEEDBACK_KIND))
+                    .kinds([
+                        Kind::Custom(gateway::JOB_CLAIM_KIND),
+                        Kind::Custom(gateway::JOB_FEEDBACK_KIND),
+                    ])
                     .author(seller_pk),
                 None,
             )
@@ -5165,7 +5187,7 @@ mod local_relay_it {
         assert!(matches!(ready, Ok(Some(()))), "daemon must reach READY (got {ready:?})");
 
         // Post a TARGETED contribution offer; the seller must recognise the class + pins and CLAIM
-        // it (kind-7000 processing) — proving the additive offer round-trips over a live relay.
+        // it (claim-kind processing) — proving the additive offer round-trips over a live relay.
         let buyer = Keys::generate();
         let seeder = connect_client(&relay_url).await;
         let offer_id = publish_contribution_offer(&seeder, &buyer, &seller_hex).await.to_hex();
@@ -5175,7 +5197,7 @@ mod local_relay_it {
         .await;
         assert!(
             claimed,
-            "seller must CLAIM a fresh contribution offer (kind-7000 processing e={offer_id}) within 10s"
+            "seller must CLAIM a fresh contribution offer (claim-kind processing e={offer_id}) within 10s"
         );
 
         wait_until(Duration::from_secs(8), || !SellerDaemon::in_flight()).await;

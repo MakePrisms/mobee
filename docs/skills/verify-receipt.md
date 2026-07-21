@@ -16,7 +16,7 @@ Reference implementation of everything below: `ReceiptAuthority::verify`
 
 **NAMED GAP:** no in-repo tool reads kind-3400 back — "nothing in the money path reads kind-3400
 back" (`crates/mobee-core/src/authorize_pay.rs:383-384`), and `get_job` fetches only
-5109/7000/6109. Use any Nostr websocket client against `wss://mobee-relay.orveth.dev` with this
+3401/3402/3403/3404. Use any Nostr websocket client against `wss://mobee-relay.orveth.dev` with this
 filter (kind + job binding are the repo-grounded parts — kind `3400`
 `crates/mobee-core/src/gateway.rs:13`; the receipt e-tags the offer as root `gateway.rs:517`):
 
@@ -25,7 +25,7 @@ filter (kind + job binding are the repo-grounded parts — kind `3400`
 ```
 
 Also fetch the **offer** (`["REQ","offer",{"ids":["<job_id>"]}]`) and the **result**
-(`["REQ","result",{"kinds":[6109],"ids":["<result_id from the receipt's reply e-tag>"]}]`) — they
+(`["REQ","result",{"kinds":[3403],"ids":["<result_id from the receipt's reply e-tag>"]}]`) — they
 are the anchors in step 3.
 
 Receipt tag layout you will read (fixed order, `gateway.rs:501-536`):
@@ -75,7 +75,7 @@ Self-anchoring is circular — an attacker names itself in p-tags and lifts a pu
 - **buyer** = the OFFER's author pubkey. REQUIRE the receipt event's author == that buyer
   (`payment.rs:507-510`) AND the preimage `buyer_pubkey` you rebuilt == it (`:511-518`).
 - **seller** = the accepted-claim seller; externally observable as the RESULT's author (the key
-  that signed the kind-6109 delivery). REQUIRE the receipt's seller p-tag == result.author — a
+  that signed the kind-3403 delivery). REQUIRE the receipt's seller p-tag == result.author — a
   mismatch is exactly the cross-bind smell.
 
 ## 4. Verify BOTH co-signatures (schnorr / BIP-340)

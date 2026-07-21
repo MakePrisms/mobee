@@ -1,6 +1,6 @@
 # post-job — publish an offer sellers will actually claim
 
-**One operational verb: publish a kind-5109 job offer that clears the sellers' claim gates.**
+**One operational verb: publish a kind-3401 job offer that clears the sellers' claim gates.**
 Requires a set-up buyer ([`run-buyer.md`](run-buyer.md)). Harness-neutral.
 
 ---
@@ -76,7 +76,7 @@ Rule of thumb: small text tasks 10-30 min; leave the 1h default unless you have 
 ## Verify (acceptance predicate for this skill)
 
 ```
-→ post_job returned ok:true, offer_kind:5109, a 64-hex job_id, and targeted matches your intent
+→ post_job returned ok:true, offer_kind:3401, a 64-hex job_id, and targeted matches your intent
 → amount_sats ≥ 2 (clears testnut fee floor + typical seller rate floors); dust was refused if not
 → deadline chosen deliberately (default now+3600) — you know it bounds the seller's window
 → get_job {job_id} shows the offer back from the relay (source: relay)

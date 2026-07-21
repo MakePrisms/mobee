@@ -28,7 +28,8 @@ const ATTEMPT_DOMAIN: &[u8] = b"mobee/v1/payment-attempt";
 /// Nostr event kind of a piece-9 co-signed settlement receipt. Stamped on
 /// [`ReceiptRecord`] so a consumer discriminates a real receipt from a legacy
 /// (kind-1059-aliased) record with a LOCAL check — never "missing id".
-const RECEIPT_EVENT_KIND: u16 = 3400;
+// The co-signed receipt kind — the single registry lives in `crate::kinds`.
+use crate::gateway::JOB_RECEIPT_KIND as RECEIPT_EVENT_KIND;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -562,7 +563,7 @@ impl ReceiptAuthority {
     /// SHARED SEAM — do NOT inline this at call sites. It is the single pre-pay point at which
     /// every seller bind is checked. The receipt (job-hash) preimage signature is checked always;
     /// piece-10 Step-1 (freelance-PR fork, `docs/meta/PIECE-10-FREELANCE-PR-DELIVERY.md`) EXTENDS
-    /// THIS POINT — for a `contribution` result, an ADDITIONAL seller signature over its signed-6109
+    /// THIS POINT — for a `contribution` result, an ADDITIONAL seller signature over its signed-result
     /// tuple bind `{job_id, seller_pubkey, target_repo, base_oid, fork_ref, commit_oid}` is verified
     /// against the SAME claim-seller anchor. One seam, more binds — never a parallel pre-pay gate.
     /// From-scratch trades pass `contribution = None` ⇒ byte-identical to the single-bind behavior.
@@ -589,7 +590,7 @@ impl ReceiptAuthority {
             verify_schnorr_hex(contribution.tuple_signature_hex, &tuple_message, &self.seller)
                 .map_err(|_| {
                     PaymentError::Refused(format!(
-                        "pre-pay contribution authorship invalid: the accepted result's signed-6109 \
+                        "pre-pay contribution authorship invalid: the accepted result's signed-result \
                          tuple sig does not verify over {{job_id, seller_pubkey, target_repo, \
                          base_oid, fork_ref, commit_oid}} against claim seller {} (zero spend; \
                          refused before payment)",
@@ -606,7 +607,7 @@ impl ReceiptAuthority {
 /// pre-pay seam [`ReceiptAuthority::verify_seller_prepay_cosig`] alongside the receipt cosig.
 #[derive(Clone, Copy, Debug)]
 pub struct ContributionCosig<'a> {
-    /// SHA-256 digest of the seller's signed-6109 authorship tuple (buyer-reconstructed).
+    /// SHA-256 digest of the seller's signed-result authorship tuple (buyer-reconstructed).
     pub tuple_digest: [u8; 32],
     /// The seller's schnorr signature (hex) over `tuple_digest`, read from the accepted result.
     pub tuple_signature_hex: &'a str,

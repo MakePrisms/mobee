@@ -77,7 +77,7 @@ pub struct ContributionPayBinds {
     pub base_branch: String,
     /// The exact commit the delivery must descend from (from the buyer's signed offer).
     pub base_oid: String,
-    /// Seller schnorr signature (hex) over the signed-6109 authorship tuple (`sig/seller-contribution`).
+    /// Seller schnorr signature (hex) over the signed-result authorship tuple (`sig/seller-contribution`).
     pub tuple_signature: String,
 }
 
@@ -320,7 +320,7 @@ pub async fn authorize_pay_async(
     // as `build_and_publish_receipt`, so the verified bytes cannot drift from the published
     // bytes) and verify the seller's `sig/seller` over it against the claim-seller anchor —
     // BEFORE the budget gate commits spent and BEFORE the wallet opens. For a contribution the
-    // SAME seam ALSO verifies the seller's signed-6109 authorship tuple (one seam, more binds).
+    // SAME seam ALSO verifies the seller's signed-result authorship tuple (one seam, more binds).
     // Fail-closed here ⇒ ZERO spend: no `authorize_then_attempt`, no lock/mint/send, no receipt,
     // no journal record.
     let prepay_preimage =

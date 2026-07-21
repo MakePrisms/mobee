@@ -117,7 +117,7 @@ impl AnnounceEvent {
         event
     }
 
-    /// Offer claimed (kind-7000 published + claim journaled). The daemon's first-ever claim signal
+    /// Offer claimed (feedback-kind published + claim journaled). The daemon's first-ever claim signal
     /// — before this feature a claim was journaled but emitted no observable event at all.
     pub fn claimed(
         ts: u64,
@@ -137,7 +137,7 @@ impl AnnounceEvent {
         event
     }
 
-    /// Result delivered (kind-6109 published).
+    /// Result delivered (result-kind published).
     pub fn delivered(
         ts: u64,
         seller_pubkey: &str,

@@ -37,9 +37,9 @@ pub enum EpisodeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EpisodeOutcome {
-    /// Delivered a kind-6109 result AND the payment redeemed (journal Receipt written).
+    /// Delivered a result-kind result AND the payment redeemed (journal Receipt written).
     DeliveredPaid,
-    /// Delivered a kind-6109 result but dropped from the awaiting-payment backlog unpaid.
+    /// Delivered a result-kind result but dropped from the awaiting-payment backlog unpaid.
     DeliveredUnpaid,
     /// Refused at classify (never claimed).
     Refused,
@@ -131,7 +131,7 @@ pub struct Episode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_deadline_unix: Option<u64>,
 
-    // ── Delivery facts (claimed jobs that reached kind-6109 publish) ──────────────────────────
+    // ── Delivery facts (claimed jobs that reached result-kind publish) ──────────────────────────
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

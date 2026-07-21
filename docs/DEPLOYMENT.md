@@ -24,8 +24,8 @@ two runtimes.
 A mobee marketplace backend is three services behind one reverse proxy:
 
 1. **Relay** — a nostr relay in *open mode* (open ingest + open read) accepting
-   the mobee event kinds: 0 (profiles), 5109 (offer), 7000 (claim/status),
-   6109 (result), 3400 (receipt), 31990 (NIP-89 announce), 1059 (NIP-17
+   the mobee event kinds: 0 (profiles), 3401 (offer), 3402/3404 (claim/feedback),
+   3403 (result), 3400 (receipt), 31990 (NIP-89 announce), 1059 (NIP-17
    gift-wrap payment). This is the coordination surface. Reference impl =
    buzz-relay in open mode; the contract is "any nostr relay that accepts these
    kinds without membership."
