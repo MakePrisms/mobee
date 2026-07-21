@@ -354,15 +354,21 @@ pub async fn post_job_async(
     // cap from the SAME config the budget gate uses (`home.config.per_job_budget_sats`).
     assert_amount_within_budget_cap(request.amount_sats, home.config.per_job_budget_sats)?;
 
-    // Dust guard: live keyset N=1 floor, fail-closed (no hardcoded fee=1).
+    // Dust guard: live keyset N=1 floor, fail-closed (no hardcoded fee=1). Bounded
+    // and mint-unreachable-aware (issue #48): a dead mint degrades to the cached
+    // keyset fee floor, and only refuses (fast, `mint_unreachable`) when no fee can
+    // be read at all — posting needs no funds, so it must not hang on a dead mint.
     #[cfg(feature = "wallet")]
     {
         let wallet = buyer_fund::open_testnut_wallet_async(home)
             .await
             .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
-        payment_wallet::require_fee_safe_amount(&wallet, cashu::Amount::from(request.amount_sats))
-            .await
-            .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
+        payment_wallet::require_fee_safe_amount_for_post(
+            &wallet,
+            cashu::Amount::from(request.amount_sats),
+        )
+        .await
+        .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
     }
 
     let draft = build_offer_draft(&request, deadline_unix, contribution.as_ref())?;

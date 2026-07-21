@@ -5,6 +5,7 @@ use std::future::Future;
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use cashu::nuts::nut18::PaymentRequestPayload;
 use cashu::{
@@ -26,6 +27,18 @@ use crate::payment_send::{PaymentPayload, PaymentSend, PaymentSent};
 use crate::wallet::{TradeLock, VerifiedPayment, verify_trade_p2pk_with_connector};
 
 const ATTEMPT_METADATA: &str = "mobee_attempt_id";
+
+/// Default bound for the mint-touching legs of the buyer money path (issue #48).
+///
+/// A live keyset/fee fetch against a dead or unroutable mint would otherwise hang
+/// past the 15s MCP tool deadline; we bound each such leg and refuse fast instead.
+pub const MINT_TOUCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Reason code surfaced when a dead mint blocks the post-time dust guard.
+pub const MINT_UNREACHABLE_POST: &str = "mint_unreachable";
+
+/// Reason code surfaced when a dead mint blocks the pay path.
+pub const MINT_UNREACHABLE_PAY: &str = "mint_unreachable_pay";
 
 /// Outcome of retiring incomplete send sagas that are safe to clean up.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -52,6 +65,18 @@ pub enum PaymentWalletError {
         received: Amount,
         predicted_fee: Amount,
     },
+    /// The configured mint could not be reached within the bounded timeout — a
+    /// dead/unroutable mint (transport failure) or an elapsed deadline (issue #48).
+    ///
+    /// The buyer money path fails fast with this instead of hanging past the MCP
+    /// tool deadline. `reason` is a stable code (`mint_unreachable` for the
+    /// post-time dust guard, `mint_unreachable_pay` for the pay path) and `mint`
+    /// names the unreachable mint URL.
+    MintUnreachable {
+        reason: &'static str,
+        mint: String,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for PaymentWalletError {
@@ -70,6 +95,14 @@ impl std::fmt::Display for PaymentWalletError {
             } => write!(
                 formatter,
                 "fee mismatch after swap: face={face} received={received} predicted_fee={predicted_fee} (wallet credit intact; do not journal)"
+            ),
+            Self::MintUnreachable {
+                reason,
+                mint,
+                detail,
+            } => write!(
+                formatter,
+                "{reason}: mint {mint} unreachable within bound ({detail})"
             ),
         }
     }
@@ -384,32 +417,136 @@ impl<'a> CdkBuyerMint<'a> {
     }
 }
 
-/// Live active-keyset redeem fee for `proof_count` inputs (`ceil(Σ ppk / 1000)`).
-///
-/// Fail-closed: fee-query errors propagate — never default the fee.
-pub async fn mint_input_fee_for_count(
+/// Classified outcome of a bounded mint fee query (issue #48).
+enum BoundedFee {
+    /// Live fee read within the bound.
+    Fee(Amount),
+    /// The mint did not answer within the bound — dead/unroutable or timed out.
+    /// Carries a human-readable detail (not a reason code; the caller labels it).
+    Unreachable(String),
+    /// A non-transport fee-query failure (fail-closed — never default the fee).
+    Failed(PaymentWalletError),
+}
+
+/// A transport-class cdk error means the mint returned no HTTP response at all —
+/// connection refused, DNS/routing failure, or connect timeout: `HttpError` with
+/// no status code. These are the "configured mint is down" signals for issue #48.
+fn is_mint_unreachable(error: &cdk::Error) -> bool {
+    matches!(error, cdk::Error::HttpError(None, _))
+}
+
+fn mint_unreachable(
+    wallet: &Wallet,
+    reason: &'static str,
+    detail: String,
+) -> PaymentWalletError {
+    PaymentWalletError::MintUnreachable {
+        reason,
+        mint: wallet.mint_url.to_string(),
+        detail,
+    }
+}
+
+/// Live active-keyset redeem fee for `proof_count` inputs (`ceil(Σ ppk / 1000)`),
+/// raw so the bounded wrapper can classify transport failures.
+async fn mint_input_fee_for_count_raw(
     wallet: &Wallet,
     proof_count: u64,
-) -> Result<Amount, PaymentWalletError> {
-    let keyset = wallet
-        .fetch_active_keyset()
+) -> Result<Amount, cdk::Error> {
+    let keyset = wallet.fetch_active_keyset().await?;
+    wallet.get_keyset_count_fee(&keyset.id, proof_count).await
+}
+
+/// Live active-keyset redeem fee bounded by `timeout` (issue #48).
+///
+/// A dead/unroutable mint (transport failure) or an elapsed deadline classifies as
+/// [`BoundedFee::Unreachable`] instead of hanging past the caller's MCP tool
+/// deadline; other fee-query errors are [`BoundedFee::Failed`] (never defaulted).
+async fn mint_input_fee_bounded(
+    wallet: &Wallet,
+    proof_count: u64,
+    timeout: Duration,
+) -> BoundedFee {
+    match tokio::time::timeout(timeout, mint_input_fee_for_count_raw(wallet, proof_count)).await {
+        Err(_elapsed) => BoundedFee::Unreachable(format!("fee query exceeded {timeout:?}")),
+        Ok(Ok(fee)) => BoundedFee::Fee(fee),
+        Ok(Err(error)) if is_mint_unreachable(&error) => {
+            BoundedFee::Unreachable(format!("fee query transport failure: {error}"))
+        }
+        Ok(Err(error)) => {
+            BoundedFee::Failed(PaymentWalletError::Wallet(format!("fee query failed: {error}")))
+        }
+    }
+}
+
+/// N=`proof_count` fee floor from the lowest-fee active keyset cached in the wallet
+/// DB for this mint+unit — a pure localstore read (no network). `None` if no such
+/// keyset is cached. Used as the post-time fallback when the mint is unreachable.
+async fn cached_input_fee_floor(
+    wallet: &Wallet,
+    proof_count: u64,
+) -> Result<Option<Amount>, PaymentWalletError> {
+    let cached = wallet
+        .localstore
+        .get_mint_keysets(wallet.mint_url.clone())
         .await
-        .map_err(|error| PaymentWalletError::Wallet(format!("fee query failed: {error}")))?;
-    wallet
-        .get_keyset_count_fee(&keyset.id, proof_count)
-        .await
-        .map_err(|error| PaymentWalletError::Wallet(format!("fee query failed: {error}")))
+        .map_err(|error| {
+            PaymentWalletError::Wallet(format!("cached keyset read failed: {error}"))
+        })?;
+    let floor = cached
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|keyset| keyset.active && keyset.unit == wallet.unit)
+        .map(|keyset| keyset.input_fee_ppk)
+        .min();
+    Ok(floor.map(|ppk| Amount::from((ppk * proof_count).div_ceil(1000))))
 }
 
 /// Refuse amounts that cannot yield a redeemable locked token after mint input fees.
 ///
-/// Uses the N=1 floor from the live keyset (`ceil(ppk/1000)`). Callers that know
-/// the real input set must also gate on CDK `get_proofs_fee` / `send_fee`.
+/// Uses the N=1 floor from the live keyset (`ceil(ppk/1000)`), bounded so a dead
+/// mint refuses fast with `mint_unreachable_pay` instead of hanging (issue #48).
+/// Callers that know the real input set must also gate on CDK
+/// `get_proofs_fee` / `send_fee`.
 pub async fn require_fee_safe_amount(
     wallet: &Wallet,
     amount: Amount,
 ) -> Result<Amount, PaymentWalletError> {
-    let fee = mint_input_fee_for_count(wallet, 1).await?;
+    let fee = match mint_input_fee_bounded(wallet, 1, MINT_TOUCH_TIMEOUT).await {
+        BoundedFee::Fee(fee) => fee,
+        BoundedFee::Failed(error) => return Err(error),
+        BoundedFee::Unreachable(detail) => {
+            return Err(mint_unreachable(wallet, MINT_UNREACHABLE_PAY, detail));
+        }
+    };
+    require_amount_covers_fee(amount, fee)?;
+    Ok(fee)
+}
+
+/// Post-time dust guard: same N=1 floor, but degrades to the cached keyset fee
+/// floor when the mint is unreachable so posting (which needs no funds) is not
+/// hard-blocked by a dead mint (issue #48).
+///
+/// Fail-closed: a guard that can read NO fee at all — neither live nor cached —
+/// refuses (fast, with `mint_unreachable`); it never silently skips the dust check.
+pub async fn require_fee_safe_amount_for_post(
+    wallet: &Wallet,
+    amount: Amount,
+) -> Result<Amount, PaymentWalletError> {
+    let fee = match mint_input_fee_bounded(wallet, 1, MINT_TOUCH_TIMEOUT).await {
+        BoundedFee::Fee(fee) => fee,
+        BoundedFee::Failed(error) => return Err(error),
+        BoundedFee::Unreachable(detail) => match cached_input_fee_floor(wallet, 1).await? {
+            Some(fee) => fee,
+            None => {
+                return Err(mint_unreachable(
+                    wallet,
+                    MINT_UNREACHABLE_POST,
+                    format!("{detail}; no cached keyset for a fee floor"),
+                ));
+            }
+        },
+    };
     require_amount_covers_fee(amount, fee)?;
     Ok(fee)
 }
@@ -2017,6 +2154,105 @@ mod tests {
         require_amount_covers_fee(Amount::from(1), Amount::from(1)).unwrap_err();
         require_amount_covers_fee(Amount::from(0), Amount::from(1)).unwrap_err();
         require_amount_covers_fee(Amount::from(2), Amount::from(1)).unwrap();
+    }
+
+    // Issue #48: an unroutable mint URL that refuses the TCP connect instantly, so
+    // the bounded fee query returns a transport error well inside the timeout — the
+    // deterministic stand-in for a down mint (no live network, no real hang wait).
+    const DEAD_MINT: &str = "https://127.0.0.1:1";
+
+    /// Post-time dust guard fails fast with `mint_unreachable` (not a hang / generic
+    /// deadline) when the mint is down and NO keyset is cached to fall back on.
+    #[tokio::test]
+    async fn post_dust_guard_fails_fast_with_mint_unreachable_when_mint_down() {
+        let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        let wallet = Wallet::new(DEAD_MINT, CurrencyUnit::Sat, store, [7; 64], None).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = require_fee_safe_amount_for_post(&wallet, Amount::from(10))
+            .await
+            .expect_err("dead mint with no cached keyset must refuse the post-time dust guard");
+        let elapsed = started.elapsed();
+
+        match &error {
+            PaymentWalletError::MintUnreachable { reason, mint, .. } => {
+                assert_eq!(*reason, MINT_UNREACHABLE_POST);
+                assert!(mint.contains("127.0.0.1"), "reason names the mint: {mint}");
+            }
+            other => panic!("expected MintUnreachable, got: {other}"),
+        }
+        assert!(
+            elapsed < MINT_TOUCH_TIMEOUT,
+            "must fail fast, took {elapsed:?}"
+        );
+    }
+
+    /// Pay path fails fast with `mint_unreachable_pay` (before any spend state) when
+    /// the mint is down — no cached fallback: the pay leg genuinely needs the mint.
+    #[tokio::test]
+    async fn pay_dust_guard_fails_fast_with_mint_unreachable_pay_when_mint_down() {
+        let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        let wallet = Wallet::new(DEAD_MINT, CurrencyUnit::Sat, store, [7; 64], None).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = require_fee_safe_amount(&wallet, Amount::from(10))
+            .await
+            .expect_err("dead mint must refuse the pay-path dust guard");
+        let elapsed = started.elapsed();
+
+        match &error {
+            PaymentWalletError::MintUnreachable { reason, mint, .. } => {
+                assert_eq!(*reason, MINT_UNREACHABLE_PAY);
+                assert!(mint.contains("127.0.0.1"), "reason names the mint: {mint}");
+            }
+            other => panic!("expected MintUnreachable, got: {other}"),
+        }
+        assert!(
+            elapsed < MINT_TOUCH_TIMEOUT,
+            "must fail fast, took {elapsed:?}"
+        );
+    }
+
+    /// When the mint is down but a keyset is cached in the wallet DB, the post-time
+    /// dust guard degrades to the cached fee floor and STILL runs the dust check
+    /// (fail-closed) rather than skipping it: dust refuses, fee+1 passes.
+    #[tokio::test]
+    async fn post_dust_guard_falls_back_to_cached_keyset_when_mint_unreachable() {
+        // input_fee_ppk = 1000 ⇒ N=1 floor = ceil(1000/1000) = 1 sat.
+        let keyset = test_keyset_with_fee(1000);
+        let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        store
+            .add_mint(mint(DEAD_MINT), Some(MintInfo::new()))
+            .await
+            .unwrap();
+        store
+            .add_mint_keysets(
+                mint(DEAD_MINT),
+                vec![KeySetInfo {
+                    id: keyset.id,
+                    unit: keyset.unit.clone(),
+                    active: true,
+                    input_fee_ppk: keyset.input_fee_ppk,
+                    final_expiry: keyset.final_expiry,
+                }],
+            )
+            .await
+            .unwrap();
+        let wallet = Wallet::new(DEAD_MINT, CurrencyUnit::Sat, store, [7; 64], None).unwrap();
+
+        // Cached floor is 1; the dust check still runs on that floor.
+        let dust = require_fee_safe_amount_for_post(&wallet, Amount::from(1))
+            .await
+            .expect_err("amount == cached fee floor is dust and must refuse");
+        assert!(
+            matches!(dust, PaymentWalletError::Policy(_)),
+            "cached fallback runs the dust check (Policy), got: {dust}"
+        );
+
+        let fee = require_fee_safe_amount_for_post(&wallet, Amount::from(2))
+            .await
+            .expect("amount above the cached fee floor must pass via the cached fallback");
+        assert_eq!(fee, Amount::from(1), "fallback used the cached N=1 fee floor");
     }
 
     #[tokio::test]
