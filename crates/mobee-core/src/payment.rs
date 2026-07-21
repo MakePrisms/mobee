@@ -13,11 +13,7 @@ use nostr_sdk::PublicKey as NostrPublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::delivery::{Delivery, DeliveryError, DeliveryVerifier};
-// The typed money path takes `&Delivery`; only the `#[cfg(test)]` `run_with_verifier` entry and
-// the in-crate test verifiers still name the `Commit` payload type directly.
-#[cfg(test)]
-use crate::delivery::GitDelivery;
+use crate::delivery::{DeliveryError, DeliveryVerifier, GitDelivery};
 use crate::delivery_git::PayPathDeliveryVerifier;
 use crate::payment_send::PaymentSent;
 use crate::receipt::ReceiptPreimage;
@@ -700,7 +696,7 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
     /// release / non-test builds).
     pub fn run<E: PaymentEffects>(
         &self,
-        delivery: &Delivery,
+        delivery: &GitDelivery,
         delivery_verifier: &mut PayPathDeliveryVerifier,
         key: &PaymentKey,
         terms: &PaymentTerms,
@@ -724,16 +720,7 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
         authority: &ReceiptAuthority,
         effects: &mut E,
     ) -> Result<PaymentState, PaymentError> {
-        // Test entry keeps the `&GitDelivery` shape (callers unchanged); the sole live variant
-        // is `Commit`, so wrap into the typed [`Delivery`] the gated impl dispatches on.
-        self.run_delivery_gated(
-            &Delivery::Commit(delivery.clone()),
-            delivery_verifier,
-            key,
-            terms,
-            authority,
-            effects,
-        )
+        self.run_delivery_gated(delivery, delivery_verifier, key, terms, authority, effects)
     }
 
     /// Shared delivery-verify → tip-bind → [`Self::advance`] impl.
@@ -742,16 +729,16 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
     /// [`Self::run`] (`PayPathDeliveryVerifier` only).
     fn run_delivery_gated<D: DeliveryVerifier, E: PaymentEffects>(
         &self,
-        delivery: &Delivery,
+        delivery: &GitDelivery,
         delivery_verifier: &mut D,
         key: &PaymentKey,
         terms: &PaymentTerms,
         authority: &ReceiptAuthority,
         effects: &mut E,
     ) -> Result<PaymentState, PaymentError> {
-        // Dispatch verify on the delivery variant (`Commit` → the existing fetch/peel/tip-match).
-        let verified = delivery
-            .verify_with(delivery_verifier)
+        // Verify the delivery (fetch the branch tip, peel `^{commit}`, tip-match).
+        let verified = delivery_verifier
+            .verify(delivery)
             .map_err(PaymentError::Delivery)?;
         if key.delivery_integrity_hash.as_str() != verified.commit_oid().as_str() {
             return Err(PaymentError::Refused(

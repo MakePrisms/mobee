@@ -15,7 +15,7 @@ use nostr_sdk::Timestamp;
 
 use crate::budget::{BudgetGate, BudgetRefuse};
 use crate::buyer_fund::{self, FundError};
-use crate::delivery::{CommitOid, Delivery, DeliveryError, GitDelivery};
+use crate::delivery::{CommitOid, DeliveryError, GitDelivery};
 use crate::delivery_git::PayPathDeliveryVerifier;
 use crate::gateway;
 use crate::home::{self, MobeeHome};
@@ -244,13 +244,10 @@ pub async fn authorize_pay_async(
     let attempt_id = key.attempt_id();
 
     let commit_oid = CommitOid::parse(request.commit_oid)?;
-    // Re-type onto the typed [`Delivery`]: the sole live variant is `Commit` (fork tip). Its
-    // `delivery_kind()` (→ `Fork`/`"fork"`) replaces the former hardcode in the receipt preimage;
-    // for `Commit` this is byte-identical. The buyer tip-match gate above stays a raw compare of
-    // `delivery_integrity_hash == commit_oid` — for `Commit`, `commit_oid` IS the variant's bound
-    // oid (routing it through the parsed `Delivery::bound_oid()` would lowercase the oid and
-    // reorder the parse-vs-gate refusals, i.e. change behavior on the refuse path).
-    let delivery = Delivery::Commit(GitDelivery::new(request.repo, request.branch, commit_oid)?);
+    // The buyer tip-match gate above stays a raw compare of `delivery_integrity_hash ==
+    // commit_oid` — routing it through the parsed oid would lowercase it and reorder the
+    // parse-vs-gate refusals, i.e. change behavior on the refuse path.
+    let delivery = GitDelivery::new(request.repo, request.branch, commit_oid)?;
     let delivery_kind = delivery.delivery_kind();
 
     let secret_hex = home::read_secret_key_hex(home)
@@ -287,8 +284,7 @@ pub async fn authorize_pay_async(
     let contribution_cosig = if let Some(binds) = request.contribution.as_ref() {
         let base_oid = CommitOid::parse(binds.base_oid.clone())
             .map_err(|error| AuthorizePayError::Input(format!("contribution base_oid: {error}")))?;
-        let Delivery::Commit(fork) = &delivery;
-        let fork = fork.clone();
+        let fork = delivery.clone();
         let policy = contribution_policy(home);
         verifier
             .verify_contribution(

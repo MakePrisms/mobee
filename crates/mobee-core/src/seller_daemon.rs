@@ -1934,9 +1934,8 @@ fn fill_delivery_facts(episode: &mut Episode, delivery: &DeliveryRecord) {
 }
 
 /// Delivery discriminator for the seller's commit/fork delivery, derived from the SAME typed
-/// [`Delivery`](crate::delivery::Delivery) the buyer's pay path uses (PIECE-12) — NOT a
-/// hardcoded label — so buyer and seller derive it from one abstraction. Commit/fork ⇒
-/// `"fork"`, byte-identical to the former `DeliveryKind::Fork` hardcode. Fails closed if the
+/// [`GitDelivery`](crate::delivery::GitDelivery) the buyer's pay path uses — NOT a hardcoded
+/// label — so buyer and seller derive it from one abstraction (`"fork"`). Fails closed if the
 /// just-pushed fields somehow do not type (impossible on the success path — a git push returns
 /// a canonical oid); never silently relabels or emits a bogus kind.
 fn seller_delivery_kind(
@@ -1944,15 +1943,13 @@ fn seller_delivery_kind(
     branch: &str,
     commit_oid: &str,
 ) -> Result<crate::receipt::DeliveryKind, DaemonError> {
-    let delivery = crate::delivery::Delivery::Commit(
-        crate::delivery::GitDelivery::new(
-            git_remote.to_owned(),
-            branch.to_owned(),
-            crate::delivery::CommitOid::parse(commit_oid.to_owned())
-                .map_err(|error| DaemonError::Policy(format!("delivery oid: {error}")))?,
-        )
-        .map_err(|error| DaemonError::Policy(format!("delivery typing: {error}")))?,
-    );
+    let delivery = crate::delivery::GitDelivery::new(
+        git_remote.to_owned(),
+        branch.to_owned(),
+        crate::delivery::CommitOid::parse(commit_oid.to_owned())
+            .map_err(|error| DaemonError::Policy(format!("delivery oid: {error}")))?,
+    )
+    .map_err(|error| DaemonError::Policy(format!("delivery typing: {error}")))?;
     Ok(delivery.delivery_kind())
 }
 
