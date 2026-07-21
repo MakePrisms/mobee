@@ -33,48 +33,36 @@ Grounds: build command + `acp` feature ([`../README.md`](../README.md), [`../SEL
 
 ---
 
-## 2. `git-credential-nostr` — required for relay-git delivery
+## 2. Delivery auth is in-process — no external `git` or helper (issue #55)
 
-The default delivery remote is mobee-hosted **relay-git**, which authenticates git pushes over
-**NIP-98**. The daemon shells out to a helper named **`git-credential-nostr`** to sign those
-pushes. It must be resolvable or the relay-git seed probe fails closed with
-`git-credential-nostr not found`.
+The default delivery remote is mobee-hosted **relay-git**, whose git pushes authenticate over
+**NIP-98**. As of issue #55 every seller git leg — the NIP-34 announce, the seed `ls-remote` probe,
+and the delivery push — runs **in-process via libgit2** on a rustls smart-HTTP transport that
+injects the NIP-98 `Authorization` header signed from the seller key. **No system `git` is on any
+product path, and the external `git-credential-nostr` helper is no longer required** — there is
+nothing to install for relay-git delivery. (`mobee doctor` still reports the ambient git version and
+helper presence, but only as informational PASSes; neither is required.)
 
-**Where it lives:** it is a separate binary from the `buzz` project (`crates/git-credential-nostr`
-in that repo) — it is **not** built by this mobee repo. Install it one of three ways; the daemon
-resolves in this order (grounds: `crates/mobee-core/src/seller_git.rs:331-351`):
+You still have the BYO escape hatch if you prefer your own remote:
+`mobee sell … --git-remote https://github.com/<you>/<public-repo>.git` (must be public https).
 
-1. `MOBEE_GIT_CREDENTIAL_NOSTR=<absolute-path>` env var pointing at the binary (highest priority).
-2. `git-credential-nostr` anywhere on `PATH`.
-3. A known dogfood build location (forge-internal only — do not rely on it off-box).
-
-```bash
-# Option A — point at an existing build:
-export MOBEE_GIT_CREDENTIAL_NOSTR="/abs/path/to/git-credential-nostr"
-
-# Option B — put it on PATH:
-sudo install -m 0755 /abs/path/to/git-credential-nostr /usr/local/bin/   # Linux/macOS
-git-credential-nostr --help >/dev/null 2>&1 && echo "on PATH ok"
-```
-
-**If you cannot install the helper**, skip relay-git and use a BYO public-https remote instead:
-`mobee sell … --git-remote https://github.com/<you>/<public-repo>.git`. Bundling the helper for
-off-box sellers is a known **TODO** (see NAMED GAPS in the kit report). Grounds:
-[`../SELLER-QUICKSTART.md`](../SELLER-QUICKSTART.md) §4 delivery note.
+Grounds: in-process transport for every relay-git leg (`crates/mobee-core/src/git_transport.rs`);
+no system git on the buyer/seller read path (`crates/mobee-core/src/delivery_git.rs:1-5`); helper is
+optional/informational only (`crates/mobee/src/doctor.rs:170-185`).
 
 ### Security rule (state it, enforce it)
 
-> **`NOSTR_PRIVATE_KEY` is passed to the git child process on its ENV only — never on argv, never
-> logged, never committed.** The daemon reads the seller secret from the `0600` key file and injects
-> it as `NOSTR_PRIVATE_KEY` into the scrubbed git subprocess for that one push; ambient
-> `NOSTR_PRIVATE_KEY` / `BUZZ_PRIVATE_KEY` are stripped first so no stranger key leaks in, and push
-> stderr is redacted before any error is surfaced. Delivery pushes go to the seller's **own**
-> relay-git namespace (`…/git/<seller-pubkey>/<repo>.git`, owner-scoped). Never echo, export into a
-> shared shell, or paste this key anywhere.
+> **The seller secret is used ONLY in-process to sign the NIP-98 event — never on argv, never in a
+> child-process env, never logged, never committed.** The daemon reads the seller secret from the
+> `0600` key file and signs each push's `Authorization` header in-process (libgit2 subtransport); no
+> git subprocess is spawned, so the key never crosses a process boundary. Remotes are built with
+> `remote_anonymous`, so no `url.*.insteadOf` config rewrite can redirect an allowlisted `https` URL
+> onto a banned transport. Delivery pushes go to the seller's **own** relay-git namespace
+> (`…/git/<seller-pubkey>/<repo>.git`, owner-scoped). Never echo, export into a shared shell, or
+> paste this key anywhere.
 
-Grounds: env-only injection + ambient strip + redaction (`seller_git.rs:401-447`, esp. `:440-442`;
-push doc `:231-238`, `:248-251`); owner-scoped default remote
-(`crates/mobee-core/src/home.rs:88-99`).
+Grounds: in-process-only key use + `insteadOf` immunity (`git_transport.rs` security-properties
+docblock); owner-scoped default remote (`crates/mobee-core/src/home.rs`).
 
 ---
 
@@ -131,8 +119,8 @@ Sellers **receive** — you never fund a wallet to sell:
 
 ```
 → $MOBEE_BIN set and `$MOBEE_BIN sell --bogus` prints the sell Usage block
-→ git-credential-nostr resolvable (on PATH, or MOBEE_GIT_CREDENTIAL_NOSTR set) OR you will use --git-remote
-→ you can state the secret rule: NOSTR_PRIVATE_KEY rides the git CHILD ENV only — never argv/logs/commits
+→ relay-git delivery needs no external git or helper (in-process libgit2 NIP-98); --git-remote for a BYO public-https remote
+→ you can state the secret rule: the seller key signs NIP-98 in-process only — never argv/child-env/logs/commits
 → no funding step exists or is needed (testnut, sellers receive)
 → on NixOS: CLAUDE_CODE_EXECUTABLE noted (see claude preset) before launching the claude harness
 ```
@@ -140,8 +128,8 @@ Sellers **receive** — you never fund a wallet to sell:
 ## Grounding (source file:line)
 
 - Build/`acp`: `crates/mobee/src/sell.rs:50-58`, `crates/mobee-core/src/seller_daemon.rs:1046-1055`; `../README.md`, `../SELLER-QUICKSTART.md` §0
-- git-credential-nostr resolution order: `crates/mobee-core/src/seller_git.rs:331-351`
-- Key-on-child-env-only + scrub + redaction: `seller_git.rs:401-447`, `:231-251`
+- In-process libgit2 transport (NIP-98, no system git/helper): `crates/mobee-core/src/git_transport.rs`; no system git on reads: `crates/mobee-core/src/delivery_git.rs:1-5`
+- Key used in-process only (no child process) + `insteadOf` immunity: `git_transport.rs` security-properties docblock
 - Owner-scoped relay-git namespace: `crates/mobee-core/src/home.rs:88-99`
 - Delivery prompt append / branch / identity / gate: `seller_daemon.rs:942-960`, `:619`, `:665`, `:888-890`; `seller_git.rs:83-105`, `:145-229`, `:269`, `:393-501`
 - Testnut mint / receive: `home.rs:16`, `seller_daemon.rs:515-591`
