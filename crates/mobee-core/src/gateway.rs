@@ -8,7 +8,7 @@ pub const MOBEE_TAG: &str = "mobee";
 // PIECE-14 A′: v2 protocol version. The kind renumber (v1 offer/result/feedback → the mobee 3400-block)
 // is the compatibility break — a v2 parser never matches a v1 event, so there is no dual-version
 // window to support.
-pub const PROTOCOL_VERSION: &str = "2";
+pub const PROTOCOL_VERSION: &str = "0";
 
 // All kind NUMBERS live in `crate::kinds` (the one registry); re-exported here so the historical
 // `gateway::JOB_*_KIND` paths keep resolving.
