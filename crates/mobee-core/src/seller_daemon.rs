@@ -481,7 +481,29 @@ impl SellerDaemon {
             return Ok(None);
         }
 
-        let claim = claim_draft(&intent.job_id, &intent.buyer_pubkey, &self.seller_pubkey);
+        // PIECE-14 Job C: the seller authors the claim's payment terms as a NUT-18 payment
+        // request (`creq…`) — accepted mints from its OWN config (not the offer), amount/unit
+        // copied from the offer, single-use, addressed to the seller's key. The claim is the
+        // invoice; the buyer satisfies this `creq`.
+        let creq = match gateway::creq::build_seller_creq(
+            &intent.job_id,
+            intent.offer.amount,
+            &intent.offer.unit,
+            &self.home.config.accepted_mints,
+            &self.seller_pubkey,
+        ) {
+            Ok(creq) => creq,
+            Err(error) => {
+                Self::end_flight();
+                return Err(DaemonError::Seller(SellerError::Io(error.to_string())));
+            }
+        };
+        let claim = claim_draft(
+            &intent.job_id,
+            &intent.buyer_pubkey,
+            &self.seller_pubkey,
+            &creq,
+        );
         let claim_id = match publish_draft(&self.home, &self.keys, &claim).await {
             Ok(id) => id,
             Err(error) => {
@@ -4779,7 +4801,16 @@ mod local_relay_it {
         offer_id: &str,
         buyer_pubkey: &str,
     ) -> nostr_sdk::EventId {
-        let draft = gateway::claim_draft(offer_id, buyer_pubkey, &seller.public_key().to_hex());
+        let seller_hex = seller.public_key().to_hex();
+        let creq = gateway::creq::build_seller_creq(
+            offer_id,
+            1,
+            "sat",
+            &[crate::home::DEFAULT_MINT_URL.to_string()],
+            &seller_hex,
+        )
+        .expect("build claim creq");
+        let draft = gateway::claim_draft(offer_id, buyer_pubkey, &seller_hex, &creq);
         let event = gateway::nostr::event_builder(&draft)
             .expect("claim event builder")
             .sign_with_keys(seller)
