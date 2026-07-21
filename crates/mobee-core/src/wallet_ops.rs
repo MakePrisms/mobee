@@ -306,6 +306,107 @@ pub async fn complete_mint_async(
     })
 }
 
+/// Look up a mint quote persisted in the shared CDK localstore.
+///
+/// The wallet sqlite is shared across every configured mint, so any opened
+/// wallet's localstore sees all stored quotes. Returns `None` when the quote id
+/// is unknown locally, or when the stored quote has no fixed amount (e.g.
+/// variable-amount methods that cannot be completed from the id alone). Lets
+/// [`complete_mint_by_id_async`] recover mint/amount/invoice from the id.
+pub async fn lookup_pending_quote_async(
+    home: &MobeeHome,
+    quote_id: &str,
+) -> Result<Option<MintQuote>, WalletOpsError> {
+    use cdk::cdk_database::WalletDatabase;
+    let quote_id = quote_id.trim();
+    if quote_id.is_empty() {
+        return Err(WalletOpsError::Wallet("quote_id is empty".into()));
+    }
+    let default_mint = normalize_mint_url(home.config.default_mint())?;
+    let wallet = open_wallet_async(home, &default_mint).await?;
+    let stored = wallet
+        .localstore
+        .get_mint_quote(quote_id)
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let Some(amount) = stored.amount else {
+        return Ok(None);
+    };
+    Ok(Some(MintQuote {
+        mint_url: stored.mint_url.to_string(),
+        invoice: stored.request,
+        quote_id: stored.id,
+        amount_sats: amount.to_u64(),
+    }))
+}
+
+/// Complete a paid mint quote identified only by its `quote_id`.
+///
+/// Recovers mint/amount/invoice from the shared CDK localstore when the quote is
+/// known there (so `amount_override`/`mint_override` may be omitted). Otherwise
+/// the caller must supply `amount_override` (and, optionally, `mint_override`)
+/// to reconstruct the quote — the underlying cdk `mint()` still requires the
+/// quote (and its NUT-20 signing key) to already live in this wallet's store, so
+/// a quote this wallet never created cannot be completed here.
+///
+/// When both a stored value and an override are present they must agree; a
+/// mismatch is refused rather than guessed, keeping the funded total exactly
+/// what was quoted.
+pub async fn complete_mint_by_id_async(
+    home: &MobeeHome,
+    quote_id: &str,
+    amount_override: Option<u64>,
+    mint_override: Option<&str>,
+) -> Result<MintOutcome, WalletOpsError> {
+    let quote_id = quote_id.trim();
+    if quote_id.is_empty() {
+        return Err(WalletOpsError::Wallet("quote_id is empty".into()));
+    }
+    let quote = match lookup_pending_quote_async(home, quote_id).await? {
+        Some(stored) => {
+            if let Some(amount) = amount_override {
+                if amount != stored.amount_sats {
+                    return Err(WalletOpsError::Wallet(format!(
+                        "amount {amount} != stored quote amount {} for quote {quote_id} (refusing mismatched completion)",
+                        stored.amount_sats
+                    )));
+                }
+            }
+            if let Some(mint) = mint_override {
+                let requested = normalize_mint_url(mint)?;
+                let stored_mint = normalize_mint_url(&stored.mint_url)?;
+                if requested != stored_mint {
+                    return Err(WalletOpsError::Wallet(format!(
+                        "mint {requested} != stored quote mint {stored_mint} for quote {quote_id} (refusing mismatched completion)"
+                    )));
+                }
+            }
+            stored
+        }
+        None => {
+            let amount_sats = amount_override.ok_or_else(|| {
+                WalletOpsError::Wallet(format!(
+                    "quote {quote_id} has no stored amount; pass --amount to complete it"
+                ))
+            })?;
+            if amount_sats == 0 {
+                return Err(WalletOpsError::Wallet("amount must be > 0".into()));
+            }
+            let mint_url = resolve_mint(home, mint_override)?;
+            MintQuote {
+                mint_url,
+                invoice: String::new(),
+                quote_id: quote_id.to_owned(),
+                amount_sats,
+            }
+        }
+    };
+    complete_mint_async(home, &quote).await
+}
+
 /// Flexible/repeatable mint-fund (no `already_funded` hard-block).
 ///
 /// Testnut ([`DEFAULT_MINT_URL`]) FakeWallet-auto-pays: begin → complete.
@@ -578,6 +679,26 @@ pub fn complete_mint_blocking(
     runtime.block_on(complete_mint_async(home, quote))
 }
 
+pub fn complete_mint_by_id_blocking(
+    home: &MobeeHome,
+    quote_id: &str,
+    amount_override: Option<u64>,
+    mint_override: Option<&str>,
+) -> Result<MintOutcome, WalletOpsError> {
+    crate::runtime_guard::refuse_nested_block_on("complete_mint_by_id_blocking")
+        .map_err(WalletOpsError::Wallet)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    runtime.block_on(complete_mint_by_id_async(
+        home,
+        quote_id,
+        amount_override,
+        mint_override,
+    ))
+}
+
 pub fn send_blocking(
     home: &MobeeHome,
     amount_sats: u64,
@@ -686,6 +807,60 @@ mod tests {
         let home = bootstrap(&root).expect("bootstrap");
         let err = mint_blocking(&home, 1, Some("https://evil.example")).expect_err("deny");
         assert!(matches!(err, WalletOpsError::MintNotAllowed { .. }));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lookup_pending_quote_unknown_id_is_none() {
+        // Pure local sqlite read — no live mint needed; an unknown id yields None
+        // rather than inventing a quote.
+        let root = temp_home("lookup-none");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let found = lookup_pending_quote_async(&home, "quote-does-not-exist")
+            .await
+            .expect("lookup");
+        assert!(found.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn complete_mint_by_id_unknown_quote_without_amount_refuses() {
+        // No stored quote + no --amount => refuse rather than guess. Reached
+        // before any mint round-trip, so this holds even with testnut down.
+        let root = temp_home("complete-noamount");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let err = complete_mint_by_id_async(&home, "unknown-quote", None, None)
+            .await
+            .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("pass --amount"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn complete_mint_by_id_empty_quote_id_refuses() {
+        let root = temp_home("complete-empty");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let err = complete_mint_by_id_async(&home, "   ", Some(21), None)
+            .await
+            .expect_err("must refuse");
+        assert!(err.to_string().contains("quote_id is empty"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_complete_mint_by_id_refuses_inside_runtime() {
+        let root = temp_home("complete-nested");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let err = complete_mint_by_id_blocking(&home, "quote", Some(21), None)
+            .expect_err("nested");
+        assert!(err.to_string().contains("nested block_on refused"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
