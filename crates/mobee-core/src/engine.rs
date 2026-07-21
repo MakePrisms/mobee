@@ -215,7 +215,7 @@ mod tests {
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn run_job_appends_piece1_events_to_log() {
+    fn run_job_appends_events_to_log() {
         let script = ScriptedSession {
             session_id: "session-1".into(),
             updates: vec![SessionUpdate::TurnEnded(StopReason::Completed)],
@@ -226,7 +226,7 @@ mod tests {
             }],
         };
         let mut driver = MockDriver::new(RuntimeId("mock".into()), vec![script]);
-        let path = test_path("piece1-log");
+        let path = test_path("run-job-log");
         let mut log = EventLog::open(&path).expect("open log");
 
         let outcome = block_on(run_job(

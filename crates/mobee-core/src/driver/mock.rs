@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn scripted_driver_run_appends_piece1_events_to_log() {
+    fn scripted_driver_run_appends_events_to_log() {
         let artifact = Artifact {
             uri_or_path: "out/result.txt".into(),
             mime: Some("text/plain".into()),

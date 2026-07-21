@@ -1043,14 +1043,14 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let mut home = bootstrap(&root).expect("bootstrap");
         home.config.profile = Some(ProfileConfig {
-            name: Some("anvil-buyer".into()),
+            name: Some("test-buyer".into()),
             about: Some("testnut only".into()),
         });
         save_config(&home).expect("save");
         home.config.profile = None;
         reload_config(&mut home).expect("reload");
         let profile = home.config.profile.expect("profile present");
-        assert_eq!(profile.name.as_deref(), Some("anvil-buyer"));
+        assert_eq!(profile.name.as_deref(), Some("test-buyer"));
         assert_eq!(profile.about.as_deref(), Some("testnut only"));
         let _ = fs::remove_dir_all(&root);
     }
