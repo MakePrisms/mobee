@@ -614,9 +614,147 @@ code {
   white-space: nowrap;
 }
 
+/* ——— identity links ——— */
+
+.chip-link,
+.tl-link {
+  color: inherit;
+  text-decoration: none;
+  border-bottom: 1px dotted transparent;
+}
+.chip-link:hover,
+.tl-link:hover {
+  border-bottom-color: currentColor;
+  color: var(--accent);
+}
+
+/* ——— profile pages ——— */
+
+.profile-panel {
+  max-width: 60rem;
+}
+
+.profile-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem 1rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 1.25rem;
+}
+
+.back-link {
+  flex-basis: 100%;
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 0.85rem;
+}
+.back-link:hover {
+  color: var(--accent);
+}
+
+.profile-id {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.dot.big {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+}
+.profile-name {
+  margin: 0;
+  font-size: 1.35rem;
+}
+.profile-sub {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+}
+.profile-pk {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+}
+
+.liveness {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-left: auto;
+  font-size: 0.82rem;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  padding: 0.35rem 0.6rem;
+  border-radius: 999px;
+}
+.live-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.liveness[data-state="live"] .live-dot { background: var(--ok); }
+.liveness[data-state="live"] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+.liveness[data-state="recent"] .live-dot { background: #d97706; }
+.liveness[data-state="stale"] .live-dot,
+.liveness[data-state="offline"] .live-dot { background: #78716c; }
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+  gap: 0.6rem;
+  margin-bottom: 1.5rem;
+}
+.metric-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  padding: 0.85rem 1rem;
+}
+
+.rel-strip {
+  margin-bottom: 1.5rem;
+}
+.rel-strip h3,
+.recent-jobs h3 {
+  font-size: 1rem;
+  margin: 0 0 0.6rem;
+}
+.rel-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.rel-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  padding: 0.4rem 0.7rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  text-decoration: none;
+  color: inherit;
+}
+.rel-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.rel-count {
+  font-family: var(--mono);
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
 @media (max-width: 720px) {
   .tail-row {
     grid-template-columns: 1fr 1fr;
+  }
+  .liveness {
+    margin-left: 0;
   }
   .conn {
     max-width: 60vw;

@@ -14,7 +14,7 @@ const NETWORK_ROOT = fileURLToPath(new URL("..", import.meta.url));
  * a standard that will not move and appears everywhere as an index, so it is not gated
  * by digits — it is still routed through the PROFILE constant.
  */
-const RENUMBERABLE = [5109, 7000, 6109, 3400, 31990];
+const RENUMBERABLE = [5109, 7000, 6109, 3400, 31990, 30340];
 
 /** Remove block and line comments so the gate scans only operative code/strings. */
 function stripComments(src) {
@@ -27,6 +27,7 @@ test("kinds module exposes every marketplace kind as a named constant", () => {
   assert.equal(kinds.RESULT, 6109);
   assert.equal(kinds.RECEIPT, 3400);
   assert.equal(kinds.HANDLER, 31990);
+  assert.equal(kinds.HEARTBEAT, 30340);
   assert.equal(kinds.PROFILE, 0);
 });
 

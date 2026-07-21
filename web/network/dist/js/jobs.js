@@ -41,20 +41,30 @@ export const ACTIVE_SELLER_WINDOW_S = 24 * 60 * 60;
  * @returns {any[]} job cards
  */
 export function aggregateJobs(events, profiles = new Map(), now = nowSeconds()) {
+  const groups = groupEvents(events);
+  const jobs = [];
+  for (const g of groups.values()) {
+    jobs.push(jobFromGroup(g, profiles, now));
+  }
+  // Newest activity first; stable tiebreak by id so renders don't jitter.
+  jobs.sort((a, b) => b.last_activity - a.last_activity || (a.id < b.id ? -1 : 1));
+  return jobs;
+}
+
+/**
+ * Group marketplace events into per-job buckets, keyed by offer id. Exposed so profile
+ * metrics can read the raw sub-events (with authors + timestamps) without re-deriving
+ * the linking rules. Each bucket: { id, offer, claims, accepts, results, receipts, refusals }.
+ * @param {any[]} events normalized events
+ * @returns {Map<string, any>}
+ */
+export function groupEvents(events) {
   /** @type {Map<string, any>} */
   const groups = new Map();
   const group = (jobId) => {
     let g = groups.get(jobId);
     if (!g) {
-      g = {
-        id: jobId,
-        offer: null,
-        claims: [],
-        accepts: [],
-        results: [],
-        receipts: [],
-        refusals: [],
-      };
+      g = { id: jobId, offer: null, claims: [], accepts: [], results: [], receipts: [], refusals: [] };
       groups.set(jobId, g);
     }
     return g;
@@ -89,17 +99,11 @@ export function aggregateJobs(events, profiles = new Map(), now = nowSeconds()) 
         break;
     }
   }
-
-  const jobs = [];
-  for (const g of groups.values()) {
-    jobs.push(buildJob(g, profiles, now));
-  }
-  // Newest activity first; stable tiebreak by id so renders don't jitter.
-  jobs.sort((a, b) => b.last_activity - a.last_activity || (a.id < b.id ? -1 : 1));
-  return jobs;
+  return groups;
 }
 
-function buildJob(g, profiles, now) {
+/** Build one job card from a group. Exposed for the profile "recent jobs" lists. */
+export function jobFromGroup(g, profiles = new Map(), now = nowSeconds()) {
   const offer = g.offer;
   const deadline = offer?.offer?.deadline ?? null;
   const status = deriveStatus(g, deadline, now);

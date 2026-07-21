@@ -18,8 +18,15 @@ export const CLAIM = 7000;
 export const RESULT = 6109;
 /** Co-signed payment receipt — the settlement proof. */
 export const RECEIPT = 3400;
-/** NIP-89 seller handler announce (a seller heartbeat / capability advert). */
+/** NIP-89 seller handler announce (a seller capability advert). */
 export const HANDLER = 31990;
+/**
+ * Seller liveness heartbeat. Addressable (parameterized-replaceable): keyed by
+ * (author, kind, d) — resolve the current one by AUTHOR + KIND (+ d), taking the
+ * newest created_at. NEVER look it up by a published event id (a replaceable event
+ * is superseded, so by-id lookups go empty and read as a false "offline").
+ */
+export const HEARTBEAT = 30340;
 
 /** Plain-English labels for a kind, for any place a kind must surface to a human. */
 export const KIND_LABELS = Object.freeze({
@@ -29,6 +36,7 @@ export const KIND_LABELS = Object.freeze({
   [RESULT]: "result",
   [RECEIPT]: "receipt",
   [HANDLER]: "handler (NIP-89)",
+  [HEARTBEAT]: "heartbeat",
 });
 
 /** Marketplace kinds the relay subscription requests. Gift-wrap (1059) stays dark. */
@@ -38,4 +46,5 @@ export const SUBSCRIBE_KINDS = Object.freeze([
   RESULT,
   RECEIPT,
   HANDLER,
+  HEARTBEAT,
 ]);

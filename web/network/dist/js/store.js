@@ -1,5 +1,6 @@
 import { percentile } from "./parse.js";
 import { aggregateJobs, computePulse } from "./jobs.js";
+import { buyerMetrics, sellerMetrics } from "./profiles.js";
 
 /** In-memory aggregator for observatory views. */
 export function createStore() {
@@ -288,6 +289,16 @@ export function createStore() {
     return computePulse([...byId.values()], js, now);
   }
 
+  /** Seller reputation view for a pubkey. */
+  function sellerProfile(pubkey, now) {
+    return sellerMetrics([...byId.values()], pubkey, profiles, now);
+  }
+
+  /** Buyer reputation view for a pubkey. */
+  function buyerProfile(pubkey, now) {
+    return buyerMetrics([...byId.values()], pubkey, profiles, now);
+  }
+
   function snapshot(now) {
     const jobsList = jobs(now);
     return {
@@ -301,7 +312,20 @@ export function createStore() {
     };
   }
 
-  return { ingest, snapshot, jobs, pulse, funnel, latency, economics, census, tail, getProfile };
+  return {
+    ingest,
+    snapshot,
+    jobs,
+    pulse,
+    sellerProfile,
+    buyerProfile,
+    funnel,
+    latency,
+    economics,
+    census,
+    tail,
+    getProfile,
+  };
 }
 
 function pushMap(map, key, value) {
