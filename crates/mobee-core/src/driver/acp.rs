@@ -204,7 +204,7 @@ impl UpdateStream {
     }
 }
 
-use super::{UsageCost, UsageMetadata, UsageTransport};
+use super::{UsageMetadata, UsageTransport};
 
 /// Extract execution usage from an ACP `session/prompt` JSON-RPC result.
 ///
@@ -217,44 +217,45 @@ use super::{UsageCost, UsageMetadata, UsageTransport};
 /// Token components are read only from a real `usage` object, never guessed off unrelated root
 /// fields.
 pub fn parse_acp_usage(result: &Value) -> Option<UsageMetadata> {
+    // The prompt result IS the ACP `PromptResponse`. `usage` is the spec's usage surface
+    // (the unstable `unstable_end_turn_token_usage` capability); `_meta.usage` is the
+    // spec-sanctioned extension point. Every field name below is verified against either the
+    // ACP `Usage` wire shape (rename_all = "camelCase") or a maintained harness's real output
+    // — none are guessed:
+    //   - inputTokens / outputTokens / cachedReadTokens / cachedWriteTokens
+    //         ACP `Usage` (camelCase) AND claude-code-acp `PromptResponse.usage`.
+    //   - input_tokens / output_tokens
+    //         Anthropic-usage snake case (claude-code-acp raw snapshot) AND codex TokenUsage.
+    //   - reasoning: ACP `Usage.thoughtTokens`; codex `reasoning_output_tokens`.
+    //   - cache read: Anthropic `cache_read_input_tokens`; codex `cached_input_tokens`.
+    //   - cache write: Anthropic `cache_creation_input_tokens`.
     let usage_obj = result
         .get("usage")
-        .or_else(|| result.get("_meta").and_then(|m| m.get("usage")))
-        .or_else(|| result.get("result").and_then(|r| r.get("usage")));
+        .or_else(|| result.get("_meta").and_then(|m| m.get("usage")));
 
     let (input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens) =
         match usage_obj {
             Some(u) => (
-                first_u64(u, &["inputTokens", "input_tokens", "promptTokens", "prompt_tokens"]),
-                first_u64(u, &["outputTokens", "output_tokens", "completionTokens", "completion_tokens"]),
-                first_u64(u, &["reasoningTokens", "reasoning_tokens", "reasoning"]),
-                first_u64(
-                    u,
-                    &["cacheReadTokens", "cache_read_tokens", "cacheReadInputTokens", "cache_read_input_tokens", "cache_read"],
-                ),
-                first_u64(
-                    u,
-                    &["cacheCreationTokens", "cache_creation_tokens", "cacheCreationInputTokens", "cache_creation_input_tokens", "cacheWriteTokens", "cache_write_tokens", "cache_write"],
-                ),
+                first_u64(u, &["inputTokens", "input_tokens"]),
+                first_u64(u, &["outputTokens", "output_tokens"]),
+                first_u64(u, &["thoughtTokens", "reasoning_output_tokens"]),
+                first_u64(u, &["cachedReadTokens", "cache_read_input_tokens", "cached_input_tokens"]),
+                first_u64(u, &["cachedWriteTokens", "cache_creation_input_tokens"]),
             ),
             None => (None, None, None, None, None),
         };
 
-    let model = first_str(result, &["model"])
-        .or_else(|| usage_obj.and_then(|u| first_str(u, &["model"])))
-        .or_else(|| result.get("_meta").and_then(|m| first_str(m, &["model"])))
-        .or_else(|| model_usage_key(result));
-
-    let cost = first_cost(result, usage_obj);
-
     let meta = UsageMetadata {
-        model,
+        // No maintained ACP harness (claude-code-acp, codex, cursor) and no ACP spec field
+        // carries a model id or a monetary cost in the `session/prompt` result, so neither is
+        // read here — a model, when known, comes from the launch preset, not the wire.
+        model: None,
         input_tokens,
         output_tokens,
         reasoning_tokens,
         cache_read_tokens,
         cache_write_tokens,
-        cost,
+        cost: None,
         transport: None,
     };
     if meta.is_empty() {
@@ -264,17 +265,6 @@ pub fn parse_acp_usage(result: &Value) -> Option<UsageMetadata> {
         transport: Some(UsageTransport::AcpNative),
         ..meta
     })
-}
-
-fn first_str(v: &Value, keys: &[&str]) -> Option<String> {
-    for key in keys {
-        if let Some(s) = v.get(*key).and_then(Value::as_str)
-            && !s.is_empty()
-        {
-            return Some(s.to_owned());
-        }
-    }
-    None
 }
 
 fn first_u64(v: &Value, keys: &[&str]) -> Option<u64> {
@@ -288,43 +278,6 @@ fn first_u64(v: &Value, keys: &[&str]) -> Option<u64> {
         }
     }
     None
-}
-
-/// claude's `json` surface exposes the model as the KEY of `modelUsage` (no top-level string).
-fn model_usage_key(result: &Value) -> Option<String> {
-    result
-        .get("modelUsage")
-        .and_then(Value::as_object)
-        .and_then(|m| m.keys().next().cloned())
-        .filter(|s| !s.is_empty())
-}
-
-/// A reported USD cost → the exact string as reported (byte-exact, never float-mangled).
-/// Basis defaults to `harness-reported-usd` (incurred API-key billing — the spec's primary
-/// mapping for `total_cost_usd`); notional/subscription detection is a named follow-up.
-fn first_cost(result: &Value, usage_obj: Option<&Value>) -> Option<UsageCost> {
-    const KEYS: &[&str] = &["total_cost_usd", "totalCostUsd", "cost_usd", "costUsd"];
-    let sources = [Some(result), usage_obj];
-    for src in sources.into_iter().flatten() {
-        for key in KEYS {
-            if let Some(raw) = src.get(*key)
-                && let Some(amount) = number_string(raw)
-            {
-                return Some(UsageCost {
-                    amount,
-                    basis: "harness-reported-usd".to_owned(),
-                });
-            }
-        }
-    }
-    None
-}
-
-fn number_string(v: &Value) -> Option<String> {
-    if v.is_number() {
-        return Some(v.to_string());
-    }
-    v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -343,21 +296,20 @@ mod usage_tests {
 
     #[test]
     fn acp_native_usage_is_captured_from_the_prompt_result() {
-        // Rich claude-shaped ACP result: model + non-cached input/output + cache siblings + USD cost.
+        // Real claude-code-acp `session/prompt` result.usage shape (camelCase, matches the ACP
+        // spec `Usage`). No model or cost is present in an ACP prompt result.
         let usage = parse_acp_usage(&json!({
             "stopReason": "end_turn",
-            "model": "claude-opus-4-8",
-            "total_cost_usd": 0.0123,
             "usage": {
                 "inputTokens": 100,
                 "outputTokens": 40,
-                "cacheReadInputTokens": 4096,
-                "cacheCreationInputTokens": 512
+                "cachedReadTokens": 4096,
+                "cachedWriteTokens": 512,
+                "totalTokens": 4748
             }
         }))
         .expect("usage present");
 
-        assert_eq!(usage.model.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(usage.input_tokens, Some(100));
         assert_eq!(usage.output_tokens, Some(40));
         // reasoning absent = unknown, NOT zero.
@@ -367,15 +319,16 @@ mod usage_tests {
         // total = input + output (+ reasoning if present); cache siblings NEVER folded in.
         assert_eq!(usage.total_tokens(), Some(140));
         assert_eq!(usage.transport, Some(UsageTransport::AcpNative));
-        let cost = usage.cost.expect("cost present");
-        assert_eq!(cost.amount, "0.0123");
-        assert_eq!(cost.basis, "harness-reported-usd");
+        // Neither is carried on the ACP wire, so neither is fabricated.
+        assert_eq!(usage.model, None);
+        assert_eq!(usage.cost, None);
     }
 
     #[test]
     fn reasoning_is_summed_into_total_when_present() {
+        // ACP spec `Usage.thoughtTokens`.
         let usage = parse_acp_usage(&json!({
-            "usage": {"input_tokens": 10, "output_tokens": 5, "reasoning_tokens": 3}
+            "usage": {"inputTokens": 10, "outputTokens": 5, "thoughtTokens": 3}
         }))
         .expect("usage present");
         assert_eq!(usage.reasoning_tokens, Some(3));
@@ -389,15 +342,5 @@ mod usage_tests {
         assert_eq!(usage.output_tokens, Some(40));
         assert_eq!(usage.input_tokens, None);
         assert_eq!(usage.total_tokens(), None);
-    }
-
-    #[test]
-    fn model_read_from_model_usage_key_when_no_top_level_string() {
-        let usage = parse_acp_usage(&json!({
-            "modelUsage": {"claude-sonnet-4-6": {"inputTokens": 1}},
-            "usage": {"inputTokens": 1, "outputTokens": 1}
-        }))
-        .expect("some");
-        assert_eq!(usage.model.as_deref(), Some("claude-sonnet-4-6"));
     }
 }
