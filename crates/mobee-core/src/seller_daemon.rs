@@ -866,6 +866,190 @@ impl SellerDaemon {
         Ok(restored)
     }
 
+    /// Reconstruct a delivered-job bind for a buffered/backfilled payment wrap from ON-RELAY
+    /// ground truth, for the recovery case [`restore_delivered_unpaid`] cannot cover: a seat that
+    /// delivered under an older build (or whose journal is lost/incomplete) has NO local `Delivery`
+    /// entry, so its wrap references a job that never enters `awaiting_payment` and buffers forever.
+    ///
+    /// Pure over the fetched [`JobView`] + the received payment (the async caller does the relay
+    /// I/O and the `awaiting_payment` push), so every fail-closed branch is unit-testable without a
+    /// relay. Returns `Ok(ActiveJob)` only when EVERY money-critical fact verifies against events
+    /// this seller itself authored; otherwise `Err(reason)` and the caller leaves the wrap buffered.
+    ///
+    /// Guards (all fail-closed — a partial reconstruction never redeems):
+    ///  * the result (kind [`JOB_RESULT_KIND`]) for `J` MUST be authored by self (a foreign author
+    ///    is refused — money only ever binds to this seller's own delivery);
+    ///  * the claim (kind 3402) for `J` MUST be authored by self AND carry a parseable `creq`;
+    ///  * that `creq` MUST bind the payload: same job id, matching unit, the payload's realized
+    ///    mint listed in the `creq`, and the `creq` amount equal to the on-relay offer amount;
+    ///  * the payload's realized mint MUST be in the seller's `accepted_mints` (the SAME allow-list
+    ///    the redeem guard enforces — checked here so a foreign mint leaves the wrap buffered
+    ///    rather than erroring the ingest);
+    ///  * the on-relay offer MUST be present (its amount/unit are the redeem terms).
+    ///
+    /// The rebuilt job carries `seller_pubkey=None` (so `assert_seller_matches` passes) and the
+    /// money-critical amount/unit from the offer; the EXISTING redeem path re-checks every guard
+    /// (`assert_redeem_mint`, terms, amount) before any funds move.
+    fn reconstruct_delivered_bind(
+        &self,
+        view: &crate::job_lifecycle::JobView,
+        received: &ReceivedPayment,
+    ) -> Result<ActiveJob, String> {
+        let job_id = received.payload.job_id();
+        // Own result (kind 3403, author == self). A result authored by ANOTHER seller is a foreign
+        // delivery — never bind money to it.
+        let own_result = view
+            .results
+            .iter()
+            .find(|result| result.seller_pubkey == self.seller_pubkey)
+            .ok_or_else(|| {
+                format!(
+                    "no self-authored result on relay for job_id={job_id} (results={}); \
+                     refusing reconstruction",
+                    view.results.len()
+                )
+            })?;
+        // Own claim (kind 3402, author == self) carrying the seller-authored NUT-18 `creq`.
+        let own_claim = view
+            .claims
+            .iter()
+            .find(|claim| claim.seller_pubkey == self.seller_pubkey)
+            .ok_or_else(|| {
+                format!("no self-authored claim on relay for job_id={job_id}; refusing reconstruction")
+            })?;
+        let creq = own_claim.creq.as_deref().ok_or_else(|| {
+            format!(
+                "self claim for job_id={job_id} carries no creq (cannot verify payment terms); \
+                 refusing reconstruction"
+            )
+        })?;
+        // Bind the reconstruction to the seller-authored request FIELD BY FIELD: the checks below
+        // verify the fetched claim's creq against the payload (payment id == job id, realized mint
+        // listed, unit match) and against the on-relay offer (amount). The seller side stores no
+        // creq hash to compare a recomputed one against (the accept-bind's `creq_hash` is a buyer
+        // artifact), so the parsed fields ARE the binding.
+        let request = gateway::creq::parse_creq(creq).map_err(|error| {
+            format!("self claim creq for job_id={job_id} unparseable: {error}; refusing reconstruction")
+        })?;
+        if request.payment_id.as_deref() != Some(job_id) {
+            return Err(format!(
+                "creq mismatch: creq payment id {:?} != job_id={job_id}; refusing reconstruction",
+                request.payment_id
+            ));
+        }
+        let payload_mint = received.payload.mint();
+        if !request.mints.contains(payload_mint) {
+            return Err(format!(
+                "creq mismatch: payload mint {payload_mint} not authored in self claim creq for \
+                 job_id={job_id}; refusing reconstruction"
+            ));
+        }
+        if request.unit.as_ref() != Some(received.payload.unit()) {
+            return Err(format!(
+                "creq mismatch: payload unit {:?} != creq unit {:?} for job_id={job_id}; \
+                 refusing reconstruction",
+                received.payload.unit(),
+                request.unit
+            ));
+        }
+        // On-relay offer supplies the redeem terms (amount/unit) the seller-authored creq copied.
+        let offer = view.offer.as_ref().ok_or_else(|| {
+            format!("no offer on relay for job_id={job_id}; refusing reconstruction")
+        })?;
+        if request.amount != Some(cashu::Amount::from(offer.amount_sats)) {
+            return Err(format!(
+                "creq mismatch: creq amount {:?} != offer amount {} for job_id={job_id}; \
+                 refusing reconstruction",
+                request.amount, offer.amount_sats
+            ));
+        }
+        // The payload's realized mint MUST be one this seller advertised — the SAME allow-list the
+        // redeem guard (`assert_redeem_mint`) enforces, applied here so an unlisted mint leaves the
+        // wrap buffered instead of erroring the ingest. Never relaxes the allow-list.
+        let accepted = self
+            .home
+            .config
+            .accepted_mints
+            .iter()
+            .map(|entry| mint_url(entry))
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .map_err(|error| format!("accepted_mints parse for job_id={job_id}: {error}"))?;
+        if !accepted.contains(payload_mint) {
+            return Err(format!(
+                "payload mint {payload_mint} not in seller accepted_mints for job_id={job_id}; \
+                 refusing reconstruction"
+            ));
+        }
+        Ok(ActiveJob {
+            job_id: job_id.to_owned(),
+            buyer_pubkey: offer.author_pubkey.clone(),
+            offer: ParsedOffer {
+                task: String::new(),
+                output: String::new(),
+                amount: offer.amount_sats,
+                unit: received.payload.unit().to_string(),
+                deadline_unix: 0,
+                seller_pubkey: None,
+            },
+            claim_id: own_claim.claim_id.clone(),
+            result_id: Some(own_result.result_id.clone()),
+            deadline_unix: 0,
+            workdir: job_workdir(&self.home, job_id),
+            contribution: None,
+            delivery: None,
+        })
+    }
+
+    /// Fetch on-relay ground truth for a buffered wrap whose delivered-job bind is missing from the
+    /// local journal, reconstruct the bind fail-closed ([`reconstruct_delivered_bind`]), and
+    /// restore it into `awaiting_payment` so the EXISTING redeem path runs. Returns `true` iff a
+    /// bind was restored. Any relay-fetch or verify failure logs a clear reason and returns `false`
+    /// (the caller leaves the wrap buffered). Never redeems on a partial reconstruction.
+    async fn reconstruct_bind_from_relay(&mut self, received: &ReceivedPayment) -> bool {
+        let job_id = received.payload.job_id().to_owned();
+        if self.awaiting_payment.len() >= AWAITING_PAYMENT_CAP {
+            eprintln!(
+                "seller wrap reconstruct job_id={job_id}: awaiting_payment full (cap \
+                 {AWAITING_PAYMENT_CAP}); leaving buffered"
+            );
+            return false;
+        }
+        let view = match crate::job_lifecycle::fetch_job_view_async(
+            &self.home,
+            &self.keys,
+            &job_id,
+            Duration::from_secs(BACKFILL_CHECK_TIMEOUT_SECS),
+            now_unix(),
+        )
+        .await
+        {
+            Ok(view) => view,
+            Err(error) => {
+                eprintln!(
+                    "seller wrap reconstruct job_id={job_id}: relay fetch failed (fail-closed, \
+                     leaving buffered): {error}"
+                );
+                return false;
+            }
+        };
+        match self.reconstruct_delivered_bind(&view, received) {
+            Ok(job) => {
+                eprintln!(
+                    "seller wrap reconstruct job_id={job_id}: bind reconstructed from on-relay \
+                     result+claim (result_id={} claim_id={}); restoring into awaiting_payment",
+                    job.result_id.as_deref().unwrap_or_default(),
+                    job.claim_id
+                );
+                self.awaiting_payment.push(job);
+                true
+            }
+            Err(reason) => {
+                eprintln!("seller wrap reconstruct job_id={job_id}: {reason}");
+                false
+            }
+        }
+    }
+
     /// Full startup reconcile: durable journal release (above) + best-effort feedback-kind
     /// error to surface the dead claim to the buyer. Publish failure is logged, not fatal —
     /// the journal release is the durable guarantee; the buyer view also derives expiry.
@@ -2300,15 +2484,25 @@ async fn try_apply_or_buffer(
         .iter()
         .any(|job| job.job_id.as_str() == payload_job);
     if !binds {
-        // No delivered job matches yet — buffer it (early pay for a still-processing job, or
-        // the wrap arrived before its delivery was recorded). Misattribution is impossible:
-        // `try_apply_payment` only receives against an exact job+result match.
-        eprintln!(
-            "seller wrap event={event_id} buffered: no delivered job binds job_id={} yet",
-            received.payload.job_id()
-        );
-        daemon.buffer_payment(event_id, received);
-        return Ok(ApplyResult::Buffered);
+        // No delivered job matches yet. Before buffering, try to reconstruct the delivered-job
+        // bind from ON-RELAY ground truth: a seat that delivered under an older build (or whose
+        // journal is lost/incomplete) has no local `Delivery` entry for `restore_delivered_unpaid`
+        // to rebuild, so the wrap would otherwise buffer forever (the exact recovery case the
+        // backfill exists for). Reconstruction is fail-closed (see `reconstruct_delivered_bind`) —
+        // it binds only a job whose result AND claim this seller itself authored, and hands the
+        // job to the SAME redeem path with its full guards. A miss (early pay for a
+        // still-processing job, an unverifiable wrap) leaves the wrap buffered as before;
+        // misattribution is impossible — `try_apply_payment` only receives against an exact
+        // job+result match.
+        if !daemon.reconstruct_bind_from_relay(&received).await {
+            eprintln!(
+                "seller wrap event={event_id} buffered: no delivered job binds job_id={} yet",
+                received.payload.job_id()
+            );
+            daemon.buffer_payment(event_id, received);
+            return Ok(ApplyResult::Buffered);
+        }
+        // Bind restored from the relay — fall through to the normal apply path (full redeem guards).
     }
     match daemon.try_apply_payment(received).await? {
         Some(outcome) => Ok(ApplyResult::Applied(outcome)),
@@ -4285,6 +4479,222 @@ mod tests {
         let again = daemon.restore_delivered_unpaid().expect("restore again");
         assert_eq!(again, 0);
         assert_eq!(daemon.awaiting_payment.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── #b: reconstruct a delivered-job bind from on-relay result+claim during wrap backfill ──
+    // The recovery case `restore_delivered_unpaid` cannot cover: no local journal Delivery entry.
+
+    const RECON_KEYSET_ID: &str = "009a1f293253e41e";
+
+    /// A received NUT-18 payment for `job_id` paid at `mint`, sealed by `buyer`.
+    fn recon_received(job_id: &str, mint: &str, buyer: &nostr_sdk::Keys) -> ReceivedPayment {
+        use std::str::FromStr;
+
+        use cashu::secret::Secret;
+        use cashu::{Amount, CurrencyUnit, Id, MintUrl, Proof, SecretKey};
+
+        let proof = Proof::new(
+            Amount::from(5),
+            Id::from_str(RECON_KEYSET_ID).expect("keyset id"),
+            Secret::new("recon-test-secret-do-not-leak"),
+            SecretKey::generate().public_key(),
+        );
+        ReceivedPayment {
+            payload: crate::payment_send::PaymentPayload {
+                seller_pubkey: String::new(),
+                payload: cashu::nuts::nut18::PaymentRequestPayload {
+                    id: Some(job_id.to_owned()),
+                    memo: None,
+                    mint: MintUrl::from_str(mint).expect("mint url"),
+                    unit: CurrencyUnit::Sat,
+                    proofs: vec![proof],
+                },
+            },
+            buyer_pubkey: buyer.public_key(),
+        }
+    }
+
+    /// A JobView carrying one result + one claim, each authored by the given seller, plus an offer.
+    /// `claim_creq` is the seller-authored `creq` tag value (built with `build_seller_creq`).
+    fn recon_job_view(
+        job_id: &str,
+        offer_amount: u64,
+        buyer_pubkey: &str,
+        result_seller: &str,
+        claim_seller: &str,
+        claim_creq: Option<String>,
+    ) -> crate::job_lifecycle::JobView {
+        use crate::job_lifecycle::{ClaimView, JobView, OfferView, ResultView};
+        JobView {
+            job_id: job_id.to_owned(),
+            offer: Some(OfferView {
+                event_id: job_id.to_owned(),
+                created_at: 1_000,
+                author_pubkey: buyer_pubkey.to_owned(),
+                author_display_name: None,
+                task: "task".into(),
+                output: "text/plain".into(),
+                amount_sats: offer_amount,
+                deadline_unix: 2_000_000_000,
+                seller_pubkey: Some(result_seller.to_owned()),
+                seller_display_name: None,
+                targeted: true,
+                repo: None,
+                branch: None,
+                job_class: None,
+                contribution: None,
+            }),
+            claims: vec![ClaimView {
+                claim_id: format!("claim-{job_id}"),
+                created_at: 1_100,
+                seller_pubkey: claim_seller.to_owned(),
+                display_name: None,
+                status: "processing".into(),
+                live: false,
+                creq: claim_creq,
+            }],
+            results: vec![ResultView {
+                result_id: format!("result-{job_id}"),
+                created_at: 1_200,
+                seller_pubkey: result_seller.to_owned(),
+                display_name: None,
+                job_hash: None,
+                repo: None,
+                branch: None,
+                commit_oid: None,
+                amount_sats: Some(offer_amount),
+                seller_signature: None,
+                contribution: None,
+            }],
+            live_claim_id: None,
+            accepted: None,
+            pending: false,
+        }
+    }
+
+    // Happy path: no journal bind, but a self-authored result + claim (with a matching creq) on the
+    // relay → the bind is reconstructed and lands in awaiting_payment so the normal redeem path's
+    // job+result lookup succeeds (redeem fires through the SAME guards — no bypass).
+    #[test]
+    fn reconstruct_binds_from_relay_when_journal_lacks_delivery() {
+        let (root, daemon) = test_daemon("recon-happy");
+        let seller = daemon.seller_pubkey().to_owned();
+        let buyer = nostr_sdk::Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let job_id = "job-recon-happy";
+        let creq = gateway::creq::build_seller_creq(
+            job_id,
+            15,
+            "sat",
+            &[DEFAULT_MINT_URL.into()],
+            &seller,
+        )
+        .expect("build creq");
+        let view = recon_job_view(job_id, 15, &buyer_hex, &seller, &seller, Some(creq));
+        let received = recon_received(job_id, DEFAULT_MINT_URL, &buyer);
+
+        assert!(daemon.awaiting_payment.is_empty());
+        let job = daemon
+            .reconstruct_delivered_bind(&view, &received)
+            .expect("reconstruct must bind a self-authored result+claim");
+        assert_eq!(job.job_id, job_id);
+        assert_eq!(job.result_id.as_deref(), Some(format!("result-{job_id}").as_str()));
+        assert_eq!(job.claim_id, format!("claim-{job_id}"));
+        assert_eq!(job.offer.amount, 15);
+        assert_eq!(job.offer.unit, "sat");
+        assert_eq!(job.buyer_pubkey, buyer_hex);
+        // seller_pubkey=None so the redeem's assert_seller_matches(self) passes.
+        assert!(job.offer.seller_pubkey.is_none());
+
+        // The reconstructed job binds the payment (the redeem path's job+result lookup succeeds).
+        let mut daemon = daemon;
+        daemon.awaiting_payment.push(job);
+        assert!(daemon
+            .awaiting_payment
+            .iter()
+            .any(|j| j.job_id == received.payload.job_id()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A result authored by ANOTHER seller for J → refuse (never bind money to a foreign delivery).
+    #[test]
+    fn reconstruct_refuses_foreign_authored_result() {
+        let (root, daemon) = test_daemon("recon-foreign");
+        let seller = daemon.seller_pubkey().to_owned();
+        let foreign = nostr_sdk::Keys::generate().public_key().to_hex();
+        let buyer = nostr_sdk::Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let job_id = "job-recon-foreign";
+        // creq is well-formed and self-authored on the claim, but the RESULT is foreign.
+        let creq = gateway::creq::build_seller_creq(
+            job_id,
+            15,
+            "sat",
+            &[DEFAULT_MINT_URL.into()],
+            &seller,
+        )
+        .expect("build creq");
+        let view = recon_job_view(job_id, 15, &buyer_hex, &foreign, &seller, Some(creq));
+        let received = recon_received(job_id, DEFAULT_MINT_URL, &buyer);
+
+        let err = daemon
+            .reconstruct_delivered_bind(&view, &received)
+            .expect_err("foreign result must refuse");
+        assert!(err.contains("no self-authored result"), "reason: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The self claim's creq lists a DIFFERENT mint than the payload realized mint (creq mismatch vs
+    // payload), while config accepts the payload mint → refuse at the creq-binding guard.
+    #[test]
+    fn reconstruct_refuses_creq_mismatch_vs_payload() {
+        let (root, daemon) = test_daemon("recon-creq-mismatch");
+        let seller = daemon.seller_pubkey().to_owned();
+        let buyer = nostr_sdk::Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let job_id = "job-recon-creq";
+        // creq authored over a mint the buyer did NOT pay at; payload pays at DEFAULT_MINT_URL
+        // (which IS in accepted_mints), isolating the creq-vs-payload mismatch from the allow-list.
+        let other_mint = "https://other-mint.example/";
+        let creq =
+            gateway::creq::build_seller_creq(job_id, 15, "sat", &[other_mint.into()], &seller)
+                .expect("build creq");
+        let view = recon_job_view(job_id, 15, &buyer_hex, &seller, &seller, Some(creq));
+        let received = recon_received(job_id, DEFAULT_MINT_URL, &buyer);
+
+        let err = daemon
+            .reconstruct_delivered_bind(&view, &received)
+            .expect_err("creq mismatch must refuse");
+        assert!(err.contains("creq mismatch"), "reason: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The payload realized mint is NOT in the seller's accepted_mints (and the creq lists it, so
+    // this isolates the allow-list guard) → refuse; the mint allow-list is never relaxed.
+    #[test]
+    fn reconstruct_refuses_mint_outside_accepted_mints() {
+        let (root, daemon) = test_daemon("recon-mint-unlisted");
+        let seller = daemon.seller_pubkey().to_owned();
+        let buyer = nostr_sdk::Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let job_id = "job-recon-mint";
+        let unlisted = "https://unlisted-mint.example/";
+        // creq authors the unlisted mint (so it binds the payload), but config accepted_mints only
+        // holds DEFAULT_MINT_URL → the allow-list guard refuses.
+        let creq =
+            gateway::creq::build_seller_creq(job_id, 15, "sat", &[unlisted.into()], &seller)
+                .expect("build creq");
+        let view = recon_job_view(job_id, 15, &buyer_hex, &seller, &seller, Some(creq));
+        let received = recon_received(job_id, unlisted, &buyer);
+
+        let err = daemon
+            .reconstruct_delivered_bind(&view, &received)
+            .expect_err("unlisted mint must refuse");
+        assert!(
+            err.contains("not in seller accepted_mints"),
+            "reason: {err}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
