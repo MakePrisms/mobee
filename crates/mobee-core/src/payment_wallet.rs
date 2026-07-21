@@ -6,6 +6,7 @@ use std::str::FromStr;
 use std::sync::mpsc;
 use std::thread;
 
+use cashu::nuts::nut18::PaymentRequestPayload;
 use cashu::{
     Amount, CheckStateRequest, CurrencyUnit, MintUrl, PublicKey as CashuPublicKey, SecretKey,
     SpendingConditions, State, Token,
@@ -89,17 +90,24 @@ impl PaymentPolicy {
         }
     }
 
-    /// Maps a validated offer and accepted seller into shared typed terms.
+    /// Maps a validated offer + accepted seller into shared typed terms, at the *realized* mint
+    /// the buyer actually paid at.
+    ///
+    /// PIECE-14 Job E: the mint is NO LONGER read off the offer (`offer.mint_url` is dead here).
+    /// It is the mint the buyer declared in its NUT-18 payload (`payload.mint`) — the seller pins
+    /// the redeem terms to what was actually paid. `amount`/`unit` are still copied from the offer,
+    /// which is exactly what the seller-authored `creq` copied (`creq.a`/`creq.u`), so checking a
+    /// redeem against these terms IS checking it against the creq. The realized mint must be one
+    /// the seller advertised (`∈ accepted_mints == allowed_mints`), else `wrong_mint`.
     pub fn terms_for_offer(
         &self,
+        realized_mint: MintUrl,
         offer: &ParsedOffer,
         accepted_seller: &str,
     ) -> Result<PaymentTerms, PaymentWalletError> {
         offer
             .assert_seller_matches(accepted_seller)
             .map_err(|error| PaymentWalletError::Policy(error.to_string()))?;
-        let mint = MintUrl::from_str(&offer.mint_url)
-            .map_err(|error| PaymentWalletError::Policy(format!("invalid mint URL: {error}")))?;
         let unit = CurrencyUnit::from_str(&offer.unit).map_err(|error| {
             PaymentWalletError::Policy(format!(
                 "unsupported payment unit {:?}: {error}",
@@ -112,9 +120,9 @@ impl PaymentPolicy {
                 offer.unit
             )));
         }
-        if !self.allowed_mints.contains(&mint) {
+        if !self.allowed_mints.contains(&realized_mint) {
             return Err(PaymentWalletError::Policy(format!(
-                "mint {mint} is outside the test-mint allowlist"
+                "wrong_mint: realized mint {realized_mint} is outside the seller's accepted_mints"
             )));
         }
         let seller_nostr_pubkey = NostrPublicKey::parse(accepted_seller).map_err(|error| {
@@ -126,13 +134,35 @@ impl PaymentPolicy {
             )?;
 
         Ok(PaymentTerms::new(
-            mint,
+            realized_mint,
             Amount::from(offer.amount),
             unit,
             seller_nostr_pubkey,
             seller_p2pk_lock,
         ))
     }
+}
+
+/// PIECE-14 Job E redeem guard: the paid token's mint must be one the seller advertised in its
+/// `creq` (`∈ accepted_mints`) AND must equal the mint the buyer declared in its NUT-18 payload
+/// (`payload.mint`). A token from any other mint is refused `wrong_mint` — no swap runs, so no
+/// funds move; the buyer re-pays from a listed mint (PIECE-14 § Money-path detection).
+pub fn assert_redeem_mint(
+    token_mint: &MintUrl,
+    payload_mint: &MintUrl,
+    accepted_mints: &HashSet<MintUrl>,
+) -> Result<(), PaymentWalletError> {
+    if !accepted_mints.contains(payload_mint) {
+        return Err(PaymentWalletError::Policy(format!(
+            "wrong_mint: payload mint {payload_mint} is not in the seller's accepted_mints"
+        )));
+    }
+    if token_mint != payload_mint {
+        return Err(PaymentWalletError::Policy(format!(
+            "wrong_mint: token mint {token_mint} does not equal payload mint {payload_mint}"
+        )));
+    }
+    Ok(())
 }
 
 /// Buyer wallet adapter backed by CDK's persisted send sagas.
@@ -707,9 +737,47 @@ enum BuyerCommand {
         response: mpsc::SyncSender<Result<VerifiedPayment, PaymentWalletError>>,
     },
     Send {
-        payload: PaymentPayload,
+        /// Job id — becomes the NUT-18 payload `id` (echoes the seller request's `i`).
+        job_id: String,
+        /// NIP-17 gift-wrap recipient (the seller, hex).
+        seller_pubkey: String,
+        /// The P2PK-locked token to pay with. Decomposed to NUT-18 `proofs` in the worker (where
+        /// the wallet's mint keysets are available).
+        token: Token,
         response: mpsc::SyncSender<Result<PaymentSent, PaymentWalletError>>,
     },
+}
+
+/// Build the buyer's NUT-18 [`PaymentRequestPayload`] from a locked token. Decomposes the token
+/// into `proofs` using the wallet's mint keysets (a TokenV4 stores short keyset ids that must be
+/// expanded), and sets `mint` to the *realized* mint the token came from. Runs on the wallet
+/// worker thread.
+#[cfg(feature = "wallet")]
+async fn build_nut18_payload(
+    wallet: &Wallet,
+    job_id: String,
+    seller_pubkey: String,
+    token: Token,
+) -> Result<PaymentPayload, PaymentWalletError> {
+    let keysets = wallet
+        .get_mint_keysets(KeysetFilter::All)
+        .await
+        .map_err(wallet_error)?;
+    let proofs = token.proofs(&keysets).map_err(wallet_error)?;
+    let mint = token.mint_url().map_err(wallet_error)?;
+    let unit = token
+        .unit()
+        .ok_or_else(|| PaymentWalletError::Policy("payment token carries no unit".into()))?;
+    Ok(PaymentPayload {
+        seller_pubkey,
+        payload: PaymentRequestPayload {
+            id: Some(job_id),
+            memo: None,
+            mint,
+            unit,
+            proofs,
+        },
+    })
 }
 
 /// Synchronous state-machine effects backed by one asynchronous wallet worker.
@@ -786,11 +854,28 @@ impl<R> CdkPaymentEffects<R> {
                                     .await;
                                 let _ = response.send(result);
                             }
-                            BuyerCommand::Send { payload, response } => {
-                                let result = payment_send
-                                    .send_payment(payload)
-                                    .await
-                                    .map_err(|error| PaymentWalletError::Wallet(error.to_string()));
+                            BuyerCommand::Send {
+                                job_id,
+                                seller_pubkey,
+                                token,
+                                response,
+                            } => {
+                                let result = match build_nut18_payload(
+                                    &wallet,
+                                    job_id,
+                                    seller_pubkey,
+                                    token,
+                                )
+                                .await
+                                {
+                                    Ok(payload) => payment_send
+                                        .send_payment(payload)
+                                        .await
+                                        .map_err(|error| {
+                                            PaymentWalletError::Wallet(error.to_string())
+                                        }),
+                                    Err(error) => Err(error),
+                                };
                                 let _ = response.send(result);
                             }
                         }
@@ -872,19 +957,20 @@ where
     ) -> Result<PaymentSent, EffectError> {
         if terms.unit != CurrencyUnit::Sat {
             return Err(EffectError::new(
-                "NIP-17 v0 payment payload supports sat only",
+                "NIP-17 NUT-18 payment payload supports sat only",
             ));
         }
-        let payload = PaymentPayload {
-            job_id: key.job_id.as_str().into(),
-            result_id: key.result_id.as_str().into(),
-            mint_url: terms.mint.to_string(),
-            amount: terms.amount.to_u64(),
-            unit: terms.unit.to_string(),
-            token: locked.token().clone(),
-            seller_pubkey: terms.seller_nostr_pubkey.to_hex(),
-        };
-        self.request(|response| BuyerCommand::Send { payload, response })
+        // The NUT-18 payload (id/mint/unit/proofs) is built on the wallet worker, where the mint
+        // keysets needed to decompose the token into proofs live. `id` == the job id.
+        let job_id = key.job_id.as_str().to_owned();
+        let seller_pubkey = terms.seller_nostr_pubkey.to_hex();
+        let token = locked.token().clone();
+        self.request(|response| BuyerCommand::Send {
+            job_id,
+            seller_pubkey,
+            token,
+            response,
+        })
     }
 
     fn publish_receipt(
@@ -903,12 +989,18 @@ impl<'a> CdkSellerReceive<'a> {
     }
 
     /// Swaps the received token at its mint before returning its redeemable amount.
+    ///
+    /// PIECE-14 Job E: `accepted_mints` is the seller's advertised mint set and `payload_mint` is
+    /// the mint the buyer declared in its NUT-18 payload. The redeem guard refuses `wrong_mint`
+    /// unless the token's mint is `∈ accepted_mints` AND equals `payload_mint`.
     pub async fn receive(
         &self,
         token: &Token,
         terms: &PaymentTerms,
+        accepted_mints: &HashSet<MintUrl>,
+        payload_mint: &MintUrl,
     ) -> Result<Amount, PaymentWalletError> {
-        self.receive_with(token, terms, |options| async move {
+        self.receive_with(token, terms, accepted_mints, payload_mint, |options| async move {
             self.wallet
                 .receive(&token.to_string(), options)
                 .await
@@ -921,6 +1013,8 @@ impl<'a> CdkSellerReceive<'a> {
         &self,
         token: &Token,
         terms: &PaymentTerms,
+        accepted_mints: &HashSet<MintUrl>,
+        payload_mint: &MintUrl,
         receive: F,
     ) -> Result<Amount, PaymentWalletError>
     where
@@ -930,13 +1024,20 @@ impl<'a> CdkSellerReceive<'a> {
         require_wallet_matches(self.wallet, terms)?;
         let token_mint = token.mint_url().map_err(wallet_error)?;
         let face = token.value().map_err(wallet_error)?;
-        if token_mint != terms.mint
-            || token.unit().as_ref() != Some(&terms.unit)
-            || face != terms.amount
-        {
+        // Job E redeem guard: token mint ∈ accepted_mints AND == payload.mint. `terms.mint` is the
+        // realized (payload) mint the seller pinned, so `token_mint != terms.mint` below is a
+        // defensive re-check of the same invariant.
+        assert_redeem_mint(&token_mint, payload_mint, accepted_mints)?;
+        if token_mint != terms.mint || token.unit().as_ref() != Some(&terms.unit) {
             return Err(PaymentWalletError::Policy(
-                "received token does not match payment terms".into(),
+                "wrong_mint: received token mint/unit does not match the realized creq terms".into(),
             ));
+        }
+        if face != terms.amount {
+            return Err(PaymentWalletError::Policy(format!(
+                "amount_mismatch: token face {face} does not match creq amount {}",
+                terms.amount
+            )));
         }
         if self.seller_key.public_key().x_only_public_key()
             != terms.seller_p2pk_lock.x_only_public_key()
@@ -1011,6 +1112,84 @@ fn wallet_error(error: impl std::fmt::Display) -> PaymentWalletError {
     PaymentWalletError::Wallet(error.to_string())
 }
 
+/// A bolt11 mint-quote at an accepted mint (step 1 of the Lightning bridge).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeQuote {
+    /// The accepted mint's quote id (used to mint proofs once the invoice is paid).
+    pub quote_id: String,
+    /// The bolt11 invoice the buyer's own mint must pay (melt) to fund the quote.
+    pub invoice: String,
+}
+
+/// The three cross-mint wallet operations of the buyer-side Lightning bridge (PIECE-14 § The
+/// Lightning bridge). Abstracted behind a trait so the orchestration below is exercised by a mock
+/// in `lightning_bridge` — the live cross-mint wiring cannot be validated without two reachable
+/// mints (v2 is fail-closed testnut-only), so it is deliberately not connected here (see
+/// [`bridge_to_accepted_mint`]).
+#[allow(async_fn_in_trait)]
+pub trait LightningBridge {
+    /// Step 1 — request a mint-quote (bolt11 invoice) for `amount` at an accepted mint.
+    async fn mint_quote(
+        &self,
+        accepted_mint: &MintUrl,
+        amount: Amount,
+    ) -> Result<BridgeQuote, PaymentWalletError>;
+
+    /// Step 2 — melt (pay) `invoice` from the buyer's OWN mint, settling it over Lightning.
+    async fn melt_pay(&self, invoice: &str) -> Result<(), PaymentWalletError>;
+
+    /// Step 3 — once the mint-quote is paid, mint fresh proofs at the accepted mint and return
+    /// them as a token whose mint is `accepted_mint`.
+    async fn mint_token(
+        &self,
+        accepted_mint: &MintUrl,
+        quote: &BridgeQuote,
+    ) -> Result<Token, PaymentWalletError>;
+}
+
+/// Bridge the buyer's balance to `accepted_mint` over Lightning: mint-quote → melt (pay the
+/// invoice at the buyer's own mint) → mint fresh proofs. Returns a token from `accepted_mint`,
+/// ready to become the NUT-18 payload.
+///
+/// Best-effort + synchronous within the pay attempt. Any leg failing refuses `mint_unreachable_pay`
+/// with NO partial state committed — the receipt only co-signs after the seller confirms
+/// redemption, so an aborted bridge leaves no binding (PIECE-14 § The Lightning bridge, § Failure
+/// semantics). Fees on both legs come out of the buyer's balance; the seller receives exactly
+/// `amount` at `accepted_mint`.
+pub async fn bridge_to_accepted_mint<B: LightningBridge>(
+    bridge: &B,
+    accepted_mint: &MintUrl,
+    amount: Amount,
+) -> Result<Token, PaymentWalletError> {
+    let quote = bridge
+        .mint_quote(accepted_mint, amount)
+        .await
+        .map_err(|error| bridge_refuse(format!("mint-quote at {accepted_mint} failed: {error}")))?;
+    bridge
+        .melt_pay(&quote.invoice)
+        .await
+        .map_err(|error| bridge_refuse(format!("melt at buyer mint failed: {error}")))?;
+    let token = bridge
+        .mint_token(accepted_mint, &quote)
+        .await
+        .map_err(|error| bridge_refuse(format!("mint at {accepted_mint} failed: {error}")))?;
+    // Post-condition: the bridged token really is from the accepted mint the seller listed.
+    let token_mint = token.mint_url().map_err(wallet_error)?;
+    if token_mint != *accepted_mint {
+        return Err(bridge_refuse(format!(
+            "bridged token mint {token_mint} != accepted mint {accepted_mint}"
+        )));
+    }
+    Ok(token)
+}
+
+/// Every bridge refusal maps to the `mint_unreachable_pay` money-path reason code (PIECE-14
+/// § Failure semantics): the buyer could not fund/mint at an accepted mint, so it walks away with
+/// no payload and no binding.
+fn bridge_refuse(detail: String) -> PaymentWalletError {
+    PaymentWalletError::Wallet(format!("mint_unreachable_pay: {detail}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
@@ -1057,27 +1236,32 @@ mod tests {
     const KEYSET_ID: &str = "009a1f293253e41e";
 
     #[test]
-    fn policy_rejects_a_mint_outside_the_allowlist() {
+    fn policy_rejects_a_realized_mint_outside_the_allowlist() {
+        // Job E: the mint is the REALIZED (payload) mint, not read off the offer. A realized mint
+        // the seller never advertised is `wrong_mint`.
         let seller = secret_key(1).public_key().to_string();
         let policy = PaymentPolicy::new([mint(MINT)]);
-        let offer = offer(OTHER_MINT, &seller);
+        let offer = offer(MINT, &seller);
 
-        let error = policy.terms_for_offer(&offer, &seller).unwrap_err();
+        let error = policy
+            .terms_for_offer(mint(OTHER_MINT), &offer, &seller)
+            .unwrap_err();
 
         assert!(matches!(
             error,
-            PaymentWalletError::Policy(message) if message.contains("outside the test-mint allowlist")
+            PaymentWalletError::Policy(message)
+                if message.contains("wrong_mint") && message.contains("accepted_mints")
         ));
     }
 
     #[test]
-    fn policy_maps_the_offer_once_into_typed_terms() {
+    fn policy_maps_the_offer_once_into_typed_terms_at_the_realized_mint() {
         let seller_lock = secret_key(1).public_key();
         let seller = nostr_key_for_p2pk(seller_lock).to_hex();
         let policy = PaymentPolicy::new([mint(MINT)]);
 
         let terms = policy
-            .terms_for_offer(&offer(MINT, &seller), &seller)
+            .terms_for_offer(mint(MINT), &offer(MINT, &seller), &seller)
             .unwrap();
 
         assert_eq!(terms.mint, mint(MINT));
@@ -1097,7 +1281,7 @@ mod tests {
         let mut offer = offer(MINT, &seller);
         offer.unit = "credit".into();
 
-        let result = policy.terms_for_offer(&offer, &seller);
+        let result = policy.terms_for_offer(mint(MINT), &offer, &seller);
 
         assert!(matches!(
             result,
@@ -1903,7 +2087,7 @@ mod tests {
         );
 
         let result = CdkSellerReceive::new(&wallet, seller_key)
-            .receive(&token, &terms)
+            .receive(&token, &terms, &accepted(&[MINT]), &mint(MINT))
             .await;
 
         assert!(matches!(result, Err(PaymentWalletError::Wallet(_))));
@@ -1930,7 +2114,7 @@ mod tests {
         );
 
         let result = CdkSellerReceive::new(&wallet, seller_key)
-            .receive(&token, &terms)
+            .receive(&token, &terms, &accepted(&[MINT]), &mint(MINT))
             .await;
 
         assert!(matches!(result, Err(PaymentWalletError::Policy(_))));
@@ -1956,7 +2140,7 @@ mod tests {
         );
 
         let result = CdkSellerReceive::new(&wallet, seller_key)
-            .receive(&token, &terms)
+            .receive(&token, &terms, &accepted(&[MINT]), &mint(MINT))
             .await;
 
         assert!(matches!(
@@ -1985,7 +2169,7 @@ mod tests {
 
         // CDK receive returns net after fees (face 2 − fee 1 = 1).
         let amount = adapter
-            .receive_with(&token, &terms, |_| async { Ok(Amount::from(1)) })
+            .receive_with(&token, &terms, &accepted(&[MINT]), &mint(MINT), |_| async { Ok(Amount::from(1)) })
             .await
             .unwrap();
 
@@ -2009,7 +2193,7 @@ mod tests {
         let adapter = CdkSellerReceive::new(&wallet, seller_key);
 
         let result = adapter
-            .receive_with(&token, &terms, |_| async { Ok(Amount::from(2)) })
+            .receive_with(&token, &terms, &accepted(&[MINT]), &mint(MINT), |_| async { Ok(Amount::from(2)) })
             .await;
 
         assert!(matches!(
@@ -2041,7 +2225,7 @@ mod tests {
         let adapter = CdkSellerReceive::new(&wallet, seller_key);
 
         let result = adapter
-            .receive_with(&token, &terms, |_| async {
+            .receive_with(&token, &terms, &accepted(&[MINT]), &mint(MINT), |_| async {
                 Ok(Amount::from(1))
             })
             .await;
@@ -2055,6 +2239,198 @@ mod tests {
             }) if face == Amount::from(7)
                 && received == Amount::from(1)
                 && predicted_fee == Amount::ZERO
+        ));
+    }
+
+    // PIECE-14 Job E acceptance: a payload whose mint ∉ the seller's creq `m` list is refused
+    // `wrong_mint`, and the token mint must equal the payload's declared mint.
+    #[test]
+    fn pay_matches_creq() {
+        let listed = mint(MINT);
+        let unlisted = mint(OTHER_MINT);
+        let creq_mints = accepted(&[MINT]);
+
+        // payload.mint is not in the creq `m` list → wrong_mint, before any swap.
+        let err = assert_redeem_mint(&unlisted, &unlisted, &creq_mints).unwrap_err();
+        assert!(matches!(
+            err,
+            PaymentWalletError::Policy(message)
+                if message.contains("wrong_mint") && message.contains("accepted_mints")
+        ));
+
+        // payload.mint is listed, but the token came from a different mint → wrong_mint.
+        let err = assert_redeem_mint(&unlisted, &listed, &creq_mints).unwrap_err();
+        assert!(matches!(
+            err,
+            PaymentWalletError::Policy(message)
+                if message.contains("wrong_mint") && message.contains("does not equal payload mint")
+        ));
+
+        // token mint == payload.mint ∈ creq `m` → accepted.
+        assert!(assert_redeem_mint(&listed, &listed, &creq_mints).is_ok());
+    }
+
+    // PIECE-14 Job E acceptance: the seller redeem accepts a token from a listed mint that equals
+    // the payload's mint, and refuses otherwise — the guard fails BEFORE the mint swap (no funds
+    // move on refusal).
+    #[tokio::test]
+    async fn redeem_guard() {
+        let seller_key = secret_key(1);
+        let keyset = test_keyset(); // fee = 0
+        let proof = p2pk_proof_for_keyset(7, seller_key.public_key(), keyset.id);
+        let token = Token::new(mint(MINT), vec![proof], None, CurrencyUnit::Sat);
+        let wallet = seller_wallet(InflatedSwapTransport::default(), keyset).await;
+        let terms = PaymentTerms::new(
+            mint(MINT),
+            Amount::from(7),
+            CurrencyUnit::Sat,
+            nostr_key_for_p2pk(seller_key.public_key()),
+            seller_key.public_key(),
+        );
+        let adapter = CdkSellerReceive::new(&wallet, seller_key);
+
+        // Accepts: token mint == payload.mint == MINT ∈ accepted_mints.
+        let amount = adapter
+            .receive_with(&token, &terms, &accepted(&[MINT]), &mint(MINT), |_| async {
+                Ok(Amount::from(7))
+            })
+            .await
+            .unwrap();
+        assert_eq!(amount, Amount::from(7));
+
+        // Refuses: payload.mint (OTHER_MINT) is not in accepted_mints → wrong_mint, no swap.
+        let swap_calls = Arc::new(AtomicUsize::new(0));
+        let counter = swap_calls.clone();
+        let err = adapter
+            .receive_with(
+                &token,
+                &terms,
+                &accepted(&[MINT]),
+                &mint(OTHER_MINT),
+                move |_| {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(Amount::from(7))
+                    }
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PaymentWalletError::Policy(message) if message.contains("wrong_mint")
+        ));
+        assert_eq!(
+            swap_calls.load(Ordering::SeqCst),
+            0,
+            "redeem guard must refuse before the mint swap"
+        );
+    }
+
+    // PIECE-14 Job E acceptance: with balance only at an unlisted mint, the buyer bridges over
+    // Lightning — mint-quote at a listed mint → melt (pay it) at its own mint → mint a fresh token
+    // from the listed mint. Driven by a mock wallet (live cross-mint bridging is fail-closed in v2).
+    #[tokio::test]
+    async fn lightning_bridge() {
+        struct MockBridge {
+            calls: Arc<std::sync::Mutex<Vec<String>>>,
+            seller: PublicKey,
+            keyset_id: Id,
+        }
+
+        impl LightningBridge for MockBridge {
+            async fn mint_quote(
+                &self,
+                accepted_mint: &MintUrl,
+                amount: Amount,
+            ) -> Result<BridgeQuote, PaymentWalletError> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("mint_quote:{accepted_mint}:{amount}"));
+                Ok(BridgeQuote {
+                    quote_id: "q1".into(),
+                    invoice: format!("lnbc-invoice-for-{accepted_mint}"),
+                })
+            }
+
+            async fn melt_pay(&self, invoice: &str) -> Result<(), PaymentWalletError> {
+                self.calls.lock().unwrap().push(format!("melt_pay:{invoice}"));
+                Ok(())
+            }
+
+            async fn mint_token(
+                &self,
+                accepted_mint: &MintUrl,
+                quote: &BridgeQuote,
+            ) -> Result<Token, PaymentWalletError> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("mint_token:{}", quote.quote_id));
+                let proof = p2pk_proof_for_keyset(7, self.seller, self.keyset_id);
+                Ok(Token::new(
+                    accepted_mint.clone(),
+                    vec![proof],
+                    None,
+                    CurrencyUnit::Sat,
+                ))
+            }
+        }
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bridge = MockBridge {
+            calls: calls.clone(),
+            seller: secret_key(1).public_key(),
+            keyset_id: Id::from_str(KEYSET_ID).unwrap(),
+        };
+
+        let token = bridge_to_accepted_mint(&bridge, &mint(MINT), Amount::from(7))
+            .await
+            .unwrap();
+
+        // The bridged token is from the listed (accepted) mint — ready to become the NUT-18 payload.
+        assert_eq!(token.mint_url().unwrap(), mint(MINT));
+        assert_eq!(token.value().unwrap(), Amount::from(7));
+        // Bridge order: mint-quote at the accepted mint → melt (pay) that invoice → mint fresh.
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![
+                format!("mint_quote:{}:7", mint(MINT)),
+                format!("melt_pay:lnbc-invoice-for-{}", mint(MINT)),
+                "mint_token:q1".to_string(),
+            ]
+        );
+
+        // A bridge leg failing refuses with the `mint_unreachable_pay` money-path reason code.
+        struct FailingBridge;
+        impl LightningBridge for FailingBridge {
+            async fn mint_quote(
+                &self,
+                _accepted_mint: &MintUrl,
+                _amount: Amount,
+            ) -> Result<BridgeQuote, PaymentWalletError> {
+                Err(PaymentWalletError::Wallet("accepted mint unreachable".into()))
+            }
+            async fn melt_pay(&self, _invoice: &str) -> Result<(), PaymentWalletError> {
+                unreachable!("mint_quote already failed")
+            }
+            async fn mint_token(
+                &self,
+                _accepted_mint: &MintUrl,
+                _quote: &BridgeQuote,
+            ) -> Result<Token, PaymentWalletError> {
+                unreachable!("mint_quote already failed")
+            }
+        }
+        let err = bridge_to_accepted_mint(&FailingBridge, &mint(MINT), Amount::from(7))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PaymentWalletError::Wallet(message) if message.contains("mint_unreachable_pay")
         ));
     }
 
@@ -2440,6 +2816,10 @@ mod tests {
 
     fn mint(url: &str) -> MintUrl {
         MintUrl::from_str(url).unwrap()
+    }
+
+    fn accepted(urls: &[&str]) -> HashSet<MintUrl> {
+        urls.iter().map(|url| mint(url)).collect()
     }
 
     struct CountingSend(Arc<AtomicUsize>);

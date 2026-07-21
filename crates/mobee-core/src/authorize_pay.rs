@@ -50,6 +50,12 @@ pub struct AuthorizePayRequest {
     /// before piece-14. NOT mandatory this job (A′ flips requirements); `Some` once Job C authors
     /// the creq. Bound into the [`PaymentKey`] attempt id and the co-signed receipt preimage.
     pub creq_hash: Option<String>,
+    /// Piece-14 Job E: the seller-authored `creq`'s accepted-mint list (`m`), read off the
+    /// accepted claim. The buyer pays from a mint it holds balance at that appears here; empty for
+    /// a v1 claim with no `creq` — the buyer then pays from the pinned default mint exactly as
+    /// before piece-14.
+    #[allow(clippy::struct_field_names)]
+    pub accepted_mints: Vec<String>,
     /// Piece-10 contribution binds. `None` ⇒ from-scratch job — EXACTLY today's path (no new
     /// verify, byte-identical produced artifacts). `Some(..)` ⇒ the fork contribution verify-path
     /// (custody fetch + base-from-pin + descendant + content) + the authorship tuple seam run
@@ -215,8 +221,8 @@ pub async fn authorize_pay_async(
     let seller_nostr = NostrPublicKey::parse(&request.seller_pubkey)
         .map_err(|error| AuthorizePayError::Input(format!("seller_pubkey: {error}")))?;
     let seller_p2pk = cashu_compressed_from_nostr(&seller_nostr)?;
-    let mint = MintUrl::from_str(DEFAULT_MINT_URL)
-        .map_err(|error| AuthorizePayError::Input(format!("mint url: {error}")))?;
+    // Piece-14 Job E: choose the realized mint the buyer pays at from the seller's `creq` `m` list.
+    let mint = resolve_realized_mint(&request.accepted_mints)?;
     let terms = PaymentTerms::new(
         mint,
         Amount::from(request.amount_sats),
@@ -391,6 +397,43 @@ fn contribution_policy(home: &MobeeHome) -> crate::contribution::ContentPolicy {
         },
         None => crate::contribution::ContentPolicy::floor(),
     }
+}
+
+/// PIECE-14 Job E buyer mint selection (§ The Lightning bridge).
+///
+/// The buyer pays from a mint it holds balance at that the seller listed in its `creq` `m` array.
+/// The buyer wallet is hard-pinned to [`DEFAULT_MINT_URL`] (`buyer_fund`), so "holds balance at a
+/// listed mint" reduces to: is the default mint in the creq list?
+///
+/// - **v1 claim (no creq ⇒ empty list):** pay from the pinned default mint — byte-identical to
+///   before piece-14.
+/// - **v2, default mint listed:** pay directly from the default mint (the direct path).
+/// - **v2, default mint NOT listed:** the buyer would have to BRIDGE over Lightning
+///   ([`crate::payment_wallet::bridge_to_accepted_mint`]). That live cross-mint path is fail-closed
+///   in v2 — accepted mints are testnut-only and the buyer wallet is single-mint, so there is no
+///   second reachable mint to mint-quote/melt against, and it cannot be validated without live
+///   mints. It refuses `mint_unreachable_pay`; no funds move, no binding is committed. The bridge
+///   mechanism itself is implemented and unit-tested for a future multi-mint enablement.
+fn resolve_realized_mint(accepted_mints: &[String]) -> Result<MintUrl, AuthorizePayError> {
+    let buyer_mint = MintUrl::from_str(DEFAULT_MINT_URL)
+        .map_err(|error| AuthorizePayError::Input(format!("mint url: {error}")))?;
+    if accepted_mints.is_empty() {
+        return Ok(buyer_mint);
+    }
+    let listed = accepted_mints
+        .iter()
+        .map(|entry| MintUrl::from_str(entry))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            AuthorizePayError::Input(format!("creq accepted mint url: {error}"))
+        })?;
+    if listed.contains(&buyer_mint) {
+        return Ok(buyer_mint);
+    }
+    Err(AuthorizePayError::Wallet(PaymentWalletError::Wallet(format!(
+        "mint_unreachable_pay: buyer holds no balance at any creq mint {listed:?}; the live \
+         cross-mint Lightning bridge is disabled in v2 (testnut-only, single-mint wallet)"
+    ))))
 }
 
 fn cashu_compressed_from_nostr(key: &NostrPublicKey) -> Result<CashuPublicKey, AuthorizePayError> {
@@ -667,6 +710,36 @@ mod tests {
     use crate::budget::BudgetGate;
     use crate::home;
 
+    // PIECE-14 Job E v1-compat: a claim WITHOUT a creq (empty accepted-mint list) resolves the
+    // realized mint to the pinned default mint — byte-identical to the pre-piece-14 pay path (this
+    // mirrors Job D's None-compat pattern).
+    #[test]
+    fn resolve_realized_mint_v1_no_creq_uses_default_mint() {
+        let mint = resolve_realized_mint(&[]).unwrap();
+        assert_eq!(mint, MintUrl::from_str(DEFAULT_MINT_URL).unwrap());
+    }
+
+    // Direct path: the buyer's default mint is one the seller listed → pay from it directly.
+    #[test]
+    fn resolve_realized_mint_direct_when_default_mint_is_listed() {
+        let mint = resolve_realized_mint(&[
+            "https://other.example".to_string(),
+            DEFAULT_MINT_URL.to_string(),
+        ])
+        .unwrap();
+        assert_eq!(mint, MintUrl::from_str(DEFAULT_MINT_URL).unwrap());
+    }
+
+    // Bridge needed but disabled in v2: the buyer holds balance only at the default mint, which the
+    // seller did NOT list → refuse `mint_unreachable_pay` fail-closed (no spend).
+    #[test]
+    fn resolve_realized_mint_refuses_when_bridge_would_be_needed() {
+        let error =
+            resolve_realized_mint(&["https://other.example".to_string()]).unwrap_err();
+        assert!(matches!(error, AuthorizePayError::Wallet(_)));
+        assert!(error.to_string().contains("mint_unreachable_pay"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn authorize_pay_sync_refuses_inside_runtime() {
         let root = std::env::temp_dir().join(format!(
@@ -692,6 +765,7 @@ mod tests {
             commit_oid: "aa".repeat(20),
             seller_signature: String::new(),
             creq_hash: None,
+            accepted_mints: Vec::new(),
             contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, request).expect_err("must refuse nested block_on");
@@ -730,6 +804,7 @@ mod tests {
             commit_oid: "aa".repeat(20),
             seller_signature: String::new(),
             creq_hash: None,
+            accepted_mints: Vec::new(),
             contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, request).expect_err("D2 empty");
@@ -767,6 +842,7 @@ mod tests {
             commit_oid: "cc".repeat(20),
             seller_signature: String::new(),
             creq_hash: None,
+            accepted_mints: Vec::new(),
             contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, request).expect_err("D2 mismatch");
@@ -816,6 +892,7 @@ mod tests {
             commit_oid: "aa".repeat(20),
             seller_signature: valid_sig,
             creq_hash: None,
+            accepted_mints: Vec::new(),
             contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, request.clone()).expect_err("ext refused");
@@ -922,6 +999,7 @@ mod tests {
             commit_oid: oid,
             seller_signature: forged_sig,
             creq_hash: None,
+            accepted_mints: Vec::new(),
             contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, request).expect_err("forged sig refused pre-pay");
@@ -976,6 +1054,7 @@ mod tests {
             commit_oid: honest_oid.clone(),
             seller_signature: sig_over_2,
             creq_hash: None,
+            accepted_mints: Vec::new(),
             contribution: None,
         };
         let err = authorize_pay(&home, &mut gate, tampered_amount).expect_err("tampered amount");
@@ -1004,6 +1083,7 @@ mod tests {
             commit_oid: tampered_oid,
             seller_signature: sig_over_aa,
             creq_hash: None,
+            accepted_mints: Vec::new(),
             contribution: None,
         };
         let err2 = authorize_pay(&home, &mut gate2, tampered_delivery).expect_err("tampered oid");
