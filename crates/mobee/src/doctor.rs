@@ -153,7 +153,7 @@ mod checks {
     use std::time::Duration;
 
     use mobee_core::doctor::{self, RelayProbe};
-    use mobee_core::home::{AgentPresetConfig, SellerConfig};
+    use mobee_core::home::{AgentPresetConfig, SellerConfig, TelemetryConfig};
     use mobee_core::seller_git;
 
     use super::Check;
@@ -166,6 +166,7 @@ mod checks {
     const RELAY_CHECK: &str = "relay reachability";
     const MINT_CHECK: &str = "mint reachability";
     const AGENT_CHECK: &str = "agent preset";
+    const TELEMETRY_CHECK: &str = "telemetry";
 
     // Informational only (issue #55): the seller signs NIP-98 in-process (libgit2 transport), so the
     // external `git-credential-nostr` helper is no longer required for delivery push / base fetch.
@@ -264,6 +265,35 @@ mod checks {
         }
     }
 
+    // Informational only: report the brain/episode telemetry channel's posture — armed?, sink
+    // resolvable?, mirror configured? — and never FAIL on it (telemetry is diagnostic, best-effort;
+    // a missing sink can never break selling). WARN only when a configured sink argv0 is unresolvable.
+    pub(super) fn check_telemetry(telemetry: TelemetryConfig) -> Check {
+        if !telemetry.enabled {
+            return Check::pass(TELEMETRY_CHECK, "disabled ([telemetry] enabled = false)");
+        }
+        let mirror = telemetry
+            .mirror_file
+            .as_ref()
+            .map(|p| format!(", mirror_file={}", p.display()))
+            .unwrap_or_default();
+        let Some(argv0) = telemetry.command.first().cloned() else {
+            return Check::pass(
+                TELEMETRY_CHECK,
+                format!("armed, no sink command configured (episodes.jsonl still captured){mirror}"),
+            );
+        };
+        if argv0_resolvable(&argv0) {
+            Check::pass(TELEMETRY_CHECK, format!("armed, sink '{argv0}' resolvable{mirror}"))
+        } else {
+            Check::warn(
+                TELEMETRY_CHECK,
+                format!("armed, sink '{argv0}' not found{mirror}"),
+                "install the sink command or fix [telemetry] command (telemetry is best-effort)",
+            )
+        }
+    }
+
     fn build_runtime() -> Result<tokio::runtime::Runtime, String> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -334,6 +364,7 @@ fn run_doctor(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         .collect();
     let seller = home.config.seller.clone();
     let custom_agents = home.config.agents.clone();
+    let telemetry = home.config.telemetry.clone();
 
     let mut checks: Vec<Box<dyn FnOnce() -> Check>> = vec![
         Box::new(check_git_version),
@@ -344,6 +375,7 @@ fn run_doctor(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         checks.push(Box::new(move || checks::check_mint(mint_url)));
     }
     checks.push(Box::new(move || checks::check_agent_preset(seller, custom_agents)));
+    checks.push(Box::new(move || checks::check_telemetry(telemetry)));
 
     let results = run_checks(checks);
     for result in &results {

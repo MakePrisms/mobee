@@ -202,6 +202,82 @@ pub fn default_announce_timeout_ms() -> u64 {
     2000
 }
 
+/// Seller **brain/episode telemetry** config (`[telemetry]` section). Wires every captured
+/// [`Episode`](crate::episode::Episode) — the per-job reasoning + economics record already written
+/// to `episodes.jsonl` — to a live stream so an operator can watch what is going on inside a
+/// mobee's brain: a pluggable sink command (one JSON event on stdin, same exec/timeout contract as
+/// [`SellerAnnounceConfig`]) and/or an append-only JSONL mirror file. See [`crate::telemetry`].
+///
+/// **Feature ON by default** (`enabled = true`): the channel is armed. It only produces output
+/// once a `command` and/or `mirror_file` is configured — with both unset, `enabled` alone emits
+/// nowhere (and `episodes.jsonl` is unaffected either way). This is deliberate: telemetry is the
+/// live wire over the top of the on-disk episode log, not a second copy of it — so the default
+/// does not silently duplicate `episodes.jsonl` to a new file.
+///
+/// NOTE (same money-path build boundary as [`SellerMemoryConfig`] / [`SellerAnnounceConfig`]):
+/// top-level on `MobeeConfig` (built only via `Default`) so no money-path file is touched.
+///
+/// Diagnostic/observability only, sharing the episode's guarantees: an event NEVER carries a
+/// token/key/proof-secret (it wraps an `Episode`, which holds none — see `episode.rs`), emission is
+/// best-effort off the hot path, and a sink/mirror failure never blocks or loses the
+/// `episodes.jsonl` append (the caller performs that FIRST). Nothing here ever feeds the pay gate,
+/// journal, or receipt bind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryConfig {
+    /// Arm the telemetry channel. Default **true**. When false, no event is emitted or mirrored
+    /// (episodes.jsonl is unaffected).
+    #[serde(default = "default_telemetry_enabled")]
+    pub enabled: bool,
+    /// Sink command as an argv array (no-shell by construction, like `agent_command`). Empty ⇒ no
+    /// sink process is spawned. Each episode spawns this command with the event JSON on stdin.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Upper bound (ms) the emitter waits for one sink invocation before killing it. Emission is
+    /// off the hot path (its own detached thread), so this bounds only that thread — the seller
+    /// loop and the episode append are never blocked regardless. Default **2000**.
+    #[serde(default = "default_telemetry_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Optional append-only JSONL mirror path. Unset ⇒ no mirror. When set, each event is durably
+    /// appended to this file in addition to (or instead of) the sink command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_file: Option<PathBuf>,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_telemetry_enabled(),
+            command: Vec::new(),
+            timeout_ms: default_telemetry_timeout_ms(),
+            mirror_file: None,
+        }
+    }
+}
+
+impl TelemetryConfig {
+    /// True when every field is at its shipped default (so config.toml stays clean — the section
+    /// only serializes once an operator points it somewhere or changes the bound/enablement).
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// True when the channel is armed AND has somewhere to emit (a sink command or a mirror file).
+    /// `enabled` alone (no command, no mirror) is armed-but-unpointed and emits nowhere.
+    pub fn is_active(&self) -> bool {
+        self.enabled && (!self.command.is_empty() || self.mirror_file.is_some())
+    }
+}
+
+/// serde default for [`TelemetryConfig::enabled`] — the brain-telemetry channel is ON by default.
+pub fn default_telemetry_enabled() -> bool {
+    true
+}
+
+/// serde default for [`TelemetryConfig::timeout_ms`] — a 2s bound on one sink invocation.
+pub fn default_telemetry_timeout_ms() -> u64 {
+    2000
+}
+
 /// `[seller_heartbeat]` — cadence + enablement for the addressable kind-30340 liveness event
 /// (PIECE-14 § Heartbeat). **Feature ON by default**: a running seller advertises liveness every
 /// [`interval_secs`](SellerHeartbeatConfig::interval_secs) seconds. The heartbeat is
@@ -447,6 +523,9 @@ pub struct MobeeConfig {
     /// `[seller_announce]` lifecycle-event sink config. Defaults (feature OFF) when absent.
     #[serde(default, skip_serializing_if = "SellerAnnounceConfig::is_default")]
     pub seller_announce: SellerAnnounceConfig,
+    /// `[telemetry]` brain/episode stream config. Defaults (armed, no sink/mirror) when absent.
+    #[serde(default, skip_serializing_if = "TelemetryConfig::is_default")]
+    pub telemetry: TelemetryConfig,
     /// `[seller_heartbeat]` addressable kind-30340 liveness config. Defaults (ON, 300s) when absent.
     #[serde(default, skip_serializing_if = "SellerHeartbeatConfig::is_default")]
     pub seller_heartbeat: SellerHeartbeatConfig,
@@ -527,6 +606,7 @@ impl Default for MobeeConfig {
             agents: BTreeMap::new(),
             seller_memory: SellerMemoryConfig::default(),
             seller_announce: SellerAnnounceConfig::default(),
+            telemetry: TelemetryConfig::default(),
             seller_heartbeat: SellerHeartbeatConfig::default(),
             seller_preflight: SellerPreflightConfig::default(),
             contribution: None,
