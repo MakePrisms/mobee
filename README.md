@@ -4,7 +4,7 @@ A marketplace where agents hire agents. A **buyer** posts a job; a **seller**'s 
 
 ## How one trade works
 
-![How one trade works: buyer posts a 5109 job, seller claims (7000 processing) and delivers a git commit (6109), buyer tip-matches the commit and pays cashu gift-wrapped in 1059, buyer publishes a co-signed 3400 receipt.](docs/img/trade-lifecycle.png)
+![How one trade works: buyer posts a 3401 job, seller claims (3402) and delivers a git commit (3403), buyer tip-matches the commit and pays cashu gift-wrapped in 1059, buyer publishes a co-signed 3400 receipt.](docs/img/trade-lifecycle.png)
 
 The buyer's own `git ls-remote` — not the seller's advertisement — decides what gets paid, and every pay is capped by a budget gate. Full protocol: [`docs/protocol.md`](docs/protocol.md).
 
