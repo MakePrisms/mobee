@@ -2,8 +2,56 @@
 //!
 //! First-run bootstrap writes working defaults: testnut mint, mobee-relay, budget caps,
 //! autogen key (`0600`), and an empty `wallet/` dir. The secret key is never returned.
+//!
+//! # Layered configuration
+//!
+//! [`MobeeConfig`] resolves in three layers, later winning:
+//!
+//! 1. **built-in defaults** — [`MobeeConfig::default`].
+//! 2. **file** — `~/.mobee/config.toml` (if present). Absent fields fall back to the defaults;
+//!    unknown fields refuse (`deny_unknown_fields`). The single-mint legacy `mint_url = "…"` key
+//!    folds into `accepted_mints`.
+//! 3. **environment** — `MOBEE_*` variables. Every field is reachable: uppercase the field path,
+//!    prefix `MOBEE_`, join nested fields with `__` (double underscore). Comma-separated for lists.
+//!
+//! The typed struct is the single in-process representation — only its *construction* is layered
+//! (the one seam is [`bootstrap`] / [`reload_config`], both routed through the env overlay). Every
+//! layer fails closed: an unknown or malformed key refuses with the offending key named, never a
+//! silent default.
+//!
+//! ## Env mapping
+//!
+//! | Field | Variable |
+//! |-------|----------|
+//! | `relay_url` | `MOBEE_RELAY_URL` |
+//! | `accepted_mints` (list) | `MOBEE_ACCEPTED_MINTS=a,b` |
+//! | `per_job_budget_sats` | `MOBEE_PER_JOB_BUDGET_SATS` |
+//! | `total_budget_sats` | `MOBEE_TOTAL_BUDGET_SATS` |
+//! | `extra_mints` (list) | `MOBEE_EXTRA_MINTS=a,b` |
+//! | `allow_real_mints` | `MOBEE_ALLOW_REAL_MINTS` |
+//! | `profile.name` | `MOBEE_PROFILE__NAME` |
+//! | `seller.rate_sats` | `MOBEE_SELLER__RATE_SATS` |
+//! | `seller.agent_command` (list) | `MOBEE_SELLER__AGENT_COMMAND=claude,--flag` |
+//! | `seller_announce.command` (list) | `MOBEE_SELLER_ANNOUNCE__COMMAND=…` |
+//! | `telemetry.mirror_file` | `MOBEE_TELEMETRY__MIRROR_FILE` |
+//! | `seller_heartbeat.interval_secs` | `MOBEE_SELLER_HEARTBEAT__INTERVAL_SECS` |
+//! | `seller_preflight.boot_push_preflight` | `MOBEE_SELLER_PREFLIGHT__BOOT_PUSH_PREFLIGHT` |
+//! | `contribution.allowed_paths` (list) | `MOBEE_CONTRIBUTION__ALLOWED_PATHS=…` |
+//!
+//! List fields comma-split only for the paths in [`LIST_ENV_KEYS`]. The `agents` map is file-only
+//! via env: its keys are dynamic, so a nested `argv` list path cannot be pre-registered for
+//! splitting. `MOBEE_`-prefixed operational/test seams ([`RESERVED_ENV_VARS`], e.g. `MOBEE_HOME`)
+//! are excluded from the config layer.
+//!
+//! ## Minimal env-only boot (file-less container)
+//!
+//! With no `config.toml`, the built-in defaults already boot a **buyer** (testnut mint, mobee-relay,
+//! budget caps). A **seller** additionally needs the seller table, whose minimal env set is:
+//! `MOBEE_SELLER__AGENT_COMMAND`, `MOBEE_SELLER__RATE_SATS`, `MOBEE_SELLER__GIT_REMOTE`. The key is
+//! still auto-generated on bootstrap (or supplied out-of-band); `NOSTR_PRIVATE_KEY` handling is
+//! unchanged and never read here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -51,6 +99,7 @@ impl std::error::Error for HomeError {}
 /// Absent by default — fresh bootstrap does **not** invent a name. Kind-0 names are
 /// untrusted display metadata only; decision paths must key on hex pubkey alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -68,6 +117,7 @@ pub const DEFAULT_RELAY_GIT_REPO: &str = "mobee-seller";
 /// `agent_command` MUST be an argv array — a TOML string/shell value is refused at parse
 /// (no-shell by construction).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SellerConfig {
     #[serde(deserialize_with = "deserialize_agent_command_argv")]
     pub agent_command: Vec<String>,
@@ -113,6 +163,7 @@ pub struct SellerConfig {
 /// This is **diagnostic/economic** context only. Nothing here ever feeds the pay gate, the
 /// journal, or the receipt bind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SellerMemoryConfig {
     /// Inline the distilled `MEMORY.md` index into the agent's job prompt at start. Default
     /// **on**; when **false** the composed prompt is byte-identical to the memory-off output.
@@ -158,6 +209,7 @@ impl Default for SellerMemoryConfig {
 /// diagnostic/observability context only; nothing here ever feeds the pay gate, journal, or
 /// receipt bind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SellerAnnounceConfig {
     /// Sink command as an argv array (no-shell by construction, like `agent_command`). Empty ⇒
     /// feature OFF. Each lifecycle event spawns this command with the event JSON on stdin.
@@ -218,6 +270,7 @@ pub fn default_announce_timeout_ms() -> u64 {
 /// `episodes.jsonl` append (the caller performs that FIRST). Nothing here ever feeds the pay gate,
 /// journal, or receipt bind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     /// Arm the telemetry channel. Default **true**. When false, no event is emitted or mirrored
     /// (episodes.jsonl is unaffected).
@@ -280,6 +333,7 @@ pub fn default_telemetry_timeout_ms() -> u64 {
 /// job loop, feeds the pay gate, or binds a receipt. Tests can override the cadence/enablement
 /// via [`crate::heartbeat::HEARTBEAT_INTERVAL_ENV`] / [`crate::heartbeat::HEARTBEAT_ENABLED_ENV`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SellerHeartbeatConfig {
     /// Publish heartbeats while the daemon runs. Default **true**.
     #[serde(default = "default_heartbeat_enabled")]
@@ -330,6 +384,7 @@ pub fn default_heartbeat_interval_secs() -> u64 {
 /// the probe is diagnostic — it NEVER feeds the pay gate, journal, or receipt bind, and NEVER
 /// refuses boot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SellerPreflightConfig {
     /// Run the boot-time dry-run push probe. Default **true**. Set false (or the env override
     /// `MOBEE_SELLER_BOOT_PUSH_PREFLIGHT=0`) to skip — e.g. tests, or air-gapped first boots.
@@ -468,6 +523,7 @@ where
 /// One custom agent preset (`[agents.<name>] argv = [...]`). The argv is a launch command
 /// for the seller ACP driver — same no-shell argv-array rule as `agent_command`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentPresetConfig {
     #[serde(deserialize_with = "deserialize_agent_command_argv")]
     pub argv: Vec<String>,
@@ -475,7 +531,10 @@ pub struct AgentPresetConfig {
 
 /// Buyer-facing packaged config (`~/.mobee/config.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MobeeConfig {
+    /// Open-market relay. Absent in the file ⇒ the built-in [`DEFAULT_RELAY_URL`].
+    #[serde(default = "default_relay_url")]
     pub relay_url: String,
     /// Seller-side accept policy: the mints this seller will accept payment at. The first
     /// entry is the mint the seller advertises first and also the buyer-side wallet default
@@ -486,7 +545,11 @@ pub struct MobeeConfig {
     /// fields with separate meanings and are never merged or repurposed for one another.
     #[serde(default = "default_accepted_mints")]
     pub accepted_mints: Vec<String>,
+    /// Per-job spend cap (sats). Absent ⇒ the built-in [`DEFAULT_PER_JOB_BUDGET_SATS`].
+    #[serde(default = "default_per_job_budget_sats")]
     pub per_job_budget_sats: u64,
+    /// Rolling/session spend cap (sats). Absent ⇒ the built-in [`DEFAULT_TOTAL_BUDGET_SATS`].
+    #[serde(default = "default_total_budget_sats")]
     pub total_budget_sats: u64,
     /// Opt-in additional mints for the BUYER wallet (`mobee wallet mints add`). The buyer's
     /// default mint stays the first `accepted_mints` entry ([`MobeeConfig::default_mint`]);
@@ -538,6 +601,7 @@ pub struct MobeeConfig {
 /// to `contribution::ContentPolicy`; kept as a plain config type so `home` need not depend on the
 /// git-delivery feature. All fields default to the floor (allow all, forbid none, no cap).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ContributionPolicyConfig {
     /// Non-empty ⇒ every changed path MUST lie under one of these prefixes (out-of-scope refuse).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -554,6 +618,21 @@ pub struct ContributionPolicyConfig {
 /// default, so an operator who configures nothing behaves identically to today.
 fn default_accepted_mints() -> Vec<String> {
     vec![DEFAULT_MINT_URL.to_owned()]
+}
+
+/// Serde default for [`MobeeConfig::relay_url`] — the built-in [`DEFAULT_RELAY_URL`].
+fn default_relay_url() -> String {
+    DEFAULT_RELAY_URL.to_owned()
+}
+
+/// Serde default for [`MobeeConfig::per_job_budget_sats`] — [`DEFAULT_PER_JOB_BUDGET_SATS`].
+fn default_per_job_budget_sats() -> u64 {
+    DEFAULT_PER_JOB_BUDGET_SATS
+}
+
+/// Serde default for [`MobeeConfig::total_budget_sats`] — [`DEFAULT_TOTAL_BUDGET_SATS`].
+fn default_total_budget_sats() -> u64 {
+    DEFAULT_TOTAL_BUDGET_SATS
 }
 
 /// The single real-mint fence predicate (issue #49), shared by the seller `accepted_mints` boot
@@ -637,7 +716,9 @@ pub fn default_home_dir() -> Result<PathBuf, HomeError> {
 /// Ensure `root` exists with config, key (`0600`), and `wallet/` dir.
 ///
 /// Idempotent: existing config/key are left in place except dead-mint migration
-/// (`testnut.cashu.space` → [`DEFAULT_MINT_URL`]). Never returns the secret key.
+/// (`testnut.cashu.space` → [`DEFAULT_MINT_URL`]). The persisted `config.toml` is the file layer;
+/// the returned [`MobeeHome::config`] additionally carries the `MOBEE_*` environment overlay (see
+/// the module docs). Never returns the secret key.
 pub fn bootstrap(root: impl AsRef<Path>) -> Result<MobeeHome, HomeError> {
     let root = root.as_ref().to_path_buf();
     fs::create_dir_all(&root).map_err(|error| HomeError::Io(error.to_string()))?;
@@ -646,7 +727,7 @@ pub fn bootstrap(root: impl AsRef<Path>) -> Result<MobeeHome, HomeError> {
     let key_path = root.join(KEY_FILE);
     let wallet_dir = root.join(WALLET_DIR);
 
-    let config = if config_path.exists() {
+    let file_config = if config_path.exists() {
         let mut config = load_config(&config_path)?;
         if migrate_dead_mint_url(&mut config) {
             write_config(&config_path, &config)?;
@@ -667,6 +748,8 @@ pub fn bootstrap(root: impl AsRef<Path>) -> Result<MobeeHome, HomeError> {
         write_new_key(&key_path)?;
         true
     };
+
+    let config = apply_env_layer(&file_config, config_env_from_process())?;
 
     Ok(MobeeHome {
         root,
@@ -690,25 +773,24 @@ pub fn migrate_dead_mint_url(config: &mut MobeeConfig) -> bool {
     changed
 }
 
-/// Back-compat shim: a legacy config carrying only the single top-level `mint_url = "…"`
-/// (pre-`accepted_mints`) folds into `accepted_mints = ["<that value>"]` when the file does
-/// not already carry an `accepted_mints` key. Never silently drops a configured mint. A no-op
-/// once `accepted_mints` is present. Operates on the raw TOML because the removed `mint_url`
-/// field is otherwise ignored on deserialize.
-fn migrate_legacy_mint_url(raw: &str, config: &mut MobeeConfig) -> Result<(), HomeError> {
-    let doc: toml::Value =
-        toml::from_str(raw).map_err(|error| HomeError::Config(error.to_string()))?;
-    let table = match doc.as_table() {
-        Some(table) => table,
-        None => return Ok(()),
+/// Back-compat: a legacy config carrying the single top-level `mint_url = "…"` (pre-
+/// `accepted_mints`) folds into `accepted_mints = ["<that value>"]` when the file does not already
+/// carry an `accepted_mints` key — the modern list wins when both are present. Never silently drops
+/// a configured mint. The legacy key is removed from the table afterward so the typed parse (which
+/// refuses unknown fields) never sees it.
+fn fold_legacy_mint_url(table: &mut toml::Table) {
+    let Some(legacy) = table.remove("mint_url") else {
+        return;
     };
     if table.contains_key("accepted_mints") {
-        return Ok(());
+        return;
     }
-    if let Some(legacy) = table.get("mint_url").and_then(|value| value.as_str()) {
-        config.accepted_mints = vec![legacy.to_owned()];
+    if let Some(mint) = legacy.as_str() {
+        table.insert(
+            "accepted_mints".to_owned(),
+            toml::Value::Array(vec![toml::Value::String(mint.to_owned())]),
+        );
     }
-    Ok(())
 }
 
 /// Hex-encode the secp256k1 x-only/public view is deferred; this returns the *public* key
@@ -740,12 +822,89 @@ pub fn public_key_hex(home: &MobeeHome) -> Result<String, HomeError> {
     Ok(keys.public_key().to_hex())
 }
 
+/// The FILE layer: read `config.toml` into the typed [`MobeeConfig`]. Absent fields fall back to
+/// the built-in defaults (so this is already the defaults→file merge); unknown fields refuse with
+/// the offending key named. The legacy single `mint_url` folds into `accepted_mints` first.
 fn load_config(path: &Path) -> Result<MobeeConfig, HomeError> {
     let raw = fs::read_to_string(path).map_err(|error| HomeError::Config(error.to_string()))?;
-    let mut config: MobeeConfig =
-        toml::from_str(&raw).map_err(|error| HomeError::Config(error.to_string()))?;
-    migrate_legacy_mint_url(&raw, &mut config)?;
-    Ok(config)
+    parse_config_toml(&raw)
+}
+
+/// Parse a `config.toml` document into the file-layer [`MobeeConfig`]. Fold legacy `mint_url`, then
+/// typed-parse under `deny_unknown_fields` so any other unknown key (at any depth) refuses.
+fn parse_config_toml(raw: &str) -> Result<MobeeConfig, HomeError> {
+    let mut table: toml::Table =
+        toml::from_str(raw).map_err(|error| HomeError::Config(format!("config.toml: {error}")))?;
+    fold_legacy_mint_url(&mut table);
+    table
+        .try_into()
+        .map_err(|error| HomeError::Config(format!("config.toml: {error}")))
+}
+
+/// `MOBEE_`-prefixed environment variables that are operational/test seams, **not**
+/// [`MobeeConfig`] fields (home resolution and the daemon test overrides read these directly). They
+/// are excluded from the env config layer so they neither collide with a field nor — under
+/// `deny_unknown_fields` — refuse resolution. None of these collide with a real field's canonical
+/// `MOBEE_*` spelling, so excluding them costs no config coverage.
+const RESERVED_ENV_VARS: &[&str] = &[
+    "MOBEE_HOME",
+    "MOBEE_HEARTBEAT_INTERVAL_SECS",
+    "MOBEE_HEARTBEAT_ENABLED",
+    "MOBEE_WRAP_BACKFILL_INTERVAL_SECS",
+    "MOBEE_SELLER_BOOT_PUSH_PREFLIGHT",
+    "MOBEE_GIT_CREDENTIAL_NOSTR",
+    "MOBEE_ACP_SMOKE",
+    "MOBEE_ACP_SMOKE_CMD",
+    "MOBEE_EVALS_SNAPSHOT_DIR",
+];
+
+/// [`MobeeConfig`] fields whose env value is a comma-separated list. The env source must be told
+/// which keys parse into a sequence — a scalar `String` field must not be split. Keyed by the
+/// resolved (lowercase, `.`-nested) config path. `agents.<name>.argv` is intentionally absent: the
+/// map keys are dynamic and cannot be pre-registered, so multi-token agent argv is file-only.
+const LIST_ENV_KEYS: &[&str] = &[
+    "accepted_mints",
+    "extra_mints",
+    "seller.agent_command",
+    "seller_announce.command",
+    "telemetry.command",
+    "contribution.allowed_paths",
+    "contribution.forbidden_paths",
+];
+
+/// The process environment's config-layer variables: every `MOBEE_`-prefixed var that is not a
+/// reserved operational seam ([`RESERVED_ENV_VARS`]).
+fn config_env_from_process() -> HashMap<String, String> {
+    std::env::vars()
+        .filter(|(key, _)| key.starts_with("MOBEE_") && !RESERVED_ENV_VARS.contains(&key.as_str()))
+        .collect()
+}
+
+/// Overlay the ENV layer on a resolved defaults/file [`MobeeConfig`]. `env` is the pre-filtered
+/// `MOBEE_*` map ([`config_env_from_process`] in production; tests inject one). A malformed value
+/// (wrong type) or an unknown `MOBEE_<FIELD>` refuses fail-closed, naming the offending key.
+fn apply_env_layer(base: &MobeeConfig, env: HashMap<String, String>) -> Result<MobeeConfig, HomeError> {
+    let mut environment = config::Environment::with_prefix("MOBEE")
+        .prefix_separator("_")
+        .separator("__")
+        .try_parsing(true)
+        .list_separator(",")
+        .ignore_empty(true)
+        .source(Some(env));
+    for key in LIST_ENV_KEYS {
+        environment = environment.with_list_parse_key(key);
+    }
+    config::Config::builder()
+        .add_source(
+            config::Config::try_from(base).map_err(|error| {
+                HomeError::Config(format!("MOBEE_* environment layer: {error}"))
+            })?,
+        )
+        .add_source(environment)
+        .build()
+        .map_err(|error| HomeError::Config(format!("MOBEE_* environment layer: {error}")))?
+        .try_deserialize::<MobeeConfig>()
+        .map_err(|error| HomeError::Config(format!("MOBEE_* environment layer: {error}")))
 }
 
 fn write_config(path: &Path, config: &MobeeConfig) -> Result<(), HomeError> {
@@ -759,12 +918,14 @@ pub fn save_config(home: &MobeeHome) -> Result<(), HomeError> {
     write_config(&home.root.join(CONFIG_FILE), &home.config)
 }
 
-/// Reload `config.toml` into `home.config` without touching the key file.
+/// Reload `config.toml` into `home.config` without touching the key file. Routes through the same
+/// layer pipeline as [`bootstrap`]: file layer then `MOBEE_*` environment overlay.
 pub fn reload_config(home: &mut MobeeHome) -> Result<(), HomeError> {
-    home.config = load_config(&home.root.join(CONFIG_FILE))?;
-    if migrate_dead_mint_url(&mut home.config) {
-        write_config(&home.root.join(CONFIG_FILE), &home.config)?;
+    let mut file_config = load_config(&home.root.join(CONFIG_FILE))?;
+    if migrate_dead_mint_url(&mut file_config) {
+        write_config(&home.root.join(CONFIG_FILE), &file_config)?;
     }
+    home.config = apply_env_layer(&file_config, config_env_from_process())?;
     Ok(())
 }
 
@@ -868,10 +1029,11 @@ mod tests {
 
     #[test]
     fn agents_table_parses_round_trips_and_refuses_string_argv() {
+        // The legacy `mint_url` filler also exercises the fold in `parse_config_toml`.
         let raw = "relay_url = 'r'\nmint_url = 'm'\n\
                    per_job_budget_sats = 1\ntotal_budget_sats = 2\n\
                    [agents.grok]\nargv = ['grok', 'agent', 'stdio']\n";
-        let config: MobeeConfig = toml::from_str(raw).expect("parse [agents]");
+        let config = parse_config_toml(raw).expect("parse [agents]");
         assert_eq!(
             config.agents.get("grok").map(|p| p.argv.clone()),
             Some(vec!["grok".into(), "agent".into(), "stdio".into()])
@@ -885,10 +1047,10 @@ mod tests {
         let shelly = "relay_url = 'r'\nmint_url = 'm'\n\
                       per_job_budget_sats = 1\ntotal_budget_sats = 2\n\
                       [agents.grok]\nargv = 'grok agent stdio'\n";
-        assert!(toml::from_str::<MobeeConfig>(shelly).is_err());
+        assert!(parse_config_toml(shelly).is_err());
 
         // Absent table stays absent (config.toml stays clean).
-        let bare: MobeeConfig = toml::from_str(
+        let bare = parse_config_toml(
             "relay_url = 'r'\nmint_url = 'm'\nper_job_budget_sats = 1\ntotal_budget_sats = 2\n",
         )
         .expect("parse bare");
@@ -1053,5 +1215,140 @@ mod tests {
         assert_eq!(profile.name.as_deref(), Some("test-buyer"));
         assert_eq!(profile.about.as_deref(), Some("testnut only"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn env_layer_wins_over_file_and_defaults() {
+        // FILE layer overrides defaults for one field; DEFAULT stands for another; ENV then wins
+        // over both — across a scalar, a numeric, and a list (incl. the legacy-folded mint list).
+        let file = parse_config_toml(
+            "relay_url = 'wss://from-file'\nper_job_budget_sats = 50\n\
+             accepted_mints = ['https://file-mint']\n",
+        )
+        .expect("file layer");
+        // Sanity: defaults<file already merged by the file parse.
+        assert_eq!(file.relay_url, "wss://from-file"); // file over default
+        assert_eq!(file.total_budget_sats, DEFAULT_TOTAL_BUDGET_SATS); // default stands
+
+        let resolved = apply_env_layer(
+            &file,
+            env(&[
+                ("MOBEE_RELAY_URL", "wss://from-env"),
+                ("MOBEE_PER_JOB_BUDGET_SATS", "7"),
+                ("MOBEE_ACCEPTED_MINTS", "https://env-a,https://env-b"),
+            ]),
+        )
+        .expect("env layer");
+
+        assert_eq!(resolved.relay_url, "wss://from-env"); // env over file
+        assert_eq!(resolved.per_job_budget_sats, 7); // env over file
+        assert_eq!(
+            resolved.accepted_mints,
+            vec!["https://env-a".to_owned(), "https://env-b".to_owned()]
+        ); // env list over file list
+        assert_eq!(resolved.total_budget_sats, DEFAULT_TOTAL_BUDGET_SATS); // untouched default survives
+    }
+
+    #[test]
+    fn env_layer_overrides_nested_field() {
+        let base = MobeeConfig::default();
+        let resolved = apply_env_layer(
+            &base,
+            env(&[("MOBEE_SELLER_HEARTBEAT__INTERVAL_SECS", "42")]),
+        )
+        .expect("nested env");
+        assert_eq!(resolved.seller_heartbeat.interval_secs, 42);
+        assert!(resolved.seller_heartbeat.enabled); // sibling default preserved
+    }
+
+    #[test]
+    fn env_layer_refuses_malformed_value_naming_the_key() {
+        let error = apply_env_layer(
+            &MobeeConfig::default(),
+            env(&[("MOBEE_PER_JOB_BUDGET_SATS", "not-a-number")]),
+        )
+        .expect_err("malformed env must refuse");
+        let message = error.to_string();
+        assert!(
+            message.contains("per_job_budget_sats"),
+            "error must name the offending key: {message}"
+        );
+    }
+
+    #[test]
+    fn env_layer_refuses_unknown_variable() {
+        // A MOBEE_-prefixed var that is neither a field nor a reserved seam fails closed.
+        let error = apply_env_layer(
+            &MobeeConfig::default(),
+            env(&[("MOBEE_NO_SUCH_FIELD", "x")]),
+        )
+        .expect_err("unknown env must refuse");
+        assert!(error.to_string().contains("environment"));
+    }
+
+    #[test]
+    fn reserved_env_seams_never_reach_the_config_layer() {
+        // MOBEE_HOME (and the daemon test seams) map to no field; excluding them is what keeps
+        // resolution from refusing when they are set. The filtered map must drop them.
+        let raw = env(&[
+            ("MOBEE_HOME", "/tmp/x"),
+            ("MOBEE_HEARTBEAT_INTERVAL_SECS", "9"),
+            ("MOBEE_RELAY_URL", "wss://kept"),
+        ]);
+        let kept: HashMap<String, String> = raw
+            .into_iter()
+            .filter(|(key, _)| key.starts_with("MOBEE_") && !RESERVED_ENV_VARS.contains(&key.as_str()))
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert!(kept.contains_key("MOBEE_RELAY_URL"));
+        // And resolution succeeds precisely because the reserved seams were dropped.
+        let resolved = apply_env_layer(&MobeeConfig::default(), kept).expect("resolve");
+        assert_eq!(resolved.relay_url, "wss://kept");
+    }
+
+    #[test]
+    fn unknown_toml_field_refuses() {
+        let error = parse_config_toml(
+            "relay_url = 'r'\nper_job_budget_sats = 1\ntotal_budget_sats = 2\nbogus_field = 5\n",
+        )
+        .expect_err("unknown TOML field must refuse");
+        let message = error.to_string();
+        assert!(message.contains("config.toml"), "names the layer: {message}");
+        assert!(message.contains("bogus_field"), "names the key: {message}");
+    }
+
+    #[test]
+    fn env_only_boots_buyer_and_seller_without_a_file() {
+        // File-less container: defaults alone already boot a BUYER (mint, relay, budget caps).
+        let buyer = apply_env_layer(&MobeeConfig::default(), HashMap::new()).expect("buyer");
+        assert!(!buyer.relay_url.is_empty());
+        assert!(!buyer.default_mint().is_empty());
+        assert!(buyer.per_job_budget_sats > 0);
+        assert!(buyer.seller.is_none());
+
+        // A SELLER needs only the seller table's required fields via env.
+        let seller = apply_env_layer(
+            &MobeeConfig::default(),
+            env(&[
+                ("MOBEE_SELLER__AGENT_COMMAND", "claude,--headless"),
+                ("MOBEE_SELLER__RATE_SATS", "3"),
+                ("MOBEE_SELLER__GIT_REMOTE", "https://relay.example/git/x/y.git"),
+            ]),
+        )
+        .expect("seller boots from env alone");
+        let seller_cfg = seller.seller.expect("seller table present");
+        assert_eq!(
+            seller_cfg.agent_command,
+            vec!["claude".to_owned(), "--headless".to_owned()]
+        );
+        assert_eq!(seller_cfg.rate_sats, 3);
+        assert_eq!(seller_cfg.git_remote, "https://relay.example/git/x/y.git");
     }
 }
