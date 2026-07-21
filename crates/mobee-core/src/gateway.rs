@@ -503,10 +503,25 @@ pub struct ReceiptDelivery<'a> {
     pub kind: &'a str,
 }
 
+/// SHA-256 hex of a seller-authored NUT-18 payment request string (piece-14).
+///
+/// The bind is over the FULL `creq` tag-value string (the `creqA…` base64url-CBOR string) as
+/// UTF-8 bytes — never a re-decoded/re-encoded form — so buyer and seller hash byte-identical
+/// input. Both the attempt id ([`crate::payment::PaymentKey`]) and the co-signed receipt preimage
+/// ([`crate::receipt::ReceiptPreimage`]) bind this hash, and the receipt event carries it as a
+/// `["creq-hash", <hex>]` tag.
+pub fn creq_hash_hex(creq: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(creq.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 /// Buyer-authored kind-3400 receipt draft. Fixed tag order + a pinned `created_at` at the
 /// event-build site give a deterministic event id (idempotent republish). `delivery` adds
 /// the D4 binding tags; `exec_metadata` appends the buyer's filtered echo (may be empty —
-/// seller-claimed, NOT covered by the co-signatures).
+/// seller-claimed, NOT covered by the co-signatures). `creq_hash` (piece-14) is the
+/// seller-authored request hash bound into the co-signed preimage; `None` for a v1 claim.
 pub fn receipt_draft(
     offer_id: &str,
     result_id: &str,
@@ -517,6 +532,7 @@ pub fn receipt_draft(
     job_hash: &str,
     seller_signature: &str,
     buyer_signature: &str,
+    creq_hash: Option<&str>,
     delivery: Option<ReceiptDelivery<'_>>,
     exec_metadata: &[TagSpec],
 ) -> EventDraft {
@@ -531,6 +547,11 @@ pub fn receipt_draft(
         TagSpec::new(["sig", "seller", seller_signature]),
         TagSpec::new(["sig", "buyer", buyer_signature]),
     ];
+    // Piece-14: emit the seller-authored request hash alongside the mint/job-hash tags when the
+    // trade bound one (v2 claim). A v1 trade (no creq) omits the tag entirely.
+    if let Some(creq_hash) = creq_hash {
+        tags.push(TagSpec::new(["creq-hash", creq_hash]));
+    }
     if let Some(delivery) = delivery {
         tags.push(TagSpec::new([
             "delivery_integrity_hash",
@@ -878,10 +899,13 @@ mod tests {
             "seller-sig",
             "buyer-sig",
             None,
+            None,
             &[],
         );
         assert_eq!(receipt.kind, JOB_RECEIPT_KIND);
         assert!(has_tag_value(&receipt.tags, "mint", TESTNUT_MINT_URL));
+        // Piece-14: no creq bound ⇒ no creq-hash tag (v1-shaped receipt).
+        assert!(first_tag(&receipt.tags, "creq-hash").is_none());
         assert!(has_tag_value_at(&receipt.tags, "e", 1, "result"));
         assert!(has_tag_value_at(&receipt.tags, "e", 3, "reply"));
         assert_eq!(
@@ -916,12 +940,15 @@ mod tests {
             "hash",
             "seller-sig",
             "buyer-sig",
+            Some(&"cc".repeat(32)),
             Some(ReceiptDelivery {
                 integrity_hash: &"a".repeat(40),
                 kind: "fork",
             }),
             &exec,
         );
+        // Piece-14: a bound creq surfaces as a `creq-hash` tag on the receipt event.
+        assert!(has_tag_value(&receipt.tags, "creq-hash", &"cc".repeat(32)));
         // D4 delivery binding present and typed.
         assert!(has_tag_value(
             &receipt.tags,
