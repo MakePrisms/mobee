@@ -3,7 +3,7 @@
  * One malformed / hostile event must never throw into the page.
  */
 
-import { CLAIM, HANDLER, OFFER, PROFILE, RECEIPT, RESULT } from "./kinds.js";
+import { CLAIM, HANDLER, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT } from "./kinds.js";
 
 /**
  * @param {unknown} raw
@@ -39,6 +39,7 @@ export function parseEvent(raw) {
     if (kind === RESULT) return { ...base, role: "result", result: parseResult(base) };
     if (kind === RECEIPT) return { ...base, role: "receipt", receipt: parseReceipt(base) };
     if (kind === HANDLER) return { ...base, role: "handler", handler: parseHandler(base) };
+    if (kind === HEARTBEAT) return { ...base, role: "heartbeat", heartbeat: parseHeartbeat(base) };
     return { ...base, role: "other" };
   } catch {
     return null;
@@ -295,6 +296,19 @@ function parseHandler(base) {
     version,
     d: firstTagValue(base.tags, "d"),
     k: allTagValues(base.tags, "k"),
+  };
+}
+
+/**
+ * Seller liveness heartbeat (kind 30340). Addressable — the `d` tag scopes it within
+ * the author. Freshness is the event's own created_at (the caller resolves the newest
+ * per author+d). `status` is an optional self-reported state; content is a free message.
+ */
+function parseHeartbeat(base) {
+  return {
+    d: firstTagValue(base.tags, "d"),
+    status: firstTagValue(base.tags, "status"),
+    message: typeof base.content === "string" && base.content ? base.content.slice(0, 280) : null,
   };
 }
 
