@@ -4,12 +4,10 @@ use serde::{Deserialize, Serialize};
 
 /// Buyer's NUT-18 payment reply plus the mobee routing it rides with.
 ///
-/// PIECE-14 Job E: the wire form is the cashu [`PaymentRequestPayload`] (NUT-18: `id`, `memo`,
-/// `mint`, `unit`, `proofs`) — the buyer emits exactly the object that satisfies the
-/// seller-authored `creq`. `id` echoes the request's `i` (Job C sets `i` to the job id), `mint`
-/// is the *realized* mint the token came from, and `proofs` carry the P2PK-locked ecash. The
-/// previous hand-rolled `PaymentEnvelope` (a bespoke canonical-JSON blob carrying a
-/// buyer-declared `mint_url`) is gone.
+/// The wire form is the cashu [`PaymentRequestPayload`] (NUT-18: `id`, `memo`, `mint`, `unit`,
+/// `proofs`) — the buyer emits exactly the object that satisfies the seller-authored `creq`.
+/// `id` echoes the request's `i` (set to the job id), `mint` is the *realized* mint the token
+/// came from, and `proofs` carry the P2PK-locked ecash.
 ///
 /// `seller_pubkey` is the NIP-17 gift-wrap recipient — routing only, NEVER serialized into the
 /// payload JSON. The buyer is authenticated by the NIP-17 seal, so the payload carries no

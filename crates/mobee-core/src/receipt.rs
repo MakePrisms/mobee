@@ -7,8 +7,8 @@ pub fn result_content_hash_hex(content: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Domain separator for the piece-9 co-signed receipt preimage (distinct from the
-/// receipt H-tuple domain above so the two hashes can never collide).
+/// Domain separator for the co-signed receipt preimage (distinct from the receipt H-tuple
+/// domain above so the two hashes can never collide).
 pub const RECEIPT_PREIMAGE_DOMAIN: &str = "mobee/v1/receipt-preimage";
 
 /// Marker committed in [`ReceiptPreimage::exec_metadata_commitment`] when no
@@ -18,10 +18,10 @@ pub const EXEC_METADATA_COMMITMENT_EMPTY: &str = "none";
 /// Delivered git object kind bound (non-forgeably) into the co-signed receipt preimage.
 ///
 /// In the preimage the kind is a signed field, so an unsigned path cannot be flipped to
-/// reinterpret the same 40-hex as a commit vs a tree oid (piece-9 D4).
+/// reinterpret the same 40-hex as a commit vs a tree oid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeliveryKind {
-    /// Fork-tip `commit_oid` (piece-7 git delivery — the only live kind today).
+    /// Fork-tip `commit_oid` (git delivery — the only live kind today).
     Fork,
     /// (Deferred) patch result `tree_oid`.
     Patch,
@@ -37,23 +37,22 @@ impl DeliveryKind {
     }
 }
 
-/// The message both parties schnorr-sign for a kind-3400 receipt (piece-9 Item 1).
+/// The message both parties schnorr-sign for a kind-3400 receipt.
 ///
-/// Binds the trade **and** the delivered git object (D4: `delivery_integrity_hash` +
+/// Binds the trade **and** the delivered git object (`delivery_integrity_hash` +
 /// `delivery_kind`).
 ///
-/// Two deliberate deviations from the literal spec preimage, FLAGGED for operator
-/// ratification (money-semantics — do not silently "fix"):
+/// Two deliberate properties of this preimage (money-semantics — do not silently "fix"):
 /// - **`result_id` is EXCLUDED.** It is the seller's own result-kind event id, unknowable
 ///   when the seller signs at delivery (the signature is a tag *inside* that very event,
 ///   so including its id is circular). The result is still bound to the receipt by the
 ///   `["e", result_id, "", "reply"]` tag under the buyer's event-level nostr signature.
 /// - **`exec_metadata_commitment` carries [`EXEC_METADATA_COMMITMENT_EMPTY`] today.** The
-///   field is speced (Item 1) but the co-signature does not yet cover exec-metadata: Item
-///   2 states `sig/seller` does not cover it (seller-claimed, result-authoritative), and
-///   the buyer filters the echo — folding a filtered set into the digest would break
-///   signature matching. Exec-metadata rides the events as unsigned tags; the commitment
-///   is walk-forward (populating it later is additive, never a retraction).
+///   co-signature does not cover exec-metadata: `sig/seller` does not cover it
+///   (seller-claimed, result-authoritative), and the buyer filters the echo — folding a
+///   filtered set into the digest would break signature matching. Exec-metadata rides the
+///   events as unsigned tags; the commitment is walk-forward (populating it later is
+///   additive, never a retraction).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiptPreimage {
     pub job_hash: String,
@@ -70,11 +69,11 @@ pub struct ReceiptPreimage {
     pub delivery_kind: String,
     /// Commitment over the echoed exec-metadata tag set, or [`EXEC_METADATA_COMMITMENT_EMPTY`].
     pub exec_metadata_commitment: String,
-    /// Piece-14: SHA-256 hex of the seller-authored NUT-18 payment request (the `creqA…` string),
-    /// so both co-signatures commit to the request the seller quoted. `None` for a v1 claim that
-    /// carries no `creq` — its preimage hashes byte-identically to the pre-piece-14 form (the slot
-    /// is omitted, not null). `Some` once the seller authors a `creq` (Job C); the buyer sources it
-    /// from the accepted claim's `creq` tag. A binding-format change, hence the version bump.
+    /// SHA-256 hex of the seller-authored NUT-18 payment request (the `creqA…` string), so both
+    /// co-signatures commit to the request the seller quoted. `None` for a claim that carries no
+    /// `creq` — the slot is then omitted (not null), so the preimage hashes byte-identically to
+    /// one built without a creq. `Some` once the seller authors a `creq`; the buyer sources it
+    /// from the accepted claim's `creq` tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creq_hash: Option<String>,
 }
@@ -95,9 +94,9 @@ impl ReceiptPreimage {
             serde_json::json!(self.delivery_kind),
             serde_json::json!(self.exec_metadata_commitment),
         ];
-        // Piece-14 additive slot at a FIXED final position: folded ONLY when a creq_hash is
-        // present, so a None-creq (v1) receipt hashes byte-identically to the pre-piece-14
-        // preimage (the regression guard) while a v2 creq changes the co-signed digest.
+        // Additive slot at a FIXED final position: folded ONLY when a creq_hash is present, so a
+        // receipt with no creq hashes byte-identically to one built without a creq, while a bound
+        // creq changes the co-signed digest.
         if let Some(creq_hash) = &self.creq_hash {
             fields.push(serde_json::json!(creq_hash));
         }
@@ -120,7 +119,7 @@ impl ReceiptPreimage {
     }
 }
 
-/// Canonical commitment over an echoed exec-metadata tag set (piece-9 Item 1 hook).
+/// Canonical commitment over an echoed exec-metadata tag set.
 ///
 /// Empty set → [`EXEC_METADATA_COMMITMENT_EMPTY`]. Otherwise a SHA-256 over the canonical
 /// JSON of the tag rows (the caller passes the already-filtered canonical set, in order).
@@ -186,10 +185,9 @@ mod tests {
         )));
     }
 
-    // Piece-14: a None creq_hash omits the additive slot entirely, so the co-signed digest is
-    // byte-identical to the pre-piece-14 preimage (the regression guard — v1 claims carry no
-    // creq). Some(creq_hash) folds the slot, changing the digest, and different creq_hashes
-    // yield different digests.
+    // A None creq_hash omits the additive slot entirely, so the co-signed digest is byte-identical
+    // to a preimage built without a creq. Some(creq_hash) folds the slot, changing the digest, and
+    // different creq_hashes yield different digests.
     #[test]
     fn receipt_preimage_binds_creq_hash_additively() {
         let none = preimage();

@@ -1,10 +1,10 @@
-//! Piece-13 Layer-0 capture: `episodes.jsonl` — one append-only, schema-versioned episode per
+//! Layer-0 capture: `episodes.jsonl` — one append-only, schema-versioned episode per
 //! job the seller **classified** (claimed or refused).
 //!
 //! This is a **separate stream** from `seller-journal.jsonl`. It NEVER writes to or re-owns any
 //! money-safety fact: episodes carry rich per-job context and *reference* the journal by
 //! `job_id`/`result_id` (they join, never duplicate). The journal stays the sole source of truth
-//! for claim/receipt/release (see `PIECE-13-SELLER-MEMORY.md` § "Why a separate file").
+//! for claim/receipt/release.
 //!
 //! **Not money-adjacent.** Episode fields (`usage`/`cost`, self-reported figures) are diagnostic
 //! and MUST never feed the pay gate, the receipt bind, or any verify decision. Writing an episode
@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Schema version for [`Episode`]. Additive-only evolution: new fields are ADDED with serde
-/// defaults, never removed or repurposed; a v2 reader parses a v1 line, a v1 reader ignores
-/// unknown v2 fields.
+/// defaults, never removed or repurposed; a newer reader parses an older line, and an older
+/// reader ignores unknown newer fields.
 pub const EPISODE_SCHEMA_VERSION: u32 = 1;
 
 const EPISODES_FILE: &str = "episodes.jsonl";
@@ -286,7 +286,7 @@ impl EpisodeLog {
     }
 
     /// The most recent `delivered_paid` episode for `job_id`, if any — the retro's seed
-    /// (PIECE-13 § Retro: "a fresh turn seeded with the episode + transcript_ref").
+    /// (a fresh turn seeded with the episode + transcript_ref).
     pub fn last_delivered_paid(&self, job_id: &str) -> io::Result<Option<Episode>> {
         Ok(self
             .entries()?
@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn schema_version_is_one_and_unknown_fields_are_tolerated() {
-        // A v1 reader must ignore an unknown (future v2) field — additive-only evolution.
+        // An older reader must ignore an unknown (future) field — additive-only evolution.
         let root = temp_root("ver");
         let log = EpisodeLog::open(&root);
         let ep = Episode::new(

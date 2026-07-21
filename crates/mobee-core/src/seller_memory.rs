@@ -1,11 +1,11 @@
-//! Piece-13 Layer-1 distilled memory: `MOBEE_HOME/memory/` — a `MEMORY.md` index plus topic
+//! Distilled memory (Layer 1): `MOBEE_HOME/memory/` — a `MEMORY.md` index plus topic
 //! files (plain markdown, `[[wikilinks]]`), read at job start and written by the seller's own
 //! agent in a post-job retro.
 //!
 //! Layer 1 is a **cache**; Layer 0 (`episodes.jsonl`) is the source of truth. Nothing here is
-//! ever an input to the pay gate, the journal, or the receipt bind (PIECE-13 § Threat & integrity).
+//! ever an input to the pay gate, the journal, or the receipt bind.
 //!
-//! Provenance (v1: file-level ownership): every topic file carries YAML frontmatter
+//! Provenance (file-level ownership): every topic file carries YAML frontmatter
 //! `author: agent | operator`. The retro regenerates only `author: agent` files; `author:
 //! operator` files (including `operator-notes.md`) are read as input and passed through untouched
 //! (merge-not-clobber, enforced at runtime by [`snapshot_operator_files`]/[`restore_snapshot`]).
@@ -225,8 +225,8 @@ impl OperatorSnapshot {
     }
 }
 
-/// Snapshot the bytes of every operator-owned file directly in `memory_dir` (non-recursive; v1
-/// memory is a flat dir). Used to guarantee operator files are byte-unchanged across a retro.
+/// Snapshot the bytes of every operator-owned file directly in `memory_dir` (non-recursive; the
+/// memory dir is flat). Used to guarantee operator files are byte-unchanged across a retro.
 pub fn snapshot_operator_files(memory_dir: &Path) -> io::Result<OperatorSnapshot> {
     let mut files = Vec::new();
     let entries = match fs::read_dir(memory_dir) {

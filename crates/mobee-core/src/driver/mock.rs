@@ -56,8 +56,8 @@ impl MockDriver {
         self
     }
 
-    /// Script the usage the driver reports (piece-9 Item-2) so the engine→`RunOutcome` plumbing
-    /// is exercisable without a live ACP rig.
+    /// Script the usage the driver reports so the engine→`RunOutcome` plumbing is exercisable
+    /// without a live ACP rig.
     pub fn with_usage(mut self, usage: UsageMetadata) -> Self {
         self.usage = Some(usage);
         self

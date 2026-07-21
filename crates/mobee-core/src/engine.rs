@@ -20,8 +20,8 @@ pub enum RunEvent<'a> {
 pub struct RunOutcome {
     pub terminal: JobExecutionStatus,
     pub artifacts: Vec<Artifact>,
-    /// piece-9 Item-2: usage the driver surfaced for this run (seller-claimed). `None` when the
-    /// harness exposed nothing — carried optionally so absent-stays-absent survives the seam.
+    /// Usage the driver surfaced for this run (seller-claimed). `None` when the harness exposed
+    /// nothing — carried optionally so absent-stays-absent survives the seam.
     pub usage: Option<UsageMetadata>,
 }
 
@@ -148,7 +148,7 @@ pub async fn run_job<D: Driver>(
             artifact_id: ArtifactId(artifact.uri_or_path.clone()),
         })?;
     }
-    // piece-9 Item-2: lift whatever usage the driver captured (absent-stays-absent → None).
+    // Lift whatever usage the driver captured (absent-stays-absent → None).
     let usage = driver.usage();
     driver.shutdown().await?;
     Ok(RunOutcome {
@@ -277,8 +277,8 @@ mod tests {
 
     #[test]
     fn run_job_threads_driver_usage_into_outcome() {
-        // piece-9 Item-2: usage the driver surfaced must ride out on RunOutcome (the seam the
-        // seller reads). A driver that exposes nothing keeps `usage: None` (absent-stays-absent).
+        // Usage the driver surfaced must ride out on RunOutcome (the seam the seller reads).
+        // A driver that exposes nothing keeps `usage: None` (absent-stays-absent).
         let usage = UsageMetadata {
             model: Some("claude-opus-4-8".into()),
             input_tokens: Some(100),

@@ -1,5 +1,4 @@
-//! Piece-10 Step-1 — freelance-PR (contribution) fork path (additive to the from-scratch money
-//! path). See `docs/meta/PIECE-10-FREELANCE-PR-DELIVERY.md`.
+//! Freelance-PR (contribution) fork path — additive to the from-scratch money path.
 //!
 //! A **contribution** job targets a buyer-owned repo (pinned by owner pubkey + clone URL) at an
 //! exact `base_oid`; the seller forks that target, works, and delivers a fork tip that MUST
@@ -19,10 +18,10 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
-/// `job-class` tag value marking a contribution offer. Absent ⇒ from-scratch (back-compat).
+/// `job-class` tag value marking a contribution offer. Absent ⇒ from-scratch (the default).
 pub const JOB_CLASS_CONTRIBUTION: &str = "contribution";
 
-/// Only seller path shipped in v1 (`accepts=fork`; `Delivery::Commit`). Patch = deferred `Tree`.
+/// The only shipped seller path (`accepts=fork`; `Delivery::Commit`). Patch (`Tree`) is deferred.
 pub const ACCEPTS_FORK: &str = "fork";
 
 /// Domain separator for the seller's signed-result authorship tuple. DISTINCT from the
@@ -37,14 +36,14 @@ pub const TAG_BASE: &str = "base";
 pub const TAG_ACCEPTS: &str = "accepts";
 pub const TAG_FORK_REF: &str = "fork-ref";
 /// `["sig","seller-contribution",<hex>]` — the tuple schnorr signature label. Distinct from the
-/// piece-9 `["sig","seller",..]` receipt cosig so both ride the same result without ambiguity.
+/// `["sig","seller",..]` receipt cosig so both ride the same result without ambiguity.
 pub const SIG_SELLER_CONTRIBUTION: &str = "seller-contribution";
 
 /// A target repo pinned by **owner pubkey + clone URL** — never a bare `d`-tag / name (the relay
-/// `.names` registry is GLOBAL across owners, so a bare name is spoofable; `home.rs:105`). This
-/// carries the security payload of a NIP-34 `naddr` (owner + locator); the owner segment scopes
-/// the fetch so a different owner is a different repo. (Canonical NIP-19 bech32 rendering for
-/// observatory interop is a deferred follow-up — the wire form here is the decoded payload.)
+/// `.names` registry is GLOBAL across owners, so a bare name is spoofable). This carries the
+/// security payload of a NIP-34 `naddr` (owner + locator); the owner segment scopes the fetch so
+/// a different owner is a different repo. (The wire form here is the decoded payload; a canonical
+/// NIP-19 bech32 rendering is a deferred follow-up.)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetRepoPin {
     owner_pubkey: String,
@@ -82,7 +81,7 @@ impl TargetRepoPin {
         &self.owner_pubkey
     }
 
-    /// The buyer-controlled clone URL `base_oid` is fetched from (MUST-2: base-from-pin).
+    /// The buyer-controlled clone URL `base_oid` is fetched from (base-from-pin).
     pub fn clone_url(&self) -> &str {
         &self.clone_url
     }
@@ -186,7 +185,7 @@ impl ForkRef {
         &self.branch
     }
 
-    /// A per-job unique custody/push ref carrying the **FULL** `job_id` (MUST-6). The
+    /// A per-job unique custody/push ref carrying the **FULL** `job_id`. The
     /// `mobee/<job_id[:8]>` prefix collides — a real field collision already occurred between two
     /// sellers sharing a remote — so the full id + owner-scoped namespaces is the shape.
     pub fn unique_branch(job_id: &str) -> String {
@@ -199,7 +198,7 @@ impl ForkRef {
 pub struct ContributionOffer {
     pub target: TargetRepoPin,
     pub base: ContributionBase,
-    /// Positional multi-value `accepts` (v1 = `["fork"]`).
+    /// Positional multi-value `accepts` (currently `["fork"]`).
     pub accepts: Vec<String>,
 }
 
@@ -210,7 +209,7 @@ impl ContributionOffer {
     }
 }
 
-/// The tuple the seller commits to in its schnorr-signed result-kind result (MUST-3). The seller's
+/// The tuple the seller commits to in its schnorr-signed result-kind result. The seller's
 /// own signature cryptographically ties `seller_pubkey → this job_id → this exact commit_oid`
 /// against the pinned target + base + fork, so it **cannot be paid for a third party's commit**.
 /// A git commit trailer is optional provenance only — NEVER this bind.
@@ -264,7 +263,7 @@ pub struct ChangedPath {
     pub bytes: u64,
 }
 
-/// Buyer-side content policy hook (MUST-5). The FLOOR (default) refuses only EMPTY diffs; it is
+/// Buyer-side content policy hook. The FLOOR (default) refuses only EMPTY diffs; it is
 /// **not** a quality gate — an in-scope-but-worthless diff can still pass (quality-judging is
 /// deferred to the payment-and-reputation chapter). Path-scope lives here (the offer table has NO
 /// paths tag): a buyer MAY tighten pre-pay with a path allowlist + forbidden paths + a max diff
@@ -375,9 +374,9 @@ pub enum ContributionError {
     /// `job-class=contribution` but a required pin/base tag is missing or malformed.
     MalformedOffer(String),
     /// Result echoed a `{target_repo|base_oid|fork_ref}` that disagrees with the buyer's signed
-    /// offer / accept-bind (MUST-4 equality-check; cross-check input, never authority).
+    /// offer / accept-bind (equality-check; cross-check input, never authority).
     EchoMismatch(String),
-    /// The seller-signed authorship tuple signature did not verify (MUST-3).
+    /// The seller-signed authorship tuple signature did not verify.
     Authorship(String),
     /// The seller-signed tuple was absent on a contribution result.
     MissingAuthorship,
@@ -434,7 +433,7 @@ pub fn contribution_offer_tags(offer: &ContributionOffer) -> Vec<TagSpec> {
 }
 
 /// Parse the contribution class from an offer/result's tags. FAIL-CLOSED:
-/// - `Ok(None)` when not a contribution (no `job-class=contribution`) ⇒ from-scratch (back-compat).
+/// - `Ok(None)` when not a contribution (no `job-class=contribution`) ⇒ from-scratch (the default).
 /// - `Ok(Some(..))` for a well-formed contribution.
 /// - `Err(..)` when `job-class=contribution` but a pin/base is missing or malformed — a malformed
 ///   contribution offer is REFUSED, never silently run as from-scratch.
@@ -520,7 +519,7 @@ pub fn contribution_sig_tag(sig_hex: &str) -> TagSpec {
 /// Seller-side: additive contribution echo + authorship-signature tags for a result-kind result.
 /// The seller echoes the offer's `{job-class, target-repo, base, accepts}` and appends its
 /// `sig/seller-contribution` over the authorship tuple. The echo is EQUALITY-CHECKED by the buyer
-/// against its signed offer (MUST-4) — never trusted as authority.
+/// against its signed offer — never trusted as authority.
 pub fn contribution_result_tags(offer: &ContributionOffer, tuple_sig_hex: &str) -> Vec<TagSpec> {
     let mut tags = contribution_offer_tags(offer);
     tags.push(contribution_sig_tag(tuple_sig_hex));
@@ -534,7 +533,7 @@ mod schnorr {
     use nostr_sdk::{Keys, PublicKey as NostrPublicKey};
 
     /// Seller-side: schnorr-sign the authorship tuple digest with the seller key (hex). This is the
-    /// `sig/seller-contribution` value; the buyer verifies it at the pre-pay seam (MUST-3).
+    /// `sig/seller-contribution` value; the buyer verifies it at the pre-pay seam.
     pub fn sign_authorship_tuple(keys: &Keys, tuple: &AuthorshipTuple) -> String {
         keys.sign_schnorr(&Message::from_digest(tuple.digest_bytes()))
             .to_string()
@@ -778,7 +777,7 @@ mod tests {
             TagSpec::new([TAG_ACCEPTS, ACCEPTS_FORK]),
         ];
         assert!(parse_contribution_offer(&tags).is_err());
-        // patch-only accepts (no fork) → REFUSE in v1.
+        // patch-only accepts (no fork) → REFUSED.
         let tags = vec![
             TagSpec::new([TAG_JOB_CLASS, JOB_CLASS_CONTRIBUTION]),
             TagSpec(pin().to_tag_values().to_vec()),

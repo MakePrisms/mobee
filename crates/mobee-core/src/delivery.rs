@@ -112,21 +112,19 @@ pub trait DeliveryVerifier {
     fn verify(&mut self, delivery: &GitDelivery) -> Result<VerifiedDelivery, DeliveryError>;
 }
 
-/// A typed delivery over the delivered git **object** (PIECE-12).
+/// A typed delivery over the delivered git **object**.
 ///
 /// The money path binds *an object oid*; this enum names which object by variant so new
 /// delivery forms are added as variants of one abstraction, never as a parallel money-path.
 ///
-/// - [`Delivery::Commit`] — the **only live** variant: a behavior-preserving re-type of today's
-///   commit path (piece-7 git delivery). Bound object = the fork-tip `commit_oid`; verify =
-///   fetch the branch tip + peel `^{commit}` + tip-match — the existing [`GitDelivery`] path,
-///   yielding today's [`VerifiedDelivery`]. **Nothing about behavior changes — only the type.**
+/// - [`Delivery::Commit`] — the **only live** variant: the commit path. Bound object = the
+///   fork-tip `commit_oid`; verify = fetch the branch tip + peel `^{commit}` + tip-match, via
+///   the [`GitDelivery`] path, yielding a [`VerifiedDelivery`].
 ///
-/// The designed-not-built `Tree` variant (NIP-34 patch; bound object = the resulting *tree* oid)
-/// is specified in PIECE-12 and lands with the future patch piece. It is intentionally **OMITTED**
-/// here — Step-0 builds **no `Tree` verify arm** — so every `match` over this enum stays exhaustive
-/// and warning-clean. Adding `Tree` later is additive (a variant + its verify arm), not a parallel
-/// money-path.
+/// The `Tree` variant (NIP-34 patch; bound object = the resulting *tree* oid) is intentionally
+/// **OMITTED** here — there is no `Tree` verify arm — so every `match` over this enum stays
+/// exhaustive and warning-clean. Adding `Tree` later is additive (a variant + its verify arm),
+/// not a parallel money-path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Delivery {
     /// Commit delivery (fork tip). Carries the advertised [`GitDelivery`] fields.
@@ -183,7 +181,7 @@ pub enum DeliveryError {
         actual: CommitOid,
     },
     MissingCommitObject,
-    /// Contribution (piece-10): `base_oid` is not present in the PINNED target (base-from-pin
+    /// Contribution: `base_oid` is not present in the PINNED target (base-from-pin
     /// fetch produced no such object). Fail-closed — the buyer never bases against a value it
     /// could not resolve from its own signed offer's target.
     MissingBaseObject,

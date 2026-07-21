@@ -23,7 +23,7 @@ pub struct Readiness {
     pub protocol_version: u32,
 }
 
-/// Where a run's usage numbers were actually captured (piece-9 Item-2 `usage_transport`).
+/// Where a run's usage numbers were actually captured (the `usage_transport` tag).
 /// This reflects reality — the surface the value came off — not a harness-declared guess.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UsageTransport {
@@ -42,7 +42,7 @@ impl UsageTransport {
     }
 }
 
-/// A real monetary cost with its accounting basis (piece-9 Item-2 `cost` tag).
+/// A real monetary cost with its accounting basis (the `cost` tag).
 /// `amount` is the exact string as reported by the harness (kept as text so it is
 /// byte-exact and never zero/float-mangled); `basis` ∈ {harness-reported-usd,
 /// harness-reported-notional}. Unit is locked to USD.
@@ -52,7 +52,7 @@ pub struct UsageCost {
     pub basis: String,
 }
 
-/// Per-run execution usage a driver surfaced for a job (piece-9 Item-2, seller-claimed).
+/// Per-run execution usage a driver surfaced for a job (seller-claimed).
 ///
 /// Every field is OPTIONAL so **absent-stays-absent** is representable end to end: a field
 /// the harness did not report is `None` and is NEVER zero-filled downstream. `total_tokens`
@@ -87,8 +87,8 @@ impl UsageMetadata {
             && self.transport.is_none()
     }
 
-    /// Derived `total_tokens = input + output + reasoning` per the locked USAGE-MATRIX
-    /// checkpoint-a rule. Returns `None` unless BOTH `input` and `output` are present (a
+    /// Derived `total_tokens = input + output + reasoning`. Returns `None` unless BOTH `input`
+    /// and `output` are present (a
     /// partial capture must never be reported as a total); `reasoning` is added when present
     /// and treated as unknown-not-zero when absent. Cache siblings are never folded in.
     pub fn total_tokens(&self) -> Option<u64> {
@@ -139,9 +139,9 @@ pub trait Driver {
     async fn cancel(&mut self, session_id: &SessionId) -> Result<(), DriverError>;
     async fn shutdown(&mut self) -> Result<(), DriverError>;
 
-    /// Execution usage captured from the most recent prompt, if the harness surfaced any
-    /// (piece-9 Item-2). Default `None` keeps **absent-stays-absent** for drivers that expose
-    /// nothing — only a driver that actually reads usage overrides this.
+    /// Execution usage captured from the most recent prompt, if the harness surfaced any.
+    /// Default `None` keeps **absent-stays-absent** for drivers that expose nothing — only a
+    /// driver that actually reads usage overrides this.
     fn usage(&self) -> Option<UsageMetadata> {
         None
     }

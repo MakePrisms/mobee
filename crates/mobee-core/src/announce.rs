@@ -12,8 +12,8 @@
 //! NIP-17 plaintext. Emission NEVER blocks the seller event loop: each event is dispatched on its
 //! OWN detached OS thread that spawns the sink, writes the JSON, and bounded-waits (killing a
 //! hung sink at the bound). A sink that is slow, hung, missing, or failing can never delay, stall,
-//! or crash the daemon (cf. the PIECE-13 § Retro hard lesson: an inline await in the event loop
-//! deafened the daemon — announce must never repeat it).
+//! or crash the daemon (an inline await in the event loop would deafen the daemon — announce
+//! must never do that).
 
 use std::io::{self, Write};
 use std::process::{Command, Stdio};

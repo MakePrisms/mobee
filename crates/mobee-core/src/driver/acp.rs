@@ -206,17 +206,16 @@ impl UpdateStream {
 
 use super::{UsageCost, UsageMetadata, UsageTransport};
 
-/// Extract piece-9 Item-2 execution usage from an ACP `session/prompt` JSON-RPC result.
+/// Extract execution usage from an ACP `session/prompt` JSON-RPC result.
 ///
-/// This is the ONLY ACP-native usage surface the driver has: it receives the prompt result
-/// Value and historically read only its stop reason. Whatever the harness places under
-/// `usage` (or `_meta.usage` / `result.usage`) is captured here. **Absent-stays-absent**: if
-/// the result carries no recognizable usage, this returns `None` and NOTHING is emitted
-/// downstream — the observatory renders a dash, never a fabricated zero. When any field IS
-/// found, `transport = acp-native`, because the value literally arrived over the ACP wire.
+/// The prompt result is the only ACP-native usage surface the driver has: whatever the harness
+/// reports under its `usage` object is captured here. **Absent-stays-absent** — a result with no
+/// recognizable usage returns `None` and nothing is emitted downstream, so a missing number is
+/// never rendered as a fabricated zero. When any field is found, `transport = acp-native`,
+/// because the value arrived over the ACP wire.
 ///
-/// Token components are read ONLY from a real `usage` object (never guessed off unrelated
-/// root fields); `model` and `cost` may sit at the result root or inside `usage`.
+/// Token components are read only from a real `usage` object, never guessed off unrelated root
+/// fields.
 pub fn parse_acp_usage(result: &Value) -> Option<UsageMetadata> {
     let usage_obj = result
         .get("usage")

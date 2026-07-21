@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Open-market demo relay (PROCESS.md).
+/// Open-market demo relay.
 pub const DEFAULT_RELAY_URL: &str = "wss://mobee-relay.orveth.dev";
-/// Standing CDK testnut mint — no real funds. Host re-locked 2026-07-15 after
-/// `testnut.cashu.space` died from turtle; class (TESTNUT) is the load-bearing rule.
+/// Standing CDK testnut mint — no real funds. The specific host may change; the load-bearing
+/// rule is the class: a testnut/dev mint only.
 pub const DEFAULT_MINT_URL: &str = "https://testnut.cashudevkit.org";
 /// Dead testnut host — bootstrap migrates config.toml away from this.
 pub const DEAD_TESTNUT_MINT_HOST: &str = "testnut.cashu.space";
@@ -95,7 +95,7 @@ pub struct SellerConfig {
     /// both paths.
     #[serde(default = "default_offer_backfill_secs")]
     pub offer_backfill_secs: u64,
-    /// Opt-in to the piece-10 contribution (freelance-PR fork) path. Default **true**. When
+    /// Opt-in to the contribution (freelance-PR fork) path. Default **true**. When
     /// **false** the daemon behaves as a seller WITHOUT contribution support: it feedback-kind
     /// `status=error`s a `job-class=contribution` offer instead of running it as from-scratch
     /// (interop courtesy — NOT a security control; buyer refusal is the boundary).
@@ -103,24 +103,19 @@ pub struct SellerConfig {
     pub contribution_enabled: bool,
 }
 
-/// Piece-13 persistent-seller-memory config (`[seller_memory]` section). The read-on-start +
+/// Persistent-seller-memory config (`[seller_memory]` section): the read-on-start +
 /// retro-write-back knobs and the two plugin seams (prompt template paths). Every field has a
-/// serde default so a config written before this section existed parses to the shipped defaults
-/// (back-compat).
+/// serde default so a config written before this section existed parses to the shipped defaults.
 ///
-/// NOTE (build judgment call): the PIECE-13 spec names this section `[seller.memory]` (nested in
-/// `[seller]`). Nesting it inside `SellerConfig` would force adding a required field to that
-/// struct, whose literal is constructed in `seller.rs` — a file the piece-13 build is forbidden
-/// to touch (money-path boundary; money-files diff must stay empty). Placing it top-level as
-/// `[seller_memory]` on `MobeeConfig` (built only via `Default`) delivers the identical knobs and
-/// seams without touching any money-path file. The nesting is cosmetic; behaviour is unchanged.
+/// Placed top-level on `MobeeConfig` rather than nested under `[seller]`, so it needs no required
+/// field on `SellerConfig`; the knobs and seams are identical either way.
 ///
 /// This is **diagnostic/economic** context only. Nothing here ever feeds the pay gate, the
-/// journal, or the receipt bind (see PIECE-13 § Threat & integrity).
+/// journal, or the receipt bind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SellerMemoryConfig {
     /// Inline the distilled `MEMORY.md` index into the agent's job prompt at start. Default
-    /// **on**; when **false** the composed prompt is byte-identical to the pre-piece-13 output.
+    /// **on**; when **false** the composed prompt is byte-identical to the memory-off output.
     #[serde(default = "default_memory_enabled")]
     pub memory_enabled: bool,
     /// Run one best-effort retro agent turn after a delivered-**paid** job to update memory.
@@ -278,8 +273,8 @@ pub fn default_telemetry_timeout_ms() -> u64 {
     2000
 }
 
-/// `[seller_heartbeat]` — cadence + enablement for the addressable kind-30340 liveness event
-/// (PIECE-14 § Heartbeat). **Feature ON by default**: a running seller advertises liveness every
+/// `[seller_heartbeat]` — cadence + enablement for the addressable kind-30340 liveness event.
+/// **Feature ON by default**: a running seller advertises liveness every
 /// [`interval_secs`](SellerHeartbeatConfig::interval_secs) seconds. The heartbeat is
 /// diagnostic/discovery context only — publish failures log-and-continue and it never blocks the
 /// job loop, feeds the pay gate, or binds a receipt. Tests can override the cadence/enablement
@@ -517,7 +512,7 @@ pub struct MobeeConfig {
     /// entry named after a built-in preset (claude|cursor|codex) OVERRIDES that built-in.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, AgentPresetConfig>,
-    /// Piece-13 `[seller_memory]` config (read-on-start + retro seams). Defaults when absent.
+    /// `[seller_memory]` config (read-on-start + retro seams). Defaults when absent.
     #[serde(default, skip_serializing_if = "SellerMemoryConfig::is_default")]
     pub seller_memory: SellerMemoryConfig,
     /// `[seller_announce]` lifecycle-event sink config. Defaults (feature OFF) when absent.
@@ -532,14 +527,14 @@ pub struct MobeeConfig {
     /// `[seller_preflight]` boot push-probe config. Defaults (probe ON) when absent.
     #[serde(default, skip_serializing_if = "SellerPreflightConfig::is_default")]
     pub seller_preflight: SellerPreflightConfig,
-    /// Optional buyer-side piece-10 contribution content policy (the MUST-5 policy hook). Absent
+    /// Optional buyer-side contribution content policy (the content-policy hook). Absent
     /// ⇒ the FLOOR (refuse only empty diffs). Present ⇒ tighten pre-pay with a path allowlist /
     /// forbidden paths / max diff size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contribution: Option<ContributionPolicyConfig>,
 }
 
-/// Buyer-side content policy for piece-10 contribution verify (the MUST-5 policy hook). Maps 1:1
+/// Buyer-side content policy for contribution verify (the content-policy hook). Maps 1:1
 /// to `contribution::ContentPolicy`; kept as a plain config type so `home` need not depend on the
 /// git-delivery feature. All fields default to the floor (allow all, forbid none, no cap).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

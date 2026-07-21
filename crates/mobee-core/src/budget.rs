@@ -1,4 +1,4 @@
-//! MCP spend authority — budget caps before any pay reaches piece-6 SM.
+//! MCP spend authority — budget caps before any pay reaches the payment state machine.
 //!
 //! Caps bind from `~/.mobee` config only. Tool args that try to set/override
 //! `per_job` / `total` are ignored by callers; this gate never reads them.
@@ -19,7 +19,7 @@
 //! the hard resource bound; the ledger is an accounting record, not the spend guard.
 //!
 //! When keyed by `attempt_id`, spent is **idempotent**: a reconciled retry of the
-//! same attempt does not re-count (allowance invariant, distinct from piece-6's
+//! same attempt does not re-count (allowance invariant, distinct from the payment
 //! journal), and the fold counts a given `attempt_id` at most once even if it appears
 //! in more than one record. The durable append still happens before `run()`'s mint
 //! effect on first authorize of that attempt.
@@ -250,7 +250,7 @@ impl BudgetGate {
 
     /// Authorize keyed by `attempt_id`: first sighting counts `amount` (durable
     /// append-before-effect); a retry of the same id skips re-count and still runs
-    /// `effect` (piece-6 reconcile / closed return). "Already counted" is judged
+    /// `effect` (reconcile / closed return). "Already counted" is judged
     /// against a fresh fold, so a spend appended by another process is respected.
     pub fn authorize_then_attempt<T>(
         &mut self,

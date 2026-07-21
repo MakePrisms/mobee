@@ -5,9 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::delivery::{CommitOid, DeliveryError, GitDelivery};
 
 pub const MOBEE_TAG: &str = "mobee";
-// PIECE-14 A′: v2 protocol version. The kind renumber (v1 offer/result/feedback → the mobee 3400-block)
-// is the compatibility break — a v2 parser never matches a v1 event, so there is no dual-version
-// window to support.
+// mobee protocol version. mobee events occupy a dedicated kind block, so a parser only ever
+// matches mobee's own events.
 pub const PROTOCOL_VERSION: &str = "2";
 
 // All kind NUMBERS live in `crate::kinds` (the one registry); re-exported here so the historical
@@ -93,8 +92,8 @@ impl OfferDraft {
     }
 
     pub fn to_event_draft(&self) -> EventDraft {
-        // PIECE-14 A′: the offer no longer names a mint — the seller authors the accepted mint(s)
-        // in its claim `creq`, so there is no `["mint", …]` tag here.
+        // The offer does not name a mint — the seller authors the accepted mint(s) in its claim
+        // `creq`, so there is no `["mint", …]` tag here.
         let mut tags = vec![
             TagSpec::new(["i", &self.task]),
             TagSpec::new(["output", &self.output]),
@@ -188,7 +187,7 @@ pub enum OfferParseError {
 pub enum GitResultParseError {
     WrongKind(u16),
     MissingTag(&'static str),
-    /// PIECE-14 A′ namespace guard: a result event without the `["t","mobee"]` tag.
+    /// Namespace guard: a result event without the `["t","mobee"]` tag.
     MissingMobeeTag,
     UnsupportedDelivery(String),
     InvalidDelivery(DeliveryError),
@@ -314,8 +313,8 @@ pub fn parse_git_result_delivery(event: &EventDraft) -> Result<GitDelivery, GitR
     if event.kind != JOB_RESULT_KIND {
         return Err(GitResultParseError::WrongKind(event.kind));
     }
-    // PIECE-14 A′ namespace guard: reject a foreign event squatting the result kind before reading
-    // any delivery field.
+    // Namespace guard: reject a foreign event squatting the result kind before reading any
+    // delivery field.
     if !has_tag_value(&event.tags, "t", MOBEE_TAG) {
         return Err(GitResultParseError::MissingMobeeTag);
     }
@@ -362,8 +361,8 @@ pub fn parse_bound_git_delivery(
     Ok(delivery)
 }
 
-/// Kind-claim CLAIM draft (`status=processing`). PIECE-14 Job C: the claim carries the
-/// seller-authored NUT-18 payment request as a `["creq", "creqA…"]` tag — the claim *is*
+/// Kind-claim CLAIM draft (`status=processing`). The claim carries the seller-authored
+/// NUT-18 payment request as a `["creq", "creqA…"]` tag — the claim *is*
 /// the invoice. Build `creq` with [`creq::build_seller_creq`]; buyers read it back with
 /// [`creq::parse_creq`].
 pub fn claim_draft(
@@ -385,8 +384,8 @@ pub fn claim_draft(
 }
 
 /// Kind-award AWARD draft (`status=accepted`). Buyer-authored selection of a claim — e-tags the
-/// offer (root) + the winning claim. PIECE-14 A′ moved this off the shared v1 `feedback` onto the
-/// buyer-authored award kind (a buyer selection must not ride the seller's feedback kind).
+/// offer (root) + the winning claim. This is its own buyer-authored award kind — a buyer
+/// selection must not ride the seller's feedback kind.
 pub fn accept_draft(
     offer_id: &str,
     claim_id: &str,
@@ -414,7 +413,7 @@ pub struct GitResultTags<'a> {
 }
 
 /// Kind-result draft. Pass `Some(git)` to attach delivery/repo/branch/commit tags;
-/// `exec_metadata` appends the piece-9 Item-2 seller-claimed usage block (may be empty).
+/// `exec_metadata` appends the seller-claimed usage block (may be empty).
 pub fn result_draft(
     offer_id: &str,
     buyer_pubkey: &str,
@@ -442,7 +441,7 @@ pub fn result_draft(
     tags.push(TagSpec::new(["amount", &amount_sats.to_string(), "sat"]));
     tags.push(TagSpec::new(["job-hash", job_hash]));
     tags.push(TagSpec::new(["sig", "seller", seller_signature]));
-    // Item-2 exec-metadata (seller-claimed, unsigned — sig/seller does NOT cover it).
+    // exec-metadata (seller-claimed, unsigned — sig/seller does NOT cover it).
     tags.extend(exec_metadata.iter().cloned());
     tags.push(mobee_tag());
     tags.push(version_tag());
@@ -503,7 +502,7 @@ pub fn error_draft(
     draft
 }
 
-/// Delivery binding (piece-9 D4) echoed into a kind-3400 receipt. Both fields are in the
+/// Delivery binding echoed into a kind-3400 receipt. Both fields are in the
 /// co-signed preimage, so the settled receipt attests which git object was paid for and
 /// its kind (commit vs tree) is not forgeable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -514,7 +513,7 @@ pub struct ReceiptDelivery<'a> {
     pub kind: &'a str,
 }
 
-/// SHA-256 hex of a seller-authored NUT-18 payment request string (piece-14).
+/// SHA-256 hex of a seller-authored NUT-18 payment request string.
 ///
 /// The bind is over the FULL `creq` tag-value string (the `creqA…` base64url-CBOR string) as
 /// UTF-8 bytes — never a re-decoded/re-encoded form — so buyer and seller hash byte-identical
@@ -531,8 +530,8 @@ pub fn creq_hash_hex(creq: &str) -> String {
 /// Buyer-authored kind-3400 receipt draft. Fixed tag order + a pinned `created_at` at the
 /// event-build site give a deterministic event id (idempotent republish). `delivery` adds
 /// the D4 binding tags; `exec_metadata` appends the buyer's filtered echo (may be empty —
-/// seller-claimed, NOT covered by the co-signatures). `creq_hash` (piece-14) is the
-/// seller-authored request hash bound into the co-signed preimage; `None` for a v1 claim.
+/// seller-claimed, NOT covered by the co-signatures). `creq_hash` is the seller-authored
+/// request hash bound into the co-signed preimage; `None` for a claim that carries no `creq`.
 pub fn receipt_draft(
     offer_id: &str,
     result_id: &str,
@@ -558,8 +557,8 @@ pub fn receipt_draft(
         TagSpec::new(["sig", "seller", seller_signature]),
         TagSpec::new(["sig", "buyer", buyer_signature]),
     ];
-    // Piece-14: emit the seller-authored request hash alongside the mint/job-hash tags when the
-    // trade bound one (v2 claim). A v1 trade (no creq) omits the tag entirely.
+    // Emit the seller-authored request hash alongside the mint/job-hash tags when the trade
+    // bound one. A trade with no creq omits the tag entirely.
     if let Some(creq_hash) = creq_hash {
         tags.push(TagSpec::new(["creq-hash", creq_hash]));
     }
@@ -577,8 +576,8 @@ pub fn receipt_draft(
 }
 
 /// Build a `status`-tagged draft of the given kind (claim `claim`, award `award`, feedback `feedback`).
-/// PIECE-14 A′ split the v1 shared `feedback` into distinct kinds; the `status` tag is retained so
-/// existing status-based view logic is unchanged.
+/// Claim, award, and feedback are distinct kinds; the `status` tag is retained so status-based
+/// view logic can read a single field across them.
 fn status_draft(kind: u16, status: &str, mut tags: Vec<TagSpec>) -> EventDraft {
     tags.insert(0, TagSpec::new(["status", status]));
     tags.push(mobee_tag());
@@ -632,7 +631,7 @@ pub mod nostr {
     }
 }
 
-/// PIECE-14 Job C — the seller-authored NUT-18 payment request (`creq…`).
+/// The seller-authored NUT-18 payment request (`creq…`).
 ///
 /// The party getting paid authors the payment terms: at claim time the seller builds a
 /// NUT-18 [`PaymentRequest`] (amount `a`, unit `u`, accepted mints `m`, a nostr transport
@@ -690,7 +689,7 @@ pub mod creq {
     ///   with a `[["n","17"]]` NIP-17 tag.
     ///
     /// `s = true` (single-use: one claim, one payment) and no `nut10` locking condition is set
-    /// (payment is not coupled to a delivery/attestation condition — PIECE-14 § Metadata trust).
+    /// (payment is not coupled to a delivery/attestation condition).
     pub fn build_seller_creq(
         payment_id: &str,
         amount: u64,
@@ -843,8 +842,8 @@ mod tests {
 
     #[test]
     fn claim_and_accept_use_split_mobee_kinds() {
-        // PIECE-14 A′: the claim (processing) is its own kind claim, and the buyer-authored accept
-        // (award) is kind award — no longer the shared v1 feedback kind.
+        // The claim (processing) is its own claim kind, and the buyer-authored accept (award)
+        // is the award kind — each distinct from the seller's feedback kind.
         assert_eq!(
             claim_draft("offer", BUYER, SELLER, "creqAtest"),
             EventDraft::new(
@@ -915,7 +914,7 @@ mod tests {
         );
         assert_eq!(receipt.kind, JOB_RECEIPT_KIND);
         assert!(has_tag_value(&receipt.tags, "mint", TESTNUT_MINT_URL));
-        // Piece-14: no creq bound ⇒ no creq-hash tag (v1-shaped receipt).
+        // No creq bound ⇒ no creq-hash tag.
         assert!(first_tag(&receipt.tags, "creq-hash").is_none());
         assert!(has_tag_value_at(&receipt.tags, "e", 1, "result"));
         assert!(has_tag_value_at(&receipt.tags, "e", 3, "reply"));
@@ -958,7 +957,7 @@ mod tests {
             }),
             &exec,
         );
-        // Piece-14: a bound creq surfaces as a `creq-hash` tag on the receipt event.
+        // A bound creq surfaces as a `creq-hash` tag on the receipt event.
         assert!(has_tag_value(&receipt.tags, "creq-hash", &"cc".repeat(32)));
         // D4 delivery binding present and typed.
         assert!(has_tag_value(
@@ -1091,7 +1090,7 @@ mod tests {
     }
 }
 
-/// PIECE-14 Job C — seller-authored `creq` in the claim. Gated on `wallet` because the
+/// Seller-authored `creq` in the claim. Gated on `wallet` because the
 /// `creq` builder uses cashu's `nut18` types (only linked under that feature).
 #[cfg(all(test, feature = "wallet"))]
 mod creq_tests {

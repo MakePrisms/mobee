@@ -125,7 +125,7 @@ pub enum JournalEntry {
         job_id: String,
         ts: u64,
         /// Derived-expiry anchor: deadline this claim was journaled against.
-        /// `#[serde(default)]` = back-compat; pre-piece-11 claim lines default to 0
+        /// `#[serde(default)]` = older claim lines (no anchor) default to 0
         /// (treated as already-expired by [`plan_orphaned_claims`], the safe default —
         /// an old orphan is released, never left live).
         #[serde(default)]
@@ -859,7 +859,7 @@ offer_backfill_secs = {backfill}
     #[test]
     fn plan_orphaned_claims_from_real_journal_marks_past_deadline_expired() {
         // REAL orphaned-claim fixture: a journaled in-flight claim + a PAST deadline,
-        // written to a real journal file (no relay). Piece-11 restart-reconcile core.
+        // written to a real journal file (no relay). Restart-reconcile core.
         let root = temp_home("reconcile-plan");
         let _ = fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("bootstrap");
@@ -928,7 +928,7 @@ offer_backfill_secs = {backfill}
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].liveness, ClaimLiveness::Live);
 
-        // Back-compat: a pre-piece-11 claim line has no deadline_unix field. It must parse
+        // An older claim line has no deadline_unix field. It must parse
         // (serde default = 0) and classify Expired for any now>0 (safe: old orphan released).
         let raw_old = r#"{"kind":"claim","job_id":"job-old","ts":1}"#;
         {

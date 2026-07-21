@@ -1,4 +1,4 @@
-//! Seller heartbeat — addressable kind-30340 liveness + capacity signal (PIECE-14 § Heartbeat).
+//! Seller heartbeat — addressable kind-30340 liveness + capacity signal.
 //!
 //! A running seller republishes an **addressable** (NIP-01 parameterized-replaceable) event,
 //! `d="mobee-seller"`, on a ~5-minute cadence. It advertises whether the seller is `accepting`
@@ -16,7 +16,7 @@ use crate::gateway::{EventDraft, MOBEE_TAG, PROTOCOL_VERSION, TagSpec};
 
 /// Addressable kind for the seller heartbeat. MUST be in NIP-01's `30000..=39999` addressable
 /// range so the relay replaces it in place keyed by `(pubkey, d)` — hence `30340`, not a `34xx`
-/// value (PIECE-14 § Heartbeat).
+/// value.
 pub const SELLER_HEARTBEAT_KIND: u16 = 30340;
 
 /// The addressable `d` identifier for the seller heartbeat.
@@ -58,8 +58,7 @@ impl HeartbeatDraft {
         }
     }
 
-    /// Convenience for this branch: still v1 wire, so the seller speaks only protocol version `1`.
-    /// (A′ bumps this once the v2 kinds land.)
+    /// Convenience constructor: the heartbeat wire carries protocol version `1`.
     pub fn v1(accepting: bool, queue_depth: u32, rate_sats: u64) -> Self {
         Self::new(
             accepting,
@@ -116,7 +115,7 @@ impl ParsedHeartbeat {
     ///
     /// **Always key a heartbeat by this, never by event id.** An addressable event is superseded
     /// in place, so an old id goes empty and a by-id lookup would read as "seller gone"
-    /// (NIP-01, PIECE-14 § Heartbeat).
+    /// (NIP-01).
     pub fn key(&self, author_pubkey: &str) -> HeartbeatKey {
         HeartbeatKey {
             pubkey: author_pubkey.to_owned(),
