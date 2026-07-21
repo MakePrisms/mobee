@@ -724,6 +724,10 @@ pub async fn accept_claim_async(
     // the echo. From-scratch offers (no `job-class=contribution`) leave `contribution = None`.
     let contribution = resolve_accepted_contribution(offer, result, &commit_oid)?;
 
+    // Piece-14 Job E (fail-closed): a present-but-malformed creq REFUSES the accept (see
+    // [`accepted_mints_from_claim_creq`]).
+    let accepted_mints = accepted_mints_from_claim_creq(claim.creq.as_deref())?;
+
     let buyer_pubkey = keys.public_key().to_hex();
     let draft = accept_draft(
         &request.job_id,
@@ -755,15 +759,8 @@ pub async fn accept_claim_async(
         // pay path binds the attempt + receipt to the exact request the seller quoted. A v1 claim
         // carries no creq ⇒ `None` ⇒ binding behaves as before piece-14.
         creq_hash: claim.creq.as_deref().map(crate::gateway::creq_hash_hex),
-        // Piece-14 Job E: record the creq's accepted-mint list so the pay path picks the realized
-        // mint from it. Empty when there is no creq (v1) or it fails to parse (the pay path then
-        // falls back to the pinned default mint).
-        accepted_mints: claim
-            .creq
-            .as_deref()
-            .and_then(|creq| crate::gateway::creq::parse_creq(creq).ok())
-            .map(|request| request.mints.iter().map(|mint| mint.to_string()).collect())
-            .unwrap_or_default(),
+        // Piece-14 Job E: the creq's accepted-mint list (validated + parsed above, fail-closed).
+        accepted_mints,
         contribution,
     };
     write_accepted_bind(home, &bind)?;
@@ -784,6 +781,30 @@ pub async fn accept_claim_async(
 ///
 /// The recorded binds (`target_*`, `base_*`) come from the OFFER; the fork is the result's
 /// repo/branch; `custody_local_ref` is derived from the fork-tip `commit_oid`.
+/// PIECE-14 Job E (fail-closed): resolve the accepted claim's `creq` accepted-mint list (`m`).
+///
+/// - `None` (a true v1 claim with no creq) ⇒ empty list; the pay path then uses the pinned default
+///   mint, byte-identically to before piece-14.
+/// - `Some(creq)` that PARSES ⇒ its `m` mints (normalized).
+/// - `Some(creq)` that does NOT parse ⇒ REFUSE. The buyer must not accept-then-pay a claim whose
+///   payment terms it could not read; silently degrading a present-but-malformed creq to the empty
+///   default-mint path would pay against unreadable terms.
+fn accepted_mints_from_claim_creq(creq: Option<&str>) -> Result<Vec<String>, JobLifecycleError> {
+    match creq {
+        Some(creq) => Ok(crate::gateway::creq::parse_creq(creq)
+            .map_err(|error| {
+                JobLifecycleError::Input(format!(
+                    "accepted claim carries an unparseable creq (refusing accept, fail-closed): {error}"
+                ))
+            })?
+            .mints
+            .iter()
+            .map(|mint| mint.to_string())
+            .collect()),
+        None => Ok(Vec::new()),
+    }
+}
+
 fn resolve_accepted_contribution(
     offer: &OfferView,
     result: &ResultView,
@@ -1403,6 +1424,37 @@ fn sig_seller_value(tags: &[TagSpec]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::home;
+
+    // PIECE-14 Job E (fail-closed): a claim carrying a present-but-malformed creq REFUSES the
+    // accept — it does NOT silently degrade to the v1 empty/default-mint path.
+    #[test]
+    fn accept_refuses_a_present_but_unparseable_creq() {
+        // A true v1 claim (no creq) yields an empty list — no refusal.
+        assert!(accepted_mints_from_claim_creq(None).unwrap().is_empty());
+
+        // A well-formed creq yields its `m` mints.
+        let seller = nostr_sdk::Keys::generate().public_key().to_hex();
+        let creq = crate::gateway::creq::build_seller_creq(
+            "job",
+            7,
+            "sat",
+            &["https://testnut.cashudevkit.org".to_string()],
+            &seller,
+        )
+        .expect("build creq");
+        assert_eq!(
+            accepted_mints_from_claim_creq(Some(&creq)).unwrap(),
+            vec!["https://testnut.cashudevkit.org".to_string()]
+        );
+
+        // Present but garbage → REFUSE (fail-closed), not the empty fallback.
+        let error =
+            accepted_mints_from_claim_creq(Some("creqAnot-valid-base64-cbor")).unwrap_err();
+        assert!(
+            error.to_string().contains("unparseable creq"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn accept_bind_round_trips_on_disk() {

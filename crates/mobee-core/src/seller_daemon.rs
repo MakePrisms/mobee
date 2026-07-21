@@ -1152,6 +1152,11 @@ impl SellerDaemon {
         // and threaded through its pay path — the co-signatures agree by construction. The mint is
         // the realized mint the buyer pays at (the seller's default accepted mint), normalized as a
         // `MintUrl` exactly as the buyer builds it, so the two receipt bytes cannot drift.
+        // TEMPORARY (multi-mint TODO): this pins the seller receipt mint to the DEFAULT accepted
+        // mint while the buyer binds its resolved realized mint; they agree ONLY because v2 is
+        // single-mint (both == DEFAULT_MINT_URL). Under multi-mint enablement a buyer paying at a
+        // non-default listed mint would silently diverge from this — the realized mint must then be
+        // reconciled onto the actual payload mint before signing.
         let authored_creq = gateway::creq::build_seller_creq(
             &active.job_id,
             active.offer.amount,
