@@ -511,7 +511,11 @@ pub struct ReceiptAuthority {
 }
 
 impl ReceiptAuthority {
-    fn verify(&self, evidence: ReceiptEvidence) -> Result<ReceiptRecord, PaymentError> {
+    fn verify(
+        &self,
+        evidence: ReceiptEvidence,
+        key: &PaymentKey,
+    ) -> Result<ReceiptRecord, PaymentError> {
         // Money-path publish rule: empty relay_success ⇒ fail closed BEFORE returning
         // evidence (mirrors `send_payment`'s empty-relay gate). Recovery retries only the
         // idempotent receipt publish.
@@ -531,10 +535,17 @@ impl ReceiptAuthority {
             return Err(PaymentError::ForgedReceipt);
         }
         // Real schnorr verification of BOTH co-signatures over the preimage digest, each
-        // against its EXTERNAL anchor.
+        // against its EXTERNAL anchor. Runs BEFORE the terms-binding check so a preimage field
+        // tampered after signing still fails as a forged (digest-mismatched) signature.
         let message = Message::from_digest(evidence.preimage.digest_bytes());
         verify_schnorr_hex(&evidence.seller_signature, &message, &self.seller)?;
         verify_schnorr_hex(&evidence.buyer_signature, &message, &self.buyer)?;
+        // Bind the receipt to THIS payment's terms. Anchor + signature checks alone would close
+        // on ANY correctly co-signed receipt from the right parties — including one for an
+        // unrelated payment. Compare every co-signed preimage field against the payment key (the
+        // realized terms: amount/unit/mint are re-pointed onto the key at pay time), refusing on
+        // any drift before the state can advance to Closed.
+        require_receipt_binds_key(&evidence.preimage, key)?;
         Ok(ReceiptRecord {
             receipt_id: evidence.receipt_id,
             receipt_kind: RECEIPT_EVENT_KIND,
@@ -605,6 +616,55 @@ pub struct ContributionCosig<'a> {
     pub tuple_digest: [u8; 32],
     /// The seller's schnorr signature (hex) over `tuple_digest`, read from the accepted result.
     pub tuple_signature_hex: &'a str,
+}
+
+/// Refuse a receipt whose co-signed preimage does not bind THIS payment's terms. Every preimage
+/// field the buyer/seller co-signed is compared against the [`PaymentKey`] (its realized
+/// amount/unit/mint), so a valid co-signed receipt for a DIFFERENT payment cannot close this one.
+/// `result_id` is not a preimage field (the co-signature binds `offer_id`==`job_id` plus the
+/// delivery/creq hashes); it is enforced separately at accept-bind time.
+fn require_receipt_binds_key(
+    preimage: &ReceiptPreimage,
+    key: &PaymentKey,
+) -> Result<(), PaymentError> {
+    let mismatch = |field: &str, expected: String, actual: &str| {
+        Err(PaymentError::Refused(format!(
+            "receipt does not bind this payment: {field} {actual:?} != expected {expected:?}"
+        )))
+    };
+    if preimage.offer_id != key.job_id.as_str() {
+        return mismatch("offer_id", key.job_id.as_str().to_owned(), &preimage.offer_id);
+    }
+    if preimage.job_hash != key.job_hash.as_str() {
+        return mismatch("job_hash", key.job_hash.as_str().to_owned(), &preimage.job_hash);
+    }
+    if preimage.amount != key.amount.to_u64() {
+        return mismatch(
+            "amount",
+            key.amount.to_u64().to_string(),
+            &preimage.amount.to_string(),
+        );
+    }
+    if preimage.unit != key.unit.to_string() {
+        return mismatch("unit", key.unit.to_string(), &preimage.unit);
+    }
+    if preimage.mint != key.mint.to_string() {
+        return mismatch("mint", key.mint.to_string(), &preimage.mint);
+    }
+    if preimage.delivery_integrity_hash != key.delivery_integrity_hash.as_str() {
+        return mismatch(
+            "delivery_integrity_hash",
+            key.delivery_integrity_hash.as_str().to_owned(),
+            &preimage.delivery_integrity_hash,
+        );
+    }
+    if preimage.creq_hash != key.creq_hash {
+        return Err(PaymentError::Refused(format!(
+            "receipt does not bind this payment: creq_hash {:?} != expected {:?}",
+            preimage.creq_hash, key.creq_hash
+        )));
+    }
+    Ok(())
 }
 
 /// Verify one schnorr signature (hex) over `message` against a nostr x-only anchor.
@@ -822,7 +882,7 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
             payment,
         }) = state.clone()
         {
-            let receipt = authority.verify(effects.publish_receipt(key, &payment)?)?;
+            let receipt = authority.verify(effects.publish_receipt(key, &payment)?, key)?;
             let published = PaymentState::ReceiptPublished {
                 attempt_id,
                 receipt,
@@ -836,6 +896,16 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
             receipt,
         }) = state.clone()
         {
+            // Refuse to close on a non-receipt kind. A `verify`-built record always carries
+            // RECEIPT_EVENT_KIND, but a record deserialized from an OLD journal defaults its
+            // `receipt_kind` to 0 (kind-1059-aliased); such a record must NOT advance to Closed —
+            // only a genuine kind-3400 receipt settles the trade.
+            if receipt.receipt_kind != RECEIPT_EVENT_KIND {
+                return Err(PaymentError::Refused(format!(
+                    "refusing to close on non-receipt kind {} (expected {RECEIPT_EVENT_KIND})",
+                    receipt.receipt_kind
+                )));
+            }
             let closed = PaymentState::Closed {
                 attempt_id,
                 receipt,
@@ -1566,6 +1636,93 @@ mod tests {
         assert_eq!(shared.receipt_count.load(Ordering::SeqCst), 0);
     }
 
+    // Finding H: a receipt correctly co-signed by the right parties but bound to a DIFFERENT
+    // payment's terms must not verify/close this payment. Same anchors + valid schnorr, but the
+    // preimage's amount is another payment's ⇒ Refused at the terms-binding gate.
+    #[test]
+    fn receipt_authority_refuses_receipt_bound_to_other_payment_terms() {
+        let other_terms = PaymentTerms::new(
+            MintUrl::from_str(MINT).unwrap(),
+            Amount::from(9), // this key pays 7
+            CurrencyUnit::Sat,
+            nostr_public_key(2),
+            public_key(2),
+        );
+        let other_key = PaymentKey::new(
+            JobId::new("job").unwrap(),
+            ResultId::new("result").unwrap(),
+            DeliveryIntegrityHash::from_hex("11".repeat(32)).unwrap(),
+            JobHash::from_hex("22".repeat(32)).unwrap(),
+            &other_terms,
+            None,
+        );
+        // Evidence is correctly co-signed over the OTHER payment's preimage (amount 9).
+        let evidence = valid_evidence(&other_key);
+        let err = authority()
+            .verify(evidence, &key())
+            .expect_err("receipt for other terms must refuse");
+        match err {
+            PaymentError::Refused(message) => {
+                assert!(
+                    message.contains("does not bind this payment") && message.contains("amount"),
+                    "unexpected refusal: {message}"
+                );
+            }
+            other => panic!("expected terms-binding refusal, got {other:?}"),
+        }
+    }
+
+    // Finding H: a ReceiptPublished state carrying a non-receipt kind (e.g. an OLD journal record
+    // whose `receipt_kind` defaults to 0) must NOT advance to Closed.
+    #[test]
+    fn recovery_refuses_to_close_on_non_receipt_kind() {
+        let journal = MemoryPaymentJournal::default();
+        let payment_key = key();
+        let attempt_id = payment_key.attempt_id();
+        let states = [
+            PaymentState::Intent {
+                attempt_id: attempt_id.clone(),
+            },
+            PaymentState::Locked {
+                attempt_id: attempt_id.clone(),
+            },
+            PaymentState::Sent {
+                attempt_id: attempt_id.clone(),
+                payment: sent(),
+            },
+            PaymentState::ReceiptPublished {
+                attempt_id,
+                receipt: ReceiptRecord {
+                    receipt_id: "1059envelopeid".into(),
+                    receipt_kind: 0, // old journal default — NOT a kind-3400 receipt
+                },
+            },
+        ];
+        {
+            let mut guard = journal.lock(&payment_key).unwrap();
+            for state in states {
+                guard
+                    .append_sync(&PaymentRecord {
+                        key: payment_key.clone(),
+                        value: state,
+                    })
+                    .unwrap();
+            }
+        }
+        let shared = FakeShared::default();
+        let mut effects = FakeEffects::new(shared);
+        let err = PaymentService::new(&journal)
+            .advance(&payment_key, &terms(), &authority(), &mut effects)
+            .expect_err("must not close on kind 0");
+        match err {
+            PaymentError::Refused(message) => assert!(
+                message.contains("non-receipt kind 0"),
+                "unexpected refusal: {message}"
+            ),
+            other => panic!("expected non-receipt-kind refusal, got {other:?}"),
+        }
+    }
+
     #[test]
     fn forged_receipt_author_or_missing_signature_is_rejected() {
         let journal = MemoryPaymentJournal::default();
@@ -1586,7 +1743,7 @@ mod tests {
     #[test]
     fn receipt_authority_accepts_real_cosigned_receipt_and_stamps_kind() {
         let record = authority()
-            .verify(valid_evidence(&key()))
+            .verify(valid_evidence(&key()), &key())
             .expect("valid co-signed receipt verifies");
         assert_eq!(record.receipt_kind, RECEIPT_EVENT_KIND);
         assert_eq!(record.receipt_id, valid_evidence(&key()).receipt_id);
@@ -1598,7 +1755,7 @@ mod tests {
         // A real schnorr signature, but by an attacker key — not the anchored seller.
         evidence.seller_signature = sign_hex(&attacker_keys(), evidence.preimage.digest_bytes());
         assert!(matches!(
-            authority().verify(evidence),
+            authority().verify(evidence, &key()),
             Err(PaymentError::ForgedReceipt)
         ));
     }
@@ -1612,7 +1769,7 @@ mod tests {
             seller: attacker_keys().public_key(),
         };
         assert!(matches!(
-            wrong_anchor.verify(valid_evidence(&key())),
+            wrong_anchor.verify(valid_evidence(&key()), &key()),
             Err(PaymentError::ForgedReceipt)
         ));
     }
@@ -1623,7 +1780,7 @@ mod tests {
         let mut evidence = valid_evidence(&key());
         evidence.relay_success.clear();
         assert!(matches!(
-            authority().verify(evidence),
+            authority().verify(evidence, &key()),
             Err(PaymentError::NoRelayAccepted)
         ));
     }
@@ -1635,7 +1792,7 @@ mod tests {
         let mut evidence = valid_evidence(&key());
         evidence.preimage.delivery_integrity_hash = "ab".repeat(20);
         assert!(matches!(
-            authority().verify(evidence),
+            authority().verify(evidence, &key()),
             Err(PaymentError::ForgedReceipt)
         ));
     }
@@ -1649,7 +1806,7 @@ mod tests {
             evidence.preimage.exec_metadata_commitment,
             crate::receipt::EXEC_METADATA_COMMITMENT_EMPTY
         );
-        assert!(authority().verify(evidence).is_ok());
+        assert!(authority().verify(evidence, &key()).is_ok());
     }
 
     #[test]
