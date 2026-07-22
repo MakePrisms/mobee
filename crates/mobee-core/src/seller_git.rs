@@ -2,8 +2,9 @@
 //!
 //! Base fetch, fork checkout, and delivery push run through [`crate::git_transport`]'s rustls
 //! smart-HTTP subtransport, which injects the seller's NIP-98 `Authorization` on relay-git requests.
-//! The authorship / non-empty-tree delivery gates read the workdir's object database directly with
-//! git2 (no `git log` / `git ls-tree` subprocess).
+//! The agent edits files in the job workdir but never commits; at delivery the daemon snapshots the
+//! final tree into ONE commit under the delivery identity via [`snapshot_delivery`] (git2 only, no
+//! `git` subprocess) and pushes that.
 //!
 //! ## Why the old scrub machinery is gone (and this is safe)
 //! The previous implementation shelled out to `git` and had to defend against ambient config: empty
@@ -21,7 +22,7 @@
 use std::path::{Path, PathBuf};
 
 use git2::build::CheckoutBuilder;
-use git2::{Direction, ObjectType, Oid, Repository, TreeWalkMode, TreeWalkResult};
+use git2::{Commit, Direction, IndexAddOption, Oid, Repository, Signature};
 
 use crate::delivery_transport::{assert_allowed_repo_locator, TransportRefuse};
 use crate::git_transport::{self, TransportError};
@@ -68,27 +69,10 @@ impl From<TransportError> for SellerGitError {
     }
 }
 
-/// Best-effort `HEAD` OID in `workdir`. `None` when the tree has no commits yet.
-///
-/// Used by gate #10 (delivery attribution): deliver only agent-authored, non-empty trees.
-pub fn try_head_oid(workdir: &Path) -> Option<String> {
-    rev_parse_oid(workdir, "HEAD")
-}
-
-fn rev_parse_oid(workdir: &Path, rev: &str) -> Option<String> {
-    let repo = Repository::open(workdir).ok()?;
-    let commit = repo.revparse_single(rev).ok()?.peel_to_commit().ok()?;
-    let oid = commit.id().to_string();
-    if oid.len() < 40 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    Some(oid)
-}
-
-/// Stamped identity for empty-base deliveries (agent-from-empty model).
-///
-/// Gate #10 accepts only commits whose author **and** committer match this stamp.
-/// Clone-then-no-work keeps the remote's original authors → refuse.
+/// The deterministic identity every delivery commit carries: `mobee-seller-<pubkey16>` /
+/// `<pubkey16>@seller.mobee.invalid`. The daemon authors the snapshot commit under this identity,
+/// so the delivered commit is provably the seat's — the seller's signature over the result and
+/// receipt is the binding attribution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryAgentIdentity {
     pub name: String,
@@ -120,8 +104,10 @@ impl DeliveryAgentIdentity {
     }
 }
 
-/// Initialise `workdir` as a fresh repo with the stamped identity in its `.git/config` (so the
-/// AGENT's later commits carry it) and `main` as the initial branch. **No harness commit.**
+/// Initialise `workdir` as a fresh repo (`main` as the initial branch) with the delivery identity
+/// in `.git/config`. The agent works from an empty tree here; the daemon snapshots the result at
+/// delivery. The config identity only spares the agent's optional scratch commits a missing-identity
+/// error — those commits are never delivered.
 pub fn init_empty_delivery_workdir(
     workdir: &Path,
     identity: &DeliveryAgentIdentity,
@@ -156,14 +142,13 @@ fn init_repo_with_identity(
 }
 
 /// Contribution fork-from-base: initialise `workdir` as a working clone of the PINNED
-/// target `base_clone_url` at `base_oid`, on a per-job unique `branch` carrying the FULL job_id
-///. The agent then commits its work on top; the daemon pushes `branch` to the seller's OWN
+/// target `base_clone_url` at `base_oid`, on a per-job unique `branch` carrying the FULL job_id.
+/// The agent then edits the tree; at delivery the daemon snapshots the result into one commit
+/// parented on `base_oid` (see [`snapshot_delivery`]) and pushes `branch` to the seller's OWN
 /// relay-git namespace. Transport-allowlisted (https + relay-git; `ext::`/file/ssh refused).
 ///
 /// FULL-depth fetch (no depth limit) so the fork carries `base_oid` + ancestry — a shallow fork
-/// would make the BUYER's descendant gate false-refuse an honest contribution. The base history is
-/// foreign (the target's authors); only the commits ADDED on top are the seller's, so the daemon
-/// scopes its authorship gate to `base_oid..HEAD` (see [`require_agent_authored_contribution`]).
+/// would make the BUYER's descendant gate false-refuse an honest contribution.
 pub fn init_contribution_workdir(
     workdir: &Path,
     identity: &DeliveryAgentIdentity,
@@ -213,232 +198,96 @@ fn checkout_base_branch(
     Ok(())
 }
 
-/// `git checkout -B <branch>` at the current HEAD (from-scratch delivery: name the agent's commits
-/// onto the per-job branch so the daemon can push it). Best-effort — points the branch ref at HEAD
-/// and moves HEAD to it (HEAD's tree is unchanged, so no working-tree checkout is needed).
-pub fn point_branch_at_head(workdir: &Path, branch: &str) -> Result<(), SellerGitError> {
-    let repo =
-        Repository::open(workdir).map_err(|error| SellerGitError::Io(format!("open: {error}")))?;
-    let head_commit = repo
-        .head()
-        .and_then(|h| h.peel_to_commit())
-        .map_err(|_| SellerGitError::CommandFailed("point-branch-head"))?;
-    repo.branch(branch, &head_commit, true)
-        .map_err(|_| SellerGitError::CommandFailed("point-branch-head"))?;
-    repo.set_head(&format!("refs/heads/{branch}"))
-        .map_err(|_| SellerGitError::CommandFailed("point-branch-head"))?;
-    Ok(())
-}
-
-/// Contribution authorship gate: deliver IFF every commit in `base_oid..HEAD` is
-/// agent-authored, HEAD advanced past `base_oid`, and the HEAD tree is non-empty. Returns the HEAD
-/// oid on success.
-pub fn require_agent_authored_contribution(
-    workdir: &Path,
-    identity: &DeliveryAgentIdentity,
-    base_oid: &str,
-    after: Option<&str>,
-) -> Result<String, SellerGitError> {
-    let after = after.ok_or_else(|| {
-        SellerGitError::Io("contribution refused: agent left no commit (HEAD missing)".into())
-    })?;
-    if after == base_oid {
-        return Err(SellerGitError::Io(
-            "contribution refused: HEAD did not advance past base_oid (no agent work)".into(),
-        ));
-    }
-    require_range_agent_authored(workdir, identity, base_oid, after)?;
-    require_head_tree_nonempty(workdir, after)?;
-    Ok(after.to_owned())
-}
-
-/// Every commit reachable from `after` but not from `base_oid` must match the stamped identity
-/// (author AND committer). Fail-closed on any read error.
-fn require_range_agent_authored(
-    workdir: &Path,
-    identity: &DeliveryAgentIdentity,
-    base_oid: &str,
-    after: &str,
-) -> Result<(), SellerGitError> {
-    let repo = Repository::open(workdir).map_err(|_| {
-        SellerGitError::Io("contribution refused: cannot open workdir — fail-closed".into())
-    })?;
-    let after_oid = Oid::from_str(after)
-        .map_err(|_| SellerGitError::Io("contribution refused: bad HEAD oid".into()))?;
-    let base = Oid::from_str(base_oid)
-        .map_err(|_| SellerGitError::Io("contribution refused: bad base oid".into()))?;
-    let mut walk = repo.revwalk().map_err(|_| {
-        SellerGitError::Io("contribution refused: cannot read commit authors — fail-closed".into())
-    })?;
-    walk.push(after_oid).map_err(|_| {
-        SellerGitError::Io("contribution refused: cannot read commit authors — fail-closed".into())
-    })?;
-    // `base_oid..after` — hide base and its ancestors (the foreign base history).
-    walk.hide(base).map_err(|_| {
-        SellerGitError::Io("contribution refused: cannot read commit authors — fail-closed".into())
-    })?;
-
-    let mut saw_commit = false;
-    for oid in walk {
-        let oid = oid.map_err(|_| {
-            SellerGitError::Io(
-                "contribution refused: cannot read commit authors — fail-closed".into(),
-            )
-        })?;
-        let commit = repo.find_commit(oid).map_err(|_| {
-            SellerGitError::Io(
-                "contribution refused: cannot read commit authors — fail-closed".into(),
-            )
-        })?;
-        saw_commit = true;
-        if !commit_matches_identity(&commit, identity) {
-            let author = commit.author();
-            return Err(SellerGitError::Io(format!(
-                "contribution refused: commit on top of base not agent-authored (author={} <{}>) — expected {} <{}>",
-                author.name().unwrap_or(""),
-                author.email().unwrap_or(""),
-                identity.name,
-                identity.email
-            )));
-        }
-    }
-    if !saw_commit {
-        return Err(SellerGitError::Io(
-            "contribution refused: no agent commits on top of base_oid".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Gate #10 (empty-base): deliver IFF HEAD is agent-authored + substantive.
+/// Snapshot the final workdir tree into ONE delivery commit under `identity` and point `branch`
+/// at it. This is the whole delivery step: the agent never commits (any commits it makes are
+/// scratch and ignored), so the daemon authors the deliverable itself from the workdir contents.
 ///
-/// - `after` missing → refuse (no harness fallback)
-/// - any commit author/committer ≠ stamped identity → refuse (clone-only / foreign history)
-/// - HEAD tree == empty tree → refuse (empty/no-op commit)
-pub fn require_agent_authored_delivery(
+/// - `base_oid = Some(oid)` (contribution): the commit is parented on the buyer-pinned base, so it
+///   descends from `base_oid` by construction (the buyer's descendant gate holds). The snapshot is
+///   refused if its tree equals the base tree — there is nothing to deliver.
+/// - `base_oid = None` (from-scratch): a root commit whose tree is the whole workdir. Refused if the
+///   tree is empty. No foreign history is ever adopted — we only ever deliver a tree we snapshot
+///   ourselves — so there is no clone-then-deliver laundering to guard against.
+///
+/// The tree is staged with `add_all`/`update_all` (tracked modifications, new non-ignored files,
+/// and deletions), so `.gitignore`d files and `.git` internals are never included and file modes
+/// (the executable bit) are preserved. libgit2's `commit()` never signs (no `gpgsig`, regardless of
+/// `commit.gpgsign`) and runs no hooks — both structural, so no config scrub is needed. Returns the
+/// delivery commit oid.
+pub fn snapshot_delivery(
     workdir: &Path,
     identity: &DeliveryAgentIdentity,
-    after: Option<&str>,
+    base_oid: Option<&str>,
+    branch: &str,
+    message: &str,
 ) -> Result<String, SellerGitError> {
-    let after = after.ok_or_else(|| {
-        SellerGitError::Io(
-            "delivery refused: agent left no commit (HEAD missing) — no harness fallback".into(),
-        )
-    })?;
-    require_all_commits_agent_authored(workdir, identity)?;
-    require_head_tree_nonempty(workdir, after)?;
-    Ok(after.to_owned())
-}
+    let repo = Repository::open(workdir)
+        .map_err(|error| SellerGitError::Io(format!("snapshot: open workdir: {error}")))?;
 
-/// Every commit reachable from HEAD must match the stamped identity.
-fn require_all_commits_agent_authored(
-    workdir: &Path,
-    identity: &DeliveryAgentIdentity,
-) -> Result<(), SellerGitError> {
-    let repo = Repository::open(workdir).map_err(|_| {
-        SellerGitError::Io(
-            "delivery refused: cannot open workdir — fail-closed (no harness fallback)".into(),
-        )
-    })?;
-    let mut walk = repo.revwalk().map_err(|_| {
-        SellerGitError::Io(
-            "delivery refused: cannot read commit authors — fail-closed (no harness fallback)"
-                .into(),
-        )
-    })?;
-    walk.push_head().map_err(|_| {
-        SellerGitError::Io(
-            "delivery refused: agent left no commit (HEAD missing) — no harness fallback".into(),
-        )
-    })?;
-
-    let mut saw_commit = false;
-    for oid in walk {
-        let oid = oid.map_err(|_| {
-            SellerGitError::Io(
-                "delivery refused: cannot read commit authors — fail-closed (no harness fallback)"
-                    .into(),
-            )
-        })?;
-        let commit = repo.find_commit(oid).map_err(|_| {
-            SellerGitError::Io(
-                "delivery refused: cannot read commit authors — fail-closed (no harness fallback)"
-                    .into(),
-            )
-        })?;
-        saw_commit = true;
-        if !commit_matches_identity(&commit, identity) {
-            let author = commit.author();
-            let committer = commit.committer();
-            return Err(SellerGitError::Io(format!(
-                "delivery refused: commit not agent-authored (author={} <{}>, committer={} <{}>; expected {} <{}>) — clone-only / foreign history",
-                author.name().unwrap_or(""),
-                author.email().unwrap_or(""),
-                committer.name().unwrap_or(""),
-                committer.email().unwrap_or(""),
-                identity.name,
-                identity.email
-            )));
+    let base = match base_oid {
+        Some(hex) => {
+            let oid = Oid::from_str(hex)
+                .map_err(|_| SellerGitError::Io("delivery refused: bad base oid".into()))?;
+            let commit = repo.find_commit(oid).map_err(|_| {
+                SellerGitError::Io("delivery refused: base_oid absent from workdir".into())
+            })?;
+            Some(commit)
         }
-    }
-    if !saw_commit {
-        return Err(SellerGitError::Io(
-            "delivery refused: agent left no commit (HEAD missing) — no harness fallback".into(),
-        ));
-    }
-    Ok(())
-}
+        None => None,
+    };
 
-/// True IFF the commit's author AND committer both match the stamped identity (name and email).
-fn commit_matches_identity(commit: &git2::Commit, identity: &DeliveryAgentIdentity) -> bool {
-    let author = commit.author();
-    let committer = commit.committer();
-    author.name() == Some(identity.name.as_str())
-        && author.email() == Some(identity.email.as_str())
-        && committer.name() == Some(identity.name.as_str())
-        && committer.email() == Some(identity.email.as_str())
-}
-
-/// Refuse a delivery whose HEAD tree contains no file (parity with `git ls-tree -r` being empty).
-fn require_head_tree_nonempty(workdir: &Path, after: &str) -> Result<(), SellerGitError> {
-    let repo = Repository::open(workdir).map_err(|_| {
-        SellerGitError::Io(
-            "delivery refused: delivery tree unknown — fail-closed (no harness fallback)".into(),
-        )
-    })?;
-    let oid = Oid::from_str(after).map_err(|_| {
-        SellerGitError::Io(
-            "delivery refused: delivery tree unknown — fail-closed (no harness fallback)".into(),
-        )
-    })?;
+    // Stage the full workdir tree: new + modified tracked files (add_all skips ignored) and
+    // removals of tracked files gone from the workdir (update_all). `.git` is never walked.
+    let mut index = repo
+        .index()
+        .map_err(|_| SellerGitError::CommandFailed("snapshot-index"))?;
+    index
+        .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+        .map_err(|_| SellerGitError::CommandFailed("snapshot-add"))?;
+    index
+        .update_all(["*"].iter(), None)
+        .map_err(|_| SellerGitError::CommandFailed("snapshot-update"))?;
+    let tree_oid = index
+        .write_tree()
+        .map_err(|_| SellerGitError::CommandFailed("snapshot-write-tree"))?;
     let tree = repo
-        .find_commit(oid)
-        .and_then(|commit| commit.tree())
-        .map_err(|_| {
-            SellerGitError::Io(
-                "delivery refused: delivery tree unknown — fail-closed (no harness fallback)".into(),
-            )
-        })?;
-    let mut has_file = false;
-    tree.walk(TreeWalkMode::PreOrder, |_, entry| {
-        if entry.kind() == Some(ObjectType::Blob) {
-            has_file = true;
-            TreeWalkResult::Abort
-        } else {
-            TreeWalkResult::Ok
+        .find_tree(tree_oid)
+        .map_err(|_| SellerGitError::CommandFailed("snapshot-tree"))?;
+
+    // Completion gate: there must be something to deliver.
+    match base.as_ref().map(|c| c.tree_id()) {
+        Some(base_tree) if base_tree == tree_oid => {
+            return Err(SellerGitError::Io(
+                "delivery refused: nothing to deliver (workdir identical to base)".into(),
+            ));
         }
-    })
-    .map_err(|_| {
-        SellerGitError::Io(
-            "delivery refused: delivery tree unknown — fail-closed (no harness fallback)".into(),
-        )
-    })?;
-    if !has_file {
-        return Err(SellerGitError::Io(
-            "delivery refused: empty tree (no substantive files) — no harness fallback".into(),
-        ));
+        None if tree.is_empty() => {
+            return Err(SellerGitError::Io(
+                "delivery refused: nothing to deliver (empty tree)".into(),
+            ));
+        }
+        _ => {}
     }
-    Ok(())
+
+    index
+        .write()
+        .map_err(|_| SellerGitError::CommandFailed("snapshot-index-write"))?;
+    let signature = Signature::now(&identity.name, &identity.email)
+        .map_err(|_| SellerGitError::CommandFailed("snapshot-signature"))?;
+    let parents: Vec<&Commit> = base.iter().collect();
+    let commit = repo
+        .commit(None, &signature, &signature, message, &tree, &parents)
+        .map_err(|_| SellerGitError::CommandFailed("snapshot-commit"))?;
+
+    // Point the delivery branch (and HEAD) at the snapshot, regardless of whatever scratch state
+    // the agent left HEAD in. Force-update the ref directly (`Repository::branch` refuses to move
+    // the checked-out branch, which is the common case).
+    let refname = format!("refs/heads/{branch}");
+    repo.reference(&refname, commit, true, "mobee delivery snapshot")
+        .map_err(|_| SellerGitError::CommandFailed("snapshot-branch"))?;
+    repo.set_head(&refname)
+        .map_err(|_| SellerGitError::CommandFailed("snapshot-set-head"))?;
+    Ok(commit.to_string())
 }
 
 /// Optional NIP-98 auth for relay-git push/fetch (key never logged / never on argv).
@@ -551,22 +400,18 @@ mod tests {
             .current_dir(path)
             .status();
         fs::write(path.join("out.txt"), "hello\n").expect("write");
-        assert!(
-            Command::new("git")
-                .args(["add", "out.txt"])
-                .current_dir(path)
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            Command::new("git")
-                .args(["commit", "-m", "seller delivery"])
-                .current_dir(path)
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(Command::new("git")
+            .args(["add", "out.txt"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-m", "seller delivery"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
     }
 
     #[test]
@@ -591,7 +436,6 @@ mod tests {
 
     #[test]
     fn push_to_local_https_style_bare_via_file_is_refused() {
-        // file:// is not on allowlist — fail closed even for fixtures.
         let root = temp("file-refuse");
         let _ = fs::remove_dir_all(&root);
         init_repo(&root);
@@ -626,11 +470,8 @@ mod tests {
 
     #[test]
     fn preflight_push_probe_fails_closed_on_unreachable_https_remote() {
-        // No mutation, no hang: an allowlisted-but-unresolvable https remote must fail closed
-        // rather than block boot. In-process libgit2 surfaces the DNS/connect failure as an Io
-        // transport error (the reqwest client's connect_timeout bounds it) — never a success.
         let err = preflight_push_probe("https://mobee-preflight.invalid/git/owner/repo.git", None)
-        .expect_err("unreachable remote must fail closed");
+            .expect_err("unreachable remote must fail closed");
         assert!(
             matches!(
                 err,
@@ -646,191 +487,6 @@ mod tests {
     fn allowlist_https_accepted_by_locator_gate() {
         assert_allowed_repo_locator("https://example.invalid/git/owner/repo.git").unwrap();
         assert_allowed_repo_locator("https://example.invalid/repo.git").unwrap();
-    }
-
-    #[test]
-    fn gate10_missing_after_refuses() {
-        let pk = "abcd".repeat(8);
-        let identity = DeliveryAgentIdentity::for_seller(&pk);
-        let err = require_agent_authored_delivery(
-            Path::new("/tmp/unused-gate10"),
-            &identity,
-            None,
-        )
-        .expect_err("missing after");
-        assert!(err.to_string().contains("no commit"), "{err}");
-    }
-
-    #[test]
-    fn gate10_wired_clone_then_no_work_refuses() {
-        // (a) Real workdir path: wipe stamped base, clone foreign repo, zero work → REFUSE.
-        let workdir = temp("gate10-clone-noop");
-        let foreign = temp("gate10-foreign-src");
-        let _ = fs::remove_dir_all(&workdir);
-        let _ = fs::remove_dir_all(&foreign);
-
-        let pk = "11".repeat(32);
-        let identity = DeliveryAgentIdentity::for_seller(&pk);
-        init_empty_delivery_workdir(&workdir, &identity).expect("stamp init");
-
-        // Foreign repo with non-agent authors (the clone-only payload).
-        fs::create_dir_all(&foreign).expect("foreign mkdir");
-        assert!(
-            Command::new("git")
-                .args(["init", "--initial-branch=main"])
-                .current_dir(&foreign)
-                .status()
-                .unwrap()
-                .success()
-        );
-        let _ = Command::new("git")
-            .args(["config", "user.name", "Upstream Author"])
-            .current_dir(&foreign)
-            .status();
-        let _ = Command::new("git")
-            .args(["config", "user.email", "upstream@example.invalid"])
-            .current_dir(&foreign)
-            .status();
-        fs::write(foreign.join("payload.txt"), "unchanged upstream tree\n").expect("write");
-        assert!(
-            Command::new("git")
-                .args(["add", "payload.txt"])
-                .current_dir(&foreign)
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            Command::new("git")
-                .args(["commit", "-m", "upstream"])
-                .current_dir(&foreign)
-                .status()
-                .unwrap()
-                .success()
-        );
-
-        // Exploit: wipe stamped .git and clone foreign history into the job workdir.
-        let _ = fs::remove_dir_all(workdir.join(".git"));
-        assert!(
-            Command::new("git")
-                .args(["clone", "--", foreign.to_str().expect("utf8"), "."])
-                .current_dir(&workdir)
-                .status()
-                .unwrap()
-                .success()
-        );
-
-        let after = try_head_oid(&workdir).expect("clone left a HEAD");
-        let err = require_agent_authored_delivery(&workdir, &identity, Some(&after))
-            .expect_err("clone-then-no-work must refuse");
-        assert!(
-            err.to_string().contains("not agent-authored")
-                || err.to_string().contains("foreign"),
-            "expected authorship refuse, got: {err}"
-        );
-
-        let _ = fs::remove_dir_all(&workdir);
-        let _ = fs::remove_dir_all(&foreign);
-    }
-
-    #[test]
-    fn gate10_wired_agent_authored_nonempty_accepts() {
-        // (b) Legit empty-base agent work under the stamp → ACCEPT.
-        let workdir = temp("gate10-ok");
-        let _ = fs::remove_dir_all(&workdir);
-
-        let pk = "22".repeat(32);
-        let identity = DeliveryAgentIdentity::for_seller(&pk);
-        init_empty_delivery_workdir(&workdir, &identity).expect("stamp init");
-        // Empty base: no HEAD yet.
-        assert!(try_head_oid(&workdir).is_none());
-
-        fs::write(workdir.join("out.txt"), "agent did the work\n").expect("write");
-        assert!(
-            Command::new("git")
-                .args(["add", "out.txt"])
-                .current_dir(&workdir)
-                .env("GIT_AUTHOR_NAME", &identity.name)
-                .env("GIT_AUTHOR_EMAIL", &identity.email)
-                .env("GIT_COMMITTER_NAME", &identity.name)
-                .env("GIT_COMMITTER_EMAIL", &identity.email)
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            Command::new("git")
-                .args(["commit", "-m", "agent delivery"])
-                .current_dir(&workdir)
-                .env("GIT_AUTHOR_NAME", &identity.name)
-                .env("GIT_AUTHOR_EMAIL", &identity.email)
-                .env("GIT_COMMITTER_NAME", &identity.name)
-                .env("GIT_COMMITTER_EMAIL", &identity.email)
-                .status()
-                .unwrap()
-                .success()
-        );
-
-        let after = try_head_oid(&workdir).expect("after");
-        let accepted =
-            require_agent_authored_delivery(&workdir, &identity, Some(&after))
-                .expect("legit agent work must accept");
-        assert_eq!(accepted, after);
-
-        let _ = fs::remove_dir_all(&workdir);
-    }
-
-    #[test]
-    fn gate10_wired_empty_tree_refuses() {
-        let workdir = temp("gate10-empty-tree");
-        let _ = fs::remove_dir_all(&workdir);
-
-        let pk = "33".repeat(32);
-        let identity = DeliveryAgentIdentity::for_seller(&pk);
-        init_empty_delivery_workdir(&workdir, &identity).expect("stamp init");
-        assert!(
-            Command::new("git")
-                .args(["commit", "--allow-empty", "-m", "empty"])
-                .current_dir(&workdir)
-                .env("GIT_AUTHOR_NAME", &identity.name)
-                .env("GIT_AUTHOR_EMAIL", &identity.email)
-                .env("GIT_COMMITTER_NAME", &identity.name)
-                .env("GIT_COMMITTER_EMAIL", &identity.email)
-                .status()
-                .unwrap()
-                .success()
-        );
-        let after = try_head_oid(&workdir).expect("empty commit has HEAD");
-        let err = require_agent_authored_delivery(&workdir, &identity, Some(&after))
-            .expect_err("empty tree must refuse");
-        assert!(
-            err.to_string().contains("empty tree"),
-            "expected empty-tree refuse, got: {err}"
-        );
-
-        let _ = fs::remove_dir_all(&workdir);
-    }
-
-    // ── Fork-from-base: allowlist + range-scoped authorship gate ──────────────────────
-    fn commit_as(dir: &Path, name: &str, email: &str, path: &str, content: &str, msg: &str) -> String {
-        let full = dir.join(path);
-        if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent).expect("mkdir parent");
-        }
-        fs::write(&full, content).expect("write");
-        assert!(Command::new("git").args(["add", "-A"]).current_dir(dir).status().unwrap().success());
-        assert!(Command::new("git")
-            .args(["commit", "-m", msg])
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", name)
-            .env("GIT_AUTHOR_EMAIL", email)
-            .env("GIT_COMMITTER_NAME", name)
-            .env("GIT_COMMITTER_EMAIL", email)
-            .status()
-            .unwrap()
-            .success());
-        let out = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap();
-        String::from_utf8(out.stdout).unwrap().trim().to_owned()
     }
 
     #[test]
@@ -852,70 +508,10 @@ mod tests {
     }
 
     #[test]
-    fn require_agent_authored_contribution_scopes_gate_to_range() {
-        let root = temp("contrib-range");
-        let identity = DeliveryAgentIdentity::for_seller(&"bb".repeat(32));
-        init_repo(&root); // base commit authored by "Mobee Seller Test" (foreign to the stamp)
-        let base_oid = {
-            let out = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&root).output().unwrap();
-            String::from_utf8(out.stdout).unwrap().trim().to_owned()
-        };
-        // Agent commit ON TOP of base, authored by the STAMPED identity.
-        let after = commit_as(&root, &identity.name, &identity.email, "src/x.rs", "work\n", "agent work");
-        // Range gate passes (base is foreign, but base_oid..HEAD is all agent-authored).
-        require_agent_authored_contribution(&root, &identity, &base_oid, Some(&after))
-            .expect("agent-authored range must pass despite foreign base");
-
-        // A foreign commit on top of base ⇒ refuse.
-        let foreign = commit_as(&root, "Stranger", "x@evil.invalid", "src/y.rs", "sneaky\n", "foreign");
-        assert!(require_agent_authored_contribution(&root, &identity, &base_oid, Some(&foreign)).is_err());
-
-        // HEAD == base (no advancement) ⇒ refuse.
-        assert!(require_agent_authored_contribution(&root, &identity, &base_oid, Some(&base_oid)).is_err());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// PATH-stripped proof: drive the seller's LOCAL git legs (init, authorship gate,
-    /// non-empty-tree gate, branch-at-head) with git2 ONLY — the delivery commit is created with
-    /// git2, never `Command`. Run with `git` absent from PATH to prove these legs have no shell-out.
-    #[test]
-    fn seller_gates_without_system_git() {
-        use git2::{Repository, Signature};
-        let workdir = temp("nogit-seller");
-        let _ = fs::remove_dir_all(&workdir);
-
-        let pk = "55".repeat(32);
-        let identity = DeliveryAgentIdentity::for_seller(&pk);
-        init_empty_delivery_workdir(&workdir, &identity).expect("init");
-
-        // Agent-authored commit via git2 (no system git), stamped as the seller identity.
-        let repo = Repository::open(&workdir).expect("open");
-        fs::write(workdir.join("out.txt"), "work\n").expect("write");
-        let mut index = repo.index().expect("index");
-        index.add_path(Path::new("out.txt")).expect("add");
-        index.write().expect("index write");
-        let tree = repo.find_tree(index.write_tree().expect("write tree")).expect("tree");
-        let sig = Signature::now(&identity.name, &identity.email).expect("sig");
-        let oid = repo
-            .commit(Some("HEAD"), &sig, &sig, "agent work", &tree, &[])
-            .expect("git2 commit");
-        let after = oid.to_string();
-
-        require_agent_authored_delivery(&workdir, &identity, Some(&after))
-            .expect("agent-authored delivery gate must pass under git2");
-        point_branch_at_head(&workdir, "mobee/job").expect("branch-at-head");
-        assert_eq!(try_head_oid(&workdir).expect("head"), after);
-
-        let _ = fs::remove_dir_all(&workdir);
-    }
-
-    #[test]
     fn checkout_base_branch_from_oid_creates_fork_tip() {
-        // `git checkout -B <branch> <oid>` must NOT pass `--` before the oid (that turns the
-        // oid into a pathspec → "not a commit ... cannot be created").
         let root = temp("checkout-base");
         let _ = fs::remove_dir_all(&root);
-        init_repo(&root); // leaves a commit whose oid is present in root's object db
+        init_repo(&root);
         let base_oid = {
             let out = Command::new("git")
                 .args(["rev-parse", "HEAD"])
@@ -928,7 +524,6 @@ mod tests {
         checkout_base_branch(&root, "mobee/contribution/job", &base_oid)
             .expect("checkout of a valid base_oid onto the fork branch must succeed");
 
-        // Now on the per-job branch, pointing at base_oid.
         let branch = Command::new("git")
             .args(["symbolic-ref", "--short", "HEAD"])
             .current_dir(&root)
@@ -944,8 +539,374 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8(head.stdout).unwrap().trim(), base_oid);
-
         let _ = fs::remove_dir_all(&root);
     }
+}
 
+/// Snapshot delivery: the daemon authors ONE commit from the final workdir tree, whatever git
+/// state the agent left. Setup uses system `git` (fixtures only); every assertion reads the
+/// delivered objects through git2. `snapshot_without_system_git` proves the delivery path itself
+/// has no shell-out.
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn workdir(label: &str) -> PathBuf {
+        let id = SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("mobee-snapshot-{label}-{}-{id}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir workdir");
+        dir
+    }
+
+    fn identity() -> DeliveryAgentIdentity {
+        DeliveryAgentIdentity::for_seller(&"ab".repeat(32))
+    }
+
+    fn git<const N: usize>(dir: &Path, args: [&str; N]) {
+        run_env(dir, args, None);
+    }
+
+    fn run_env<const N: usize>(dir: &Path, args: [&str; N], who: Option<(&str, &str)>) {
+        let mut cmd = Command::new("git");
+        cmd.args(args).current_dir(dir);
+        if let Some((name, email)) = who {
+            cmd.env("GIT_AUTHOR_NAME", name)
+                .env("GIT_AUTHOR_EMAIL", email)
+                .env("GIT_COMMITTER_NAME", name)
+                .env("GIT_COMMITTER_EMAIL", email);
+        }
+        let out = cmd.output().expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A repo with one base commit (foreign upstream identity), checked out on `branch`. Returns base oid.
+    fn init_with_base(dir: &Path, branch: &str) -> String {
+        git(dir, ["init", "--initial-branch=main"]);
+        fs::write(dir.join("README.md"), "base\n").expect("write base");
+        git(dir, ["add", "-A"]);
+        run_env(
+            dir,
+            ["commit", "-m", "base"],
+            Some(("Upstream", "upstream@example.invalid")),
+        );
+        let base = head(dir);
+        git(dir, ["checkout", "-B", branch, &base]);
+        base
+    }
+
+    fn head(dir: &Path) -> String {
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .expect("rev-parse");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    fn write(dir: &Path, path: &str, content: &str) {
+        let full = dir.join(path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).expect("mkdir parent");
+        }
+        fs::write(&full, content).expect("write file");
+    }
+
+    fn tree_paths(dir: &Path, oid: &str) -> Vec<String> {
+        let repo = Repository::open(dir).expect("open");
+        let tree = repo
+            .find_commit(Oid::from_str(oid).unwrap())
+            .unwrap()
+            .tree()
+            .unwrap();
+        let mut paths = Vec::new();
+        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if entry.kind() == Some(git2::ObjectType::Blob) {
+                paths.push(format!("{root}{}", entry.name().unwrap_or("")));
+            }
+            git2::TreeWalkResult::Ok
+        })
+        .unwrap();
+        paths
+    }
+
+    fn commit(dir: &Path, oid: &str) -> git2::Commit<'static> {
+        // Leak the repo so the returned commit's lifetime is convenient in asserts.
+        let repo = Box::leak(Box::new(Repository::open(dir).expect("open")));
+        repo.find_commit(Oid::from_str(oid).unwrap()).expect("commit")
+    }
+
+    // ── Field case: agent edits, never commits — the daemon snapshots the workdir ──────────────
+    #[test]
+    fn snapshots_uncommitted_workdir_onto_base() {
+        let dir = workdir("uncommitted");
+        let base = init_with_base(&dir, "mobee/job");
+        write(&dir, "src/feature.rs", "agent work, never committed\n");
+        let id = identity();
+
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "mobee delivery: task")
+            .expect("snapshot");
+
+        let c = commit(&dir, &oid);
+        assert_eq!(c.parent_count(), 1, "delivery is one commit on top of base");
+        assert_eq!(c.parent_id(0).unwrap().to_string(), base, "parented on the pinned base");
+        assert_eq!(c.author().email(), Some(id.email.as_str()));
+        assert_eq!(c.committer().email(), Some(id.email.as_str()));
+        assert!(tree_paths(&dir, &oid).contains(&"src/feature.rs".to_owned()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Agent scratch commits (foreign identity, extra commits) are ignored ────────────────────
+    #[test]
+    fn ignores_agent_scratch_commits_delivers_single_commit_on_base() {
+        let dir = workdir("scratch");
+        let base = init_with_base(&dir, "mobee/job");
+        // Agent makes two scratch commits under a foreign identity.
+        write(&dir, "a.rs", "one\n");
+        git(&dir, ["add", "-A"]);
+        run_env(&dir, ["commit", "-m", "scratch 1"], Some(("Claude", "c@anthropic.invalid")));
+        write(&dir, "b.rs", "two\n");
+        git(&dir, ["add", "-A"]);
+        run_env(&dir, ["commit", "-m", "scratch 2"], Some(("Claude", "c@anthropic.invalid")));
+        let id = identity();
+
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg").expect("snapshot");
+
+        let c = commit(&dir, &oid);
+        assert_eq!(c.parent_id(0).unwrap().to_string(), base, "parented on base, not the scratch tip");
+        assert_eq!(c.author().email(), Some(id.email.as_str()), "delivery identity, not the agent's");
+        // Exactly one commit between base and the delivery tip.
+        let repo = Repository::open(&dir).unwrap();
+        let mut walk = repo.revwalk().unwrap();
+        walk.push(Oid::from_str(&oid).unwrap()).unwrap();
+        walk.hide(Oid::from_str(&base).unwrap()).unwrap();
+        assert_eq!(walk.count(), 1, "the delivery collapses to a single commit");
+        // Both files the agent produced are present.
+        let paths = tree_paths(&dir, &oid);
+        assert!(paths.contains(&"a.rs".to_owned()) && paths.contains(&"b.rs".to_owned()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── From-scratch: root commit whose tree is the whole workdir ──────────────────────────────
+    #[test]
+    fn snapshots_from_scratch_as_root_commit() {
+        let dir = workdir("scratch-base");
+        let id = identity();
+        init_empty_delivery_workdir(&dir, &id).expect("init");
+        write(&dir, "out.rs", "work\n");
+
+        let oid = snapshot_delivery(&dir, &id, None, "mobee/job", "msg").expect("snapshot");
+
+        let c = commit(&dir, &oid);
+        assert_eq!(c.parent_count(), 0, "from-scratch delivery is a root commit");
+        assert_eq!(c.author().email(), Some(id.email.as_str()));
+        assert!(tree_paths(&dir, &oid).contains(&"out.rs".to_owned()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Completion gate: nothing to deliver refuses cleanly (both floors) ──────────────────────
+    #[test]
+    fn nothing_to_deliver_contribution_refuses() {
+        let dir = workdir("empty-contrib");
+        let base = init_with_base(&dir, "mobee/job");
+        let id = identity();
+        // Workdir untouched — identical to base.
+        let err = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg")
+            .expect_err("must refuse");
+        assert!(err.to_string().contains("identical to base"), "got: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nothing_to_deliver_from_scratch_refuses() {
+        let dir = workdir("empty-scratch");
+        let id = identity();
+        init_empty_delivery_workdir(&dir, &id).expect("init");
+        let err = snapshot_delivery(&dir, &id, None, "mobee/job", "msg").expect_err("must refuse");
+        assert!(err.to_string().contains("empty tree"), "got: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── .gitignore'd files are never delivered ─────────────────────────────────────────────────
+    #[test]
+    fn snapshot_excludes_gitignored_files() {
+        let dir = workdir("ignore");
+        let base = init_with_base(&dir, "mobee/job");
+        write(&dir, ".gitignore", "secret.txt\n");
+        write(&dir, "secret.txt", "do not deliver\n");
+        write(&dir, "real.rs", "delivered\n");
+        let id = identity();
+
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg").expect("snapshot");
+
+        let paths = tree_paths(&dir, &oid);
+        assert!(paths.contains(&"real.rs".to_owned()));
+        assert!(!paths.contains(&"secret.txt".to_owned()), "ignored file must not be delivered");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── `.git` internals are never delivered ───────────────────────────────────────────────────
+    #[test]
+    fn snapshot_never_includes_git_internals() {
+        let dir = workdir("gitinternals");
+        let base = init_with_base(&dir, "mobee/job");
+        write(&dir, "work.rs", "work\n");
+        let id = identity();
+
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg").expect("snapshot");
+
+        for path in tree_paths(&dir, &oid) {
+            assert!(!path.starts_with(".git/") && path != ".git", "git internals leaked: {path}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Host commit.gpgsign is ignored — libgit2 never signs ───────────────────────────────────
+    #[test]
+    fn snapshot_commit_is_never_signed() {
+        let dir = workdir("gpgsign");
+        let base = init_with_base(&dir, "mobee/job");
+        git(&dir, ["config", "commit.gpgsign", "true"]);
+        git(&dir, ["config", "user.signingkey", "DEADBEEF"]);
+        write(&dir, "work.rs", "work\n");
+        let id = identity();
+
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg").expect("snapshot");
+
+        assert!(
+            !commit(&dir, &oid).raw_header().unwrap().contains("gpgsig"),
+            "delivery commit must carry no signature"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── A blocking pre-commit hook cannot stop the snapshot ────────────────────────────────────
+    #[test]
+    fn snapshot_bypasses_base_repo_hooks() {
+        let dir = workdir("hooks");
+        let base = init_with_base(&dir, "mobee/job");
+        let hook = dir.join(".git/hooks/pre-commit");
+        fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("write hook");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod hook");
+        write(&dir, "work.rs", "work\n");
+        let id = identity();
+
+        snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg")
+            .expect("libgit2 runs no hooks, so a failing pre-commit cannot block delivery");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Executable bit is preserved ────────────────────────────────────────────────────────────
+    #[test]
+    fn snapshot_preserves_executable_bit() {
+        let dir = workdir("execbit");
+        let base = init_with_base(&dir, "mobee/job");
+        let script = dir.join("run.sh");
+        fs::write(&script, "#!/bin/sh\necho hi\n").expect("write script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let id = identity();
+
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg").expect("snapshot");
+
+        let repo = Repository::open(&dir).unwrap();
+        let entry = repo
+            .find_commit(Oid::from_str(&oid).unwrap())
+            .unwrap()
+            .tree()
+            .unwrap()
+            .get_path(Path::new("run.sh"))
+            .unwrap();
+        assert_eq!(entry.filemode(), 0o100755, "executable bit must be preserved");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Deletions are honored: a file removed from the workdir is absent from the delivery ─────
+    #[test]
+    fn snapshot_reflects_deletions() {
+        let dir = workdir("delete");
+        let base = init_with_base(&dir, "mobee/job");
+        // README.md exists in base; the agent deletes it and adds a replacement.
+        fs::remove_file(dir.join("README.md")).expect("rm");
+        write(&dir, "new.rs", "replacement\n");
+        let id = identity();
+
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg").expect("snapshot");
+
+        let paths = tree_paths(&dir, &oid);
+        assert!(!paths.contains(&"README.md".to_owned()), "deleted file must not be delivered");
+        assert!(paths.contains(&"new.rs".to_owned()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PATH-stripped proof: build the base with git2 ONLY and snapshot — no `Command`. Run with
+    /// `git` absent from PATH to prove the delivery path has no hidden shell-out.
+    #[test]
+    fn snapshot_without_system_git() {
+        use git2::{Repository, Signature};
+        let dir = workdir("nogit");
+        let repo = Repository::init(&dir).expect("git2 init");
+        // Base commit via git2.
+        fs::write(dir.join("README.md"), "base\n").expect("write");
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new("README.md")).expect("add");
+        index.write().expect("index write");
+        let tree = repo.find_tree(index.write_tree().expect("wt")).expect("tree");
+        let sig = Signature::now("Upstream", "u@u.invalid").expect("sig");
+        let base = repo
+            .commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .expect("git2 commit")
+            .to_string();
+        // Agent edit, uncommitted. (snapshot_delivery opens its own repo handle.)
+        fs::write(dir.join("feature.rs"), "work\n").expect("write");
+        let id = identity();
+
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg")
+            .expect("git2-only snapshot");
+
+        assert_eq!(commit(&dir, &oid).parent_id(0).unwrap().to_string(), base);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── End-to-end: snapshot → push the delivery branch to a bare remote ───────────────────────
+    #[test]
+    fn deliver_after_snapshot_pushes_branch() {
+        let dir = workdir("e2e");
+        let base = init_with_base(&dir, "mobee/job");
+        // Agent left scratch commits AND uncommitted edits — the daemon ignores all of it.
+        write(&dir, "feature.rs", "impl\n");
+        git(&dir, ["add", "-A"]);
+        run_env(&dir, ["commit", "-m", "scratch"], Some(("Claude", "c@anthropic.invalid")));
+        write(&dir, "extra.rs", "more, uncommitted\n");
+        let id = identity();
+
+        let oid = snapshot_delivery(&dir, &id, Some(&base), "mobee/job", "msg").expect("snapshot");
+
+        let remote = workdir("e2e-remote.git");
+        git(&remote, ["init", "--bare", "--initial-branch=main"]);
+        git(&dir, ["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&dir, ["push", "origin", "mobee/job"]);
+        let out = Command::new("git")
+            .args(["rev-parse", "refs/heads/mobee/job"])
+            .current_dir(&remote)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), oid);
+        let paths = tree_paths(&dir, &oid);
+        assert!(paths.contains(&"feature.rs".to_owned()) && paths.contains(&"extra.rs".to_owned()));
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&remote);
+    }
 }

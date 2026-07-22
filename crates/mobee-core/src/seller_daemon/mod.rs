@@ -1522,32 +1522,27 @@ impl SellerDaemon {
                 return Err(error);
             }
         };
-        let after_oid = seller_git::try_head_oid(&active.workdir);
-        // Contribution scopes the agent-authorship gate to `base_oid..HEAD` (the base history is the
-        // target's, not agent-authored); from-scratch requires the whole history agent-authored.
-        let gate_result = match &active.contribution {
-            Some(contribution) => seller_git::require_agent_authored_contribution(
-                &active.workdir,
-                &identity,
-                contribution.base.oid(),
-                after_oid.as_deref(),
-            ),
-            None => seller_git::require_agent_authored_delivery(
-                &active.workdir,
-                &identity,
-                after_oid.as_deref(),
-            ),
-        };
-        if let Err(error) = gate_result {
+        // Completion gate, then delivery. The agent edits files; it never commits (any commits it
+        // makes are scratch and ignored). First run the job-carried completion check, if any (a
+        // failing check refuses cleanly); then snapshot the final workdir tree into ONE commit under
+        // the delivery identity, parented on the pinned base (or a root commit for a from-scratch
+        // job). An empty tree — or one identical to the base — is refused with a precise reason.
+        let base_oid = active.contribution.as_ref().map(|c| c.base.oid());
+        // The offer does not yet carry a completion-check command over the wire (adding an offer
+        // field is the open question flagged in the PR); until it does, the check is `None` and the
+        // snapshot's tree-diff gate is the sole completion signal.
+        if let Err(error) = run_completion_check(&active.workdir, None) {
             self.fail_active(ErrorReasonCode::AgentRunFailed, &error.to_string())
                 .await?;
             return Err(error.into());
         }
-
-        // From-scratch: name the empty-base commits onto the job branch (best-effort). Contribution
-        // is ALREADY on `branch` (set by init_contribution_workdir at base_oid), so skip the reset.
-        if active.contribution.is_none() {
-            let _ = seller_git::point_branch_at_head(&active.workdir, &branch);
+        let message = delivery_message(&active.offer.task);
+        if let Err(error) =
+            seller_git::snapshot_delivery(&active.workdir, &identity, base_oid, &branch, &message)
+        {
+            self.fail_active(ErrorReasonCode::AgentRunFailed, &error.to_string())
+                .await?;
+            return Err(error.into());
         }
 
         // NIP-98: key from 0600 file → git child env only (never argv / never logged).
@@ -2106,6 +2101,55 @@ fn fill_delivery_facts(episode: &mut Episode, delivery: &DeliveryRecord) {
     episode.harness = Some(delivery.harness.clone());
     episode.transcript_ref = Some(delivery.transcript_ref.clone());
     episode.deliver_ts = Some(delivery.deliver_ts);
+}
+
+/// Run the job-carried completion check in `workdir`, if the offer specifies one. `None` ⇒ no
+/// check (the snapshot's tree-diff gate stands alone). A non-zero exit refuses the delivery with a
+/// precise reason so the seat does not deliver work that fails its own acceptance command.
+///
+/// The check runs via the login shell (`sh -c`) in the job workdir — the same jailed directory the
+/// agent worked in. This is the completion seam; the wire field that carries the command is the
+/// open question flagged in the PR.
+fn run_completion_check(workdir: &Path, check: Option<&str>) -> Result<(), DaemonError> {
+    let Some(command) = check.map(str::trim).filter(|c| !c.is_empty()) else {
+        return Ok(());
+    };
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(workdir)
+        .status()
+        .map_err(|error| {
+            DaemonError::Policy(format!("delivery refused: completion check failed to run: {error}"))
+        })?;
+    if !status.success() {
+        return Err(DaemonError::Policy(format!(
+            "delivery refused: completion check `{command}` exited {}",
+            status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "by signal".to_owned()),
+        )));
+    }
+    Ok(())
+}
+
+/// A concise, single-line delivery-commit message derived from the offer task: the first non-empty
+/// line, whitespace-collapsed and length-capped. Falls back to a fixed label for an empty task.
+fn delivery_message(task: &str) -> String {
+    let summary: String = task
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if summary.is_empty() {
+        return "mobee delivery".to_owned();
+    }
+    let capped: String = summary.chars().take(72).collect();
+    format!("mobee delivery: {capped}")
 }
 
 /// Delivery discriminator for the seller's commit/fork delivery, derived from the SAME typed
