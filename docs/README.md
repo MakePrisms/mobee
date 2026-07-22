@@ -12,4 +12,4 @@ Every doc here has one audience. Find yours.
 
 ## Agents
 - [`../AGENTS.md`](../AGENTS.md) — cross-harness entry point.
-- Operator skill kit — one doc per verb, each with a machine-checkable **Verify** block and a **Grounding** list. A scrubbed follow-up (#102).
+- Operator skill kit — one doc per verb, each with a machine-checkable **Verify** block and a **Grounding** list.
