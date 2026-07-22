@@ -906,7 +906,12 @@ fn apply_env_layer(base: &MobeeConfig, env: HashMap<String, String>) -> Result<M
 fn write_config(path: &Path, config: &MobeeConfig) -> Result<(), HomeError> {
     let raw = toml::to_string_pretty(config)
         .map_err(|error| HomeError::Config(error.to_string()))?;
-    fs::write(path, raw).map_err(|error| HomeError::Io(error.to_string()))
+    // Crash-atomic rewrite: config.toml holds money-adjacent state (budget caps, accepted mints), so
+    // a truncating write that dies mid-flush must never leave it empty/half-written. temp → sync →
+    // rename → dir-fsync.
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    crate::durable::write_atomic(dir, path, raw.as_bytes())
+        .map_err(|error| HomeError::Io(error.to_string()))
 }
 
 /// Persist an explicit config change to `config.toml`, keeping `MOBEE_*` overrides runtime-only.
@@ -1023,6 +1028,12 @@ fn write_new_key(path: &Path) -> Result<(), HomeError> {
         .map_err(|error| HomeError::Key(error.to_string()))?;
     file.sync_all()
         .map_err(|error| HomeError::Key(error.to_string()))?;
+    // The key is written once and never rewritten, but its directory ENTRY must be fsync'd or a
+    // power-loss right after creation can drop the only copy of the identity/spend key — locking
+    // any funds already received. sync_all on the file alone does not make the new entry durable.
+    if let Some(parent) = path.parent() {
+        crate::durable::sync_dir(parent).map_err(|error| HomeError::Key(error.to_string()))?;
+    }
     Ok(())
 }
 

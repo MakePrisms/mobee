@@ -163,6 +163,32 @@ pub enum JournalEntry {
         amount: u64,
         unit: String,
         buyer_pubkey: String,
+        /// The mints this seller advertised for THIS job (the creq `m` list authored at claim,
+        /// captured at delivery). The redeem guard for a RESTORED job settles against these — the
+        /// ORIGINAL terms — not current config, so a config change across restart can neither
+        /// strand an old payment (mint dropped) nor let a newly-added mint settle an old claim.
+        /// `#[serde(default)]`: a delivery journaled before this field defaults to empty and
+        /// restores against current config (prior behavior — back-compat).
+        #[serde(default)]
+        accepted_mints: Vec<String>,
+        ts: u64,
+    },
+    /// Intent-to-receive breadcrumb written BEFORE the mint swap: a durable AUDIT record that this
+    /// seller attempted to redeem this token for this job. If a crash lands the swap but not the
+    /// `Receipt`, this breadcrumb (a pending receive with no matching `Receipt`) is the record an
+    /// operator reconciles from. It is NOT auto-finalize proof of payment (finding S): a breadcrumb
+    /// is appended immediately before every swap, so its presence proves only intent, never a prior
+    /// redeem — an "already spent" receive is refused, never finalized off this record. Keyed by
+    /// `token_hash` (SHA-256 of the token string — NEVER the token/proof plaintext). A matching
+    /// `Receipt` supersedes it.
+    PendingReceive {
+        job_id: String,
+        result_id: String,
+        /// SHA-256 hex of the received token string. No proof/secret material.
+        token_hash: String,
+        buyer: String,
+        mint: String,
+        amount: u64,
         ts: u64,
     },
 }
@@ -176,6 +202,9 @@ pub struct DeliveredUnpaid {
     pub amount: u64,
     pub unit: String,
     pub buyer_pubkey: String,
+    /// Original advertised mints journaled at delivery (empty for a pre-field delivery line);
+    /// the restored job redeems against these, not current config (terms-drift fix).
+    pub accepted_mints: Vec<String>,
 }
 
 /// Whether an orphaned claim is past its deadline at reconcile time.
@@ -212,7 +241,9 @@ pub fn plan_orphaned_claims(entries: &[JournalEntry], now: u64) -> Vec<OrphanCla
             | JournalEntry::Release { job_id, .. }
             // #57: a delivered job is NOT an orphaned in-flight claim — it published a result and is
             // awaiting payment (rebuilt into awaiting_payment on boot), so it must never be released.
-            | JournalEntry::Delivery { job_id, .. } => {
+            | JournalEntry::Delivery { job_id, .. }
+            // An in-flight receive (swap initiated) is likewise not an orphaned claim.
+            | JournalEntry::PendingReceive { job_id, .. } => {
                 terminal.insert(job_id.as_str());
             }
             JournalEntry::Claim { .. } => {}
@@ -257,11 +288,18 @@ pub struct SellerJournal {
 impl SellerJournal {
     pub fn open(home: &MobeeHome) -> Result<Self, SellerError> {
         let path = home.root.join(JOURNAL_FILE);
-        if let Some(parent) = path.parent() {
+        let parent = path.parent();
+        if let Some(parent) = parent {
             fs::create_dir_all(parent).map_err(|error| SellerError::Io(error.to_string()))?;
         }
         if !path.exists() {
             File::create(&path).map_err(|error| SellerError::Io(error.to_string()))?;
+            // The append path's `sync_all` makes each record durable, but the file's directory
+            // ENTRY must be fsync'd once at creation or a power-loss before the first append can
+            // drop the whole journal — losing pay-once/receipt state on restart.
+            if let Some(parent) = parent {
+                crate::durable::sync_dir(parent).map_err(|error| SellerError::Io(error.to_string()))?;
+            }
         }
         Ok(Self { path })
     }
@@ -271,7 +309,17 @@ impl SellerJournal {
     }
 
     pub fn entries(&self) -> Result<Vec<JournalEntry>, SellerError> {
-        let file = File::open(&self.path).map_err(|error| SellerError::Io(error.to_string()))?;
+        // Fail-closed money-path read: a MISSING journal is the legitimate first-boot empty case
+        // (Ok(empty)); every OTHER read failure — an unreadable/permission-denied file (Io) or a
+        // corrupt line (Journal) — PROPAGATES so callers refuse/buffer/degrade rather than proceed
+        // as if the journal were empty. This is the single seam the has_*/last_receipt_ts/
+        // oldest_unsettled/pending_receive reads all funnel through, so none of them can silently
+        // treat an unreadable journal as absent.
+        let file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(SellerError::Io(error.to_string())),
+        };
         let mut out = Vec::new();
         for line in BufReader::new(file).lines() {
             let line = line.map_err(|error| SellerError::Io(error.to_string()))?;
@@ -292,6 +340,7 @@ impl SellerJournal {
             JournalEntry::Receipt { job_id: id, .. } => id == job_id,
             JournalEntry::Release { job_id: id, .. } => id == job_id,
             JournalEntry::Delivery { job_id: id, .. } => id == job_id,
+            JournalEntry::PendingReceive { job_id: id, .. } => id == job_id,
         }))
     }
 
@@ -313,18 +362,45 @@ impl SellerJournal {
     /// (#57), so a restart re-fetches stored 1059 payments the live subscription did not replay.
     /// `Ok(None)` when there are no receipts yet (or no journal file exists).
     pub fn last_receipt_ts(&self) -> Result<Option<u64>, SellerError> {
-        let entries = match self.entries() {
-            Ok(entries) => entries,
-            Err(SellerError::Io(_)) => return Ok(None),
-            Err(other) => return Err(other),
-        };
-        Ok(entries
+        // Fail-closed: any read error propagates (see `entries`). A genuinely-absent journal folds to
+        // an empty list ⇒ Ok(None) ⇒ legitimate first boot; an unreadable one aborts the backfill.
+        Ok(self
+            .entries()?
             .iter()
             .filter_map(|entry| match entry {
                 JournalEntry::Receipt { ts, .. } => Some(*ts),
                 _ => None,
             })
             .max())
+    }
+
+    /// Oldest `Delivery` timestamp among jobs that are still UNSETTLED (no matching `Receipt` or
+    /// `Release`). This is the safe lower bound for the wrap-backfill `since` cursor: a receipt for
+    /// a NEWER job must never advance the cursor past an OLDER delivered-but-unpaid job whose
+    /// payment wrap has not yet been collected. `Ok(None)` when nothing is unsettled.
+    pub fn oldest_unsettled_delivery_ts(&self) -> Result<Option<u64>, SellerError> {
+        // Fail-closed: any read error propagates (see `entries`); absent journal ⇒ empty ⇒ Ok(None).
+        let entries = self.entries()?;
+        let mut settled: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for entry in &entries {
+            match entry {
+                JournalEntry::Receipt { job_id, .. } | JournalEntry::Release { job_id, .. } => {
+                    settled.insert(job_id.as_str());
+                }
+                _ => {}
+            }
+        }
+        Ok(entries
+            .iter()
+            .filter_map(|entry| match entry {
+                JournalEntry::Delivery { job_id, ts, .. }
+                    if !settled.contains(job_id.as_str()) =>
+                {
+                    Some(*ts)
+                }
+                _ => None,
+            })
+            .min())
     }
 
     /// Journal a CLAIMED transition. `claim_id`/`buyer_pubkey`/`deadline_unix` are the
@@ -402,6 +478,67 @@ impl SellerJournal {
         })
     }
 
+    /// Journal an intent-to-receive breadcrumb BEFORE the mint swap (see
+    /// [`JournalEntry::PendingReceive`]). `token_hash` is the SHA-256 hex of the token string; no
+    /// proof/secret material is stored. No-op if a receipt already exists for the job (pay-once).
+    pub fn append_pending_receive(
+        &self,
+        job_id: &str,
+        result_id: &str,
+        token_hash: &str,
+        buyer: &str,
+        mint: &str,
+        amount: u64,
+    ) -> Result<(), SellerError> {
+        self.append(JournalEntry::PendingReceive {
+            job_id: job_id.to_owned(),
+            result_id: result_id.to_owned(),
+            token_hash: token_hash.to_owned(),
+            buyer: buyer.to_owned(),
+            mint: mint.to_owned(),
+            amount,
+            ts: now_unix(),
+        })
+    }
+
+    /// Look up an un-finalized intent-to-receive for `token_hash`: a [`JournalEntry::PendingReceive`]
+    /// whose job has no matching [`JournalEntry::Receipt`] yet. Returns the carried
+    /// `(job_id, result_id, buyer, mint, amount)` for operator reconcile of an interrupted redeem.
+    /// This is NOT used to auto-finalize a receipt (finding S — a breadcrumb is not proof of a prior
+    /// redeem); `Ok(None)` when none.
+    #[allow(clippy::type_complexity)]
+    pub fn pending_receive_for_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<(String, String, String, String, u64)>, SellerError> {
+        // Fail-closed: any read error propagates (see `entries`); absent journal ⇒ empty ⇒ Ok(None).
+        let entries = self.entries()?;
+        let mut receipted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for entry in &entries {
+            if let JournalEntry::Receipt { job_id, .. } = entry {
+                receipted.insert(job_id.as_str());
+            }
+        }
+        Ok(entries.iter().rev().find_map(|entry| match entry {
+            JournalEntry::PendingReceive {
+                job_id,
+                result_id,
+                token_hash: hash,
+                buyer,
+                mint,
+                amount,
+                ..
+            } if hash == token_hash && !receipted.contains(job_id.as_str()) => Some((
+                job_id.clone(),
+                result_id.clone(),
+                buyer.clone(),
+                mint.clone(),
+                *amount,
+            )),
+            _ => None,
+        }))
+    }
+
     /// Journal a delivered-but-unpaid transition (#57) so a restart can rebuild the awaiting-payment
     /// binding and a stored/buffered wrap can redeem. Idempotent-safe to call more than once.
     pub fn append_delivery(
@@ -411,6 +548,7 @@ impl SellerJournal {
         amount: u64,
         unit: &str,
         buyer_pubkey: &str,
+        accepted_mints: &[String],
     ) -> Result<(), SellerError> {
         self.append(JournalEntry::Delivery {
             job_id: job_id.to_owned(),
@@ -418,6 +556,7 @@ impl SellerJournal {
             amount,
             unit: unit.to_owned(),
             buyer_pubkey: buyer_pubkey.to_owned(),
+            accepted_mints: accepted_mints.to_vec(),
             ts: now_unix(),
         })
     }
@@ -449,6 +588,7 @@ impl SellerJournal {
                 amount,
                 unit,
                 buyer_pubkey,
+                accepted_mints,
                 ..
             } = entry
             {
@@ -463,6 +603,7 @@ impl SellerJournal {
                         amount: *amount,
                         unit: unit.clone(),
                         buyer_pubkey: buyer_pubkey.clone(),
+                        accepted_mints: accepted_mints.clone(),
                     },
                 );
             }
@@ -599,6 +740,54 @@ mod tests {
             deadline_unix: 2_000_000_000,
             seller_pubkey: seller.map(str::to_owned),
         }
+    }
+
+    // Z3 (fail-closed journal reads) — the whole read class funnels through `entries`: a MISSING
+    // journal is the only "empty" case (first boot); a CORRUPT/unreadable journal PROPAGATES an
+    // error so no read silently proceeds as if the journal were empty. Covers entries + the derived
+    // reads (has_receipt / last_receipt_ts / oldest_unsettled_delivery_ts / pending_receive).
+    #[test]
+    fn journal_reads_fail_closed_on_corruption_and_treat_missing_as_empty() {
+        let root = temp_home("z3-failclosed");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+
+        // Missing journal ⇒ empty, not an error (legitimate first boot).
+        let journal_path = home.root.join(JOURNAL_FILE);
+        let _ = std::fs::remove_file(&journal_path);
+        let journal = SellerJournal::open(&home).expect("open");
+        // open() touches the file; remove it again to exercise the NotFound⇒empty path directly.
+        let _ = std::fs::remove_file(&journal_path);
+        assert_eq!(journal.entries().expect("missing⇒empty"), Vec::new());
+        assert_eq!(journal.last_receipt_ts().expect("missing⇒None"), None);
+        assert_eq!(
+            journal.oldest_unsettled_delivery_ts().expect("missing⇒None"),
+            None
+        );
+        assert!(!journal.has_receipt("job").expect("missing⇒false"));
+
+        // Corrupt line ⇒ every read fails closed (Err), never Ok(empty)/Ok(None)/Ok(false).
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&journal_path)
+                .expect("open journal");
+            f.write_all(b"{not valid json\n").expect("corrupt");
+        }
+        assert!(journal.entries().is_err(), "corrupt entries must Err");
+        assert!(journal.last_receipt_ts().is_err(), "corrupt last_receipt must Err");
+        assert!(
+            journal.oldest_unsettled_delivery_ts().is_err(),
+            "corrupt oldest_unsettled must Err"
+        );
+        assert!(journal.has_receipt("job").is_err(), "corrupt has_receipt must Err");
+        assert!(
+            journal.pending_receive_for_token("hash").is_err(),
+            "corrupt pending_receive must Err"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -799,6 +988,100 @@ offer_backfill_secs = {backfill}
         assert!(ts >= before, "receipt ts {ts} must be >= {before}");
     }
 
+    // Finding F: a receipt for a NEWER job must not let the wrap-backfill cursor skip an OLDER
+    // delivered-but-unpaid job. `last_receipt_ts` advances to the newer receipt, but
+    // `oldest_unsettled_delivery_ts` (the clamp for the cursor) still points at the older wrap.
+    #[test]
+    fn oldest_unsettled_delivery_ts_survives_newer_receipt() {
+        let root = temp_home("oldest-unsettled");
+        let _ = fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("bootstrap");
+        let journal = SellerJournal::open(&home).expect("journal");
+
+        let delivery = |job: &str, ts: u64| JournalEntry::Delivery {
+            job_id: job.into(),
+            result_id: format!("r-{job}"),
+            amount: 5,
+            unit: "sat".into(),
+            buyer_pubkey: "buyer".into(),
+            accepted_mints: Vec::new(),
+            ts,
+        };
+        let receipt = |job: &str, ts: u64| JournalEntry::Receipt {
+            job_id: job.into(),
+            result_id: format!("r-{job}"),
+            amount_received: 5,
+            mint: "https://testnut.cashudevkit.org".into(),
+            buyer: "buyer".into(),
+            swap_ok: true,
+            ts,
+        };
+
+        // Two deliveries: older (ts=100), newer (ts=200); both unpaid.
+        journal.append(delivery("old", 100)).expect("old delivery");
+        journal.append(delivery("new", 200)).expect("new delivery");
+        // A receipt arrives for the NEWER job only.
+        journal.append(receipt("new", 250)).expect("newer receipt");
+
+        assert_eq!(journal.last_receipt_ts().expect("ts"), Some(250));
+        assert_eq!(
+            journal.oldest_unsettled_delivery_ts().expect("ts"),
+            Some(100),
+            "cursor clamp must still reach the older unpaid wrap"
+        );
+
+        // Settling the older job too leaves nothing unsettled.
+        journal.append(receipt("old", 300)).expect("older receipt");
+        assert_eq!(journal.oldest_unsettled_delivery_ts().expect("ts"), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Finding K: an intent-to-receive breadcrumb is written BEFORE the mint swap so a crash after
+    // the swap but before the Receipt is recoverable. The lookup finds an un-finalized pending
+    // receive by token hash, ignores other tokens, and stops matching once the Receipt supersedes.
+    #[test]
+    fn pending_receive_breadcrumb_found_then_superseded_by_receipt() {
+        let root = temp_home("pending-receive");
+        let _ = fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("bootstrap");
+        let journal = SellerJournal::open(&home).expect("journal");
+        const MINT: &str = "https://testnut.cashudevkit.org";
+        let token_hash = "a".repeat(64);
+
+        // Before the swap: breadcrumb written; recovery lookup finds it with carried fields.
+        journal
+            .append_pending_receive("job-k", "result-k", &token_hash, "buyer-k", MINT, 7)
+            .expect("pending");
+        assert_eq!(
+            journal
+                .pending_receive_for_token(&token_hash)
+                .expect("lookup")
+                .expect("present"),
+            (
+                "job-k".to_string(),
+                "result-k".to_string(),
+                "buyer-k".to_string(),
+                MINT.to_string(),
+                7
+            )
+        );
+        // A different token hash is never matched.
+        assert!(journal
+            .pending_receive_for_token(&"b".repeat(64))
+            .expect("lookup")
+            .is_none());
+
+        // Once the receipt is journaled, the pending receive is superseded (finalized).
+        journal
+            .append_receipt("job-k", "result-k", "job-k", "result-k", 7, 7, MINT, "buyer-k", true)
+            .expect("receipt");
+        assert!(journal
+            .pending_receive_for_token(&token_hash)
+            .expect("lookup")
+            .is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // #57: a delivered-but-unpaid job (Claim + Delivery, no Receipt) is NOT an orphaned in-flight
     // claim (never released, even past deadline) AND is recoverable for awaiting_payment rebuild.
     #[test]
@@ -811,16 +1094,29 @@ offer_backfill_secs = {backfill}
             .append_claim("job-d", "claim-d", "buyer-d", 10)
             .expect("claim");
         journal
-            .append_delivery("job-d", "result-d", 15, "sat", "buyer-d")
+            .append_delivery(
+                "job-d",
+                "result-d",
+                15,
+                "sat",
+                "buyer-d",
+                &["https://mint-orig.testnut.example".to_string()],
+            )
             .expect("delivery");
 
-        // Recoverable: one delivered-but-unpaid job with the money-critical fields.
+        // Recoverable: one delivered-but-unpaid job with the money-critical fields, INCLUDING the
+        // original advertised mints (Fix Q — restored job redeems against these, not current config).
         let unpaid = journal.deliveries_awaiting_receipt().expect("unpaid");
         assert_eq!(unpaid.len(), 1);
         assert_eq!(unpaid[0].job_id, "job-d");
         assert_eq!(unpaid[0].result_id, "result-d");
         assert_eq!(unpaid[0].amount, 15);
         assert_eq!(unpaid[0].buyer_pubkey, "buyer-d");
+        assert_eq!(
+            unpaid[0].accepted_mints,
+            vec!["https://mint-orig.testnut.example".to_string()],
+            "original advertised mints must round-trip through the delivery journal"
+        );
 
         // Not orphaned even long past the claim deadline (delivery resolves the claim).
         assert!(plan_orphaned_claims(&journal.entries().unwrap(), 9_999_999_999).is_empty());

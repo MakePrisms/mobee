@@ -16,6 +16,7 @@ pub mod git_transport;
 pub mod doctor;
 pub mod delivery_transport;
 pub mod driver;
+pub mod durable;
 pub mod engine;
 pub mod episode;
 pub mod event;
