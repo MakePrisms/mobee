@@ -1,0 +1,50 @@
+<!-- Source for docs/img/doc-map.png. Regenerate: open in a browser and screenshot the .fig element (width 980). -->
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  body { margin: 0; background: #FAF8F3; color: #241E16;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .fig { width: 980px; padding: 28px 32px 26px; }
+  .head { display: flex; align-items: center; gap: 11px; }
+  .head h1 { font-family: ui-monospace, Menlo, monospace; font-weight: 600; font-size: 21px; margin: 0; }
+  .head .hex { color: #B9791A; font-size: 19px; }
+  .head .sub { margin-left: auto; font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #6E6555; }
+  .head .sub code { background: #EFE9DD; padding: 1px 6px; border-radius: 3px; }
+  .cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 20px; align-items: start; }
+  .col { border: 1px solid #EAE4D8; border-top: 3px solid var(--t); border-radius: 6px; padding: 13px 15px 6px; background: #fff; }
+  .col h2 { font-family: ui-monospace, Menlo, monospace; font-size: 13px; color: var(--t); margin: 0; }
+  .col .who { font-size: 11px; color: #948B79; margin: 2px 0 0; }
+  .col ul { list-style: none; margin: 11px 0 0; padding: 0; }
+  .col li { font-family: ui-monospace, Menlo, monospace; font-size: 12px; padding: 7px 0; border-top: 1px solid #F0EBE0; color: #6E6555; line-height: 1.3; }
+  .col li:first-child { border-top: 0; }
+  .col li b { color: #241E16; font-weight: 600; }
+  .col.humans { --t: #33608A; }
+  .col.agents { --t: #B9791A; }
+  .col.meta   { --t: #8B8069; }
+  .star { color: #B9791A; }
+</style>
+<div class="fig">
+  <div class="head"><span class="hex">⬡</span><h1>The doc map</h1><span class="sub">every doc in <code>docs/</code> has one audience</span></div>
+  <div class="cols">
+    <div class="col humans">
+      <h2>Humans</h2>
+      <p class="who">read it to understand + use mobee</p>
+      <ul>
+        <li><b>README</b> — what it is, one trade</li>
+        <li><b>ONBOARDING</b> — pick a role</li>
+        <li><b>QUICKSTART</b> — buyer, zero → paid</li>
+        <li><b>SELLER-QUICKSTART</b> — seller</li>
+        <li><b>protocol</b> — kinds + invariants</li>
+        <li><b>DEPLOYMENT</b> — self-host</li>
+      </ul>
+    </div>
+    <div class="col agents">
+      <h2>Agents</h2>
+      <p class="who">any harness, self-served</p>
+      <ul>
+        <li><b>AGENTS.md</b> — cross-harness entry point</li>
+        <li><b>skills/**</b> — one doc per verb <span class="star">★ source of truth</span></li>
+      </ul>
+    </div>
+  </div>
+</div>

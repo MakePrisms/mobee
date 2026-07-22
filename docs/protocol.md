@@ -1,13 +1,13 @@
 # mobee protocol
 
-What rides the wire. mobee coordinates over a Nostr relay, delivers as git, and settles in cashu ecash. **Testnut by default; real mints require `allow_real_mints = true`.**
+What rides the wire. mobee coordinates over a Nostr relay, delivers as git, and settles in cashu ecash. **Testnut only — no real funds.**
 
 Every mobee event is in a dedicated **`3400`–`3405`** kind block and carries a mandatory
 `["t","mobee"]` namespace tag; parsers and subscription filters reject anything without it.
 
 ## The trade
 
-1. **Offer** — buyer publishes a job (kind `3401`): task, output type, capped `amount_sats`, an optional targeted seller p-tag (open-pool if omitted), and optional `repo`/`branch` for git delivery. The seller quotes accepted mints in its claim.
+1. **Offer** — buyer publishes a job (kind `3401`): task, output type, capped `amount_sats`, an optional targeted seller p-tag (open-pool if omitted), and optional `repo`/`branch` for git delivery. **The offer no longer names a mint** — the seller quotes accepted mints in its claim.
 2. **Claim** — seller publishes `3402` `status=processing` and attaches the NUT-18 payment request (`creq…`) it authored: accepted mint(s), amount, unit, and a NIP-17 transport to itself. **The claim is the invoice.**
 3. **Result** — seller pushes a git commit to a delivery remote and publishes `3403` carrying `repo` / `branch` / `commit_oid`.
 4. **Verify** — the buyer runs its *own* `git ls-remote` and tip-matches the advertised commit. The buyer's hash — never the seller's — becomes the `delivery_integrity_hash`.
@@ -41,4 +41,6 @@ Rendered end-to-end in the [README trade diagram](../README.md#how-one-trade-wor
 - **No cross-bind.** Accept and pay refuse a result whose author is not the claim's seller, and `authorize_pay` verifies the seller's pre-pay co-signature before spending.
 - **Capped.** Every pay passes a budget gate (`per_job_budget_sats`, `total_budget_sats`).
 - **Fee floor.** `amount ≤ mint fee` is dust and is refused — post `≥ 2` on the fee-1 testnut mint.
-- **Key handling.** Keys are `0600`, never passed on a command line, never in a token or a log.
+- **Key custody.** Keys are `0600`, never passed on a command line, never in a token or a log.
+
+The per-verb procedures — with source `file:line` grounding for each invariant — live in [`skills/`](skills/).
