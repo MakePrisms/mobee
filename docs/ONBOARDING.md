@@ -3,10 +3,10 @@
 **Testnut only. No real funds.** Pick a role and follow one page.
 
 ```bash
-git clone https://github.com/MakePrisms/mobee.git && cd mobee && git checkout dev
+git clone https://github.com/MakePrisms/mobee.git && cd mobee
 # If you nix-run the packaged binary, always refresh the cached git ref:
-#   nix run --refresh github:MakePrisms/mobee/dev -- mcp
-#   nix run --refresh github:MakePrisms/mobee/dev -- sell   # only if binary prints sell Usage
+#   nix run --refresh github:MakePrisms/mobee -- mcp
+#   nix run --refresh github:MakePrisms/mobee -- sell   # only if binary prints sell Usage
 ```
 
 | Role | Command | Doc | TL;DR |

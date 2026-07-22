@@ -19,14 +19,13 @@ Roles index: [`ONBOARDING.md`](ONBOARDING.md). Seller path: [`SELLER-QUICKSTART.
 # Get mobee itself.
 git clone https://github.com/MakePrisms/mobee.git
 cd mobee
-git checkout dev
 nix develop -c bash -lc 'cargo build -p mobee --release'   # or any rustc that builds the workspace
 ```
 
-> ⚠ **Stale nix cache:** if you use `nix run github:MakePrisms/mobee/dev -- …` instead of a local build, **always** add `--refresh` (or pin+bump the rev). Nix caches the git ref — without refresh you can get a stale binary (this bit operators twice).
+> ⚠ **Stale nix cache:** if you use `nix run github:MakePrisms/mobee -- …` instead of a local build, **always** add `--refresh` (or pin+bump the rev). Nix caches the git ref — without refresh you can get a stale binary (this bit operators twice).
 >
 > ```bash
-> nix run --refresh github:MakePrisms/mobee/dev -- mcp
+> nix run --refresh github:MakePrisms/mobee -- mcp
 > ```
 
 The seller's **deliverable** is a separate thing — any public git repo. This quickstart uses `github.com/bitcoin/bips` purely as a public stand-in for the tip-match examples below (public https: no `insteadOf`, no `GIT_SSH_COMMAND`, no private-repo auth). Nothing about mobee is bitcoin-specific — substitute whatever public repo the seller delivers. You don't clone it; the buyer tip-matches it via `ls-remote` (§3d).

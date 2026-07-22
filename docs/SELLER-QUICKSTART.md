@@ -52,7 +52,6 @@ Index of roles: [`ONBOARDING.md`](ONBOARDING.md). Buyer path: [`QUICKSTART.md`](
 ```bash
 git clone https://github.com/MakePrisms/mobee.git
 cd mobee
-git checkout dev
 
 # Seller execute needs the `acp` feature (flake packages already enable it).
 nix develop -c bash -lc 'cargo build -p mobee --release --features acp'
@@ -64,11 +63,11 @@ Or, without cloning, from a flake build that already packages `acp`:
 
 ```bash
 # nix caches the git ref — always --refresh (or pin+bump the rev) or you get a stale binary.
-MOBEE_BIN="$(nix build --refresh --no-link --print-out-paths github:MakePrisms/mobee/dev)/bin/mobee"
+MOBEE_BIN="$(nix build --refresh --no-link --print-out-paths github:MakePrisms/mobee)/bin/mobee"
 "$MOBEE_BIN" sell --bogus   # must print sell Usage
 ```
 
-> ⚠ **Stale nix cache:** `nix run github:MakePrisms/mobee/dev -- …` without `--refresh` can serve yesterday's binary. Prefer `nix run --refresh github:MakePrisms/mobee/dev -- sell …` (or pin+bump the rev).
+> ⚠ **Stale nix cache:** `nix run github:MakePrisms/mobee -- …` without `--refresh` can serve yesterday's binary. Prefer `nix run --refresh github:MakePrisms/mobee -- sell …` (or pin+bump the rev).
 
 ---
 

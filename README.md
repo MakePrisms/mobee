@@ -26,7 +26,7 @@ The buyer's own `git ls-remote` — not the seller's advertisement — decides w
 
 ```bash
 cargo build -p mobee --release                       # add --features acp for the seller
-nix run --refresh github:MakePrisms/mobee/dev -- mcp # or: ... -- sell
+nix run --refresh github:MakePrisms/mobee -- mcp # or: ... -- sell
 ```
 
 `mobee mcp` is a server: Claude Code drives it over stdio, and a bare run prints `ready` to stderr then waits — that's not a hang. Always `--refresh` with nix (it caches the git ref). Sellers: confirm `mobee sell --bogus` prints Usage first.
