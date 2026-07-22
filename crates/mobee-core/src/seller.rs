@@ -165,6 +165,22 @@ pub enum JournalEntry {
         buyer_pubkey: String,
         ts: u64,
     },
+    /// Intent-to-receive breadcrumb written BEFORE the mint swap, so a crash AFTER the swap but
+    /// BEFORE the `Receipt` is durable is recoverable: on restart the seller sees a pending
+    /// receive with no matching `Receipt` and, when the mint reports the token already spent
+    /// (the swap DID land), finalizes the receipt from these carried fields instead of leaving
+    /// the job unpaid forever. Keyed by `token_hash` (SHA-256 of the token string — NEVER the
+    /// token/proof plaintext). A matching `Receipt` supersedes it.
+    PendingReceive {
+        job_id: String,
+        result_id: String,
+        /// SHA-256 hex of the received token string. No proof/secret material.
+        token_hash: String,
+        buyer: String,
+        mint: String,
+        amount: u64,
+        ts: u64,
+    },
 }
 
 /// A delivered-but-unpaid job recovered from the journal at boot, enough to rebuild an
@@ -212,7 +228,9 @@ pub fn plan_orphaned_claims(entries: &[JournalEntry], now: u64) -> Vec<OrphanCla
             | JournalEntry::Release { job_id, .. }
             // #57: a delivered job is NOT an orphaned in-flight claim — it published a result and is
             // awaiting payment (rebuilt into awaiting_payment on boot), so it must never be released.
-            | JournalEntry::Delivery { job_id, .. } => {
+            | JournalEntry::Delivery { job_id, .. }
+            // An in-flight receive (swap initiated) is likewise not an orphaned claim.
+            | JournalEntry::PendingReceive { job_id, .. } => {
                 terminal.insert(job_id.as_str());
             }
             JournalEntry::Claim { .. } => {}
@@ -292,6 +310,7 @@ impl SellerJournal {
             JournalEntry::Receipt { job_id: id, .. } => id == job_id,
             JournalEntry::Release { job_id: id, .. } => id == job_id,
             JournalEntry::Delivery { job_id: id, .. } => id == job_id,
+            JournalEntry::PendingReceive { job_id: id, .. } => id == job_id,
         }))
     }
 
@@ -432,6 +451,69 @@ impl SellerJournal {
             swap_ok,
             ts: now_unix(),
         })
+    }
+
+    /// Journal an intent-to-receive breadcrumb BEFORE the mint swap (see
+    /// [`JournalEntry::PendingReceive`]). `token_hash` is the SHA-256 hex of the token string; no
+    /// proof/secret material is stored. No-op if a receipt already exists for the job (pay-once).
+    pub fn append_pending_receive(
+        &self,
+        job_id: &str,
+        result_id: &str,
+        token_hash: &str,
+        buyer: &str,
+        mint: &str,
+        amount: u64,
+    ) -> Result<(), SellerError> {
+        self.append(JournalEntry::PendingReceive {
+            job_id: job_id.to_owned(),
+            result_id: result_id.to_owned(),
+            token_hash: token_hash.to_owned(),
+            buyer: buyer.to_owned(),
+            mint: mint.to_owned(),
+            amount,
+            ts: now_unix(),
+        })
+    }
+
+    /// Look up an un-finalized intent-to-receive for `token_hash`: a [`JournalEntry::PendingReceive`]
+    /// whose job has no matching [`JournalEntry::Receipt`] yet. Returns the carried
+    /// `(job_id, result_id, buyer, mint, amount)` so a crash-recovery path can finalize the receipt
+    /// (the swap already landed the money) instead of leaving the job unpaid. `Ok(None)` when none.
+    #[allow(clippy::type_complexity)]
+    pub fn pending_receive_for_token(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<(String, String, String, String, u64)>, SellerError> {
+        let entries = match self.entries() {
+            Ok(entries) => entries,
+            Err(SellerError::Io(_)) => return Ok(None),
+            Err(other) => return Err(other),
+        };
+        let mut receipted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for entry in &entries {
+            if let JournalEntry::Receipt { job_id, .. } = entry {
+                receipted.insert(job_id.as_str());
+            }
+        }
+        Ok(entries.iter().rev().find_map(|entry| match entry {
+            JournalEntry::PendingReceive {
+                job_id,
+                result_id,
+                token_hash: hash,
+                buyer,
+                mint,
+                amount,
+                ..
+            } if hash == token_hash && !receipted.contains(job_id.as_str()) => Some((
+                job_id.clone(),
+                result_id.clone(),
+                buyer.clone(),
+                mint.clone(),
+                *amount,
+            )),
+            _ => None,
+        }))
     }
 
     /// Journal a delivered-but-unpaid transition (#57) so a restart can rebuild the awaiting-payment
@@ -875,6 +957,52 @@ offer_backfill_secs = {backfill}
         // Settling the older job too leaves nothing unsettled.
         journal.append(receipt("old", 300)).expect("older receipt");
         assert_eq!(journal.oldest_unsettled_delivery_ts().expect("ts"), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Finding K: an intent-to-receive breadcrumb is written BEFORE the mint swap so a crash after
+    // the swap but before the Receipt is recoverable. The lookup finds an un-finalized pending
+    // receive by token hash, ignores other tokens, and stops matching once the Receipt supersedes.
+    #[test]
+    fn pending_receive_breadcrumb_found_then_superseded_by_receipt() {
+        let root = temp_home("pending-receive");
+        let _ = fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("bootstrap");
+        let journal = SellerJournal::open(&home).expect("journal");
+        const MINT: &str = "https://testnut.cashudevkit.org";
+        let token_hash = "a".repeat(64);
+
+        // Before the swap: breadcrumb written; recovery lookup finds it with carried fields.
+        journal
+            .append_pending_receive("job-k", "result-k", &token_hash, "buyer-k", MINT, 7)
+            .expect("pending");
+        assert_eq!(
+            journal
+                .pending_receive_for_token(&token_hash)
+                .expect("lookup")
+                .expect("present"),
+            (
+                "job-k".to_string(),
+                "result-k".to_string(),
+                "buyer-k".to_string(),
+                MINT.to_string(),
+                7
+            )
+        );
+        // A different token hash is never matched.
+        assert!(journal
+            .pending_receive_for_token(&"b".repeat(64))
+            .expect("lookup")
+            .is_none());
+
+        // Once the receipt is journaled, the pending receive is superseded (finalized).
+        journal
+            .append_receipt("job-k", "result-k", "job-k", "result-k", 7, 7, MINT, "buyer-k", true)
+            .expect("receipt");
+        assert!(journal
+            .pending_receive_for_token(&token_hash)
+            .expect("lookup")
+            .is_none());
         let _ = fs::remove_dir_all(&root);
     }
 

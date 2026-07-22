@@ -725,13 +725,13 @@ pub async fn accept_claim_async(
         &buyer_pubkey,
         &claim.seller_pubkey,
     );
-    let accept_event_id = publish_draft_async(home, &keys, &draft).await?;
-    let accepted_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
 
-    let bind = AcceptedBind {
+    // Durability ordering: write the pay-bind BEFORE publishing the accept, so a crash between
+    // publish and bind-write can never leave a PUBLIC accepted state on the relay with NO local
+    // bind (which would strand the buyer — unable to pay, at risk of re-accepting). The pending
+    // bind carries an empty `accept_event_id` (the pay path never reads that field — it is a
+    // record only), then we publish and finalize the bind with the real id + timestamp.
+    let mut bind = AcceptedBind {
         job_id: request.job_id.clone(),
         claim_id: request.claim_id.clone(),
         result_id: result.result_id.clone(),
@@ -741,8 +741,9 @@ pub async fn accept_claim_async(
         branch,
         job_hash,
         amount_sats,
-        accept_event_id: accept_event_id.clone(),
-        accepted_at,
+        // Pending marker until the accept is published + finalized below.
+        accept_event_id: String::new(),
+        accepted_at: 0,
         // Capture sig/seller so authorize_pay can co-sign the receipt preimage.
         seller_signature: result.seller_signature.clone().unwrap_or_default(),
         // Hash the seller-authored creq from the accepted claim (when present) so the
@@ -753,6 +754,19 @@ pub async fn accept_claim_async(
         accepted_mints,
         contribution,
     };
+    write_accepted_bind(home, &bind)?;
+
+    let accept_event_id = publish_draft_async(home, &keys, &draft).await?;
+    let accepted_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Finalize: stamp the published id + timestamp and re-persist. A crash before this leaves the
+    // pending bind on disk (accept may or may not be public); a subsequent accept re-publishes
+    // idempotently and re-finalizes.
+    bind.accept_event_id = accept_event_id.clone();
+    bind.accepted_at = accepted_at;
     write_accepted_bind(home, &bind)?;
 
     Ok(AcceptClaimOutcome {
@@ -1733,6 +1747,62 @@ mod tests {
             .expect("load")
             .expect("present");
         assert_eq!(loaded, bind);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Finding L: accept writes a PENDING bind before publishing, then finalizes with the accept
+    // event id. This models the two-phase durability primitive: a crash after the pending write
+    // (but before/after publish) always leaves a local bind on disk, so a public accept can never
+    // exist with no local record. Simulates the sequence write-pending → (publish) → finalize.
+    #[test]
+    fn accept_bind_pending_then_finalize_durability() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-jobs-bind-pending-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let mut bind = AcceptedBind {
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "cc".repeat(32),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 1,
+            // Pending marker: written BEFORE publish (empty id, ts 0).
+            accept_event_id: String::new(),
+            accepted_at: 0,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            contribution: None,
+        };
+        // Phase 1: pending write is durable and reloads with the empty-id marker.
+        write_accepted_bind(&home, &bind).expect("write pending");
+        let pending = load_accepted_bind(&home, &bind.job_id)
+            .expect("load")
+            .expect("present after pending write");
+        assert!(
+            pending.accept_event_id.is_empty(),
+            "pending bind must carry the empty accept_event_id marker"
+        );
+
+        // Phase 2: finalize with the published id + timestamp overwrites the same record.
+        bind.accept_event_id = "11".repeat(32);
+        bind.accepted_at = 1;
+        write_accepted_bind(&home, &bind).expect("finalize");
+        let finalized = load_accepted_bind(&home, &bind.job_id)
+            .expect("load")
+            .expect("present after finalize");
+        assert_eq!(finalized, bind);
+        assert!(!finalized.accept_event_id.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -534,15 +534,22 @@ impl SellerDaemon {
             &self.seller_pubkey,
             &creq,
         );
-        let claim_id = match publish_draft(&self.home, &self.keys, &claim).await {
-            Ok(id) => id,
+        // Sign the claim FIRST (its deterministic id == the published id), so we can durably
+        // journal the CLAIMED transition BEFORE putting a live payable creq on the relay. This
+        // ordering closes the re-claim gap: publishing first and journaling second (the old order)
+        // left a live creq with no local record on a crash/journal-failure in between, so a
+        // restart would re-claim the same offer. Now a journal failure aborts with NO live creq;
+        // a crash after publish still has the claim recorded (restart-reconcile can release it).
+        let claim_event = match sign_draft(&self.keys, &claim) {
+            Ok(event) => event,
             Err(error) => {
                 Self::end_flight();
                 return Err(error);
             }
         };
+        let claim_id = claim_event.id.to_hex();
         // Journal the CLAIMED transition WITH the deadline/claim_id/buyer so a restart can
-        // reconcile this claim without the relay (restart-reconcile).
+        // reconcile this claim without the relay (restart-reconcile) — BEFORE publish.
         if let Err(error) = self.journal.append_claim(
             &intent.job_id,
             &claim_id,
@@ -551,6 +558,11 @@ impl SellerDaemon {
         ) {
             Self::end_flight();
             return Err(error.into());
+        }
+        // Publish only AFTER the durable claim record exists.
+        if let Err(error) = send_signed_event(&self.home, &self.keys, &claim_event).await {
+            Self::end_flight();
+            return Err(error);
         }
 
         let workdir = job_workdir(&self.home, &intent.job_id);
@@ -843,7 +855,8 @@ impl SellerDaemon {
     /// Without this, a job the offer-scan classifies "already delivered" is never re-added and its
     /// wrap buffers forever. Idempotent: skips jobs already present; respects the backlog cap. The
     /// rebuilt offer carries only the money-critical fields the redeem path reads (amount/unit);
-    /// `seller_pubkey=None` so `assert_seller_matches` passes.
+    /// its `seller_pubkey` is pinned to THIS seller (not a `None` wildcard) so the redeem path's
+    /// `assert_seller_matches` binds to us exactly rather than matching any seller.
     pub fn restore_delivered_unpaid(&mut self) -> Result<usize, DaemonError> {
         let unpaid = self.journal.deliveries_awaiting_receipt()?;
         let mut restored = 0usize;
@@ -872,7 +885,8 @@ impl SellerDaemon {
                     amount: d.amount,
                     unit,
                     deadline_unix: 0,
-                    seller_pubkey: None,
+                    // Pin to this seller (we authored the delivery) — not a None wildcard.
+                    seller_pubkey: Some(self.seller_pubkey.clone()),
                 },
                 claim_id: String::new(),
                 result_id: Some(d.result_id),
@@ -907,9 +921,10 @@ impl SellerDaemon {
     ///    rather than erroring the ingest);
     ///  * the on-relay offer MUST be present (its amount/unit are the redeem terms).
     ///
-    /// The rebuilt job carries `seller_pubkey=None` (so `assert_seller_matches` passes) and the
-    /// money-critical amount/unit from the offer; the EXISTING redeem path re-checks every guard
-    /// (`assert_redeem_mint`, terms, amount) before any funds move.
+    /// The rebuilt job pins `seller_pubkey` to THIS seller (we authored the result+claim it binds
+    /// to) rather than a `None` wildcard, so `assert_seller_matches` binds to us exactly; it carries
+    /// the money-critical amount/unit from the offer, and the EXISTING redeem path re-checks every
+    /// guard (`assert_redeem_mint`, terms, amount) before any funds move.
     fn reconstruct_delivered_bind(
         &self,
         view: &crate::job_lifecycle::JobView,
@@ -1009,7 +1024,8 @@ impl SellerDaemon {
                 amount: offer.amount_sats,
                 unit: received.payload.payload.unit.to_string(),
                 deadline_unix: 0,
-                seller_pubkey: None,
+                // Pin to this seller (we authored the bound result+claim) — not a None wildcard.
+                seller_pubkey: Some(self.seller_pubkey.clone()),
             },
             claim_id: own_claim.claim_id.clone(),
             result_id: Some(own_result.result_id.clone()),
@@ -1194,10 +1210,53 @@ impl SellerDaemon {
         // Must await — seller loop already owns a tokio runtime; blocking open nests block_on → panic.
         let wallet = buyer_fund::open_wallet_async(&self.home).await?;
         let adapter = CdkSellerReceive::new(&wallet, cashu_key);
-        let amount = adapter
+
+        // Durable intent-to-receive breadcrumb BEFORE the mint swap. If append_receipt later fails
+        // (the swap DID land the money), a restart re-sees this wrap and — because the mint reports
+        // the token already spent AND this pending-receive record exists — finalizes the receipt
+        // instead of leaving the job unpaid forever. token_hash is SHA-256 of the token string; no
+        // proof/secret material is journaled.
+        let token_hash = {
+            use sha2::Digest as _;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(token.to_string().as_bytes());
+            hex::encode(hasher.finalize())
+        };
+        self.journal.append_pending_receive(
+            &local_job,
+            &local_result,
+            &token_hash,
+            &buyer,
+            &mint,
+            expected_amount,
+        )?;
+
+        let amount_received = match adapter
             .receive(&token, &terms, &accepted_mints, &payload_mint)
-            .await?;
-        let amount_received = amount.to_u64();
+            .await
+        {
+            Ok(amount) => amount.to_u64(),
+            Err(error) => {
+                let daemon_err = DaemonError::from(error);
+                // Crash-recovery finalize: the token is already spent AND we hold a durable
+                // intent-to-receive for exactly this token. Only the seller can spend a token
+                // P2PK-locked to it, so the swap landed in a prior run — the money is in the
+                // wallet. Finalize the receipt from the recorded (exact P2PK-locked) amount rather
+                // than stranding a paid job as unpaid. Any other receive error propagates.
+                if is_idempotent_already_redeemed(&daemon_err)
+                    && self.journal.pending_receive_for_token(&token_hash)?.is_some()
+                {
+                    eprintln!(
+                        "seller receive recovery: token already spent with a pending-receive record \
+                         (job_id={local_job} result_id={local_result}); finalizing receipt (swap \
+                         landed in a prior run)"
+                    );
+                    expected_amount
+                } else {
+                    return Err(daemon_err);
+                }
+            }
+        };
         // (g) collect-leg observability: sats redeemed at the mint (no key/token material).
         eprintln!(
             "{}",
@@ -2259,19 +2318,27 @@ fn reconcile_error_content(liveness: ClaimLiveness) -> String {
     seller_error_content(ErrorReasonCode::ClaimReleased, reconcile_reason(liveness))
 }
 
-async fn publish_draft(
-    home: &MobeeHome,
+/// Build + sign an [`EventDraft`] into a signed nostr event WITHOUT publishing it. The signed
+/// event carries its deterministic id (`event.id`), so a caller can durably journal that id
+/// BEFORE the network publish (the write-before-publish ordering the claim path needs).
+fn sign_draft(
     keys: &nostr_sdk::Keys,
     draft: &EventDraft,
-) -> Result<String, DaemonError> {
-    use nostr_sdk::prelude::{Client, Kind};
-
+) -> Result<nostr_sdk::Event, DaemonError> {
     let builder = gateway::nostr::event_builder(draft)
         .map_err(|error| DaemonError::Relay(format!("event builder: {error}")))?;
-    let event = builder
+    builder
         .sign_with_keys(keys)
-        .map_err(|error| DaemonError::Relay(format!("sign: {error}")))?;
-    let _ = Kind::Custom(draft.kind);
+        .map_err(|error| DaemonError::Relay(format!("sign: {error}")))
+}
+
+/// Publish an already-signed event and return the accepted event id (== `event.id`).
+async fn send_signed_event(
+    home: &MobeeHome,
+    keys: &nostr_sdk::Keys,
+    event: &nostr_sdk::Event,
+) -> Result<String, DaemonError> {
+    use nostr_sdk::prelude::Client;
 
     let client = Client::new(keys.clone());
     client
@@ -2280,7 +2347,7 @@ async fn publish_draft(
         .map_err(|error| DaemonError::Relay(format!("add relay: {error}")))?;
     client.connect().await;
     let output = client
-        .send_event_to([&home.config.relay_url], &event)
+        .send_event_to([&home.config.relay_url], event)
         .await;
     client.disconnect().await;
     let output = output.map_err(|error| DaemonError::Relay(format!("send: {error}")))?;
@@ -2288,6 +2355,15 @@ async fn publish_draft(
         return Err(DaemonError::Relay("no relay accepted event".into()));
     }
     Ok(output.val.to_hex())
+}
+
+async fn publish_draft(
+    home: &MobeeHome,
+    keys: &nostr_sdk::Keys,
+    draft: &EventDraft,
+) -> Result<String, DaemonError> {
+    let event = sign_draft(keys, draft)?;
+    send_signed_event(home, keys, &event).await
 }
 
 /// Publish one addressable kind-30340 heartbeat off the daemon loop's tick. This is best-effort

@@ -1243,8 +1243,9 @@
         assert_eq!(job.result_id.as_deref(), Some("del-result"));
         assert_eq!(job.offer.amount, 15);
         assert_eq!(job.offer.unit, "sat");
-        // seller_pubkey=None so the redeem's assert_seller_matches(self) passes.
-        assert!(job.offer.seller_pubkey.is_none());
+        // Rebuilt offer is pinned to THIS seller (not a None wildcard) — assert_seller_matches
+        // binds to us exactly.
+        assert_eq!(job.offer.seller_pubkey.as_deref(), Some(daemon.seller_pubkey()));
 
         // Idempotent: a delivered job already in awaiting_payment is not duplicated.
         let again = daemon.restore_delivered_unpaid().expect("restore again");
@@ -1375,8 +1376,9 @@
         assert_eq!(job.offer.amount, 15);
         assert_eq!(job.offer.unit, "sat");
         assert_eq!(job.buyer_pubkey, buyer_hex);
-        // seller_pubkey=None so the redeem's assert_seller_matches(self) passes.
-        assert!(job.offer.seller_pubkey.is_none());
+        // Rebuilt offer is pinned to THIS seller (not a None wildcard) — assert_seller_matches
+        // binds to us exactly.
+        assert_eq!(job.offer.seller_pubkey.as_deref(), Some(seller.as_str()));
 
         // The reconstructed job binds the payment (the redeem path's job+result lookup succeeds).
         let mut daemon = daemon;
@@ -1385,6 +1387,36 @@
             .awaiting_payment
             .iter()
             .any(|j| j.job_id == received.payload.job_id()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Finding J: the claim id is derivable from the SIGNED event BEFORE publish, so the CLAIMED
+    // transition can be journaled before a live creq exists on the relay. Proves the write-before-
+    // publish primitive: sign → (journal) → publish, with the journaled id == the deterministic
+    // published id.
+    #[test]
+    fn claim_journaled_with_presign_id_before_publish() {
+        let (root, daemon) = test_daemon("claim-presign");
+        let seller = daemon.seller_pubkey().to_owned();
+        let creq = gateway::creq::build_seller_creq(
+            "job-presign",
+            5,
+            "sat",
+            &[DEFAULT_MINT_URL.into()],
+            &seller,
+        )
+        .expect("creq");
+        let claim = claim_draft("job-presign", "buyer-x", &seller, &creq);
+        let event = sign_draft(&daemon.keys, &claim).expect("sign");
+        let claim_id = event.id.to_hex();
+        assert_eq!(claim_id.len(), 64, "pre-publish claim id must be a full event id");
+
+        // The journal records the pre-publish id — a durable claim exists with NO network publish.
+        daemon
+            .journal
+            .append_claim("job-presign", &claim_id, "buyer-x", 2_000_000_000)
+            .expect("journal claim");
+        assert!(daemon.journal.has_claim("job-presign").expect("has_claim"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
