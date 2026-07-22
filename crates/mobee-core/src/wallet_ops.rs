@@ -187,6 +187,33 @@ fn post_confirm_balance(read: Result<u64, String>, before: u64, spent_sats: u64,
     }
 }
 
+/// Resolve the reported post-receive balance from a balance-read result (finding X, sibling of
+/// finding U). A successful `receive` is the effect boundary — the token's proofs are already
+/// redeemed into the wallet — so a read failure, or a stale/non-increasing balance, must NEVER make
+/// the caller discard the credited outcome (a discarded outcome retries into an already-spent
+/// token): report the read balance when available, otherwise a best-effort `before + received`
+/// estimate. Pure so "a read failure still yields the outcome" is unit-testable without a mint.
+fn post_receive_balance(read: Result<u64, String>, before: u64, received_sats: u64) -> u64 {
+    match read {
+        Ok(balance) => {
+            if balance <= before {
+                eprintln!(
+                    "wallet receive WARN: post-receive balance did not increase (before={before} \
+                     after={balance}); returning the credited outcome anyway (receive already happened)"
+                );
+            }
+            balance
+        }
+        Err(error) => {
+            eprintln!(
+                "wallet receive WARN: post-receive balance read failed (returning the credited \
+                 outcome anyway; receive already happened): {error}"
+            );
+            before.saturating_add(received_sats)
+        }
+    }
+}
+
 fn resolve_mint(home: &MobeeHome, mint_override: Option<&str>) -> Result<String, WalletOpsError> {
     match mint_override {
         Some(url) => mint_is_allowed(home, url),
@@ -553,16 +580,16 @@ pub async fn receive_async(
             "receive credited 0 sats (refusing phantom credit)".into(),
         ));
     }
-    let balance = wallet
+    // `receive` is the effect boundary: the token's proofs are already redeemed, so the post-receive
+    // balance read is observational and must NEVER discard the credited outcome (finding X). A read
+    // failure or a stale/non-increasing balance yields a best-effort figure via `post_receive_balance`;
+    // the authoritative record is `received_sats`.
+    let read = wallet
         .total_balance()
         .await
-        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?
-        .to_u64();
-    if balance <= before {
-        return Err(WalletOpsError::Wallet(format!(
-            "receive did not increase balance: before={before} after={balance}"
-        )));
-    }
+        .map(|balance| balance.to_u64())
+        .map_err(|error| error.to_string());
+    let balance = post_receive_balance(read, before, received_sats);
     Ok(ReceiveOutcome {
         mint_url,
         received_sats,
@@ -912,6 +939,20 @@ mod tests {
         assert_eq!(post_confirm_balance(Ok(70), 100, 30, "melt"), 70);
         // Read ok but stale/equal (did-not-decrease) → still returned, WARN only (no discard).
         assert_eq!(post_confirm_balance(Ok(100), 100, 30, "send"), 100);
+    }
+
+    // Finding X: a successful `receive` is the effect boundary (proofs already redeemed), so a
+    // post-receive balance-read FAILURE must never discard the credited outcome — `post_receive_balance`
+    // returns a best-effort `before + received` estimate and never errors. A stale/non-increasing
+    // read also still returns (WARN only), so the caller never retries into an already-spent token.
+    #[test]
+    fn post_receive_balance_read_failure_preserves_outcome() {
+        // Read failed: best-effort `before + received`, never an error → the outcome is preserved.
+        assert_eq!(post_receive_balance(Err("boom".into()), 100, 30), 130);
+        // Read ok and balance increased → report the read value.
+        assert_eq!(post_receive_balance(Ok(130), 100, 30), 130);
+        // Read ok but stale/non-increasing → still returned, WARN only (no discard).
+        assert_eq!(post_receive_balance(Ok(100), 100, 30), 100);
     }
 
     #[tokio::test(flavor = "current_thread")]

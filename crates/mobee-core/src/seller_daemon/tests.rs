@@ -12,6 +12,43 @@
         ))
     }
 
+    /// Finding Y: the backfill `since` cursor decision. A journal READ ERROR (corrupt journal) must
+    /// ABORT the cycle (propagate `Err`) rather than defaulting to since=0 and running a full-history
+    /// backfill. A missing/empty journal (folded to `Ok(None)` by the journal reads) yields 0
+    /// (legitimate first boot); the oldest-unsettled anchor clamps the cursor.
+    #[test]
+    fn backfill_since_aborts_on_journal_error() {
+        // Corrupt last-receipt read ⇒ abort (Err), NOT since=0.
+        let err = resolve_backfill_since(
+            Err(SellerError::Journal("corrupt journal line".into())),
+            Ok(None),
+        )
+        .expect_err("journal error must abort the backfill cycle");
+        assert!(matches!(err, SellerError::Journal(_)));
+
+        // Corrupt oldest-unsettled read ⇒ abort as well.
+        assert!(resolve_backfill_since(
+            Ok(Some(1_000)),
+            Err(SellerError::Journal("corrupt journal line".into())),
+        )
+        .is_err());
+
+        // Missing/empty journal (both Ok(None)) ⇒ since=0, the legitimate first-boot path.
+        assert_eq!(resolve_backfill_since(Ok(None), Ok(None)).unwrap(), 0);
+
+        // No unsettled delivery ⇒ cursor is the last-receipt ts.
+        assert_eq!(
+            resolve_backfill_since(Ok(Some(5_000)), Ok(None)).unwrap(),
+            5_000
+        );
+
+        // Oldest unsettled delivery clamps the cursor to (oldest - margin) when that is earlier.
+        assert_eq!(
+            resolve_backfill_since(Ok(Some(50_000)), Ok(Some(10_000))).unwrap(),
+            10_000u64.saturating_sub(WRAP_BACKFILL_MARGIN_SECS)
+        );
+    }
+
     /// Periodic backfill CADENCE decision function. The interval is a fixed
     /// constant in production (300s); the env seam (used only by tests) overrides it, and a
     /// `0`/unparseable value is ignored. This is the extracted `resolve_wrap_backfill_interval_secs`

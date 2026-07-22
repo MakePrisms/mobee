@@ -9,7 +9,7 @@
 //! Local bind under `~/.mobee/jobs/<job_id>.json` is accept-state only.
 
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -676,6 +676,14 @@ pub async fn accept_claim_async(
 
     let result = select_result(&view.results, &claim.seller_pubkey, request.result_id.as_deref())?;
 
+    // Finding W: hold a per-job advisory lock across the single-settlement check→durable-bind-write
+    // so two concurrent accepts for DIFFERENT results of one job cannot both observe "no bind" and
+    // both write (the unlocked TOCTOU that would let two distinct AttemptIds each become payable).
+    // Same pattern as the budget flock (`budget.rs::acquire_lock`): blocks until any other accept on
+    // THIS job releases. Held until the function returns (past the pending + finalized bind writes),
+    // so the loser re-reads the winner's bind and refuses at `assert_single_settlement`.
+    let _job_lock = acquire_job_lock(home, &request.job_id)?;
+
     // Interim single-settlement guard (P): a job binds at most ONE result. If an accept-bind
     // already exists for this job pinned to a DIFFERENT result, refuse — a second/different
     // result_id must not mint a second buyer attempt/payment for one job. Re-accepting the SAME
@@ -1061,9 +1069,16 @@ pub fn authorize_request_from_bind(
 /// preimage field neither asserted against nor otherwise filled from the bind, so a caller whose
 /// `job_hash` diverged from the bind would build a preimage the seller never co-signed and the pay
 /// would refuse "pre-pay seller co-signature invalid"; sourcing it from the bind keeps the explicit
-/// form byte-identical to the bind-first form. `seller_signature`, `creq_hash`, `accepted_mints`,
+/// form byte-identical to the bind-first form. `seller_signature`, `creq_hash`,
 /// and the contribution binds fill from the bind only when the explicit caller left them
 /// empty/absent.
+///
+/// `accepted_mints` is taken from the bind UNCONDITIONALLY, overwriting any caller-supplied value
+/// (finding V). The co-signed receipt preimage binds only `creq_hash` (which pins the accepted SET),
+/// not the realized mint, so the seller cosig does not pin `accepted_mints`; a caller-supplied list
+/// could otherwise substitute a mint outside the bound set. Deriving it solely from the sealed bind
+/// closes that: the realized-mint selection ([`crate::authorize_pay::resolve_realized_mint`]) can
+/// only pick the buyer's own mint from within the bound set.
 pub fn fill_explicit_request_from_bind(
     request: &mut crate::authorize_pay::AuthorizePayRequest,
     bind: &AcceptedBind,
@@ -1082,9 +1097,10 @@ pub fn fill_explicit_request_from_bind(
     if request.creq_hash.is_none() {
         request.creq_hash = bind.creq_hash.clone();
     }
-    if request.accepted_mints.is_empty() {
-        request.accepted_mints = bind.accepted_mints.clone();
-    }
+    // Finding V: derive the accepted-mint set SOLELY from the sealed bind, overwriting any
+    // caller-supplied value. The seller cosig does not pin the realized mint (the preimage binds
+    // only creq_hash), so a caller list must never be trusted to select the paying mint.
+    request.accepted_mints = bind.accepted_mints.clone();
     if request.contribution.is_none() {
         request.contribution = bind.contribution.as_ref().map(|c| {
             crate::authorize_pay::ContributionPayBinds {
@@ -1113,6 +1129,27 @@ fn write_accepted_bind(home: &MobeeHome, bind: &AcceptedBind) -> Result<(), JobL
 fn bind_path(home: &MobeeHome, job_id: &str) -> PathBuf {
     // Event ids are hex — safe as a single path segment.
     home.root.join(JOBS_DIR).join(format!("{job_id}.json"))
+}
+
+/// Acquire the per-job exclusive advisory lock guarding the accept-bind check→write section
+/// (finding W). Blocks until any other accept holding this job's lock releases; the returned
+/// handle holds the `flock` until it drops. Separate lock file per job (`<job_id>.lock`) so
+/// accepts on DIFFERENT jobs never contend. Mirrors `budget.rs::acquire_lock`.
+fn acquire_job_lock(home: &MobeeHome, job_id: &str) -> Result<File, JobLifecycleError> {
+    let dir = home.root.join(JOBS_DIR);
+    fs::create_dir_all(&dir).map_err(|error| JobLifecycleError::Io(error.to_string()))?;
+    // Event ids are hex — safe as a single path segment.
+    let lock_path = dir.join(format!("{job_id}.lock"));
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| JobLifecycleError::Io(error.to_string()))?;
+    // Blocks until any other accept process/task holding this job's lock releases it.
+    file.lock()
+        .map_err(|error| JobLifecycleError::Io(error.to_string()))?;
+    Ok(file)
 }
 
 /// Canonical job-hash for offer/result signing (buyer + seller share this).
@@ -1785,6 +1822,61 @@ mod tests {
         );
     }
 
+    // Finding V: the explicit-pay form must NOT retain a caller-supplied accepted_mints. The
+    // co-signed receipt preimage binds only creq_hash (the accepted SET), not the realized mint, so
+    // a caller list is unpinned by the seller cosig; `fill_explicit_request_from_bind` overwrites it
+    // from the sealed bind unconditionally. Here the caller passes a mint OUTSIDE the bind's set;
+    // after fill the request carries ONLY the bind's set, so realized-mint selection can never pick
+    // the substituted mint (`resolve_realized_mint` accepts only a buyer mint within that set).
+    #[test]
+    fn fill_explicit_overwrites_caller_accepted_mints_with_bind() {
+        let bound_mint = "https://mint.minibits.cash/Bitcoin".to_string();
+        let attacker_mint = "https://evil.example/attacker".to_string();
+        let bind = AcceptedBind {
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "cc".repeat(32),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 5,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: "ab".repeat(32),
+            creq_hash: Some("2ad9b34c".repeat(8)),
+            accepted_mints: vec![bound_mint.clone()],
+            contribution: None,
+        };
+        let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            job_id: bind.job_id.clone(),
+            result_id: bind.result_id.clone(),
+            job_class: crate::authorize_pay::JobClass::FromScratch,
+            delivery_integrity_hash: bind.commit_oid.clone(),
+            job_hash: bind.job_hash.clone(),
+            seller_pubkey: bind.seller_pubkey.clone(),
+            amount_sats: bind.amount_sats,
+            repo: bind.repo.clone(),
+            branch: bind.branch.clone(),
+            commit_oid: bind.commit_oid.clone(),
+            seller_signature: bind.seller_signature.clone(),
+            creq_hash: bind.creq_hash.clone(),
+            // Caller substitutes a mint OUTSIDE the bound set.
+            accepted_mints: vec![attacker_mint.clone()],
+            contribution: None,
+        };
+        fill_explicit_request_from_bind(&mut explicit, &bind);
+        assert_eq!(
+            explicit.accepted_mints, bind.accepted_mints,
+            "caller accepted_mints must be overwritten by the sealed bind"
+        );
+        assert!(
+            !explicit.accepted_mints.contains(&attacker_mint),
+            "substituted mint must not survive into the pay request"
+        );
+    }
+
     #[test]
     fn accept_bind_round_trips_on_disk() {
         let root = std::env::temp_dir().join(format!(
@@ -1819,6 +1911,97 @@ mod tests {
             .expect("load")
             .expect("present");
         assert_eq!(loaded, bind);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Finding W: two overlapping accepts for DIFFERENT results of one job must resolve to exactly
+    // one durable bind — the loser observes the winner's bind and refuses. Models the accept
+    // check→write critical section (acquire_job_lock → load → assert_single_settlement → write)
+    // run concurrently from two threads against one shared home. The per-job flock serializes the
+    // two, so the second thread reads the first's bind and `assert_single_settlement` refuses; on
+    // disk exactly one result stays bound. Without the lock both could observe no bind and both
+    // write.
+    #[test]
+    fn concurrent_accepts_for_different_results_bind_exactly_one() {
+        use std::sync::{Arc, Barrier};
+        let root = std::env::temp_dir().join(format!(
+            "mobee-jobs-bind-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = Arc::new(home::bootstrap(&root).expect("home"));
+        let job_id = "aa".repeat(32);
+
+        let bind_for = |result_id: &str| AcceptedBind {
+            job_id: job_id.clone(),
+            claim_id: "bb".repeat(32),
+            result_id: result_id.to_owned(),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 1,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            contribution: None,
+        };
+
+        // The accept check→write critical section, guarded by the per-job lock.
+        let attempt = |home: Arc<MobeeHome>, job_id: String, result_id: String, bind: AcceptedBind| {
+            let _lock = acquire_job_lock(&home, &job_id)?;
+            let existing = load_accepted_bind(&home, &job_id)?;
+            assert_single_settlement(existing.as_ref(), &job_id, &result_id)?;
+            write_accepted_bind(&home, &bind)?;
+            Ok::<(), JobLifecycleError>(())
+        };
+
+        let barrier = Arc::new(Barrier::new(2));
+        let results = ["cc".repeat(32), "dd".repeat(32)];
+        let handles: Vec<_> = results
+            .iter()
+            .map(|result_id| {
+                let home = Arc::clone(&home);
+                let barrier = Arc::clone(&barrier);
+                let job_id = job_id.clone();
+                let result_id = result_id.clone();
+                let bind = bind_for(&result_id);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    attempt(home, job_id, result_id, bind)
+                })
+            })
+            .collect();
+
+        let outcomes: Vec<Result<(), JobLifecycleError>> =
+            handles.into_iter().map(|h| h.join().expect("thread")).collect();
+
+        let ok = outcomes.iter().filter(|r| r.is_ok()).count();
+        let err = outcomes.iter().filter(|r| r.is_err()).count();
+        assert_eq!(ok, 1, "exactly one accept must bind");
+        assert_eq!(err, 1, "the other accept must refuse");
+        let refusal = outcomes
+            .iter()
+            .find_map(|r| r.as_ref().err())
+            .expect("one refusal")
+            .to_string();
+        assert!(
+            refusal.contains("refusing to bind a different result"),
+            "loser must refuse via single-settlement guard, got: {refusal}"
+        );
+
+        // Exactly one bind on disk, and it is one of the two contested results.
+        let bound = load_accepted_bind(&home, &job_id)
+            .expect("load")
+            .expect("present");
+        assert!(results.contains(&bound.result_id));
         let _ = std::fs::remove_dir_all(&root);
     }
 

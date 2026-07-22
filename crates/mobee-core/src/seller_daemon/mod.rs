@@ -3102,6 +3102,26 @@ fn resolve_wrap_backfill_interval_secs() -> u64 {
     }
 }
 
+/// Compute the wrap-backfill `since` cursor from the two journal reads, or ABORT (finding Y).
+///
+/// A journal read ERROR (e.g. a corrupt journal line surfacing as `SellerError::Journal`) must NOT
+/// default to since=0 — that silently turns a corrupt journal into a full-history backfill. Return
+/// `Err` so the caller aborts this cycle and retries next tick. A missing/empty journal is folded to
+/// `Ok(None)` inside the journal reads (legitimate first boot) and yields `Ok(0)` here. Clamps the
+/// last-receipt anchor to the oldest unsettled delivery (minus the skew margin) so a receipt for a
+/// newer job never advances the cursor past an older unsettled job's uncollected wrap. Pure so the
+/// abort-on-error path is unit-testable without a live journal.
+fn resolve_backfill_since(
+    last_receipt: Result<Option<u64>, SellerError>,
+    oldest_unsettled: Result<Option<u64>, SellerError>,
+) -> Result<u64, SellerError> {
+    let last_receipt = last_receipt?.unwrap_or(0);
+    Ok(match oldest_unsettled? {
+        Some(oldest) => last_receipt.min(oldest.saturating_sub(WRAP_BACKFILL_MARGIN_SECS)),
+        None => last_receipt,
+    })
+}
+
 /// Fetch stored kind-1059 payment gift-wraps p-tagged to this seller since the last journaled
 /// receipt and run EACH through the SAME idempotent redeem path as the live subscription
 /// ([`ingest_gift_wrap`] → `try_apply_or_buffer`: already-receipted wraps skip, already-redeemed
@@ -3127,10 +3147,23 @@ async fn run_wrap_backfill(
     // payment wrap forever. Clamping to the oldest unsettled delivery keeps that wrap in range;
     // the per-job idempotency guards (`has_receipt` skip, mint already-redeemed refuse) make the
     // wider window safe to re-scan.
-    let last_receipt = daemon.journal.last_receipt_ts().unwrap_or(None).unwrap_or(0);
-    let backfill_since = match daemon.journal.oldest_unsettled_delivery_ts().unwrap_or(None) {
-        Some(oldest) => last_receipt.min(oldest.saturating_sub(WRAP_BACKFILL_MARGIN_SECS)),
-        None => last_receipt,
+    // Finding Y: a journal ERROR computing the cursor must ABORT this cycle, never default to
+    // since=0 — a corrupt journal silently becoming a full-history backfill. `resolve_backfill_since`
+    // folds a missing/empty journal to 0 (legitimate first boot, surfaced as `Ok(None)` inside the
+    // journal reads) but propagates a real read error so we bail and retry next cycle. `has_receipt`
+    // still prevents an unsafe redeem, but fail-closed is correct here.
+    let backfill_since = match resolve_backfill_since(
+        daemon.journal.last_receipt_ts(),
+        daemon.journal.oldest_unsettled_delivery_ts(),
+    ) {
+        Ok(since) => since,
+        Err(error) => {
+            eprintln!(
+                "seller wrap backfill{source}: ABORT — journal cursor read failed \
+                 (retrying next cycle, NOT defaulting to since=0): {error}"
+            );
+            return 0;
+        }
     };
     // Log the ATTEMPT unconditionally, BEFORE the fetch — silence must never read as "no wraps".
     eprintln!(
