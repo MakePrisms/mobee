@@ -7,7 +7,7 @@ use crate::delivery::{CommitOid, DeliveryError, GitDelivery};
 pub const MOBEE_TAG: &str = "mobee";
 // mobee protocol version. mobee events occupy a dedicated kind block, so a parser only ever
 // matches mobee's own events.
-pub const PROTOCOL_VERSION: &str = "2";
+pub const PROTOCOL_VERSION: &str = "0";
 
 // All kind NUMBERS live in `crate::kinds` (the one registry); re-exported here so the historical
 // `gateway::JOB_*_KIND` paths keep resolving.
