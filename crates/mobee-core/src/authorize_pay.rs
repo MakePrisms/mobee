@@ -378,7 +378,8 @@ pub async fn authorize_pay_async(
     crate::payment::verify_pay_path_delivery(&mut verifier, &delivery, &key)
         .map_err(AuthorizePayError::Payment)?;
 
-    let wallet = buyer_fund::open_wallet_async(home).await?;
+    let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))
+        .await?;
     // Dust guard (live keyset N=1 floor, fail-closed). lock_or_reconcile re-checks
     // against CDK input-count send_fee after prepare_send.
     crate::payment_wallet::require_fee_safe_amount(&wallet, terms.amount)
@@ -449,6 +450,24 @@ fn contribution_policy(home: &MobeeHome) -> crate::contribution::ContentPolicy {
 /// - **configured mint NOT listed:** the single-mint buyer wallet holds no balance at any mint the
 ///   seller listed, so it cannot pay this claim and refuses `mint_unreachable_pay`; no funds move,
 ///   no binding is committed.
+/// The mint URL the pay path opens the buyer wallet at: the FROZEN realized mint sealed into the
+/// payment terms (`terms.mint`), NEVER `home.config.default_mint()`. The realized mint is already
+/// resolved from the sealed accept-bind ([`resolve_realized_mint`]) and bound into `terms`; opening
+/// the wallet at the live config default instead would, after accept seals mint A and the buyer
+/// flips its config default to B, bind the wallet to B while the attempt id + send target A — the
+/// budget is appended, then the send refuses on mint mismatch and strands the reservation. Taking
+/// the mint from the sealed terms keeps the wallet, the attempt id, and the send all on one mint.
+/// `home` is passed so the already-fenced invariant is asserted at this seam (the realized mint was
+/// fenced by `resolve_realized_mint`; `open_wallet_at_mint_async` re-checks, redundant-safe).
+pub(crate) fn wallet_open_mint_url(home: &MobeeHome, terms: &PaymentTerms) -> String {
+    let mint_url = terms.mint.to_string();
+    debug_assert!(
+        crate::home::mint_allowed(&mint_url, home.config.allow_real_mints),
+        "frozen realized mint must already be fenced before wallet open"
+    );
+    mint_url
+}
+
 pub(crate) fn resolve_realized_mint(
     buyer_mint_url: &str,
     accepted_mints: &[String],
