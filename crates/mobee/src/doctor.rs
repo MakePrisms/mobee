@@ -3,12 +3,6 @@
 //! Runs a registry of independent checks, each printing `PASS`/`WARN`/`FAIL` plus a one-line fix
 //! hint, and exits `0` when nothing FAILed, `1` when any check FAILed (a WARN never fails the exit).
 //! Every check runs even when an earlier one fails, so one run surfaces the full picture.
-//!
-//! The load-bearing motivation is the boot-time field failure: git 2.53 and earlier silently drop
-//! the Authorization credential on the git-receive-pack POST (reads work, pushes 401), so a seller
-//! looks healthy until the first delivery. The git-version check is the definitive detector for that
-//! class; the relay/mint/helper/agent checks catch the rest of the "can this box actually sell"
-//! surface.
 
 use std::io::Write;
 
@@ -87,64 +81,6 @@ fn exit_code(results: &[Check]) -> i32 {
     }
 }
 
-/// Parse `git version` output (e.g. `git version 2.54.1` or `git version 2.39.5 (Apple Git-154)`)
-/// into `(major, minor)`. Returns `None` when no version token is recognizable.
-fn parse_git_version(output: &str) -> Option<(u64, u64)> {
-    let token = output
-        .split_whitespace()
-        .find(|part| part.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
-    let mut parts = token.split('.');
-    let major: u64 = parts.next()?.parse().ok()?;
-    let minor: u64 = parts
-        .next()?
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
-        .ok()?;
-    Some((major, minor))
-}
-
-/// git ≤ 2.53 silently dropped the Authorization credential on the git-receive-pack POST (reads
-/// work, pushes 401). Historically the seller needed `(major, minor) >= (2, 54)` for delivery push.
-/// As of issue #55 ALL of the seller's git legs are in-process libgit2 with NIP-98 signed and
-/// injected on every request, so this bug no longer affects the seller — the check is INFORMATIONAL.
-fn git_version_ok(version: (u64, u64)) -> bool {
-    version >= (2, 54)
-}
-
-const GIT_VERSION_CHECK: &str = "git version";
-
-/// Informational only (issue #55): the seller does NOT use system `git` — all delivery/verify legs
-/// are in-process libgit2. This check reports the ambient git version (if any) but never fails.
-fn check_git_version() -> Check {
-    let raw = match std::process::Command::new("git").arg("version").output() {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_owned()
-        }
-        _ => {
-            return Check::pass(
-                GIT_VERSION_CHECK,
-                "system git not found — OK, the seller uses in-process libgit2 (no system git required)",
-            );
-        }
-    };
-    match parse_git_version(&raw) {
-        None => Check::pass(
-            GIT_VERSION_CHECK,
-            format!("could not parse git version from {raw:?} — informational only; system git is not required"),
-        ),
-        Some(version) if git_version_ok(version) => {
-            Check::pass(GIT_VERSION_CHECK, format!("git {}.{}", version.0, version.1))
-        }
-        Some((major, minor)) => Check::pass(
-            GIT_VERSION_CHECK,
-            format!(
-                "git {major}.{minor} (< 2.54 dropped push credentials, but the seller no longer uses system git — in-process libgit2 handles auth)"
-            ),
-        ),
-    }
-}
 
 #[cfg(feature = "wallet")]
 mod checks {
@@ -367,7 +303,6 @@ fn run_doctor(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let telemetry = home.config.telemetry.clone();
 
     let mut checks: Vec<Box<dyn FnOnce() -> Check>> = vec![
-        Box::new(check_git_version),
         Box::new(checks::check_credential_helper),
         Box::new(move || checks::check_relay(relay_url, secret)),
     ];
@@ -393,40 +328,6 @@ fn run_doctor(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn git_version_parse_and_verdict() {
-        assert_eq!(parse_git_version("git version 2.54.0"), Some((2, 54)));
-        assert_eq!(parse_git_version("git version 2.53.9"), Some((2, 53)));
-        assert_eq!(parse_git_version("git version 2.55.1"), Some((2, 55)));
-        assert_eq!(parse_git_version("git version 3.0.0"), Some((3, 0)));
-        // Vendor suffixes (Apple / Windows) still parse the leading X.Y.
-        assert_eq!(
-            parse_git_version("git version 2.39.5 (Apple Git-154)"),
-            Some((2, 39))
-        );
-        assert_eq!(parse_git_version("git version 2.54.windows.1"), Some((2, 54)));
-        // Garbage → None (surfaced as WARN by the check).
-        assert_eq!(parse_git_version("not a version"), None);
-        assert_eq!(parse_git_version(""), None);
-
-        assert!(!git_version_ok((2, 53)), "2.53 drops push creds");
-        assert!(git_version_ok((2, 54)), "2.54 fixed it");
-        assert!(git_version_ok((2, 55)));
-        assert!(git_version_ok((3, 0)));
-        assert!(!git_version_ok((1, 99)), "ancient git fails");
-    }
-
-    #[test]
-    fn garbage_git_version_is_warn_not_fail() {
-        // A parse miss must WARN (advisory), never FAIL — we cannot prove the push path is broken.
-        let check = match parse_git_version("wat") {
-            None => Check::warn(GIT_VERSION_CHECK, "unparsed", "hint"),
-            Some(v) if git_version_ok(v) => Check::pass(GIT_VERSION_CHECK, "ok"),
-            Some((a, b)) => Check::fail(GIT_VERSION_CHECK, format!("{a}.{b}"), "upgrade"),
-        };
-        assert_eq!(check.status, Status::Warn);
-    }
 
     #[test]
     fn registry_runs_every_check_even_after_an_early_fail() {

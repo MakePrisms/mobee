@@ -31,9 +31,9 @@ pub fn resolve_agent_preset(
         return Ok((configured.clone(), preset.argv.clone()));
     }
     match key.as_str() {
-        "claude" => Ok(("claude".into(), resolve_claude())),
-        "cursor" => Ok(("cursor".into(), resolve_cursor())),
-        "codex" => Ok(("codex".into(), resolve_codex())),
+        "claude" => resolve_claude().map(|argv| ("claude".into(), argv)),
+        "cursor" => resolve_cursor().map(|argv| ("cursor".into(), argv)),
+        "codex" => resolve_codex().map(|argv| ("codex".into(), argv)),
         other => Err(format!(
             "unknown --agent {other:?} (want {}, or use --agent-argv)",
             preset_choices(custom)
@@ -61,13 +61,11 @@ pub fn detect_available_agents(custom: &BTreeMap<String, AgentPresetConfig>) -> 
         let available = match custom.get(name) {
             Some(preset) => custom_preset_available(preset),
             None => match name {
-                "claude" => {
-                    which("claude-agent-acp").is_some()
-                        || which("claude").is_some()
-                        || npx_available()
-                }
+                // Available only when the ACP adapter binary the resolver actually launches is on
+                // PATH — so doctor never reports an agent the seller cannot actually run.
+                "claude" => which("claude-agent-acp").is_some(),
                 "cursor" => which("cursor-agent").is_some() || which("agent").is_some(),
-                "codex" => which("codex-acp").is_some() || npx_available(),
+                "codex" => which("codex-acp").is_some(),
                 _ => false,
             },
         };
@@ -93,53 +91,37 @@ fn custom_preset_available(preset: &AgentPresetConfig) -> bool {
     }
 }
 
-fn resolve_claude() -> Vec<String> {
-    if let Some(bin) = which("claude-agent-acp") {
-        return vec![bin.to_string_lossy().into_owned()];
+fn resolve_claude() -> Result<Vec<String>, String> {
+    match which("claude-agent-acp") {
+        Some(bin) => Ok(vec![bin.to_string_lossy().into_owned()]),
+        None => Err(
+            "claude ACP adapter not found on PATH: install it \
+             (npm i -g @agentclientprotocol/claude-agent-acp) or put claude-agent-acp on PATH"
+                .into(),
+        ),
     }
-    // npx resolves the published ACP adapter (no raw ACP knowledge required of the seller).
-    if let Some(npx) = which("npx") {
-        return vec![
-            npx.to_string_lossy().into_owned(),
-            "-y".into(),
-            "@agentclientprotocol/claude-agent-acp".into(),
-        ];
-    }
-    // Last resort: still emit the canonical package argv (install-time failure is clearer).
-    vec![
-        "npx".into(),
-        "-y".into(),
-        "@agentclientprotocol/claude-agent-acp".into(),
-    ]
 }
 
-fn resolve_cursor() -> Vec<String> {
-    if let Some(bin) = which("cursor-agent").or_else(|| which("agent")) {
-        return vec![bin.to_string_lossy().into_owned(), "acp".into()];
+fn resolve_cursor() -> Result<Vec<String>, String> {
+    match which("cursor-agent").or_else(|| which("agent")) {
+        Some(bin) => Ok(vec![bin.to_string_lossy().into_owned(), "acp".into()]),
+        None => Err(
+            "cursor ACP adapter not found on PATH: install the cursor agent and put \
+             cursor-agent (or agent) on PATH"
+                .into(),
+        ),
     }
-    vec!["cursor-agent".into(), "acp".into()]
 }
 
-fn resolve_codex() -> Vec<String> {
-    if let Some(bin) = which("codex-acp") {
-        return vec![bin.to_string_lossy().into_owned()];
+fn resolve_codex() -> Result<Vec<String>, String> {
+    match which("codex-acp") {
+        Some(bin) => Ok(vec![bin.to_string_lossy().into_owned()]),
+        None => Err(
+            "codex ACP adapter not found on PATH: install it \
+             (npm i -g @agentclientprotocol/codex-acp) or put codex-acp on PATH"
+                .into(),
+        ),
     }
-    if let Some(npx) = which("npx") {
-        return vec![
-            npx.to_string_lossy().into_owned(),
-            "-y".into(),
-            "@agentclientprotocol/codex-acp".into(),
-        ];
-    }
-    vec![
-        "npx".into(),
-        "-y".into(),
-        "@agentclientprotocol/codex-acp".into(),
-    ]
-}
-
-fn npx_available() -> bool {
-    which("npx").is_some()
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -172,13 +154,26 @@ mod tests {
     }
 
     #[test]
-    fn presets_resolve_nonempty_argv() {
+    fn builtin_presets_resolve_to_binary_or_install_hint() {
+        // A built-in resolves to a non-empty argv only when its ACP adapter binary is on PATH;
+        // otherwise it fails with an install hint (no npx auto-launch fallback).
         let none = BTreeMap::new();
         for name in BUILTIN_PRESETS {
-            let (label, argv) = resolve_agent_preset(name, &none).expect("preset");
-            assert_eq!(label, name);
-            assert!(!argv.is_empty());
-            assert!(argv.iter().all(|p| !p.is_empty()));
+            match resolve_agent_preset(name, &none) {
+                Ok((label, argv)) => {
+                    assert_eq!(label, name);
+                    assert!(!argv.is_empty());
+                    assert!(argv.iter().all(|p| !p.is_empty()));
+                    assert!(
+                        !argv.iter().any(|p| p == "npx"),
+                        "{name} must not resolve to an npx fallback: {argv:?}"
+                    );
+                }
+                Err(message) => assert!(
+                    message.contains("install") && message.contains("PATH"),
+                    "{name} missing-adapter error must carry an install hint: {message:?}"
+                ),
+            }
         }
     }
 
