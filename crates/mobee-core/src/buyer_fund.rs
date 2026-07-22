@@ -1,9 +1,10 @@
 //! Buyer wallet fund path for packaged `~/.mobee`.
 //!
-//! Flow: mint quote → surface the bolt11 invoice → poll quote state until paid → mint. A testnut
-//! FakeWallet auto-marks the invoice paid, so the loop completes immediately; a real mint completes
-//! once the invoice is paid externally. The wallet mint is the configured mint
-//! ([`crate::home::MobeeConfig::default_mint`]).
+//! One universal, mint-agnostic flow: request a mint quote → surface its bolt11 invoice → poll the
+//! quote state until the invoice is paid → mint the proofs. There is no per-mint branch — a
+//! testnut/fake mint simply auto-marks its invoice paid, so the same poll returns immediately, while
+//! a real mint's quote flips to paid once the invoice is paid externally. The wallet mint is the
+//! configured mint ([`crate::home::MobeeConfig::default_mint`]).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -179,8 +180,9 @@ pub async fn fund_wallet(
     let quote_id = quote.id.clone();
 
     // Poll HTTP quote status — do not use wait_and_mint_quote (its WS stream can hang; polling is
-    // deterministic). A testnut FakeWallet marks the invoice paid immediately; a real mint's quote
-    // flips to Paid once the invoice is paid externally. Poll until Paid/Issued.
+    // deterministic). Same path for every mint: wait until the quote flips to Paid/Issued. A
+    // testnut/fake mint marks its invoice paid immediately, so this returns at once; a real mint's
+    // quote flips once the invoice is paid externally.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {
         let status = wallet
