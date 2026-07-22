@@ -648,9 +648,9 @@ fn require_receipt_binds_key(
     if preimage.unit != key.unit.to_string() {
         return mismatch("unit", key.unit.to_string(), &preimage.unit);
     }
-    if preimage.mint != key.mint.to_string() {
-        return mismatch("mint", key.mint.to_string(), &preimage.mint);
-    }
+    // The realized `mint` is deliberately NOT in the co-signed preimage (see `ReceiptPreimage`):
+    // the accepted-mint SET is bound via `creq_hash` and the specific mint is enforced by the
+    // allowlist guards on both ends, so there is no mint field to bind here.
     if preimage.delivery_integrity_hash != key.delivery_integrity_hash.as_str() {
         return mismatch(
             "delivery_integrity_hash",
@@ -749,23 +749,22 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
         Self { journal }
     }
 
-    /// Verifies the buyer store before allowing the first durable payment intent.
+    /// Advance a payment whose delivery has ALREADY been verified + bind-checked (via
+    /// [`verify_pay_path_delivery`]) by the caller.
     ///
-    /// By construction the pay path accepts only [`PayPathDeliveryVerifier`] — a bare
-    /// or otherwise un-allowlisted `impl DeliveryVerifier` is a type error at the
-    /// `authorize_pay` / MCP call site (compiler refuse). In-crate unit tests that inject
-    /// fake verifiers use [`Self::run_with_verifier`] (`#[cfg(test)]` only — absent from
-    /// release / non-test builds).
-    pub(crate) fn run<E: PaymentEffects>(
+    /// The production pay entry. The caller runs delivery verification BEFORE committing any
+    /// budget (so a failed/hung verify burns zero budget) and then commits budget before the
+    /// wallet send inside this call (write-before-mint). By construction the pay path only ever
+    /// verifies through [`PayPathDeliveryVerifier`] (allowlist-sealed); in-crate unit tests that
+    /// inject fake verifiers use [`Self::run_with_verifier`] (`#[cfg(test)]` only).
+    pub(crate) fn run_verified<E: PaymentEffects>(
         &self,
-        delivery: &GitDelivery,
-        delivery_verifier: &mut PayPathDeliveryVerifier,
         key: &PaymentKey,
         terms: &PaymentTerms,
         authority: &ReceiptAuthority,
         effects: &mut E,
     ) -> Result<PaymentState, PaymentError> {
-        self.run_delivery_gated(delivery, delivery_verifier, key, terms, authority, effects)
+        self.advance(key, terms, authority, effects)
     }
 
     /// Delivery-gated pay entry for in-crate unit tests only (fake / bare verifiers).
@@ -787,8 +786,8 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
 
     /// Shared delivery-verify → tip-bind → [`Self::advance`] impl.
     ///
-    /// Private: not a production generic entry. Production callers must go through
-    /// [`Self::run`] (`PayPathDeliveryVerifier` only).
+    /// Private: not a production generic entry. Production callers verify via
+    /// [`verify_pay_path_delivery`] (before budget) then call [`Self::run_verified`].
     fn run_delivery_gated<D: DeliveryVerifier, E: PaymentEffects>(
         &self,
         delivery: &GitDelivery,
@@ -916,6 +915,26 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
 
         state.ok_or_else(|| PaymentError::Refused("payment state is absent".into()))
     }
+}
+
+/// Verify a pay-path delivery (allowlist + fetch + tip-match) and bind-check the verified commit
+/// against the payment key. The production pay path calls this BEFORE committing any budget, so a
+/// failed or hung verification burns ZERO budget (the invariant the budget-before-wallet-send
+/// ordering must not violate). Mirrors the verify + bind step of [`PaymentService::run_delivery_gated`].
+pub(crate) fn verify_pay_path_delivery(
+    delivery_verifier: &mut PayPathDeliveryVerifier,
+    delivery: &GitDelivery,
+    key: &PaymentKey,
+) -> Result<(), PaymentError> {
+    let verified = delivery_verifier
+        .verify(delivery)
+        .map_err(PaymentError::Delivery)?;
+    if key.delivery_integrity_hash.as_str() != verified.commit_oid().as_str() {
+        return Err(PaymentError::Refused(
+            "payment key does not bind the verified delivery commit".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn append_transition<G: PaymentJournalGuard>(
@@ -2146,7 +2165,6 @@ mod tests {
             offer_id: key.job_id.as_str().to_owned(),
             amount: key.amount.to_u64(),
             unit: key.unit.to_string(),
-            mint: key.mint.to_string(),
             buyer_pubkey: buyer_keys().public_key().to_hex(),
             seller_pubkey: seller_keys().public_key().to_hex(),
             delivery_integrity_hash: key.delivery_integrity_hash.as_str().to_owned(),

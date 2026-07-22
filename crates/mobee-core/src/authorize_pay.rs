@@ -357,6 +357,13 @@ pub async fn authorize_pay_async(
         )));
     }
 
+    // Verify the delivery (allowlist + fetch + tip-match) and bind-check it against the key BEFORE
+    // committing any budget below, so a failed or hung delivery verification burns ZERO budget
+    // (and does not even open the wallet). The budget append still precedes the wallet send inside
+    // `run_verified` (write-before-mint), so the reconcile saga's idempotency is preserved.
+    crate::payment::verify_pay_path_delivery(&mut verifier, &delivery, &key)
+        .map_err(AuthorizePayError::Payment)?;
+
     let wallet = buyer_fund::open_wallet_async(home).await?;
     // Dust guard (live keyset N=1 floor, fail-closed). lock_or_reconcile re-checks
     // against CDK input-count send_fee after prepare_send.
@@ -388,15 +395,10 @@ pub async fn authorize_pay_async(
     let journal = FsPaymentJournal::new(journal_dir.join(format!("{}.jsonl", attempt_id.as_str())));
 
     let amount = request.amount_sats;
+    // Delivery already verified + bind-checked above (pre-budget). The budget append happens here,
+    // before the wallet send inside `run_verified`.
     let state = gate.authorize_then_attempt(attempt_id.as_str(), amount, || {
-        PaymentService::new(&journal).run(
-            &delivery,
-            &mut verifier,
-            &key,
-            &terms,
-            &authority,
-            &mut effects,
-        )
+        PaymentService::new(&journal).run_verified(&key, &terms, &authority, &mut effects)
     })??;
 
     Ok(AuthorizePayOutcome {
@@ -474,7 +476,7 @@ fn resolve_realized_mint(
 /// is safe to log/return on a cosig refusal. The never-echo test asserts no secret leaks.
 fn cosig_refusal_diagnostic(preimage: &ReceiptPreimage) -> String {
     format!(
-        "digest={} job_hash={} offer_id={} amount={} unit={} mint={} buyer_pubkey={} \
+        "digest={} job_hash={} offer_id={} amount={} unit={} buyer_pubkey={} \
          seller_pubkey={} delivery_integrity_hash={} delivery_kind={} exec_metadata_commitment={} \
          creq_hash={}",
         preimage.digest_hex(),
@@ -482,7 +484,6 @@ fn cosig_refusal_diagnostic(preimage: &ReceiptPreimage) -> String {
         preimage.offer_id,
         preimage.amount,
         preimage.unit,
-        preimage.mint,
         preimage.buyer_pubkey,
         preimage.seller_pubkey,
         preimage.delivery_integrity_hash,
@@ -517,7 +518,6 @@ fn receipt_preimage_for(
         offer_id: key.job_id.as_str().to_owned(),
         amount: key.amount.to_u64(),
         unit: key.unit.to_string(),
-        mint: key.mint.to_string(),
         buyer_pubkey: buyer_pubkey_hex.to_owned(),
         seller_pubkey: seller_pubkey_hex.to_owned(),
         delivery_integrity_hash: key.delivery_integrity_hash.as_str().to_owned(),
@@ -944,15 +944,11 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("home");
-        // Fund path not needed: budget check runs first, then run() refuses ext before fetch.
-        // Pre-seed spent path via from_home; caps from config.
         let mut gate = BudgetGate::from_home(&home).expect("gate");
-        // Fee-safe tiny amount (testnut fee=1 → need ≥2) within default caps.
-        // Dust guard runs before delivery verify; amount=1 would false-pass this test.
-        // A VALID seller co-signature is required to reach this point: the pre-pay tooth
-        // runs first, so a bad/empty sig would refuse at ZERO spend and this test would no
-        // longer exercise the write-before-effect (spent==2) path it guards. Signing here lets
-        // the pre-pay gate PASS, so the pay path still refuses at the ext locator AFTER spent.
+        // Finding N: delivery verification (here the transport allowlist refusing an `ext::`
+        // locator) runs and must PASS before any budget is committed, so a failed verify burns
+        // ZERO budget. A valid seller co-signature lets the pre-pay cosig seam PASS, so the refusal
+        // is exercised at the delivery-verify step (not the cosig).
         let valid_sig = seller_cosig(
             &home,
             &prepay_preimage(&home, "job-ext", "result-ext", &"bb".repeat(32), &"aa".repeat(20), 2),
@@ -979,10 +975,10 @@ mod tests {
             message.contains("ext") || message.contains("refused") || message.contains("transport"),
             "unexpected error: {message}"
         );
-        // Write-before-effect: spent was committed before run() refused.
-        assert_eq!(gate.spent(), 2);
+        // Verify-before-budget: a delivery-verify refusal burns ZERO budget.
+        assert_eq!(gate.spent(), 0, "failed delivery verify must not commit budget");
 
-        // Reconciled retry of the same PaymentKey attempt_id must not re-count spent.
+        // A retry still refuses at the verify step, still at zero spend.
         let err2 = authorize_pay_blocking(&home, &mut gate, request).expect_err("retry still refuses");
         let message2 = err2.to_string();
         assert!(
@@ -991,9 +987,9 @@ mod tests {
                 || message2.contains("transport"),
             "unexpected retry error: {message2}"
         );
-        assert_eq!(gate.spent(), 2, "retry must not double-count spent");
+        assert_eq!(gate.spent(), 0, "retry verify refusal must stay zero spend");
         let reloaded = BudgetGate::from_home(&home).expect("reload");
-        assert_eq!(reloaded.spent(), 2);
+        assert_eq!(reloaded.spent(), 0, "durable spent must stay 0 after verify refusal");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1001,6 +997,48 @@ mod tests {
     // Rebuild the co-signed receipt preimage EXACTLY as `authorize_pay_async` does (via the
     // shared `receipt_preimage_for`), for a home where buyer == seller == the home key. Used to
     // mint a REAL seller co-signature (or one over tampered bytes) for the pre-pay tooth.
+    // Finding I: the co-signed receipt preimage is mint-agnostic, so a buyer paying at a NON-default
+    // accepted mint builds the SAME digest the seller co-signed at delivery (the seller no longer
+    // pins a mint). Two payment keys identical except for the realized mint yield identical digests.
+    #[test]
+    fn receipt_preimage_digest_is_independent_of_realized_mint() {
+        let seller_keys = Keys::generate();
+        let seller_nostr = seller_keys.public_key();
+        let seller = seller_nostr.to_hex();
+        let buyer = Keys::generate().public_key().to_hex();
+        let seller_p2pk = cashu_compressed_from_nostr(&seller_nostr).expect("p2pk");
+        let key_at = |mint: &str| {
+            let terms = PaymentTerms::new(
+                MintUrl::from_str(mint).expect("mint"),
+                Amount::from(7),
+                CurrencyUnit::Sat,
+                seller_nostr,
+                seller_p2pk,
+            );
+            PaymentKey::new(
+                JobId::new("job").expect("job id"),
+                ResultId::new("result").expect("result id"),
+                DeliveryIntegrityHash::from_hex(&"11".repeat(32)).expect("oid"),
+                JobHash::from_hex(&"22".repeat(32)).expect("job hash"),
+                &terms,
+                None,
+            )
+        };
+        let default_mint =
+            receipt_preimage_for(&key_at(DEFAULT_MINT_URL), &buyer, &seller, DeliveryKind::Fork);
+        let other_mint = receipt_preimage_for(
+            &key_at("https://other-accepted.testnut.example"),
+            &buyer,
+            &seller,
+            DeliveryKind::Fork,
+        );
+        assert_eq!(
+            default_mint.digest_hex(),
+            other_mint.digest_hex(),
+            "co-signed preimage digest must not depend on the realized mint"
+        );
+    }
+
     fn prepay_preimage(
         home: &MobeeHome,
         job_id: &str,
@@ -1150,7 +1188,6 @@ mod tests {
             "offer_id=job-diag".to_string(),
             "amount=2".to_string(),
             "unit=sat".to_string(),
-            format!("mint={DEFAULT_MINT_URL}"),
             format!("buyer_pubkey={seller_pubkey}"),
             format!("seller_pubkey={seller_pubkey}"),
             format!("delivery_integrity_hash={oid}"),

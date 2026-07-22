@@ -1191,6 +1191,17 @@ impl SellerDaemon {
         }
 
         let buyer = received.buyer_pubkey.to_hex();
+        // Third-party settlement guard: the authenticated NIP-17 seal sender MUST be the bound
+        // offer buyer (the pubkey folded into the seller-signed receipt preimage). Without this a
+        // THIRD party could pay-once and close someone else's job. Fail closed on mismatch; the
+        // receipt below binds the offer buyer (== `buyer` after this check).
+        if buyer != job.buyer_pubkey {
+            return Err(DaemonError::Policy(format!(
+                "payment sender refused: seal sender {buyer} is not the bound offer buyer \
+                 {} for job {local_job}",
+                job.buyer_pubkey
+            )));
+        }
         // Redeem guard: the paid token's mint must be one the seller advertised
         // (`∈ accepted_mints`) AND equal the payload's declared mint. Build the accepted set from
         // the seller's OWN config (the same list authored into the creq `m`), pin the terms to the
@@ -1466,9 +1477,10 @@ impl SellerDaemon {
         // commit to the payment terms the seller published. The creq is reconstructed from the
         // SAME inputs used at claim time (`build_seller_creq` is pure over job id / amount / unit /
         // accepted_mints / seller key), so its hash equals the one the buyer read off the claim
-        // and threaded through its pay path — the co-signatures agree by construction. The mint is
-        // the realized mint the buyer pays at (the seller's default accepted mint), normalized as a
-        // `MintUrl` exactly as the buyer builds it, so the two receipt bytes cannot drift.
+        // and threaded through its pay path — the co-signatures agree by construction. The specific
+        // realized mint is deliberately NOT in the preimage (the seller signs at delivery, before
+        // the buyer chooses which accepted mint to pay from); the accepted-mint SET is bound via
+        // this creq_hash, so buyer/seller cosigs agree for ANY accepted mint.
         let authored_creq = gateway::creq::build_seller_creq(
             &active.job_id,
             active.offer.amount,
@@ -1477,13 +1489,11 @@ impl SellerDaemon {
             &self.seller_pubkey,
         )
         .map_err(|error| DaemonError::Seller(SellerError::Io(error.to_string())))?;
-        let realized_mint = mint_url(self.home.config.default_mint())?.to_string();
         let preimage = crate::receipt::ReceiptPreimage {
             job_hash: job_hash.clone(),
             offer_id: active.job_id.clone(),
             amount: active.offer.amount,
             unit: "sat".to_owned(),
-            mint: realized_mint,
             buyer_pubkey: active.buyer_pubkey.clone(),
             seller_pubkey: self.seller_pubkey.clone(),
             delivery_integrity_hash: commit.clone(),

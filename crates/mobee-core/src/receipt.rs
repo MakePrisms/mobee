@@ -42,11 +42,18 @@ impl DeliveryKind {
 /// Binds the trade **and** the delivered git object (`delivery_integrity_hash` +
 /// `delivery_kind`).
 ///
-/// Two deliberate properties of this preimage (money-semantics — do not silently "fix"):
+/// Three deliberate properties of this preimage (money-semantics — do not silently "fix"):
 /// - **`result_id` is EXCLUDED.** It is the seller's own result-kind event id, unknowable
 ///   when the seller signs at delivery (the signature is a tag *inside* that very event,
 ///   so including its id is circular). The result is still bound to the receipt by the
 ///   `["e", result_id, "", "reply"]` tag under the buyer's event-level nostr signature.
+/// - **The realized `mint` is EXCLUDED.** The seller co-signs at delivery, BEFORE the buyer
+///   picks which of the seller's `accepted_mints` it pays from, so a single co-signed mint would
+///   make buyer/seller cosigs disagree on any non-default accepted mint (multi-mint claims). The
+///   accepted-mint SET is still co-signed via `creq_hash`; the SPECIFIC realized mint is enforced
+///   operationally on both ends (buyer pays only a mint ∈ accepted_mints; the seller redeem guard
+///   `assert_redeem_mint` refuses a token from a mint outside its accepted set) and is proven by
+///   the cashu token itself — it does not need to be in the signed preimage.
 /// - **`exec_metadata_commitment` carries [`EXEC_METADATA_COMMITMENT_EMPTY`] today.** The
 ///   co-signature does not cover exec-metadata: `sig/seller` does not cover it
 ///   (seller-claimed, result-authoritative), and the buyer filters the echo — folding a
@@ -59,7 +66,6 @@ pub struct ReceiptPreimage {
     pub offer_id: String,
     pub amount: u64,
     pub unit: String,
-    pub mint: String,
     /// Buyer nostr x-only pubkey hex (== offer author; the external anchor).
     pub buyer_pubkey: String,
     /// Seller nostr x-only pubkey hex (== accepted-claim seller; the external anchor).
@@ -87,7 +93,6 @@ impl ReceiptPreimage {
             serde_json::json!(self.offer_id),
             serde_json::json!(self.amount),
             serde_json::json!(self.unit),
-            serde_json::json!(self.mint),
             serde_json::json!(self.buyer_pubkey),
             serde_json::json!(self.seller_pubkey),
             serde_json::json!(self.delivery_integrity_hash),
@@ -154,7 +159,6 @@ mod tests {
             offer_id: "offer".into(),
             amount: 7,
             unit: "sat".into(),
-            mint: "https://testnut.cashu.space".into(),
             buyer_pubkey: "bb".repeat(32),
             seller_pubkey: "cc".repeat(32),
             delivery_integrity_hash: "dd".repeat(20),

@@ -3030,7 +3030,6 @@ mod tests {
             offer_id: key.job_id.as_str().to_owned(),
             amount: key.amount.to_u64(),
             unit: key.unit.to_string(),
-            mint: key.mint.to_string(),
             buyer_pubkey: receipt_buyer_keys().public_key().to_hex(),
             seller_pubkey: receipt_seller_keys().public_key().to_hex(),
             delivery_integrity_hash: key.delivery_integrity_hash.as_str().to_owned(),

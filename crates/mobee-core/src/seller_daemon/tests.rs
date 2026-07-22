@@ -1450,6 +1450,38 @@
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Finding M: a payment whose authenticated NIP-17 seal sender is NOT the bound offer buyer is
+    // refused BEFORE any redeem (no third-party pay-once close of someone else's job).
+    #[tokio::test]
+    async fn payment_from_non_offer_buyer_is_refused_before_redeem() {
+        let (root, mut daemon) = test_daemon("third-party-settle");
+        let offer_buyer = nostr_sdk::Keys::generate();
+        let attacker = nostr_sdk::Keys::generate();
+        let job_id = "job-3p";
+
+        let mut job = active_job(job_id, daemon.seller_pubkey(), Some("r-3p"), 0, &root);
+        job.buyer_pubkey = offer_buyer.public_key().to_hex();
+        daemon.awaiting_payment.push(job);
+
+        // The wrap's seal sender is the ATTACKER, not the offer buyer.
+        let received = recon_received(job_id, DEFAULT_MINT_URL, &attacker);
+        let err = daemon
+            .try_apply_payment(received)
+            .await
+            .expect_err("third-party settlement must refuse");
+        match err {
+            DaemonError::Policy(message) => assert!(
+                message.contains("not the bound offer buyer"),
+                "unexpected refusal: {message}"
+            ),
+            other => panic!("expected Policy refusal, got {other:?}"),
+        }
+        // No receipt journaled, job still awaiting payment.
+        assert!(!daemon.journal.has_receipt(job_id).expect("has_receipt"));
+        assert_eq!(daemon.awaiting_payment.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // A result authored by ANOTHER seller for J → refuse (never bind money to a foreign delivery).
     #[test]
     fn reconstruct_refuses_foreign_authored_result() {
