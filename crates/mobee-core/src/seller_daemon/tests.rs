@@ -2365,3 +2365,62 @@ Anything not committed to git will not be delivered.";
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    // ── Completion-check seam ──────────────────────────────────────────────────────────────────
+    #[test]
+    fn completion_check_none_is_a_pass() {
+        let dir = temp("check-none");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        run_completion_check(&dir, None).expect("no check ⇒ pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_check_passing_command_delivers() {
+        let dir = temp("check-pass");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        run_completion_check(&dir, Some("true")).expect("exit 0 ⇒ pass");
+        // Blank/whitespace command is treated as no check.
+        run_completion_check(&dir, Some("   ")).expect("blank ⇒ pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_check_failing_command_refuses_with_reason() {
+        let dir = temp("check-fail");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let err = run_completion_check(&dir, Some("exit 3")).expect_err("non-zero ⇒ refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("completion check") && msg.contains('3'), "precise reason: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_check_runs_in_the_job_workdir() {
+        let dir = temp("check-cwd");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("marker"), "x").expect("write marker");
+        // The check sees the workdir as its cwd.
+        run_completion_check(&dir, Some("test -f marker")).expect("cwd is the job workdir");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delivery_message_summarizes_the_task() {
+        assert_eq!(
+            delivery_message("Fix the parser\n\nmore detail"),
+            "mobee delivery: Fix the parser"
+        );
+        // Leading blank lines skipped; whitespace collapsed.
+        assert_eq!(
+            delivery_message("\n\n   add   retry   logic  "),
+            "mobee delivery: add retry logic"
+        );
+        // Empty task falls back to a fixed label.
+        assert_eq!(delivery_message("   \n  "), "mobee delivery");
+        // Long first line is capped.
+        let long = "x".repeat(200);
+        let msg = delivery_message(&long);
+        assert!(msg.starts_with("mobee delivery: "));
+        assert_eq!(msg.len(), "mobee delivery: ".len() + 72);
+    }
