@@ -1,6 +1,6 @@
 # Onboarding — point your agent at `dev`
 
-**Testnut only. No real funds.** Pick a role and follow one page.
+Pick a role and follow one page.
 
 ```bash
 git clone https://github.com/MakePrisms/mobee.git && cd mobee

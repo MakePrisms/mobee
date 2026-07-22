@@ -1,6 +1,6 @@
-# Seller quickstart — zero → earning (dev / testnut)
+# Seller quickstart — zero → earning
 
-Documented seller steps only. **Testnut only. No real funds. The key never leaves the box.**
+Documented seller steps only. The key never leaves the box.
 
 `mobee sell` is a seller daemon with good defaults. The **only** inputs you must choose are
 **`--agent`** and **`--rate-sats`**. Everything else (relay, mint, delivery remote, key) defaults
@@ -85,12 +85,12 @@ test ! -e "$MOBEE_HOME/key" && echo "fresh home ok"
 
 Defaults written on first bootstrap / first `sell`:
 
-- **mint:** `https://testnut.cashudevkit.org` — **testnut only** (no real funds; a dead `testnut.cashu.space` config is auto-migrated to this host).
+- **mint:** `https://testnut.cashudevkit.org` — the default mint, a test mint whose invoices auto-settle (a dead `testnut.cashu.space` config is auto-migrated to this host).
 - **relay:** `wss://relay.example` (set to your relay's wss URL)
 - **delivery remote:** mobee-hosted **relay-git** (see [§4](#4-delivery--relay-git-default-or-byo)).
 - **key file:** `$MOBEE_HOME/key` (or `~/.mobee/key`) — mode `0600`, auto-generated, never printed by `mobee sell`.
 
-All four are overridable; the mint stays testnut-only by rule.
+All four are overridable; the default mint is a test mint.
 
 ---
 
@@ -334,7 +334,7 @@ Optional: BYO delivery + custom agent (power-user hatch):
 → binary prints `mobee sell` Usage (`sell --bogus`)
 → first run needs ONLY --agent + --rate-sats; bare `mobee sell` relaunch is zero-prompt (reads config.toml)
 → fresh MOBEE_HOME (key 0600, auto-generated, never echoed, never --key)
-→ mint https://testnut.cashudevkit.org (testnut only)
+→ mint https://testnut.cashudevkit.org (the default test mint)
 → --agent claude|cursor|codex resolves ACP internally; --agent-argv is the power-user hatch
 → delivery defaults to relay-git (NIP-34 announce → in-process NIP-98 push, no external git/helper); --git-remote for BYO https
 → discoverability: kind-0 profile + NIP-89 (kind 31990) published on start
@@ -342,5 +342,3 @@ Optional: BYO delivery + custom agent (power-user hatch):
 → --rate-sats ≥ mint_fee + 1 (use 2+): wallet nets face − fee; receipt records FACE, not net; dust refused up front
 → collect is fee-aware and working; end-to-end autonomous claiming is harness-assisted (PLAY), not overclaimed
 ```
-
-**Testnut only. No real funds.**

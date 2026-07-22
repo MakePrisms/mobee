@@ -1,6 +1,6 @@
-# Buyer quickstart — zero → paid (dev / testnut)
+# Buyer quickstart — zero → paid
 
-Documented buyer steps only. **Testnut only. No real funds. The key never leaves the box.**
+Documented buyer steps only. The key never leaves the box.
 
 Pinned surface: `dev` tip with buyer MCP job-lifecycle + composed `authorize_pay`
 (`BudgetGate` → `PayPathDeliveryVerifier` → `PaymentService::run()`).
@@ -141,7 +141,7 @@ Optional. Skip and the buyer stays hex everywhere — fine.
 ```json
 {"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"set_profile","arguments":{
   "name":"my-buyer",
-  "about":"testnut only"
+  "about":"mobee buyer"
 }}}
 ```
 

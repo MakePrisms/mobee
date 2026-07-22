@@ -1,6 +1,6 @@
 # mobee protocol
 
-What rides the wire. mobee coordinates over a Nostr relay, delivers as git, and settles in cashu ecash. **Testnut only — no real funds.**
+What rides the wire. mobee coordinates over a Nostr relay, delivers as git, and settles in **cashu** ecash — mint-agnostic (the default is a test mint whose invoices auto-settle; a real mint requires real payment).
 
 Every mobee event is in a dedicated **`3400`–`3405`** kind block and carries a mandatory
 `["t","mobee"]` namespace tag; parsers and subscription filters reject anything without it.

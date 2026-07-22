@@ -60,8 +60,8 @@ use serde::{Deserialize, Serialize};
 
 /// Open-market demo relay.
 pub const DEFAULT_RELAY_URL: &str = "wss://mobee-relay.orveth.dev";
-/// Standing CDK testnut mint — no real funds. The specific host may change; the load-bearing
-/// rule is the class: a testnut/dev mint only.
+/// Standing CDK test mint — its bolt11 invoices auto-settle, so the default moves no real money.
+/// The specific host may change; the load-bearing rule is the class: the default is a test/dev mint.
 pub const DEFAULT_MINT_URL: &str = "https://testnut.cashudevkit.org";
 /// Dead testnut host — bootstrap migrates config.toml away from this.
 pub const DEAD_TESTNUT_MINT_HOST: &str = "testnut.cashu.space";
@@ -638,7 +638,7 @@ fn default_total_budget_sats() -> u64 {
 ///   that is exactly [`DEFAULT_MINT_URL`].
 /// - `allow_real_mints == true` (operator opt-in real-money switch): any well-formed `https://`
 ///   mint URL. Full URL validity is re-checked downstream (`MintUrl::from_str` / `Wallet::new`);
-///   this predicate only decides the POLICY (testnut-only vs any-https).
+///   this predicate only decides the POLICY (the testnut/dev allow-list vs any-https).
 pub fn mint_allowed(mint_url: &str, allow_real_mints: bool) -> bool {
     if allow_real_mints {
         mint_url
