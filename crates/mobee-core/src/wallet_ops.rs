@@ -1,8 +1,7 @@
-//! Flexible ecash wallet ops for `mobee wallet` / MCP mirrors.
-//!
-//! Additive surface over the packaged CDK wallet at `home/.mobee/wallet`.
-//! Does **not** replace the [`crate::buyer_fund::fund_wallet`] path
-//! (`setup_wallet` keeps hardcoded 21 + `already_funded`).
+//! Flexible ecash wallet ops for `mobee wallet` / MCP mirrors, over the packaged CDK wallet at
+//! `home/.mobee/wallet`. This module owns the mint-fund path: [`begin_mint_async`] creates a mint
+//! quote and returns the bolt11 invoice up front, then [`complete_mint_async`] mints once it is
+//! paid. ([`crate::buyer_fund`] covers wallet open, seed derivation, and balance read.)
 //!
 //! **Funding assumption:** only the pinned testnut host ([`DEFAULT_MINT_URL`])
 //! FakeWallet-auto-pays mint quotes. For other configured mints, [`begin_mint_async`]

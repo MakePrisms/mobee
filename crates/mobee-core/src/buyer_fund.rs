@@ -1,44 +1,26 @@
-//! Buyer wallet fund path for packaged `~/.mobee`.
+//! Buyer wallet setup for packaged `~/.mobee`: open the CDK wallet at a mint, derive its seed from
+//! the nostr secret, and read its balance. The wallet opens at the configured mint
+//! ([`crate::home::MobeeConfig::default_mint`]) or at an explicit realized mint
+//! ([`open_wallet_at_mint_async`]); the real-mint fence gates non-testnut mints.
 //!
-//! One universal, mint-agnostic flow: request a mint quote → surface its bolt11 invoice → poll the
-//! quote state until the invoice is paid → mint the proofs. There is no per-mint branch — a
-//! testnut/fake mint simply auto-marks its invoice paid, so the same poll returns immediately, while
-//! a real mint's quote flips to paid once the invoice is paid externally. The wallet mint is the
-//! configured mint ([`crate::home::MobeeConfig::default_mint`]).
+//! Funding a wallet (mint quote → surface the bolt11 invoice → wait for payment → mint) lives in
+//! [`crate::wallet_ops`]: `begin_mint_async` returns the invoice up front and `complete_mint_async`
+//! finishes once it is paid.
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
-use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod};
+use cdk::nuts::CurrencyUnit;
 use cdk::wallet::Wallet;
-use cdk::Amount;
 use cdk_sqlite::wallet::WalletSqliteDatabase;
 use sha2::{Digest, Sha256};
 
 use crate::home::{self, HomeError, MobeeHome};
 
-/// Small default fund amount for first-run setup (sats).
-pub const DEFAULT_FUND_AMOUNT_SATS: u64 = 21;
-
-/// Result of a successful fund (or already-funded status read).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FundOutcome {
-    pub mint_url: String,
-    pub invoice: Option<String>,
-    pub funded_sats: u64,
-    pub balance_sats: u64,
-    pub already_funded: bool,
-}
-
 #[derive(Debug)]
 pub enum FundError {
     Home(HomeError),
     Wallet(String),
-    /// The mint quote was still unpaid when the poll window elapsed. Fail-closed (no mint), but
-    /// the bolt11 `invoice` is reported so a slow external payment (real mint) is not lost — pay it
-    /// and re-run to complete the mint.
-    QuoteUnpaid { invoice: String, quote_id: String },
     /// The configured mint is not permitted under the real-mint fence (issue #49): a real mint with
     /// `allow_real_mints == false`. Fail-closed before opening/quoting the wallet.
     MintNotAllowed { mint_url: String },
@@ -49,10 +31,6 @@ impl std::fmt::Display for FundError {
         match self {
             Self::Home(error) => write!(formatter, "{error}"),
             Self::Wallet(message) => write!(formatter, "wallet fund error: {message}"),
-            Self::QuoteUnpaid { invoice, quote_id } => write!(
-                formatter,
-                "mint quote {quote_id} still unpaid; pay the invoice and re-run to complete: {invoice}"
-            ),
             Self::MintNotAllowed { mint_url } => write!(
                 formatter,
                 "mint {mint_url} not allowed (allow_real_mints is off; set MOBEE_ALLOW_REAL_MINTS to opt in)"
@@ -150,103 +128,6 @@ pub async fn wallet_balance_sats(home: &MobeeHome) -> Result<u64, FundError> {
     Ok(balance.to_u64())
 }
 
-/// Fund via mint-quote → wait for payment → mint. Idempotent if balance > 0.
-pub async fn fund_wallet(
-    home: &MobeeHome,
-    amount_sats: u64,
-) -> Result<FundOutcome, FundError> {
-    let wallet = open_wallet_async(home).await?;
-    let existing = wallet
-        .total_balance()
-        .await
-        .map_err(|error| FundError::Wallet(error.to_string()))?
-        .to_u64();
-    if existing > 0 {
-        return Ok(FundOutcome {
-            mint_url: home.config.default_mint().to_owned(),
-            invoice: None,
-            funded_sats: 0,
-            balance_sats: existing,
-            already_funded: true,
-        });
-    }
-
-    let amount = Amount::from(amount_sats);
-    let quote = wallet
-        .mint_quote(PaymentMethod::BOLT11, Some(amount), None, None)
-        .await
-        .map_err(|error| FundError::Wallet(error.to_string()))?;
-    let invoice = quote.request.clone();
-    let quote_id = quote.id.clone();
-
-    // Poll HTTP quote status — do not use wait_and_mint_quote (its WS stream can hang; polling is
-    // deterministic). Same path for every mint: wait until the quote flips to Paid/Issued. A
-    // testnut/fake mint marks its invoice paid immediately, so this returns at once; a real mint's
-    // quote flips once the invoice is paid externally.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-    loop {
-        let status = wallet
-            .check_mint_quote(&quote_id)
-            .await
-            .map_err(|error| FundError::Wallet(error.to_string()))?;
-        match status.state {
-            MintQuoteState::Paid | MintQuoteState::Issued => break,
-            MintQuoteState::Unpaid => {
-                if tokio::time::Instant::now() >= deadline {
-                    // Fail closed (no mint) but report the invoice so a slow external payment is
-                    // not lost — the caller can pay it and re-run to complete the mint.
-                    return Err(FundError::QuoteUnpaid {
-                        invoice: invoice.clone(),
-                        quote_id: quote_id.clone(),
-                    });
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        }
-    }
-
-    let proofs = wallet
-        .mint(&quote_id, Default::default(), None)
-        .await
-        .map_err(|error| FundError::Wallet(error.to_string()))?;
-    let funded = proofs
-        .iter()
-        .map(|proof| proof.amount.to_u64())
-        .fold(0u64, |acc, value| acc.saturating_add(value));
-    let balance = wallet
-        .total_balance()
-        .await
-        .map_err(|error| FundError::Wallet(error.to_string()))?
-        .to_u64();
-    if balance == 0 {
-        return Err(FundError::Wallet(
-            "mint completed but observed balance is 0".into(),
-        ));
-    }
-    Ok(FundOutcome {
-        mint_url: home.config.default_mint().to_owned(),
-        invoice: Some(invoice),
-        funded_sats: funded,
-        balance_sats: balance,
-        already_funded: false,
-    })
-}
-
-/// Blocking wrapper for CLI / tests (current-thread runtime).
-/// Nested call from an async context fails fast — use [`fund_wallet`].
-pub fn fund_wallet_blocking(
-    home: &MobeeHome,
-    amount_sats: u64,
-) -> Result<FundOutcome, FundError> {
-    crate::runtime_guard::refuse_nested_block_on("fund_wallet_blocking")
-        .map_err(FundError::Wallet)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| FundError::Wallet(error.to_string()))?;
-    runtime.block_on(fund_wallet(home, amount_sats))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,21 +212,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn blocking_fund_refuses_inside_runtime() {
-        let root = temp_home("nested-refuse");
-        let _ = std::fs::remove_dir_all(&root);
-        let home = bootstrap(&root).expect("bootstrap");
-        let err = fund_wallet_blocking(&home, DEFAULT_FUND_AMOUNT_SATS)
-            .expect_err("must refuse nested block_on");
-        let message = err.to_string();
-        assert!(
-            message.contains("nested block_on refused"),
-            "unexpected: {message}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn blocking_open_refuses_inside_runtime() {
         let root = temp_home("nested-open-refuse");
         let _ = std::fs::remove_dir_all(&root);
@@ -357,26 +223,6 @@ mod tests {
             "unexpected: {message}"
         );
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn live_testnut_fund_observes_balance_gt_zero() {
-        let root = temp_home("live");
-        let _ = std::fs::remove_dir_all(&root);
-        let home = bootstrap(&root).expect("bootstrap");
-        assert_eq!(home.config.default_mint(), DEFAULT_MINT_URL);
-        let outcome = fund_wallet_blocking(&home, DEFAULT_FUND_AMOUNT_SATS)
-            .expect("live testnut fund");
-        assert!(!outcome.already_funded);
-        assert!(outcome.balance_sats > 0, "balance={}", outcome.balance_sats);
-        assert!(outcome.invoice.as_ref().is_some_and(|invoice| !invoice.is_empty()));
-        assert_eq!(outcome.mint_url, DEFAULT_MINT_URL);
-
-        // Idempotent second call — balance still visible, no double-fund required.
-        let again = fund_wallet_blocking(&home, DEFAULT_FUND_AMOUNT_SATS)
-            .expect("already funded");
-        assert!(again.already_funded);
-        assert!(again.balance_sats > 0);
     }
 
     #[test]

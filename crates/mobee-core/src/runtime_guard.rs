@@ -6,7 +6,7 @@
 
 /// Returns `Err` when `Handle::try_current()` succeeds.
 ///
-/// `op` names the sync wrapper (e.g. `fund_wallet_blocking`) so the
+/// `op` names the sync wrapper (e.g. `open_wallet_blocking`) so the
 /// error points at the `_async` twin.
 pub fn refuse_nested_block_on(op: &str) -> Result<(), String> {
     if tokio::runtime::Handle::try_current().is_ok() {
