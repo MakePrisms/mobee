@@ -1980,6 +1980,100 @@ mod tests {
         assert_eq!(explicit.realized_mint.as_deref(), Some(bound_mint.as_str()));
     }
 
+    // Finding CC (end-to-end double-pay regression): the exact retry-stability scenario the
+    // mint-freeze closes. The accept-bind seals realized_mint = A (the buyer's then-configured
+    // default, A in the accepted set). The buyer THEN flips its configured default to B (also
+    // accepted) and RE-RUNS the pay authorization (retry). Because the pay path derives the realized
+    // mint from the SEALED bind — not the live config — the retry's PaymentKey/attempt id is
+    // byte-identical to the first attempt (the config flip did NOT shift it) and still targets the
+    // frozen mint A, so the budget/journal idempotency dedups it instead of minting a SECOND payment
+    // identity for one job. Drives the REAL seal path (`authorize_request_from_bind`) and mirrors
+    // `authorize_pay`'s exact mint-selection + attempt-id derivation over the resulting request.
+    #[test]
+    fn config_default_flip_after_accept_does_not_shift_attempt_id() {
+        use crate::authorize_pay::resolve_realized_mint;
+        use crate::payment::{
+            DeliveryIntegrityHash, JobHash, JobId, PaymentKey, PaymentTerms, ResultId,
+        };
+        use cashu::{Amount, CurrencyUnit, MintUrl, PublicKey as CashuPublicKey};
+        use std::str::FromStr;
+
+        // A and B are BOTH in the accepted set; A is the buyer's default at accept, B the flipped
+        // default on retry. `allow_real_mints` is on so two distinct mints both pass the fence.
+        let mint_a = "https://mint-a.example";
+        let mint_b = "https://mint-b.example";
+        let seller_nostr = nostr_sdk::Keys::generate().public_key();
+        let seller_p2pk =
+            CashuPublicKey::from_str(&format!("02{}", seller_nostr.to_hex())).expect("p2pk");
+
+        let bind = AcceptedBind {
+            job_id: "job-cc".into(),
+            claim_id: "bb".repeat(32),
+            result_id: "res-cc".into(),
+            seller_pubkey: seller_nostr.to_hex(),
+            commit_oid: "ee".repeat(20),
+            repo: "https://example.invalid/repo.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 7,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: String::new(),
+            creq_hash: Some("2ad9b34c".repeat(8)),
+            accepted_mints: vec![mint_a.to_string(), mint_b.to_string()],
+            // Sealed at accept from the buyer's then-configured default (A).
+            realized_mint: Some(mint_a.to_string()),
+            contribution: None,
+        };
+
+        // The pay request built through the REAL seal path threads the frozen mint.
+        let request =
+            authorize_request_from_bind(&bind, bind.amount_sats, bind.commit_oid.clone())
+                .expect("request from bind");
+        assert_eq!(
+            request.realized_mint.as_deref(),
+            Some(mint_a),
+            "seal must thread the frozen mint into the pay request"
+        );
+
+        // Reproduce authorize_pay's mint selection + attempt-id derivation for a given LIVE config
+        // default (the value that changes between the two attempts).
+        let attempt_for = |config_default: &str| -> (String, MintUrl) {
+            let selected = request.realized_mint.as_deref().unwrap_or(config_default);
+            let mint = resolve_realized_mint(selected, &request.accepted_mints, true)
+                .expect("resolve realized mint");
+            let terms = PaymentTerms::new(
+                mint.clone(),
+                Amount::from(request.amount_sats),
+                CurrencyUnit::Sat,
+                seller_nostr,
+                seller_p2pk,
+            );
+            let key = PaymentKey::new(
+                JobId::new(&request.job_id).expect("job id"),
+                ResultId::new(&request.result_id).expect("result id"),
+                DeliveryIntegrityHash::from_hex(&request.delivery_integrity_hash).expect("oid"),
+                JobHash::from_hex(&request.job_hash).expect("job hash"),
+                &terms,
+                request.creq_hash.clone(),
+            );
+            (key.attempt_id().as_str().to_owned(), mint)
+        };
+
+        let (first_attempt, first_mint) = attempt_for(mint_a); // accept-time default
+        let (retry_attempt, retry_mint) = attempt_for(mint_b); // buyer flipped config to B, retries
+
+        // (a) attempt id / PaymentKey identity is preserved across the config-default flip.
+        assert_eq!(
+            first_attempt, retry_attempt,
+            "config-default flip after accept must NOT shift the attempt id (no second payment identity)"
+        );
+        // (b) both attempts target the FROZEN mint A, never the flipped default B.
+        assert_eq!(first_mint, MintUrl::from_str(mint_a).unwrap());
+        assert_eq!(retry_mint, MintUrl::from_str(mint_a).unwrap());
+        assert_ne!(retry_mint, MintUrl::from_str(mint_b).unwrap());
+    }
+
     #[test]
     fn accept_bind_round_trips_on_disk() {
         let root = std::env::temp_dir().join(format!(
