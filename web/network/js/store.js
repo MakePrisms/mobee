@@ -203,7 +203,7 @@ export function createStore() {
       }
     }
     // the seller's kind-3403 RESULT is the AUTHORITATIVE usage source (the kind-3400
-    // receipt echo is a convenience copy, and no 3400s are published on dev yet). A settled
+    // receipt echo is a convenience copy that may be absent). A settled
     // trade therefore fills the dashboard from its result. Skip offers that already carry a
     // receipt row (echo stands in there) to avoid double counting; an UNTAGGED result
     // contributes only dashes (absent-stays-absent — legacy trades are never backfilled).
