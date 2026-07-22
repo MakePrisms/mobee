@@ -691,42 +691,56 @@
         )));
     }
 
-    // Finding S: a receive that reports the token "already spent" is REFUSED, never auto-finalized.
-    // The removed recovery path treated (already-spent AND a pending-receive breadcrumb exists) as
-    // proof a prior swap of ours landed — but the breadcrumb is appended in THIS process immediately
-    // before the swap, so it is trivially present. A malicious buyer could replay an already-redeemed
-    // seller-locked token against a NEW same-value job and forge a receipt for zero new funds. The
-    // decision is now a pure function of the receive result and NEVER consults the journal breadcrumb,
-    // so a spent token can no longer yield an amount to finalize.
+    // Finding S: a receive that reports the token "already spent" is discriminated ONLY by a COMPLETED
+    // receipt for the job (positive proof of our own prior collection) — NEVER by the pending-receive
+    // breadcrumb (appended before every swap, so it proves nothing). The old recovery inferred "our
+    // swap landed" from the breadcrumb, so a replayed already-redeemed seller-locked token forged a
+    // receipt for a new same-value job with zero new funds. `has_receipt` is read FAIL-CLOSED.
     #[test]
-    fn receive_already_spent_is_refused_not_finalized() {
-        // Attack: mint reports proofs already spent (replayed token). Must propagate as an error —
-        // there is NO amount to finalize, so no receipt can be forged.
+    fn receive_already_spent_discriminated_by_completed_receipt() {
         let already_spent =
-            DaemonError::Wallet(PaymentWalletError::Wallet("Token Already Spent".into()));
-        let refused =
-            redeem_amount_or_refuse(Err(already_spent), "job-replay", "res-replay", DEFAULT_MINT_URL, 7);
+            || DaemonError::Wallet(PaymentWalletError::Wallet("Token Already Spent".into()));
+
+        // 1. already-spent + a COMPLETED receipt exists → idempotent no-op (legit backfill/restart
+        //    re-see: already collected AND receipted, no double-anything).
+        let decision = classify_redeem_outcome(Err(already_spent()), || Ok(true));
         assert!(
-            matches!(refused, Err(DaemonError::Wallet(_))),
-            "already-spent must refuse (no finalize), got {refused:?}"
+            matches!(decision, RedeemDecision::IdempotentNoOp),
+            "already-spent + has_receipt=true must be an idempotent no-op"
         );
 
-        // A genuine successful receive still finalizes exactly its redeemed amount.
-        let ok = redeem_amount_or_refuse(Ok(7), "job-ok", "res-ok", DEFAULT_MINT_URL, 7);
-        assert_eq!(ok.expect("successful receive finalizes"), 7);
+        // 2. already-spent + NO completed receipt → refuse (the replay/theft case, and a genuine
+        //    interrupted redeem — indistinguishable, so fail closed; NO receipt forged).
+        let decision = classify_redeem_outcome(Err(already_spent()), || Ok(false));
+        assert!(
+            matches!(decision, RedeemDecision::Refuse(DaemonError::Wallet(_))),
+            "already-spent + has_receipt=false must refuse (no forged receipt)"
+        );
 
-        // Any other receive error also fails closed (never finalizes).
-        let other = redeem_amount_or_refuse(
+        // 3. already-spent + has_receipt READ ERROR → refuse, FAIL CLOSED (an unreadable receipt
+        //    journal must never be read as "no receipt ⇒ safe to proceed" — same class as item G).
+        let decision = classify_redeem_outcome(Err(already_spent()), || {
+            Err(SellerError::Journal("corrupt journal line".into()))
+        });
+        assert!(
+            matches!(
+                decision,
+                RedeemDecision::Refuse(DaemonError::Seller(SellerError::Journal(_)))
+            ),
+            "has_receipt read error must fail closed (refuse), never proceed"
+        );
+
+        // A genuine successful receive finalizes exactly its amount — has_receipt is never consulted.
+        let decision =
+            classify_redeem_outcome(Ok(7), || panic!("has_receipt must not be read on success"));
+        assert!(matches!(decision, RedeemDecision::Finalize(7)));
+
+        // A non-already-spent receive error refuses without consulting has_receipt.
+        let decision = classify_redeem_outcome(
             Err(DaemonError::Relay("connection refused".into())),
-            "job-neterr",
-            "res-neterr",
-            DEFAULT_MINT_URL,
-            7,
+            || panic!("has_receipt must not be read for a non-already-spent error"),
         );
-        assert!(
-            matches!(other, Err(DaemonError::Relay(_))),
-            "non-spent receive error must also refuse, got {other:?}"
-        );
+        assert!(matches!(decision, RedeemDecision::Refuse(DaemonError::Relay(_))));
     }
 
     // Finding T(1): the seller redeem path fails closed on a non-allowlisted REAL mint when

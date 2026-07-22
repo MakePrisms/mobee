@@ -139,35 +139,45 @@ fn is_idempotent_already_redeemed(error: &DaemonError) -> bool {
     message.contains("already spent") || message.contains("already redeemed")
 }
 
-/// Interpret a seller-receive result on the redeem path (finding S). On success the redeemed amount
-/// is finalized; on error we FAIL CLOSED — every receive error propagates and NO receipt is
-/// finalized. In particular an "already spent" error is NOT treated as proof that an earlier swap of
-/// OURS landed: the pending-receive breadcrumb is appended in THIS process immediately BEFORE the
-/// swap, so its presence proves only intent-to-receive-now, never a prior redeem. The removed
-/// auto-finalize-on-already-spent path let a malicious buyer replay an already-redeemed seller-locked
-/// token against a NEW same-value job and forge a receipt for zero new funds (theft-of-service). A
-/// genuine crash-after-swap (money in the wallet, receipt not durable) is left for manual reconcile —
-/// the breadcrumb is its durable audit record. Pure over the receive result so the refuse decision is
-/// unit-testable without a mint.
-fn redeem_amount_or_refuse(
+/// Decision for a seller-receive result on the redeem path (finding S).
+enum RedeemDecision {
+    /// Receive succeeded — finalize a receipt for this redeemed amount.
+    Finalize(u64),
+    /// Idempotent re-see: the token is already spent AND a COMPLETED receipt exists for this job, so
+    /// we already collected AND receipted it. No-op — never double-collect / re-receipt / re-announce.
+    IdempotentNoOp,
+    /// Fail closed — do NOT finalize; refuse and buffer for manual reconcile.
+    Refuse(DaemonError),
+}
+
+/// Classify a seller-receive result on the redeem path (finding S). The load-bearing rule: NEVER
+/// infer "our swap already landed" from a pending-receive breadcrumb. The breadcrumb is appended
+/// before EVERY swap, so it proves only intent, never a prior collection — inferring collection from
+/// it let a malicious buyer replay an already-redeemed seller-locked token against a NEW same-value
+/// job and forge a receipt for zero new funds (theft-of-service).
+///
+/// The ONLY positive proof of OUR OWN prior collection is a COMPLETED `Receipt` for this job
+/// (`has_receipt == true`), so on an "already spent" error:
+/// - `has_receipt == Ok(true)`  → idempotent no-op (the legit backfill/restart re-see);
+/// - `has_receipt == Ok(false)` → refuse + buffer (replay/theft, or a genuine interrupted redeem —
+///   both indistinguishable, so fail closed and leave it for manual reconcile);
+/// - `has_receipt == Err(_)`    → refuse (fail CLOSED: an unreadable receipt journal must NEVER be
+///   read as "no receipt ⇒ safe to proceed" — same posture as the wrap-entry gate, item G).
+///
+/// Any non-already-spent receive error also refuses. `has_receipt` is a closure so the journal is
+/// read only on the already-spent branch, and so the decision is unit-testable without a mint.
+fn classify_redeem_outcome(
     receive_result: Result<u64, DaemonError>,
-    job_id: &str,
-    result_id: &str,
-    mint: &str,
-    expected_amount: u64,
-) -> Result<u64, DaemonError> {
+    has_receipt: impl FnOnce() -> Result<bool, SellerError>,
+) -> RedeemDecision {
     match receive_result {
-        Ok(amount) => Ok(amount),
-        Err(error) => {
-            if is_idempotent_already_redeemed(&error) {
-                eprintln!(
-                    "seller receive REFUSED (already-spent, no proof of a prior redeem by us): \
-                     job_id={job_id} result_id={result_id} mint={mint} expected={expected_amount}; \
-                     NOT finalizing — manual reconcile required"
-                );
-            }
-            Err(error)
-        }
+        Ok(amount) => RedeemDecision::Finalize(amount),
+        Err(error) if !is_idempotent_already_redeemed(&error) => RedeemDecision::Refuse(error),
+        Err(error) => match has_receipt() {
+            Ok(true) => RedeemDecision::IdempotentNoOp,
+            Ok(false) => RedeemDecision::Refuse(error),
+            Err(read_err) => RedeemDecision::Refuse(DaemonError::from(read_err)),
+        },
     }
 }
 
@@ -1325,13 +1335,33 @@ impl SellerDaemon {
             .await
             .map(|amount| amount.to_u64())
             .map_err(DaemonError::from);
-        let amount_received = redeem_amount_or_refuse(
-            receive_result,
-            &local_job,
-            &local_result,
-            &mint,
-            expected_amount,
-        )?;
+        // Positive proof of OUR prior collection = a COMPLETED receipt for this job, read fail-closed.
+        // A pending-receive breadcrumb is NEVER proof (finding S — see `classify_redeem_outcome`).
+        let amount_received =
+            match classify_redeem_outcome(receive_result, || self.journal.has_receipt(&local_job)) {
+                RedeemDecision::Finalize(amount) => amount,
+                RedeemDecision::IdempotentNoOp => {
+                    // Already collected AND receipted (legit backfill/restart re-see). Drop the stale
+                    // binding; never double-collect, re-receipt, or re-announce.
+                    eprintln!(
+                        "seller receive idempotent no-op: token already-spent AND a completed receipt \
+                         exists (job_id={local_job} result_id={local_result}); nothing to finalize"
+                    );
+                    self.awaiting_payment.remove(idx);
+                    return Ok(None);
+                }
+                RedeemDecision::Refuse(error) => {
+                    if is_idempotent_already_redeemed(&error) {
+                        eprintln!(
+                            "seller receive REFUSED (already-spent but NO completed receipt — no proof \
+                             of a prior collection by us): job_id={local_job} result_id={local_result} \
+                             mint={mint} expected={expected_amount}; NOT finalizing — buffered for \
+                             manual reconcile"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
         // (g) collect-leg observability: sats redeemed at the mint (no key/token material).
         eprintln!(
             "{}",
