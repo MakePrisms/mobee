@@ -1989,8 +1989,8 @@ mod tests {
     // frozen mint A, so the budget/journal idempotency dedups it instead of minting a SECOND payment
     // identity for one job. Drives the REAL seal path (`authorize_request_from_bind`) and mirrors
     // `authorize_pay`'s exact mint-selection + attempt-id derivation over the resulting request.
-    #[test]
-    fn config_default_flip_after_accept_does_not_shift_attempt_id() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn config_default_flip_after_accept_does_not_shift_attempt_id() {
         use crate::authorize_pay::{resolve_realized_mint, wallet_open_mint_url};
         use crate::payment::{
             DeliveryIntegrityHash, JobHash, JobId, PaymentKey, PaymentTerms, ResultId,
@@ -2054,8 +2054,10 @@ mod tests {
         );
 
         // Reproduce authorize_pay's mint selection + attempt-id derivation + wallet-open target for a
-        // given LIVE config default (the value that changes between the two attempts).
-        let attempt_for = |config_default: &str| -> (String, MintUrl, String) {
+        // given LIVE config default (the value that changes between the two attempts). Returns the
+        // attempt id, the resolved realized mint, and the payment terms (whose `mint` is what the
+        // wallet-open seam consumes).
+        let attempt_for = |config_default: &str| -> (String, MintUrl, PaymentTerms) {
             let selected = request.realized_mint.as_deref().unwrap_or(config_default);
             let mint = resolve_realized_mint(selected, &request.accepted_mints, true)
                 .expect("resolve realized mint");
@@ -2074,14 +2076,11 @@ mod tests {
                 &terms,
                 request.creq_hash.clone(),
             );
-            // The mint the pay path opens the buyer wallet at — the same decision authorize_pay makes
-            // at the wallet-open seam (over a home whose LIVE default is B).
-            let wallet_mint = wallet_open_mint_url(&home, &terms);
-            (key.attempt_id().as_str().to_owned(), mint, wallet_mint)
+            (key.attempt_id().as_str().to_owned(), mint, terms)
         };
 
-        let (first_attempt, first_mint, first_wallet) = attempt_for(mint_a); // accept-time default
-        let (retry_attempt, retry_mint, retry_wallet) = attempt_for(mint_b); // flipped to B, retries
+        let (first_attempt, first_mint, _first_terms) = attempt_for(mint_a); // accept-time default
+        let (retry_attempt, retry_mint, retry_terms) = attempt_for(mint_b); // flipped to B, retries
 
         // (a) attempt id / PaymentKey identity is preserved across the config-default flip.
         assert_eq!(
@@ -2092,16 +2091,30 @@ mod tests {
         assert_eq!(first_mint, MintUrl::from_str(mint_a).unwrap());
         assert_eq!(retry_mint, MintUrl::from_str(mint_a).unwrap());
         assert_ne!(retry_mint, MintUrl::from_str(mint_b).unwrap());
-        // (c) the pay path opens the wallet at the FROZEN mint A, NOT the live config default B —
-        // even though home.config.default_mint() == B. This is the unfinished half of CC: opening at
-        // B would append budget then strand on a mint-mismatch send. FAILS on the pre-fix wallet-open
-        // (which used home.config.default_mint()).
-        assert_eq!(first_wallet, mint_a, "wallet must open at the frozen mint A");
+
+        // (c) THE WALLET-OPEN HALF OF CC. Drive the EXACT production wallet-open expression from
+        // authorize_pay's :381 seam — `open_wallet_at_mint_async(home, &wallet_open_mint_url(home,
+        // &terms))` — over the retry (home's LIVE default is now B) and observe the REAL opened
+        // Wallet's bound mint. It MUST be the frozen mint A, never the flipped default B. Pre-fix
+        // (:381 = `open_wallet_async(home)`) the wallet bound to B → budget appended, then the send
+        // refuses on mint mismatch and strands the reservation. Reverting `wallet_open_mint_url` to
+        // the live default flips this observed mint B↔A (red-on-revert).
+        let opened = crate::buyer_fund::open_wallet_at_mint_async(
+            &home,
+            &wallet_open_mint_url(&home, &retry_terms),
+        )
+        .await
+        .expect("open pay wallet");
         assert_eq!(
-            retry_wallet, mint_a,
-            "after config flip to B, wallet must STILL open at the frozen mint A, not B"
+            opened.mint_url.to_string(),
+            mint_a,
+            "pay wallet must open at the FROZEN mint A even though the live config default is B"
         );
-        assert_ne!(retry_wallet, mint_b, "wallet must not open at the flipped config default B");
+        assert_ne!(
+            opened.mint_url.to_string(),
+            home.config.default_mint(),
+            "pay wallet must NOT open at the flipped live config default (B)"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
