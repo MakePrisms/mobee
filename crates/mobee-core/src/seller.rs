@@ -173,12 +173,14 @@ pub enum JournalEntry {
         accepted_mints: Vec<String>,
         ts: u64,
     },
-    /// Intent-to-receive breadcrumb written BEFORE the mint swap, so a crash AFTER the swap but
-    /// BEFORE the `Receipt` is durable is recoverable: on restart the seller sees a pending
-    /// receive with no matching `Receipt` and, when the mint reports the token already spent
-    /// (the swap DID land), finalizes the receipt from these carried fields instead of leaving
-    /// the job unpaid forever. Keyed by `token_hash` (SHA-256 of the token string — NEVER the
-    /// token/proof plaintext). A matching `Receipt` supersedes it.
+    /// Intent-to-receive breadcrumb written BEFORE the mint swap: a durable AUDIT record that this
+    /// seller attempted to redeem this token for this job. If a crash lands the swap but not the
+    /// `Receipt`, this breadcrumb (a pending receive with no matching `Receipt`) is the record an
+    /// operator reconciles from. It is NOT auto-finalize proof of payment (finding S): a breadcrumb
+    /// is appended immediately before every swap, so its presence proves only intent, never a prior
+    /// redeem — an "already spent" receive is refused, never finalized off this record. Keyed by
+    /// `token_hash` (SHA-256 of the token string — NEVER the token/proof plaintext). A matching
+    /// `Receipt` supersedes it.
     PendingReceive {
         job_id: String,
         result_id: String,
@@ -489,8 +491,9 @@ impl SellerJournal {
 
     /// Look up an un-finalized intent-to-receive for `token_hash`: a [`JournalEntry::PendingReceive`]
     /// whose job has no matching [`JournalEntry::Receipt`] yet. Returns the carried
-    /// `(job_id, result_id, buyer, mint, amount)` so a crash-recovery path can finalize the receipt
-    /// (the swap already landed the money) instead of leaving the job unpaid. `Ok(None)` when none.
+    /// `(job_id, result_id, buyer, mint, amount)` for operator reconcile of an interrupted redeem.
+    /// This is NOT used to auto-finalize a receipt (finding S — a breadcrumb is not proof of a prior
+    /// redeem); `Ok(None)` when none.
     #[allow(clippy::type_complexity)]
     pub fn pending_receive_for_token(
         &self,

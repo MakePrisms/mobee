@@ -160,6 +160,33 @@ fn mint_is_allowed(home: &MobeeHome, mint_url: &str) -> Result<String, WalletOps
     }
 }
 
+/// Resolve the reported post-confirm balance from a balance-read result (finding U). A cashu
+/// `confirm` is the effect boundary — the ecash has already moved — so a read failure, or a
+/// stale/equal balance, must NEVER make the caller discard the confirmed token/outcome: report the
+/// read balance when available, otherwise a best-effort `before - spent` estimate (the authoritative
+/// record is the returned token / paid+fee). `op` is `"send"`/`"melt"` for the diagnostic. Pure so
+/// "a read failure still yields the outcome" is unit-testable without a mint.
+fn post_confirm_balance(read: Result<u64, String>, before: u64, spent_sats: u64, op: &str) -> u64 {
+    match read {
+        Ok(balance) => {
+            if balance >= before {
+                eprintln!(
+                    "wallet {op} WARN: post-confirm balance did not decrease (before={before} \
+                     after={balance}); returning the confirmed outcome anyway ({op} already happened)"
+                );
+            }
+            balance
+        }
+        Err(error) => {
+            eprintln!(
+                "wallet {op} WARN: post-confirm balance read failed (returning the confirmed outcome \
+                 anyway; {op} already happened): {error}"
+            );
+            before.saturating_sub(spent_sats)
+        }
+    }
+}
+
 fn resolve_mint(home: &MobeeHome, mint_override: Option<&str>) -> Result<String, WalletOpsError> {
     match mint_override {
         Some(url) => mint_is_allowed(home, url),
@@ -465,20 +492,20 @@ pub async fn send_async(
         .prepare_send(Amount::from(amount_sats), SendOptions::default())
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    // `confirm` is the effect boundary: it consumes the input proofs and mints the outgoing token, so
+    // past this point the ecash has left the spendable balance and the caller MUST receive the token.
+    // The post-confirm balance read is observational; a read failure must never discard the token
+    // (finding U — see `post_confirm_balance`).
     let token = prepared
         .confirm(None)
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
-    let balance = wallet
+    let read = wallet
         .total_balance()
         .await
-        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?
-        .to_u64();
-    if balance >= before {
-        return Err(WalletOpsError::Wallet(format!(
-            "send did not move ecash: balance before={before} after={balance}"
-        )));
-    }
+        .map(|balance| balance.to_u64())
+        .map_err(|error| error.to_string());
+    let balance = post_confirm_balance(read, before, amount_sats, "send");
     Ok(SendOutcome {
         mint_url,
         sent_sats: amount_sats,
@@ -503,6 +530,13 @@ pub async fn receive_async(
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?
         .to_string();
     let mint_url = mint_is_allowed(home, &mint_url)?;
+    // Real-mint fence (issue #49): `mint_is_allowed` only checks the mint is in the CONFIGURED list;
+    // this additionally fails closed on a real mint unless the operator opted in, the same gate
+    // send/melt enforce. Without it a real mint left in the configured list would redeem while
+    // `allow_real_mints == false`.
+    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+        return Err(WalletOpsError::MintNotAllowed { mint_url });
+    }
     let wallet = open_wallet_async(home, &mint_url).await?;
     let before = wallet
         .total_balance()
@@ -537,7 +571,8 @@ pub async fn receive_async(
 }
 
 /// Pay a lightning invoice from ecash (fail-closed on insufficient / unpaid).
-/// Post-confirm: refuses if balance did not drop (same movement guard as send).
+/// `confirm` is the effect boundary; the post-confirm balance read is observational and never
+/// discards the settled outcome (finding U — see [`post_confirm_balance`]).
 pub async fn melt_async(
     home: &MobeeHome,
     bolt11: &str,
@@ -578,18 +613,17 @@ pub async fn melt_async(
         .confirm()
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    // `confirm` is the effect boundary — the melt has settled and funds have left the wallet, so the
+    // outcome (paid/fee, both read from `confirmed`) MUST be returned. The post-confirm balance read
+    // is observational; a read failure must never discard the outcome (finding U).
     let paid_sats = confirmed.amount().to_u64();
     let fee_sats = confirmed.fee_paid().to_u64();
-    let balance_sats = wallet
+    let read = wallet
         .total_balance()
         .await
-        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?
-        .to_u64();
-    if balance_sats >= before {
-        return Err(WalletOpsError::Wallet(format!(
-            "melt did not drop balance: before={before} after={balance_sats} (refusing unproven melt)"
-        )));
-    }
+        .map(|balance| balance.to_u64())
+        .map_err(|error| error.to_string());
+    let balance_sats = post_confirm_balance(read, before, paid_sats.saturating_add(fee_sats), "melt");
     Ok(MeltOutcome {
         mint_url,
         paid_sats,
@@ -822,6 +856,62 @@ mod tests {
         let err = mint_blocking(&home, 1, Some("https://evil.example")).expect_err("deny");
         assert!(matches!(err, WalletOpsError::MintNotAllowed { .. }));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Finding T(3): the standalone receive path fails closed on a non-allowlisted REAL mint when
+    // allow_real_mints=false — even though the mint IS in the configured list (so `mint_is_allowed`
+    // passes) — the same real-mint fence send/melt enforce. Reached before any wallet open, so it
+    // holds offline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_refuses_real_mint_when_disallowed() {
+        use std::str::FromStr;
+
+        use cashu::secret::Secret;
+        use cashu::{Amount, CurrencyUnit, Id, MintUrl, Proof, SecretKey, Token};
+
+        let real_mint = "https://real-mint.example/";
+        let root = temp_home("receive-real-mint-fence");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        home.config.accepted_mints = vec![real_mint.into()];
+        home.config.allow_real_mints = false;
+
+        let proof = Proof::new(
+            Amount::from(5),
+            Id::from_str("009a1f293253e41e").expect("keyset id"),
+            Secret::new("receive-fence-test-secret"),
+            SecretKey::generate().public_key(),
+        );
+        let token = Token::new(
+            MintUrl::from_str(real_mint).expect("mint url"),
+            vec![proof],
+            None,
+            CurrencyUnit::Sat,
+        );
+
+        let err = receive_async(&home, &token.to_string())
+            .await
+            .expect_err("real mint must refuse under allow_real_mints=false");
+        assert!(
+            matches!(&err, WalletOpsError::MintNotAllowed { mint_url } if mint_url.contains("real-mint.example")),
+            "expected MintNotAllowed, got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Finding U: `confirm` is the effect boundary, so a post-confirm balance-read FAILURE must never
+    // discard the confirmed token/outcome — `post_confirm_balance` returns a best-effort estimate and
+    // never errors, so the caller always returns the token. A stale/equal balance also still returns.
+    #[test]
+    fn post_confirm_balance_read_failure_preserves_outcome() {
+        // Read failed: best-effort `before - spent`, never an error → the token is still returned.
+        assert_eq!(post_confirm_balance(Err("boom".into()), 100, 30, "send"), 70);
+        // Underflow-safe when the estimate would go negative.
+        assert_eq!(post_confirm_balance(Err("boom".into()), 10, 30, "send"), 0);
+        // Read ok and balance decreased → report the read value.
+        assert_eq!(post_confirm_balance(Ok(70), 100, 30, "melt"), 70);
+        // Read ok but stale/equal (did-not-decrease) → still returned, WARN only (no discard).
+        assert_eq!(post_confirm_balance(Ok(100), 100, 30, "send"), 100);
     }
 
     #[tokio::test(flavor = "current_thread")]

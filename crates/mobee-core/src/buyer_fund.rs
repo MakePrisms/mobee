@@ -38,6 +38,9 @@ pub enum FundError {
     /// the bolt11 `invoice` is reported so a slow external payment (real mint) is not lost — pay it
     /// and re-run to complete the mint.
     QuoteUnpaid { invoice: String, quote_id: String },
+    /// The configured mint is not permitted under the real-mint fence (issue #49): a real mint with
+    /// `allow_real_mints == false`. Fail-closed before opening/quoting the wallet.
+    MintNotAllowed { mint_url: String },
 }
 
 impl std::fmt::Display for FundError {
@@ -48,6 +51,10 @@ impl std::fmt::Display for FundError {
             Self::QuoteUnpaid { invoice, quote_id } => write!(
                 formatter,
                 "mint quote {quote_id} still unpaid; pay the invoice and re-run to complete: {invoice}"
+            ),
+            Self::MintNotAllowed { mint_url } => write!(
+                formatter,
+                "mint {mint_url} not allowed (allow_real_mints is off; set MOBEE_ALLOW_REAL_MINTS to opt in)"
             ),
         }
     }
@@ -89,6 +96,15 @@ pub async fn open_wallet_async(home: &MobeeHome) -> Result<Wallet, FundError> {
     // The wallet opens at the CONFIGURED mint (`MobeeConfig::default_mint`), the same
     // source of truth the pay path resolves the realized mint from — no compile-time pin. A
     // malformed mint URL fails closed inside `Wallet::new`.
+    // Real-mint fence (issue #49): fail closed BEFORE opening/quoting if the configured mint is a
+    // real mint and the operator has not opted in (`allow_real_mints == false`), the same gate the
+    // send/melt/receive paths enforce.
+    let mint_url = home.config.default_mint();
+    if !home::mint_allowed(mint_url, home.config.allow_real_mints) {
+        return Err(FundError::MintNotAllowed {
+            mint_url: mint_url.to_owned(),
+        });
+    }
     let secret = home::read_secret_key_hex(home)?;
     let seed = seed_from_secret_hex(&secret)?;
     let path = sqlite_path(&home.wallet_dir);
@@ -250,15 +266,35 @@ mod tests {
     }
 
     // The wallet opens at the CONFIGURED mint, not a compile-time pin — a buyer
-    // configured at a non-default mint spends from that mint (no `MintPinned` refusal).
+    // configured at a non-default mint spends from that mint (no `MintPinned` refusal). A real
+    // (non-testnut) mint requires the operator opt-in (`allow_real_mints`; see the real-mint fence).
     #[test]
     fn wallet_opens_at_the_configured_mint() {
         let root = temp_home("cfg-mint");
         let _ = std::fs::remove_dir_all(&root);
         let mut home = bootstrap(&root).expect("bootstrap");
         home.config.accepted_mints = vec!["https://minibits.example".into()];
+        home.config.allow_real_mints = true;
         let wallet = open_wallet_blocking(&home).expect("open at configured mint");
         assert_eq!(wallet.mint_url.to_string(), "https://minibits.example");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Finding T(2): opening the buyer wallet fails closed on a non-allowlisted REAL mint when
+    // allow_real_mints=false — BEFORE any network open/quote — the same fence send/melt/receive
+    // enforce. With the opt-in it opens (covered by `wallet_opens_at_the_configured_mint`).
+    #[test]
+    fn open_wallet_refuses_real_mint_when_disallowed() {
+        let root = temp_home("open-real-mint-fence");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        home.config.accepted_mints = vec!["https://real-mint.example/".into()];
+        home.config.allow_real_mints = false;
+        let err = open_wallet_blocking(&home).expect_err("real mint must refuse under allow_real_mints=false");
+        assert!(
+            matches!(&err, FundError::MintNotAllowed { mint_url } if mint_url == "https://real-mint.example/"),
+            "expected MintNotAllowed, got {err:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

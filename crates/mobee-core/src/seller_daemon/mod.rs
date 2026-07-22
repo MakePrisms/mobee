@@ -139,6 +139,38 @@ fn is_idempotent_already_redeemed(error: &DaemonError) -> bool {
     message.contains("already spent") || message.contains("already redeemed")
 }
 
+/// Interpret a seller-receive result on the redeem path (finding S). On success the redeemed amount
+/// is finalized; on error we FAIL CLOSED — every receive error propagates and NO receipt is
+/// finalized. In particular an "already spent" error is NOT treated as proof that an earlier swap of
+/// OURS landed: the pending-receive breadcrumb is appended in THIS process immediately BEFORE the
+/// swap, so its presence proves only intent-to-receive-now, never a prior redeem. The removed
+/// auto-finalize-on-already-spent path let a malicious buyer replay an already-redeemed seller-locked
+/// token against a NEW same-value job and forge a receipt for zero new funds (theft-of-service). A
+/// genuine crash-after-swap (money in the wallet, receipt not durable) is left for manual reconcile —
+/// the breadcrumb is its durable audit record. Pure over the receive result so the refuse decision is
+/// unit-testable without a mint.
+fn redeem_amount_or_refuse(
+    receive_result: Result<u64, DaemonError>,
+    job_id: &str,
+    result_id: &str,
+    mint: &str,
+    expected_amount: u64,
+) -> Result<u64, DaemonError> {
+    match receive_result {
+        Ok(amount) => Ok(amount),
+        Err(error) => {
+            if is_idempotent_already_redeemed(&error) {
+                eprintln!(
+                    "seller receive REFUSED (already-spent, no proof of a prior redeem by us): \
+                     job_id={job_id} result_id={result_id} mint={mint} expected={expected_amount}; \
+                     NOT finalizing — manual reconcile required"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
 /// Redeem-time accepted-mint set for a job (Fix Q — terms-drift). A RESTORED/reconstructed job
 /// (non-empty `job_accepted_mints`) settles against the mints it ORIGINALLY advertised, so a
 /// config change across restart can neither strand an old payment (mint dropped) nor let a
@@ -1252,6 +1284,16 @@ impl SellerDaemon {
         let policy = PaymentPolicy::new(accepted_mints.iter().cloned());
         let terms = policy.terms_for_offer(payload_mint.clone(), &offer, &self.seller_pubkey)?;
         // Amount in terms == offer.amount (NOT rate_sats).
+        // Real-mint fence (issue #49): the restored/live redeem path must also fail closed on a
+        // non-allowlisted real mint, exactly as send/melt do. The redeem guard above only checks the
+        // mint is one this seller ADVERTISED; this additionally enforces the `allow_real_mints`
+        // policy so a real mint can never settle unless the operator opted in.
+        if !home::mint_allowed(&mint, self.home.config.allow_real_mints) {
+            return Err(DaemonError::Policy(format!(
+                "redeem refused: mint {mint} not allowed (allow_real_mints={})",
+                self.home.config.allow_real_mints
+            )));
+        }
         let secret = home::read_secret_key_hex(&self.home)?;
         let cashu_key = cashu_secret_from_nostr_hex(&secret)?;
         // Must await — seller loop already owns a tokio runtime; blocking open nests block_on → panic.
@@ -1278,32 +1320,18 @@ impl SellerDaemon {
             expected_amount,
         )?;
 
-        let amount_received = match adapter
+        let receive_result = adapter
             .receive(&token, &terms, &accepted_mints, &payload_mint)
             .await
-        {
-            Ok(amount) => amount.to_u64(),
-            Err(error) => {
-                let daemon_err = DaemonError::from(error);
-                // Crash-recovery finalize: the token is already spent AND we hold a durable
-                // intent-to-receive for exactly this token. Only the seller can spend a token
-                // P2PK-locked to it, so the swap landed in a prior run — the money is in the
-                // wallet. Finalize the receipt from the recorded (exact P2PK-locked) amount rather
-                // than stranding a paid job as unpaid. Any other receive error propagates.
-                if is_idempotent_already_redeemed(&daemon_err)
-                    && self.journal.pending_receive_for_token(&token_hash)?.is_some()
-                {
-                    eprintln!(
-                        "seller receive recovery: token already spent with a pending-receive record \
-                         (job_id={local_job} result_id={local_result}); finalizing receipt (swap \
-                         landed in a prior run)"
-                    );
-                    expected_amount
-                } else {
-                    return Err(daemon_err);
-                }
-            }
-        };
+            .map(|amount| amount.to_u64())
+            .map_err(DaemonError::from);
+        let amount_received = redeem_amount_or_refuse(
+            receive_result,
+            &local_job,
+            &local_result,
+            &mint,
+            expected_amount,
+        )?;
         // (g) collect-leg observability: sats redeemed at the mint (no key/token material).
         eprintln!(
             "{}",

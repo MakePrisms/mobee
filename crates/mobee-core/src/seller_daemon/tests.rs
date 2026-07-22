@@ -691,6 +691,82 @@
         )));
     }
 
+    // Finding S: a receive that reports the token "already spent" is REFUSED, never auto-finalized.
+    // The removed recovery path treated (already-spent AND a pending-receive breadcrumb exists) as
+    // proof a prior swap of ours landed — but the breadcrumb is appended in THIS process immediately
+    // before the swap, so it is trivially present. A malicious buyer could replay an already-redeemed
+    // seller-locked token against a NEW same-value job and forge a receipt for zero new funds. The
+    // decision is now a pure function of the receive result and NEVER consults the journal breadcrumb,
+    // so a spent token can no longer yield an amount to finalize.
+    #[test]
+    fn receive_already_spent_is_refused_not_finalized() {
+        // Attack: mint reports proofs already spent (replayed token). Must propagate as an error —
+        // there is NO amount to finalize, so no receipt can be forged.
+        let already_spent =
+            DaemonError::Wallet(PaymentWalletError::Wallet("Token Already Spent".into()));
+        let refused =
+            redeem_amount_or_refuse(Err(already_spent), "job-replay", "res-replay", DEFAULT_MINT_URL, 7);
+        assert!(
+            matches!(refused, Err(DaemonError::Wallet(_))),
+            "already-spent must refuse (no finalize), got {refused:?}"
+        );
+
+        // A genuine successful receive still finalizes exactly its redeemed amount.
+        let ok = redeem_amount_or_refuse(Ok(7), "job-ok", "res-ok", DEFAULT_MINT_URL, 7);
+        assert_eq!(ok.expect("successful receive finalizes"), 7);
+
+        // Any other receive error also fails closed (never finalizes).
+        let other = redeem_amount_or_refuse(
+            Err(DaemonError::Relay("connection refused".into())),
+            "job-neterr",
+            "res-neterr",
+            DEFAULT_MINT_URL,
+            7,
+        );
+        assert!(
+            matches!(other, Err(DaemonError::Relay(_))),
+            "non-spent receive error must also refuse, got {other:?}"
+        );
+    }
+
+    // Finding T(1): the seller redeem path fails closed on a non-allowlisted REAL mint when
+    // allow_real_mints=false, BEFORE any swap — the same real-mint fence send/melt enforce. Refuses
+    // even though the mint is in the seller's configured accepted_mints (the redeem guard alone would
+    // admit it); no receipt is journaled.
+    #[tokio::test]
+    async fn redeem_refuses_non_allowlisted_real_mint_when_disallowed() {
+        let real_mint = "https://real-mint.example/";
+        let (root, mut daemon) = test_daemon("redeem-real-mint-fence");
+        home::save_config(&mut daemon.home, |config| {
+            config.accepted_mints = vec![real_mint.into()];
+            config.allow_real_mints = false;
+        })
+        .expect("save");
+        let buyer = nostr_sdk::Keys::generate();
+        let job_id = "job-real-mint";
+        let mut job = active_job(job_id, daemon.seller_pubkey(), Some("r-real"), 0, &root);
+        job.buyer_pubkey = buyer.public_key().to_hex();
+        daemon.awaiting_payment.push(job);
+
+        let received = recon_received(job_id, real_mint, &buyer);
+        let err = daemon
+            .try_apply_payment(received)
+            .await
+            .expect_err("real mint must refuse under allow_real_mints=false");
+        match err {
+            DaemonError::Policy(message) => assert!(
+                message.contains("not allowed") && message.contains("allow_real_mints=false"),
+                "unexpected refusal: {message}"
+            ),
+            other => panic!("expected Policy refusal, got {other:?}"),
+        }
+        assert!(
+            !daemon.journal.has_receipt(job_id).expect("has_receipt"),
+            "no receipt may be journaled for a fenced real mint"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn collect_ok_log_line_carries_amount_and_no_key_material() {
         let line = collect_ok_log_line("job1", "res1", 5, 5, "https://testnut.example");
