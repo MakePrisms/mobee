@@ -139,6 +139,22 @@ fn is_idempotent_already_redeemed(error: &DaemonError) -> bool {
     message.contains("already spent") || message.contains("already redeemed")
 }
 
+/// Redeem-time accepted-mint set for a job (Fix Q — terms-drift). A RESTORED/reconstructed job
+/// (non-empty `job_accepted_mints`) settles against the mints it ORIGINALLY advertised, so a
+/// config change across restart can neither strand an old payment (mint dropped) nor let a
+/// newly-added mint settle an old claim. A live job delivered this process (empty) settles against
+/// current config, which authored its creq. Pure so the selection is unit-testable without a wallet.
+fn redeem_accepted_mints<'a>(
+    job_accepted_mints: &'a [String],
+    config_accepted_mints: &'a [String],
+) -> &'a [String] {
+    if job_accepted_mints.is_empty() {
+        config_accepted_mints
+    } else {
+        job_accepted_mints
+    }
+}
+
 /// (g) Collect-leg observability: the single, key-material-free line logged the moment a
 /// kind-1059 payment is redeemed (proofs swapped at the mint), so the collect leg is
 /// diagnosable in the daemon's stderr. NEVER includes the token or any secret.
@@ -198,6 +214,12 @@ pub struct ActiveJob {
     /// `mark_delivered` so the terminal episode (paid at receipt, or unpaid at eviction) is a
     /// single complete append. `None` until the job delivers. Diagnostic only — never money state.
     pub delivery: Option<DeliveryRecord>,
+    /// The mints this job ORIGINALLY advertised (creq `m` list), populated ONLY for a job
+    /// restored/reconstructed after restart (Fix Q). The redeem guard uses these instead of
+    /// current config so a config change cannot strand an old payment or let a newly-added mint
+    /// settle an old claim. EMPTY for a job delivered in this process — current config authored
+    /// its creq and IS the original terms.
+    pub accepted_mints: Vec<String>,
 }
 
 /// The delivery-time facts an [`Episode`] needs, captured once at result-kind publish.
@@ -597,6 +619,9 @@ impl SellerDaemon {
             workdir,
             contribution: intent.contribution,
             delivery: None,
+            // Live job: current config authored this creq and is the original terms; the redeem
+            // guard reads config directly (see the redeem path). Populated only on restore.
+            accepted_mints: Vec::new(),
         });
         Ok(self.active.as_ref())
     }
@@ -811,6 +836,10 @@ impl SellerDaemon {
                     job.offer.amount,
                     &job.offer.unit,
                     &job.buyer_pubkey,
+                    // Journal the ORIGINAL advertised mints (Fix Q). Config is fixed for a process
+                    // lifetime, so config.accepted_mints here equals the creq `m` list authored at
+                    // claim; persisting it lets a restart redeem against the original terms.
+                    &self.home.config.accepted_mints,
                 ) {
                     eprintln!(
                         "seller WARN: failed to journal delivery for job_id={} (payment recovery on restart may be degraded): {error}",
@@ -894,6 +923,9 @@ impl SellerDaemon {
                 workdir: job_workdir(&self.home, &d.job_id),
                 contribution: None,
                 delivery: None,
+                // Redeem against the ORIGINAL advertised mints journaled at delivery (Fix Q), not
+                // current config. Empty (a pre-field delivery line) falls back to config downstream.
+                accepted_mints: d.accepted_mints,
             });
             restored += 1;
         }
@@ -1033,6 +1065,9 @@ impl SellerDaemon {
             workdir: job_workdir(&self.home, job_id),
             contribution: None,
             delivery: None,
+            // Redeem against the mints the ON-RELAY creq originally advertised (Fix Q), read from
+            // the seller's own claim above — the original terms, not current config.
+            accepted_mints: request.mints.iter().map(|mint| mint.to_string()).collect(),
         })
     }
 
@@ -1203,13 +1238,14 @@ impl SellerDaemon {
             )));
         }
         // Redeem guard: the paid token's mint must be one the seller advertised
-        // (`∈ accepted_mints`) AND equal the payload's declared mint. Build the accepted set from
-        // the seller's OWN config (the same list authored into the creq `m`), pin the terms to the
-        // realized mint, and hand both to the receive guard.
-        let accepted_mints = self
-            .home
-            .config
-            .accepted_mints
+        // (`∈ accepted_mints`) AND equal the payload's declared mint. Fix Q — a RESTORED job
+        // settles against the mints it ORIGINALLY advertised (journaled at delivery / read off the
+        // on-relay creq), NOT current config, so a config change across restart cannot strand an
+        // old payment or let a newly-added mint settle an old claim. A live job (empty
+        // `job.accepted_mints`) uses config, which authored its creq this run.
+        let redeem_mints =
+            redeem_accepted_mints(&job.accepted_mints, &self.home.config.accepted_mints);
+        let accepted_mints = redeem_mints
             .iter()
             .map(|entry| mint_url(entry))
             .collect::<Result<std::collections::HashSet<_>, _>>()?;

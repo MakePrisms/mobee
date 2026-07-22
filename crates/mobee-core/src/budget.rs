@@ -13,10 +13,13 @@
 //! Crash after append / before effect shrinks remaining allowance — fail-closed vs
 //! restart-resets-allowance.
 //!
-//! The cap check itself is **check-then-append** across processes: two buyers that
-//! fold-then-append in a tight interleave can each pass a check that their combined
-//! spend would exceed. This benign TOCTOU is acceptable — the wallet balance is
-//! the hard resource bound; the ledger is an accounting record, not the spend guard.
+//! The refresh→check→append→in-memory-update critical section is serialized ACROSS
+//! processes by an advisory exclusive lock (`flock` via [`std::fs::File::lock`]) held over
+//! `spent.lock` next to the ledger. Two buyers sharing one `~/.mobee` therefore cannot both
+//! fold-then-append in a tight interleave and each pass a check their combined spend would
+//! exceed — the TOCTOU is closed, so the ledger cap is a real cross-process guard (not merely an
+//! accounting record backstopped by the wallet balance). The lock is released BEFORE the wallet
+//! effect runs; attempt-id dedupe stays inside the locked section.
 //!
 //! When keyed by `attempt_id`, spent is **idempotent**: a reconciled retry of the
 //! same attempt does not re-count (allowance invariant, distinct from the payment
@@ -38,6 +41,9 @@ use crate::home::{MobeeConfig, MobeeHome};
 const LEDGER_FILE: &str = "spent.jsonl";
 /// Legacy whole-file total (pre-#22). Read once as an opening base, never rewritten.
 const LEGACY_SPENT_FILE: &str = "spent.toml";
+/// Advisory lock file guarding the refresh→check→append→update critical section across
+/// processes (created on first durable reserve; never carries spend data).
+const LOCK_FILE: &str = "spent.lock";
 
 /// Fail-closed refusal — never a silent clamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,11 +229,7 @@ impl BudgetGate {
 
     /// Fail-closed check then durable append (append-before any external effect).
     pub fn authorize_and_commit(&mut self, amount: u64) -> Result<(), BudgetRefuse> {
-        self.refresh()?;
-        self.check(amount)?;
-        self.append_spend(amount, None)?;
-        self.spent = self.spent.saturating_add(amount);
-        Ok(())
+        self.reserve(amount, None)
     }
 
     /// Authorize, **append the spend**, then run `effect`. Refuse leaves the ledger
@@ -235,40 +237,76 @@ impl BudgetGate {
     ///
     /// Always counts `amount` (no attempt key). Prefer
     /// [`Self::authorize_then_attempt`] on the real pay path so reconciled retries
-    /// do not double-count spent.
+    /// do not double-count spent. The cross-process lock is released before `effect` runs.
     pub fn authorize_then<T>(
         &mut self,
         amount: u64,
         effect: impl FnOnce() -> T,
     ) -> Result<T, BudgetRefuse> {
-        self.refresh()?;
-        self.check(amount)?;
-        self.append_spend(amount, None)?;
-        self.spent = self.spent.saturating_add(amount);
+        self.reserve(amount, None)?;
         Ok(effect())
     }
 
     /// Authorize keyed by `attempt_id`: first sighting counts `amount` (durable
     /// append-before-effect); a retry of the same id skips re-count and still runs
     /// `effect` (reconcile / closed return). "Already counted" is judged
-    /// against a fresh fold, so a spend appended by another process is respected.
+    /// against a fresh fold under the lock, so a spend appended by another process is respected.
+    /// The cross-process lock is released before `effect` runs.
     pub fn authorize_then_attempt<T>(
         &mut self,
         attempt_id: &str,
         amount: u64,
         effect: impl FnOnce() -> T,
     ) -> Result<T, BudgetRefuse> {
+        self.reserve(amount, Some(attempt_id))?;
+        Ok(effect())
+    }
+
+    /// Reserve `amount` against the cap: hold the cross-process advisory lock over the whole
+    /// refresh→check→append→in-memory-update section so two buyer processes sharing one home
+    /// cannot both pass the cap check and both spend (TOCTOU closed). When `attempt_id` is set,
+    /// an id already counted (judged against the fresh fold under the lock) is a no-op — no
+    /// append, no double-count. The lock drops on return, BEFORE any caller effect (wallet send).
+    fn reserve(&mut self, amount: u64, attempt_id: Option<&str>) -> Result<(), BudgetRefuse> {
+        let _lock = self.acquire_lock()?;
         self.refresh()?;
-        if self.counted_attempts.contains(attempt_id) {
-            // Already counted and persisted — do not re-add; still run effect.
-            return Ok(effect());
+        if let Some(id) = attempt_id {
+            if self.counted_attempts.contains(id) {
+                // Already counted and persisted — do not re-add.
+                return Ok(());
+            }
         }
         self.check(amount)?;
         // Durable append-before mint/effect — crash-retry cannot exceed cap.
-        self.append_spend(amount, Some(attempt_id))?;
+        self.append_spend(amount, attempt_id)?;
         self.spent = self.spent.saturating_add(amount);
-        self.counted_attempts.insert(attempt_id.to_owned());
-        Ok(effect())
+        if let Some(id) = attempt_id {
+            self.counted_attempts.insert(id.to_owned());
+        }
+        Ok(())
+    }
+
+    /// Acquire the exclusive advisory lock guarding the durable critical section. `None`
+    /// (no-op) for the in-memory gate — a single process with a `Mutex` needs no file lock.
+    /// The returned handle holds the `flock` until it drops (end of [`Self::reserve`]).
+    fn acquire_lock(&self) -> Result<Option<File>, BudgetRefuse> {
+        let Some(ledger) = self.ledger_path.as_ref() else {
+            return Ok(None);
+        };
+        let lock_path = ledger.with_file_name(LOCK_FILE);
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
+        // Blocks until any other buyer process holding the lock releases it.
+        file.lock()
+            .map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
+        Ok(Some(file))
     }
 
     /// Append one spend record to the ledger (durable). No-op for the in-memory gate.
@@ -728,6 +766,67 @@ mod tests {
         }
         let err = fold_ledger(&ledger, None).expect_err("must fail closed");
         assert!(matches!(err, BudgetRefuse::Persist(_)));
+    }
+
+    // Fix O — cross-process TOCTOU closed. "Process 1" holds the advisory lock (its critical
+    // section). A second handle's `authorize_and_commit` MUST block on the lock rather than
+    // fold-then-append against a stale (0) view. While blocked, process 1 records a 40-sat spend
+    // and releases; the second handle then refolds (sees 40) and refuses the 40 that would take
+    // total to 80 > cap 60 — the cap can never be exceeded. Reverting the lock lets the second
+    // handle fold the stale 0, pass the check, and overspend (append a second 40), so this test
+    // goes red on revert.
+    #[test]
+    fn budget_lock_serializes_reserve_and_enforces_cap() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = temp_home("budget-lock");
+        let _ = fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("bootstrap");
+        home.config.total_budget_sats = 60;
+        home.config.per_job_budget_sats = 40;
+
+        let ledger = root.join(LEDGER_FILE);
+        let lock_path = ledger.with_file_name(LOCK_FILE);
+        // Process 1 enters its critical section: hold the exclusive advisory lock.
+        let held = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock");
+        held.lock().expect("hold lock");
+
+        let (tx, rx) = mpsc::channel();
+        let home2 = home.clone();
+        let handle = thread::spawn(move || {
+            let mut gate = BudgetGate::from_home(&home2).expect("gate");
+            let result = gate.authorize_and_commit(40);
+            tx.send(()).expect("signal completion");
+            result
+        });
+
+        // Process 2 must be blocked on the lock — no completion signal yet.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(400)).is_err(),
+            "reserve ran while another process held the lock (TOCTOU not closed)"
+        );
+
+        // Process 1 records its own 40-sat spend, then releases the lock.
+        append_record(
+            &ledger,
+            &LedgerRecord { amount_sats: 40, attempt_id: None, recorded_at: 0 },
+        )
+        .expect("process-1 spend");
+        held.unlock().expect("release lock");
+
+        // Process 2 now refolds (sees 40); its 40 would take total to 80 > cap 60 → refused.
+        let result = handle.join().expect("join");
+        assert!(
+            matches!(result, Err(BudgetRefuse::Total { remaining: 20, .. })),
+            "second reserve must refuse after seeing process-1's spend, got {result:?}"
+        );
+        assert_eq!(load_spent(&ledger).expect("load"), 40, "cap must not be exceeded");
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn write_legacy(path: &Path, spent: u64, attempts: &[&str]) {

@@ -163,6 +163,14 @@ pub enum JournalEntry {
         amount: u64,
         unit: String,
         buyer_pubkey: String,
+        /// The mints this seller advertised for THIS job (the creq `m` list authored at claim,
+        /// captured at delivery). The redeem guard for a RESTORED job settles against these — the
+        /// ORIGINAL terms — not current config, so a config change across restart can neither
+        /// strand an old payment (mint dropped) nor let a newly-added mint settle an old claim.
+        /// `#[serde(default)]`: a delivery journaled before this field defaults to empty and
+        /// restores against current config (prior behavior — back-compat).
+        #[serde(default)]
+        accepted_mints: Vec<String>,
         ts: u64,
     },
     /// Intent-to-receive breadcrumb written BEFORE the mint swap, so a crash AFTER the swap but
@@ -192,6 +200,9 @@ pub struct DeliveredUnpaid {
     pub amount: u64,
     pub unit: String,
     pub buyer_pubkey: String,
+    /// Original advertised mints journaled at delivery (empty for a pre-field delivery line);
+    /// the restored job redeems against these, not current config (terms-drift fix).
+    pub accepted_mints: Vec<String>,
 }
 
 /// Whether an orphaned claim is past its deadline at reconcile time.
@@ -525,6 +536,7 @@ impl SellerJournal {
         amount: u64,
         unit: &str,
         buyer_pubkey: &str,
+        accepted_mints: &[String],
     ) -> Result<(), SellerError> {
         self.append(JournalEntry::Delivery {
             job_id: job_id.to_owned(),
@@ -532,6 +544,7 @@ impl SellerJournal {
             amount,
             unit: unit.to_owned(),
             buyer_pubkey: buyer_pubkey.to_owned(),
+            accepted_mints: accepted_mints.to_vec(),
             ts: now_unix(),
         })
     }
@@ -563,6 +576,7 @@ impl SellerJournal {
                 amount,
                 unit,
                 buyer_pubkey,
+                accepted_mints,
                 ..
             } = entry
             {
@@ -577,6 +591,7 @@ impl SellerJournal {
                         amount: *amount,
                         unit: unit.clone(),
                         buyer_pubkey: buyer_pubkey.clone(),
+                        accepted_mints: accepted_mints.clone(),
                     },
                 );
             }
@@ -929,6 +944,7 @@ offer_backfill_secs = {backfill}
             amount: 5,
             unit: "sat".into(),
             buyer_pubkey: "buyer".into(),
+            accepted_mints: Vec::new(),
             ts,
         };
         let receipt = |job: &str, ts: u64| JournalEntry::Receipt {
@@ -1018,16 +1034,29 @@ offer_backfill_secs = {backfill}
             .append_claim("job-d", "claim-d", "buyer-d", 10)
             .expect("claim");
         journal
-            .append_delivery("job-d", "result-d", 15, "sat", "buyer-d")
+            .append_delivery(
+                "job-d",
+                "result-d",
+                15,
+                "sat",
+                "buyer-d",
+                &["https://mint-orig.testnut.example".to_string()],
+            )
             .expect("delivery");
 
-        // Recoverable: one delivered-but-unpaid job with the money-critical fields.
+        // Recoverable: one delivered-but-unpaid job with the money-critical fields, INCLUDING the
+        // original advertised mints (Fix Q — restored job redeems against these, not current config).
         let unpaid = journal.deliveries_awaiting_receipt().expect("unpaid");
         assert_eq!(unpaid.len(), 1);
         assert_eq!(unpaid[0].job_id, "job-d");
         assert_eq!(unpaid[0].result_id, "result-d");
         assert_eq!(unpaid[0].amount, 15);
         assert_eq!(unpaid[0].buyer_pubkey, "buyer-d");
+        assert_eq!(
+            unpaid[0].accepted_mints,
+            vec!["https://mint-orig.testnut.example".to_string()],
+            "original advertised mints must round-trip through the delivery journal"
+        );
 
         // Not orphaned even long past the claim deadline (delivery resolves the claim).
         assert!(plan_orphaned_claims(&journal.entries().unwrap(), 9_999_999_999).is_empty());

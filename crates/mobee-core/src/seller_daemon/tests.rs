@@ -793,6 +793,7 @@
             workdir: root.join(job_id),
             contribution: None,
             delivery: None,
+            accepted_mints: Vec::new(),
         }
     }
 
@@ -1229,9 +1230,20 @@
             .journal
             .append_claim("del-job", "del-claim", &buyer, 1_000_000_000)
             .expect("claim");
+        // Journal an ORIGINAL advertised-mint list that DIFFERS from the daemon's current config
+        // (config = [DEFAULT_MINT_URL]) so the restore can be proven to carry the original terms,
+        // not current config (Fix Q — terms-drift).
+        let original_mint = "https://mint-original.testnut.example";
         daemon
             .journal
-            .append_delivery("del-job", "del-result", 15, "sat", &buyer)
+            .append_delivery(
+                "del-job",
+                "del-result",
+                15,
+                "sat",
+                &buyer,
+                &[original_mint.to_string()],
+            )
             .expect("delivery");
         assert!(daemon.awaiting_payment.is_empty());
 
@@ -1243,6 +1255,14 @@
         assert_eq!(job.result_id.as_deref(), Some("del-result"));
         assert_eq!(job.offer.amount, 15);
         assert_eq!(job.offer.unit, "sat");
+        // Fix Q: the restored job carries the ORIGINAL advertised mints (not current config), and
+        // the redeem-mint selection therefore resolves to them.
+        assert_eq!(job.accepted_mints, vec![original_mint.to_string()]);
+        assert_eq!(
+            redeem_accepted_mints(&job.accepted_mints, &daemon.home.config.accepted_mints),
+            &[original_mint.to_string()],
+            "restored job must redeem against its original mints, not current config"
+        );
         // Rebuilt offer is pinned to THIS seller (not a None wildcard) — assert_seller_matches
         // binds to us exactly.
         assert_eq!(job.offer.seller_pubkey.as_deref(), Some(daemon.seller_pubkey()));
@@ -1252,6 +1272,18 @@
         assert_eq!(again, 0);
         assert_eq!(daemon.awaiting_payment.len(), 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Fix Q — redeem-mint selection: a restored job (non-empty original mints) settles against
+    // THOSE mints, not current config; a live job (empty) settles against config.
+    #[test]
+    fn redeem_accepted_mints_prefers_original_terms_for_restored_job() {
+        let original = vec!["https://mint-orig.testnut.example".to_string()];
+        let config = vec!["https://mint-current.testnut.example".to_string()];
+        // Restored job: original terms win over current config.
+        assert_eq!(redeem_accepted_mints(&original, &config), original.as_slice());
+        // Live job (no original terms recorded): falls back to current config.
+        assert_eq!(redeem_accepted_mints(&[], &config), config.as_slice());
     }
 
     // ── #b: reconstruct a delivered-job bind from on-relay result+claim during wrap backfill ──

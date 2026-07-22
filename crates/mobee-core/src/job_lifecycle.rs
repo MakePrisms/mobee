@@ -675,6 +675,19 @@ pub async fn accept_claim_async(
     }
 
     let result = select_result(&view.results, &claim.seller_pubkey, request.result_id.as_deref())?;
+
+    // Interim single-settlement guard (P): a job binds at most ONE result. If an accept-bind
+    // already exists for this job pinned to a DIFFERENT result, refuse — a second/different
+    // result_id must not mint a second buyer attempt/payment for one job. Re-accepting the SAME
+    // result stays idempotent (the durability re-publish/finalize below rewrites the same bind).
+    // TEMPORARY: the full job-scoped settlement-key refactor (which would let a job legitimately
+    // re-bind a corrected result) is tracked separately; until then one settlement per job.
+    assert_single_settlement(
+        load_accepted_bind(home, &request.job_id)?.as_ref(),
+        &request.job_id,
+        &result.result_id,
+    )?;
+
     let repo = result
         .repo
         .clone()
@@ -942,6 +955,27 @@ pub fn assert_authorize_matches_bind(
             "authorize_pay commit_oid {} does not match accepted commit {}",
             commit_oid, bind.commit_oid
         )));
+    }
+    Ok(())
+}
+
+/// Interim single-settlement guard (P): a job binds at most one result. An existing accept-bind
+/// pinned to a DIFFERENT result refuses (a second/different result_id must not mint a second
+/// buyer attempt/payment for one job); re-accepting the SAME result is idempotent (the durability
+/// re-publish/finalize rewrites the same bind). No existing bind ⇒ allowed. Non-secret error.
+fn assert_single_settlement(
+    existing: Option<&AcceptedBind>,
+    job_id: &str,
+    new_result_id: &str,
+) -> Result<(), JobLifecycleError> {
+    if let Some(existing) = existing {
+        if existing.result_id != new_result_id {
+            return Err(JobLifecycleError::Input(format!(
+                "job {job_id} already accepted result {}; refusing to bind a different result \
+                 {new_result_id} (one settlement per job)",
+                existing.result_id
+            )));
+        }
     }
     Ok(())
 }
@@ -1602,6 +1636,44 @@ mod tests {
         // Matching amount → ok.
         let req = authorize_request_from_bind(&bind, 5, bind.commit_oid.clone()).expect("ok");
         assert_eq!(req.amount_sats, 5);
+    }
+
+    // Fix P — interim single-settlement guard: a second accept binding a DIFFERENT result for a
+    // job that already has an accept-bind is refused, so a second result_id cannot mint a second
+    // buyer attempt/payment for one job. Re-accepting the SAME result is idempotent; no prior bind
+    // is allowed.
+    #[test]
+    fn single_settlement_refuses_different_result_and_is_idempotent_on_same() {
+        let existing = AcceptedBind {
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "res-A".into(),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 5,
+            accept_event_id: "11".repeat(32),
+            accepted_at: 1,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            contribution: None,
+        };
+        // A different result for the already-bound job → refused (one settlement per job).
+        let err = assert_single_settlement(Some(&existing), &existing.job_id, "res-B")
+            .expect_err("different result refused");
+        assert!(
+            err.to_string().contains("already accepted result res-A")
+                && err.to_string().contains("res-B"),
+            "unexpected error: {err}"
+        );
+        // Re-accepting the SAME result is idempotent (durability re-publish/finalize).
+        assert_single_settlement(Some(&existing), &existing.job_id, "res-A")
+            .expect("same result idempotent");
+        // No prior bind → allowed.
+        assert_single_settlement(None, &existing.job_id, "res-B").expect("first accept allowed");
     }
 
     // Load-bearing: the explicit 9-field form (with bind-fill applied) and the
