@@ -302,7 +302,17 @@ impl SellerJournal {
     }
 
     pub fn entries(&self) -> Result<Vec<JournalEntry>, SellerError> {
-        let file = File::open(&self.path).map_err(|error| SellerError::Io(error.to_string()))?;
+        // Fail-closed money-path read: a MISSING journal is the legitimate first-boot empty case
+        // (Ok(empty)); every OTHER read failure — an unreadable/permission-denied file (Io) or a
+        // corrupt line (Journal) — PROPAGATES so callers refuse/buffer/degrade rather than proceed
+        // as if the journal were empty. This is the single seam the has_*/last_receipt_ts/
+        // oldest_unsettled/pending_receive reads all funnel through, so none of them can silently
+        // treat an unreadable journal as absent.
+        let file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(SellerError::Io(error.to_string())),
+        };
         let mut out = Vec::new();
         for line in BufReader::new(file).lines() {
             let line = line.map_err(|error| SellerError::Io(error.to_string()))?;
@@ -345,12 +355,10 @@ impl SellerJournal {
     /// (#57), so a restart re-fetches stored 1059 payments the live subscription did not replay.
     /// `Ok(None)` when there are no receipts yet (or no journal file exists).
     pub fn last_receipt_ts(&self) -> Result<Option<u64>, SellerError> {
-        let entries = match self.entries() {
-            Ok(entries) => entries,
-            Err(SellerError::Io(_)) => return Ok(None),
-            Err(other) => return Err(other),
-        };
-        Ok(entries
+        // Fail-closed: any read error propagates (see `entries`). A genuinely-absent journal folds to
+        // an empty list ⇒ Ok(None) ⇒ legitimate first boot; an unreadable one aborts the backfill.
+        Ok(self
+            .entries()?
             .iter()
             .filter_map(|entry| match entry {
                 JournalEntry::Receipt { ts, .. } => Some(*ts),
@@ -364,11 +372,8 @@ impl SellerJournal {
     /// a NEWER job must never advance the cursor past an OLDER delivered-but-unpaid job whose
     /// payment wrap has not yet been collected. `Ok(None)` when nothing is unsettled.
     pub fn oldest_unsettled_delivery_ts(&self) -> Result<Option<u64>, SellerError> {
-        let entries = match self.entries() {
-            Ok(entries) => entries,
-            Err(SellerError::Io(_)) => return Ok(None),
-            Err(other) => return Err(other),
-        };
+        // Fail-closed: any read error propagates (see `entries`); absent journal ⇒ empty ⇒ Ok(None).
+        let entries = self.entries()?;
         let mut settled: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for entry in &entries {
             match entry {
@@ -499,11 +504,8 @@ impl SellerJournal {
         &self,
         token_hash: &str,
     ) -> Result<Option<(String, String, String, String, u64)>, SellerError> {
-        let entries = match self.entries() {
-            Ok(entries) => entries,
-            Err(SellerError::Io(_)) => return Ok(None),
-            Err(other) => return Err(other),
-        };
+        // Fail-closed: any read error propagates (see `entries`); absent journal ⇒ empty ⇒ Ok(None).
+        let entries = self.entries()?;
         let mut receipted: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for entry in &entries {
             if let JournalEntry::Receipt { job_id, .. } = entry {
@@ -731,6 +733,54 @@ mod tests {
             deadline_unix: 2_000_000_000,
             seller_pubkey: seller.map(str::to_owned),
         }
+    }
+
+    // Z3 (fail-closed journal reads) — the whole read class funnels through `entries`: a MISSING
+    // journal is the only "empty" case (first boot); a CORRUPT/unreadable journal PROPAGATES an
+    // error so no read silently proceeds as if the journal were empty. Covers entries + the derived
+    // reads (has_receipt / last_receipt_ts / oldest_unsettled_delivery_ts / pending_receive).
+    #[test]
+    fn journal_reads_fail_closed_on_corruption_and_treat_missing_as_empty() {
+        let root = temp_home("z3-failclosed");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+
+        // Missing journal ⇒ empty, not an error (legitimate first boot).
+        let journal_path = home.root.join(JOURNAL_FILE);
+        let _ = std::fs::remove_file(&journal_path);
+        let journal = SellerJournal::open(&home).expect("open");
+        // open() touches the file; remove it again to exercise the NotFound⇒empty path directly.
+        let _ = std::fs::remove_file(&journal_path);
+        assert_eq!(journal.entries().expect("missing⇒empty"), Vec::new());
+        assert_eq!(journal.last_receipt_ts().expect("missing⇒None"), None);
+        assert_eq!(
+            journal.oldest_unsettled_delivery_ts().expect("missing⇒None"),
+            None
+        );
+        assert!(!journal.has_receipt("job").expect("missing⇒false"));
+
+        // Corrupt line ⇒ every read fails closed (Err), never Ok(empty)/Ok(None)/Ok(false).
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&journal_path)
+                .expect("open journal");
+            f.write_all(b"{not valid json\n").expect("corrupt");
+        }
+        assert!(journal.entries().is_err(), "corrupt entries must Err");
+        assert!(journal.last_receipt_ts().is_err(), "corrupt last_receipt must Err");
+        assert!(
+            journal.oldest_unsettled_delivery_ts().is_err(),
+            "corrupt oldest_unsettled must Err"
+        );
+        assert!(journal.has_receipt("job").is_err(), "corrupt has_receipt must Err");
+        assert!(
+            journal.pending_receive_for_token("hash").is_err(),
+            "corrupt pending_receive must Err"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

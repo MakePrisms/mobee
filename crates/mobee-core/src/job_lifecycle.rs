@@ -10,7 +10,7 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -1120,33 +1120,11 @@ fn write_accepted_bind(home: &MobeeHome, bind: &AcceptedBind) -> Result<(), JobL
     let path = bind_path(home, &bind.job_id);
     let raw = serde_json::to_string_pretty(bind)
         .map_err(|error| JobLifecycleError::Io(format!("accept bind encode: {error}")))?;
-    write_atomic_durable(&dir, &path, raw.as_bytes())
-}
-
-/// Crash-safe durable file write: write the full payload to a temp sibling, `sync_all` it, atomic
-/// `rename` over the target, then `sync_all` the parent directory so the rename itself is durable.
-/// Power-loss at any point leaves EITHER the prior file or the complete new file — never a
-/// truncated/empty bind (which would let the daemon re-accept a job and pay a SECOND time).
-fn write_atomic_durable(dir: &std::path::Path, path: &std::path::Path, bytes: &[u8]) -> Result<(), JobLifecycleError> {
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)
-            .map_err(|error| JobLifecycleError::Io(error.to_string()))?;
-        file.write_all(bytes)
-            .map_err(|error| JobLifecycleError::Io(error.to_string()))?;
-        file.sync_all()
-            .map_err(|error| JobLifecycleError::Io(error.to_string()))?;
-    }
-    fs::rename(&tmp, path).map_err(|error| JobLifecycleError::Io(error.to_string()))?;
-    // fsync the directory so the rename (a directory-entry mutation) survives power-loss.
-    File::open(dir)
-        .and_then(|dir_file| dir_file.sync_all())
-        .map_err(|error| JobLifecycleError::Io(error.to_string()))?;
-    Ok(())
+    // Crash-atomic rewrite (temp → sync → rename → dir-fsync): a crash between the relay publish and
+    // the bind-write can never leave a truncated/empty bind, which would let the daemon re-accept a
+    // job and pay a SECOND time. Serialized per-job by `acquire_job_lock`.
+    crate::durable::write_atomic(&dir, &path, raw.as_bytes())
+        .map_err(|error| JobLifecycleError::Io(error.to_string()))
 }
 
 fn bind_path(home: &MobeeHome, job_id: &str) -> PathBuf {
