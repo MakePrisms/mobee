@@ -1101,6 +1101,12 @@ pub fn fill_explicit_request_from_bind(
     // caller-supplied value. The seller cosig does not pin the realized mint (the preimage binds
     // only creq_hash), so a caller list must never be trusted to select the paying mint.
     request.accepted_mints = bind.accepted_mints.clone();
+    // Same seal for the delivery locator: repo/branch identify WHERE the paid commit is fetched
+    // from, so they must come from the sealed bind (which `authorize_request_from_bind` already
+    // does), never caller input — a caller must not be able to redirect the fetch to a different
+    // locator for the accepted commit.
+    request.repo = bind.repo.clone();
+    request.branch = bind.branch.clone();
     if request.contribution.is_none() {
         request.contribution = bind.contribution.as_ref().map(|c| {
             crate::authorize_pay::ContributionPayBinds {
@@ -1768,6 +1774,49 @@ mod tests {
             "explicit-form and bind-form requests must be identical so both build the same \
              co-signed receipt preimage"
         );
+    }
+
+    // Finding BB: repo/branch identify WHERE the paid commit is fetched, so the explicit form must
+    // seal them from the bind and never keep a caller's divergent locator.
+    #[test]
+    fn explicit_form_seals_repo_and_branch_from_bind() {
+        let bind = AcceptedBind {
+            job_id: "2a195bece5f6".into(),
+            claim_id: "0a8bbc5284e8".into(),
+            result_id: "058886d7b19e".into(),
+            seller_pubkey: "aa".repeat(32),
+            commit_oid: "bb".repeat(20),
+            repo: "https://bound.invalid/repo.git".into(),
+            branch: "mobee/bound-branch".into(),
+            job_hash: "cc".repeat(32),
+            amount_sats: 5,
+            accept_event_id: "accept-x".into(),
+            accepted_at: 1,
+            seller_signature: "dd".repeat(64),
+            creq_hash: Some("2ad9b34cbf8c".to_string()),
+            accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
+            contribution: None,
+        };
+        let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            job_id: bind.job_id.clone(),
+            result_id: bind.result_id.clone(),
+            job_class: crate::authorize_pay::JobClass::FromScratch,
+            delivery_integrity_hash: bind.commit_oid.clone(),
+            job_hash: bind.job_hash.clone(),
+            seller_pubkey: bind.seller_pubkey.clone(),
+            amount_sats: 5,
+            // Caller supplies a DIFFERENT allowlisted locator for the same commit.
+            repo: "https://caller.invalid/mirror.git".into(),
+            branch: "mobee/caller-branch".into(),
+            commit_oid: bind.commit_oid.clone(),
+            seller_signature: String::new(),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            contribution: None,
+        };
+        fill_explicit_request_from_bind(&mut explicit, &bind);
+        assert_eq!(explicit.repo, bind.repo, "repo must be sealed from the bind");
+        assert_eq!(explicit.branch, bind.branch, "branch must be sealed from the bind");
     }
 
     // Incident diagnosis: the LIVE failure had the explicit call's job_hash BYTE-EQUAL

@@ -1376,7 +1376,6 @@
         assert_error_content_starts_with("contribution_malformed", &malformed);
     }
 
-    #[test]
     // A delivered-but-unpaid job in the journal is rebuilt into awaiting_payment on boot, so a
     // stored/buffered wrap can bind and redeem. Without this the wrap buffers forever.
     #[test]

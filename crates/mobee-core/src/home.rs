@@ -1028,6 +1028,12 @@ fn write_new_key(path: &Path) -> Result<(), HomeError> {
         .map_err(|error| HomeError::Key(error.to_string()))?;
     file.sync_all()
         .map_err(|error| HomeError::Key(error.to_string()))?;
+    // The key is written once and never rewritten, but its directory ENTRY must be fsync'd or a
+    // power-loss right after creation can drop the only copy of the identity/spend key — locking
+    // any funds already received. sync_all on the file alone does not make the new entry durable.
+    if let Some(parent) = path.parent() {
+        crate::durable::sync_dir(parent).map_err(|error| HomeError::Key(error.to_string()))?;
+    }
     Ok(())
 }
 

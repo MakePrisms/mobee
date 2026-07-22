@@ -1,5 +1,8 @@
-//! Crash-atomic durable file writes for money-state that is REWRITTEN in place (as opposed to
-//! append-only journals, which stay durable via `OpenOptions::append` + `File::sync_all`).
+//! Crash-atomic durable file writes for money-state that is REWRITTEN in place. Append-only money
+//! journals stay durable via `OpenOptions::append` + `File::sync_all` for each record, PLUS a
+//! one-time [`sync_dir`] of the parent when the file is first created — otherwise a power-loss
+//! before the directory entry is flushed can drop the whole journal (see the ledger/journal/key
+//! creators, which fsync their parent dir on create).
 //!
 //! A truncating `File::create`/`fs::write` can leave a half-written or empty file if the process
 //! dies mid-flush. For money-state that is disastrous: an empty accept-bind lets the daemon

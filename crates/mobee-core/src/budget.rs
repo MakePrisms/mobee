@@ -388,6 +388,11 @@ fn append_record(path: &Path, record: &LedgerRecord) -> Result<(), BudgetRefuse>
     let mut line =
         serde_json::to_string(record).map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
     line.push('\n');
+    // Whether the ledger's directory entry is already durable: on the FIRST spend `spent.jsonl`
+    // does not exist yet, so after creating+syncing it we must also fsync the parent dir — else a
+    // power-loss can drop the ledger entry while ecash has already left, restoring the full budget
+    // on restart (overspend past the cap). Subsequent appends only need the file `sync_all`.
+    let ledger_existed = path.exists();
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -397,6 +402,12 @@ fn append_record(path: &Path, record: &LedgerRecord) -> Result<(), BudgetRefuse>
         .map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
     file.sync_all()
         .map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
+    if !ledger_existed {
+        if let Some(parent) = path.parent() {
+            crate::durable::sync_dir(parent)
+                .map_err(|error| BudgetRefuse::Persist(error.to_string()))?;
+        }
+    }
     Ok(())
 }
 

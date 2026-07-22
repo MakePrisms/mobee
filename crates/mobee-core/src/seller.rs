@@ -288,11 +288,18 @@ pub struct SellerJournal {
 impl SellerJournal {
     pub fn open(home: &MobeeHome) -> Result<Self, SellerError> {
         let path = home.root.join(JOURNAL_FILE);
-        if let Some(parent) = path.parent() {
+        let parent = path.parent();
+        if let Some(parent) = parent {
             fs::create_dir_all(parent).map_err(|error| SellerError::Io(error.to_string()))?;
         }
         if !path.exists() {
             File::create(&path).map_err(|error| SellerError::Io(error.to_string()))?;
+            // The append path's `sync_all` makes each record durable, but the file's directory
+            // ENTRY must be fsync'd once at creation or a power-loss before the first append can
+            // drop the whole journal — losing pay-once/receipt state on restart.
+            if let Some(parent) = parent {
+                crate::durable::sync_dir(parent).map_err(|error| SellerError::Io(error.to_string()))?;
+            }
         }
         Ok(Self { path })
     }
