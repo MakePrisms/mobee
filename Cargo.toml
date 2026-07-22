@@ -2,6 +2,7 @@
 members = [
     "crates/mobee-core",
     "crates/mobee-evals",
+    "crates/mobee",
 ]
 resolver = "3"
 

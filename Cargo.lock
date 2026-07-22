@@ -1799,6 +1799,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mobee"
+version = "0.1.0"
+dependencies = [
+ "git2",
+ "mobee-core",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "mobee-core"
 version = "0.1.0"
 dependencies = [
