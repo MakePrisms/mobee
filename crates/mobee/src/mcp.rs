@@ -16,7 +16,8 @@ use mobee_core::budget::BudgetGate;
 use mobee_core::home::{self, MobeeHome};
 #[cfg(feature = "wallet")]
 use mobee_core::job_lifecycle::{
-    self, AcceptClaimRequest, ContributionSpec, GetJobRequest, JobKind, PostJobRequest, WaitFor,
+    self, AcceptClaimRequest, AwardClaimRequest, ContributionSpec, GetJobRequest, JobKind,
+    PostJobRequest, WaitFor,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -269,6 +270,19 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "award_claim",
+            "description": "Award a seller claim BEFORE work: publish the buyer AWARD (kind-3405, status=accepted) selecting one claim so that seller executes and every other claimant releases without spending compute. Verifies the claim is present, still processing, and (for a targeted offer) authored by the targeted seller. Returns quoted_mints — the mints the claim's creq will be paid at — so an incompatible award is visible before you commit. No pay-bind — settle after delivery with accept_claim. Never echoes secrets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string" },
+                    "claim_id": { "type": "string" }
+                },
+                "required": ["job_id", "claim_id"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "accept_claim",
             "description": "Accept a seller claim: publish the buyer AWARD (status=accepted) and record local pay-bind {seller_pubkey, result_id, commit_oid, repo, branch, job_hash} for authorize_pay. Requires a matching git result on the relay. Never echoes secrets.",
             "inputSchema": {
@@ -468,6 +482,7 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
                 Err("get_result requires the wallet feature".into())
             }
         }
+        "award_claim" => award_claim_tool_async(state, &arguments).await,
         "accept_claim" => {
             #[cfg(feature = "wallet")]
             {
@@ -1429,6 +1444,33 @@ fn get_job_tool(_state: &McpState, _arguments: &Value) -> Result<Value, String> 
 }
 
 #[cfg(feature = "wallet")]
+async fn award_claim_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
+    let require_str = |key: &str| -> Result<String, String> {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("award_claim requires {key} (string)"))
+    };
+    let outcome = job_lifecycle::award_claim_async(
+        &state.home,
+        AwardClaimRequest {
+            job_id: require_str("job_id")?,
+            claim_id: require_str("claim_id")?,
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(tool_ok(json!({
+        "ok": true,
+        "award_event_id": outcome.award_event_id,
+        "job_id": outcome.job_id,
+        "claim_id": outcome.claim_id,
+        "seller_pubkey": outcome.seller_pubkey,
+        "quoted_mints": outcome.quoted_mints,
+    })))
+}
+
 async fn accept_claim_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
     let require_str = |key: &str| -> Result<String, String> {
         arguments

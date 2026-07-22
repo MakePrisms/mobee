@@ -185,6 +185,8 @@
             // Short auth-wait: the ungated in-process relay never challenges, so proceed fast.
             auth_wait: Some(Duration::from_millis(500)),
             wrap_backfill_done: None,
+            awarded: None,
+            released: None,
         }
     }
 
@@ -223,6 +225,8 @@
                     ready: Some(ready),
                     auth_wait: Some(Duration::from_millis(500)),
                     wrap_backfill_done: Some(backfill_done),
+                    awarded: None,
+                    released: None,
                 },
             ));
         })
@@ -976,5 +980,279 @@
         );
 
         wait_until(Duration::from_secs(8), || !SellerDaemon::in_flight()).await;
+        relay.shutdown();
+    }
+
+    // ── Award-before-work: the seller executes ONLY on the buyer's award ──────────────────────
+    //
+    // The claim is cheap (no compute); execution waits for a kind-award AWARD naming this claim.
+    // These prove the three award outcomes end-to-end over the in-process relay via the RunHooks
+    // seams (`awarded` / `released`), never stderr scraping:
+    //  * (a) award for OUR claim → the seller executes;
+    //  * (b) award for a DIFFERENT claim → the seller releases, never executing;
+    //  * (c) no award → the offer deadline sweep releases, never executing.
+
+    /// Collect the seller's published CLAIM ids keyed by the offer they e-tag: `(offer_id, claim_id)`.
+    /// A claim's own event id IS the claim id the buyer awards.
+    fn spawn_claim_id_collector(
+        client: &Client,
+        seller_pk: PublicKey,
+    ) -> Arc<Mutex<Vec<(String, String)>>> {
+        let ids: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = ids.clone();
+        let mut notif = client.notifications();
+        tokio::spawn(async move {
+            while let Ok(n) = notif.recv().await {
+                if let RelayPoolNotification::Event { event, .. } = n {
+                    if event.kind.as_u16() == gateway::JOB_CLAIM_KIND && event.pubkey == seller_pk {
+                        if let Some(offer) = tag_value(&event, "e") {
+                            sink.lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push((offer, event.id.to_hex()));
+                        }
+                    }
+                }
+            }
+        });
+        ids
+    }
+
+    /// Poll for the seller's claim id on `offer_id`.
+    async fn wait_for_claim_id(
+        ids: &Arc<Mutex<Vec<(String, String)>>>,
+        offer_id: &str,
+        timeout: Duration,
+    ) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some((_, claim_id)) = ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|(o, _)| o == offer_id)
+            {
+                return Some(claim_id.clone());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Publish the buyer's kind-award AWARD selecting `claim_id` for `offer_id`.
+    async fn publish_award(
+        client: &Client,
+        buyer: &Keys,
+        offer_id: &str,
+        claim_id: &str,
+        seller_hex: &str,
+    ) -> nostr_sdk::EventId {
+        let draft =
+            gateway::award_draft(offer_id, claim_id, &buyer.public_key().to_hex(), seller_hex);
+        let event = gateway::nostr::event_builder(&draft)
+            .expect("award event builder")
+            .sign_with_keys(buyer)
+            .expect("sign award");
+        let id = event.id;
+        client.send_event(&event).await.expect("publish award");
+        id
+    }
+
+    /// Boot a daemon wired with the award-decision hooks (`awarded` / `released`) + readiness.
+    fn spawn_daemon_thread_with_award_hooks(
+        daemon: SellerDaemon,
+        ready: tokio::sync::mpsc::UnboundedSender<()>,
+        awarded: tokio::sync::mpsc::UnboundedSender<String>,
+        released: tokio::sync::mpsc::UnboundedSender<(String, String)>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("daemon runtime");
+            let _ = rt.block_on(run_forever_hooked(
+                daemon,
+                RunHooks {
+                    ready: Some(ready),
+                    auth_wait: Some(Duration::from_millis(500)),
+                    wrap_backfill_done: None,
+                    awarded: Some(awarded),
+                    released: Some(released),
+                },
+            ));
+        })
+    }
+
+    /// Boot a targeted-offer seller with award hooks; return `(seeder, seller_hex, claim_ids,
+    /// awarded_rx, released_rx, handle)` after READY. The observer client feeds the claim-id
+    /// collector; the seeder is kept for publishing the offer + award.
+    async fn start_award_seller(
+        label: &str,
+        relay_url: &str,
+    ) -> (
+        Client,
+        String,
+        Arc<Mutex<Vec<(String, String)>>>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        tokio::sync::mpsc::UnboundedReceiver<(String, String)>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let home = seller_home(&unique_root(label), relay_url, false, 0);
+        let daemon = SellerDaemon::open(home).expect("open seller daemon");
+        let seller_pk = PublicKey::parse(daemon.seller_pubkey()).expect("seller pubkey");
+        let seller_hex = daemon.seller_pubkey().to_string();
+
+        let observer = connect_client(relay_url).await;
+        observer
+            .subscribe(
+                Filter::new()
+                    .kind(Kind::Custom(gateway::JOB_CLAIM_KIND))
+                    .author(seller_pk),
+                None,
+            )
+            .await
+            .expect("observer subscribe");
+        let claim_ids = spawn_claim_id_collector(&observer, seller_pk);
+        // The collector task holds its own notification handle; keep the client alive for the test.
+        std::mem::forget(observer);
+
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (awarded_tx, awarded_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (released_tx, released_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle =
+            spawn_daemon_thread_with_award_hooks(daemon, ready_tx, awarded_tx, released_tx);
+        let ready = tokio::time::timeout(Duration::from_secs(10), ready_rx.recv()).await;
+        assert!(
+            matches!(ready, Ok(Some(()))),
+            "daemon must reach READY within 10s (got {ready:?})"
+        );
+
+        let seeder = connect_client(relay_url).await;
+        (seeder, seller_hex, claim_ids, awarded_rx, released_rx, handle)
+    }
+
+    /// (a) A claim awarded to THIS seller executes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn awarded_claim_executes() {
+        let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        SellerDaemon::end_flight();
+
+        let (relay, relay_url) = start_relay(RelayBuilder::default()).await;
+        let (seeder, seller_hex, claim_ids, mut awarded_rx, _released_rx, _daemon) =
+            start_award_seller("award-a", &relay_url).await;
+
+        let buyer = Keys::generate();
+        let offer_id = publish_offer(&seeder, &buyer, &offer_draft(Some(&seller_hex)), None)
+            .await
+            .to_hex();
+        let claim_id = wait_for_claim_id(&claim_ids, &offer_id, Duration::from_secs(10))
+            .await
+            .expect("a: seller must publish its claim within 10s");
+
+        // The buyer awards THIS claim before any work — the seller must now execute it.
+        publish_award(&seeder, &buyer, &offer_id, &claim_id, &seller_hex).await;
+        let awarded = tokio::time::timeout(Duration::from_secs(10), awarded_rx.recv()).await;
+        assert_eq!(
+            awarded.ok().flatten().as_deref(),
+            Some(offer_id.as_str()),
+            "a: awarding THIS seller's claim must move the job into execution"
+        );
+
+        wait_until(Duration::from_secs(8), || !SellerDaemon::in_flight()).await;
+        relay.shutdown();
+    }
+
+    /// (b) A claim awarded to a DIFFERENT seller is released, never executed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn losing_claim_is_released_never_executed() {
+        let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        SellerDaemon::end_flight();
+
+        let (relay, relay_url) = start_relay(RelayBuilder::default()).await;
+        let (seeder, seller_hex, claim_ids, mut awarded_rx, mut released_rx, _daemon) =
+            start_award_seller("award-b", &relay_url).await;
+
+        let buyer = Keys::generate();
+        let offer_id = publish_offer(&seeder, &buyer, &offer_draft(Some(&seller_hex)), None)
+            .await
+            .to_hex();
+        wait_for_claim_id(&claim_ids, &offer_id, Duration::from_secs(10))
+            .await
+            .expect("b: seller must publish its claim within 10s");
+
+        // The buyer awards a DIFFERENT claim (another seller) — ours must release, never execute.
+        let other_claim = "00".repeat(32);
+        publish_award(&seeder, &buyer, &offer_id, &other_claim, &seller_hex).await;
+        let released = tokio::time::timeout(Duration::from_secs(10), released_rx.recv()).await;
+        let released = released.ok().flatten().expect("b: our claim must be released");
+        assert_eq!(released.0, offer_id, "b: released the awaited job");
+        assert!(
+            released.1.contains("different claim"),
+            "b: release reason names the different-award cause: {}",
+            released.1
+        );
+        assert!(
+            !SellerDaemon::in_flight(),
+            "b: a released claim must NOT take the single-flight slot (no execution)"
+        );
+        assert!(
+            awarded_rx.try_recv().is_err(),
+            "b: a losing seller must never be signalled to execute"
+        );
+
+        relay.shutdown();
+    }
+
+    /// (c) No award → the offer-deadline sweep releases the claim, never executing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unawarded_claim_releases_on_deadline_never_executes() {
+        let _serial = FLIGHT_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        SellerDaemon::end_flight();
+        // Fast sweep via the test seam (held under the guard, so no concurrent daemon reads it).
+        unsafe {
+            std::env::set_var(AWARD_SWEEP_INTERVAL_ENV, "1");
+        }
+
+        let (relay, relay_url) = start_relay(RelayBuilder::default()).await;
+        let (seeder, seller_hex, claim_ids, mut awarded_rx, mut released_rx, _daemon) =
+            start_award_seller("award-c", &relay_url).await;
+
+        // Short offer deadline: claimable now, but lapses in a few seconds with no award.
+        let buyer = Keys::generate();
+        let deadline = now_unix() + 4;
+        let offer_id = publish_offer(
+            &seeder,
+            &buyer,
+            &offer_draft_with_deadline(Some(&seller_hex), deadline),
+            None,
+        )
+        .await
+        .to_hex();
+        wait_for_claim_id(&claim_ids, &offer_id, Duration::from_secs(10))
+            .await
+            .expect("c: seller must publish its claim within 10s");
+
+        // No award is ever published — the deadline sweep must release the parked claim.
+        let released = tokio::time::timeout(Duration::from_secs(15), released_rx.recv()).await;
+        let released = released.ok().flatten().expect("c: claim must release on deadline");
+        assert_eq!(released.0, offer_id, "c: released the unawarded job");
+        assert!(
+            released.1.contains("deadline"),
+            "c: release reason names the deadline cause: {}",
+            released.1
+        );
+        assert!(
+            awarded_rx.try_recv().is_err(),
+            "c: an unawarded claim must never be signalled to execute"
+        );
+        assert!(
+            !SellerDaemon::in_flight(),
+            "c: an unawarded claim must NOT take the single-flight slot"
+        );
+
+        unsafe {
+            std::env::remove_var(AWARD_SWEEP_INTERVAL_ENV);
+        }
         relay.shutdown();
     }
