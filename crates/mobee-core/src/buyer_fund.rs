@@ -94,12 +94,23 @@ fn sqlite_path(wallet_dir: &Path) -> std::path::PathBuf {
 /// already current (no nested `block_on` panic).
 pub async fn open_wallet_async(home: &MobeeHome) -> Result<Wallet, FundError> {
     // The wallet opens at the CONFIGURED mint (`MobeeConfig::default_mint`), the same
-    // source of truth the pay path resolves the realized mint from — no compile-time pin. A
-    // malformed mint URL fails closed inside `Wallet::new`.
-    // Real-mint fence (issue #49): fail closed BEFORE opening/quoting if the configured mint is a
-    // real mint and the operator has not opted in (`allow_real_mints == false`), the same gate the
-    // send/melt/receive paths enforce.
-    let mint_url = home.config.default_mint();
+    // source of truth the pay path resolves the realized mint from — no compile-time pin.
+    open_wallet_at_mint_async(home, home.config.default_mint()).await
+}
+
+/// Open the shared wallet store at an EXPLICIT mint (async). Multi-mint redemption: a buyer may
+/// pay at any mint in the seller's accepted set, so the seller must open the wallet at the
+/// buyer's REALIZED mint (the NUT-18 payload mint), not the seller default — otherwise
+/// `require_wallet_matches` refuses every non-default-mint payment. The store (sqlite) is shared
+/// across mints; only the `Wallet`'s bound mint differs.
+pub async fn open_wallet_at_mint_async(
+    home: &MobeeHome,
+    mint_url: &str,
+) -> Result<Wallet, FundError> {
+    // Real-mint fence (issue #49): fail closed BEFORE opening/quoting if this mint is a real mint
+    // and the operator has not opted in (`allow_real_mints == false`), the same gate the
+    // send/melt/receive paths enforce. Callers may have already fenced the realized mint; this
+    // re-checks so the helper is safe on its own.
     if !home::mint_allowed(mint_url, home.config.allow_real_mints) {
         return Err(FundError::MintNotAllowed {
             mint_url: mint_url.to_owned(),
@@ -111,14 +122,8 @@ pub async fn open_wallet_async(home: &MobeeHome) -> Result<Wallet, FundError> {
     let store = WalletSqliteDatabase::new(path)
         .await
         .map_err(|error| FundError::Wallet(error.to_string()))?;
-    Wallet::new(
-        home.config.default_mint(),
-        CurrencyUnit::Sat,
-        Arc::new(store),
-        seed,
-        None,
-    )
-    .map_err(|error| FundError::Wallet(error.to_string()))
+    Wallet::new(mint_url, CurrencyUnit::Sat, Arc::new(store), seed, None)
+        .map_err(|error| FundError::Wallet(error.to_string()))
 }
 
 /// Thin sync wrapper for non-async callers (CLI / tests).
@@ -277,6 +282,31 @@ mod tests {
         home.config.allow_real_mints = true;
         let wallet = open_wallet_blocking(&home).expect("open at configured mint");
         assert_eq!(wallet.mint_url.to_string(), "https://minibits.example");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Z2 (multi-mint redeem): the seller opens the shared store at the buyer's REALIZED mint, which
+    // may be a NON-default member of accepted_mints (default_mint == accepted_mints[0]). The opened
+    // wallet binds to the requested realized mint, not the config default — the fix that lets
+    // `require_wallet_matches` pass for a non-default-mint payment.
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_wallet_at_mint_binds_to_realized_non_default_mint() {
+        let root = temp_home("realized-mint");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        // accepted[0] (== default) is the seller default; accepted[1] is the realized mint.
+        home.config.accepted_mints = vec![
+            "https://default-testnut.example".into(),
+            "https://realized-testnut.example".into(),
+        ];
+        home.config.allow_real_mints = true;
+        assert_eq!(home.config.default_mint(), "https://default-testnut.example");
+        let realized = "https://realized-testnut.example";
+        let wallet = open_wallet_at_mint_async(&home, realized)
+            .await
+            .expect("open at realized mint");
+        assert_eq!(wallet.mint_url.to_string(), realized);
+        assert_ne!(wallet.mint_url.to_string(), home.config.default_mint());
         let _ = std::fs::remove_dir_all(&root);
     }
 

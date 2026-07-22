@@ -957,6 +957,36 @@
         (root, daemon)
     }
 
+    // Z3 (fail-closed startup journal): with a clean journal the daemon may claim new work; with an
+    // unreadable/corrupt journal it must NOT — the startup path reads this gate to skip the offer
+    // subscription (receive-only degraded mode), so a daemon that lost its prior state never claims
+    // fresh liability.
+    #[test]
+    fn unreadable_journal_disables_new_claims_at_startup() {
+        let (root, daemon) = test_daemon("z3-journal-gate");
+        // Clean journal (fresh bootstrap) ⇒ claiming allowed.
+        assert!(
+            daemon.claim_allowed_after_journal_check(),
+            "clean journal must allow claiming"
+        );
+        // Corrupt the journal with a non-JSON line ⇒ entries() errors ⇒ claiming refused.
+        let journal_path = daemon.journal.path().to_path_buf();
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&journal_path)
+                .expect("open journal");
+            f.write_all(b"{not valid json\n").expect("corrupt");
+            f.sync_all().expect("sync");
+        }
+        assert!(
+            !daemon.claim_allowed_after_journal_check(),
+            "unreadable journal must DISABLE new claims (receive-only degraded mode)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn offer_event(
         buyer: &nostr_sdk::Keys,
         seller_pubkey: &str,

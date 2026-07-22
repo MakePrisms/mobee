@@ -1120,8 +1120,31 @@ fn write_accepted_bind(home: &MobeeHome, bind: &AcceptedBind) -> Result<(), JobL
     let path = bind_path(home, &bind.job_id);
     let raw = serde_json::to_string_pretty(bind)
         .map_err(|error| JobLifecycleError::Io(format!("accept bind encode: {error}")))?;
-    let mut file = File::create(&path).map_err(|error| JobLifecycleError::Io(error.to_string()))?;
-    file.write_all(raw.as_bytes())
+    write_atomic_durable(&dir, &path, raw.as_bytes())
+}
+
+/// Crash-safe durable file write: write the full payload to a temp sibling, `sync_all` it, atomic
+/// `rename` over the target, then `sync_all` the parent directory so the rename itself is durable.
+/// Power-loss at any point leaves EITHER the prior file or the complete new file — never a
+/// truncated/empty bind (which would let the daemon re-accept a job and pay a SECOND time).
+fn write_atomic_durable(dir: &std::path::Path, path: &std::path::Path, bytes: &[u8]) -> Result<(), JobLifecycleError> {
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|error| JobLifecycleError::Io(error.to_string()))?;
+        file.write_all(bytes)
+            .map_err(|error| JobLifecycleError::Io(error.to_string()))?;
+        file.sync_all()
+            .map_err(|error| JobLifecycleError::Io(error.to_string()))?;
+    }
+    fs::rename(&tmp, path).map_err(|error| JobLifecycleError::Io(error.to_string()))?;
+    // fsync the directory so the rename (a directory-entry mutation) survives power-loss.
+    File::open(dir)
+        .and_then(|dir_file| dir_file.sync_all())
         .map_err(|error| JobLifecycleError::Io(error.to_string()))?;
     Ok(())
 }
@@ -1911,6 +1934,67 @@ mod tests {
             .expect("load")
             .expect("present");
         assert_eq!(loaded, bind);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Z1 (crash-safe durable bind write): the accept-bind is written via temp-file + sync + atomic
+    // rename, so a completed write leaves the full bind at the target and NO leftover temp file, and
+    // an overwrite of an existing bind is durable and leaves exactly one file. A truncating write
+    // that crashed mid-flush could leave an empty/partial bind → the daemon re-accepts and pays a
+    // SECOND time; the atomic path forbids that intermediate state.
+    #[test]
+    fn accept_bind_write_is_atomic_no_temp_leftover_and_durable_overwrite() {
+        let root = std::env::temp_dir().join(format!(
+            "mobee-jobs-bind-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let mut bind = AcceptedBind {
+            job_id: "aa".repeat(32),
+            claim_id: "bb".repeat(32),
+            result_id: "cc".repeat(32),
+            seller_pubkey: "dd".repeat(32),
+            commit_oid: "ee".repeat(20),
+            repo: "https://github.com/bitcoin/bips.git".into(),
+            branch: "master".into(),
+            job_hash: "ff".repeat(32),
+            amount_sats: 1,
+            // Pending marker first (the pre-publish write), then finalize below.
+            accept_event_id: String::new(),
+            accepted_at: 0,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            contribution: None,
+        };
+        write_accepted_bind(&home, &bind).expect("write pending");
+        // Finalize (the second write in accept_claim) — overwrites the same target atomically.
+        bind.accept_event_id = "11".repeat(32);
+        bind.accepted_at = 42;
+        write_accepted_bind(&home, &bind).expect("write finalized");
+
+        let loaded = load_accepted_bind(&home, &bind.job_id)
+            .expect("load")
+            .expect("present");
+        assert_eq!(loaded, bind, "finalized bind must be durable and complete");
+
+        // No temp remnant and exactly one bind file (target only) — proves the rename replaced,
+        // never left a partial temp beside it.
+        let dir = home.root.join(JOBS_DIR);
+        let mut json_files = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("read jobs dir") {
+            let name = entry.expect("entry").file_name().to_string_lossy().into_owned();
+            assert!(!name.ends_with(".tmp"), "leftover temp file: {name}");
+            if name.ends_with(".json") {
+                json_files += 1;
+            }
+        }
+        assert_eq!(json_files, 1, "exactly one bind json expected");
         let _ = std::fs::remove_dir_all(&root);
     }
 

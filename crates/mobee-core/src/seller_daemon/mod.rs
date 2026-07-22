@@ -903,6 +903,14 @@ impl SellerDaemon {
         Self::end_flight();
     }
 
+    /// Z3 fail-closed gate: may this daemon claim NEW work? The seller journal is the durable record
+    /// of prior active/delivered state; if it is unreadable/corrupt at startup, reconciliation
+    /// recovers nothing, so claiming new work would take on fresh liability while blind to prior
+    /// in-flight jobs. A clean read ⇒ claiming allowed; a read error ⇒ receive-only / NO-CLAIM.
+    pub fn claim_allowed_after_journal_check(&self) -> bool {
+        self.journal.entries().is_ok()
+    }
+
     /// Pure restart-reconcile plan: orphaned in-flight claims (journaled, no receipt, no
     /// release) classified Expired/Live by the injected `now`. No relay, no wall-clock.
     pub fn reconcile_plan(&self, now: u64) -> Result<Vec<OrphanClaim>, DaemonError> {
@@ -1307,7 +1315,11 @@ impl SellerDaemon {
         let secret = home::read_secret_key_hex(&self.home)?;
         let cashu_key = cashu_secret_from_nostr_hex(&secret)?;
         // Must await — seller loop already owns a tokio runtime; blocking open nests block_on → panic.
-        let wallet = buyer_fund::open_wallet_async(&self.home).await?;
+        // Multi-mint: open the shared store at the buyer's REALIZED (payload) mint, not the seller
+        // default — the buyer paid seller-locked ecash at `mint`, and `require_wallet_matches`
+        // refuses unless the wallet is bound to that same mint. The realized mint already passed the
+        // accepted-set redeem guard AND the `allow_real_mints` fence above.
+        let wallet = buyer_fund::open_wallet_at_mint_async(&self.home, &mint).await?;
         let adapter = CdkSellerReceive::new(&wallet, cashu_key);
 
         // Durable intent-to-receive breadcrumb BEFORE the mint swap. If append_receipt later fails
@@ -3262,6 +3274,24 @@ pub(crate) async fn run_forever_hooked(
         }
     };
 
+    // Fail-closed journal gate: the seller journal is the durable record of prior active/delivered
+    // state. If it is unreadable/corrupt at startup, reconciliation below recovers NOTHING, so
+    // claiming new work would take on fresh liability while blind to prior in-flight jobs (their
+    // incoming payments would buffer or depend on relay reconstruction). Least-disruptive correct
+    // option: enter a receive-only / NO-CLAIM degraded mode — keep the wrap subscription + backfill
+    // so recoverable pending payments can still settle, but do NOT subscribe to offers (no new
+    // claims) until an operator repairs the journal and restarts. A single explicit read here is the
+    // clean seam: the pay-once guard (`journal.has_receipt`) reads the same journal, so redeem is
+    // already fail-closed on corruption; this ensures the claim path is too.
+    let claim_enabled = daemon.claim_allowed_after_journal_check();
+    if !claim_enabled {
+        eprintln!(
+            "seller FAIL-CLOSED: journal unreadable at startup; entering RECEIVE-ONLY degraded \
+             mode — will NOT claim new offers until the journal reads clean. Repair the journal \
+             and restart to resume claiming."
+        );
+    }
+
     // Restart-reconcile: release any orphaned in-flight claims from a prior run BEFORE
     // serving new offers, so a claim left live by a crash never reads "processing" forever.
     // Durable via journal; feedback-kind surface is best-effort.
@@ -3315,18 +3345,28 @@ pub(crate) async fn run_forever_hooked(
     let subscribe_now = Timestamp::now();
     let daemon_start_unix = subscribe_now.as_secs();
     let mut offer_sub_ids: Vec<SubscriptionId> = Vec::new();
-    for filters in offer_subscriptions(
-        seller_pubkey,
-        claim_open_pool,
-        subscribe_now,
-        offer_backfill_secs,
-    ) {
-        let output = client
-            .pool()
-            .subscribe(filters, SubscribeOptions::default())
-            .await
-            .map_err(|error| DaemonError::Relay(format!("subscribe offers: {error}")))?;
-        offer_sub_ids.push(output.val);
+    // Receive-only degraded mode (unreadable journal): skip the offer subscription entirely so the
+    // daemon claims NO new work, while the wrap subscription + backfill below still run to settle
+    // recoverable pending payments.
+    if claim_enabled {
+        for filters in offer_subscriptions(
+            seller_pubkey,
+            claim_open_pool,
+            subscribe_now,
+            offer_backfill_secs,
+        ) {
+            let output = client
+                .pool()
+                .subscribe(filters, SubscribeOptions::default())
+                .await
+                .map_err(|error| DaemonError::Relay(format!("subscribe offers: {error}")))?;
+            offer_sub_ids.push(output.val);
+        }
+    } else {
+        eprintln!(
+            "seller receive-only: offer subscription SKIPPED (journal unreadable) — no new claims \
+             this run"
+        );
     }
     let wrap_filter = wrap_subscription_filter(seller_pubkey);
     client

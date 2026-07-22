@@ -2562,6 +2562,67 @@ mod tests {
         assert_eq!(amount, Amount::from(2));
     }
 
+    // Z2 (multi-mint redeem at realized mint): when the buyer pays at a NON-default accepted mint,
+    // the seller opens its wallet at that REALIZED mint, so redeem succeeds. Wallet bound to MINT2
+    // (non-default) + terms/token/payload at MINT2 + accepted={MINT,MINT2} → receive returns face.
+    #[tokio::test]
+    async fn seller_receive_succeeds_when_wallet_opened_at_non_default_realized_mint() {
+        const MINT2: &str = "https://alt-testnut.example";
+        let seller_key = secret_key(1);
+        let keyset = test_keyset(); // fee = 0
+        let proof = p2pk_proof_for_keyset(5, seller_key.public_key(), keyset.id);
+        let token = Token::new(mint(MINT2), vec![proof], None, CurrencyUnit::Sat);
+        // Seller wallet bound to the realized (non-default) mint, as the daemon now opens it.
+        let wallet = seller_wallet_at(MINT2, InflatedSwapTransport::default(), keyset).await;
+        let terms = PaymentTerms::new(
+            mint(MINT2),
+            Amount::from(5),
+            CurrencyUnit::Sat,
+            nostr_key_for_p2pk(seller_key.public_key()),
+            seller_key.public_key(),
+        );
+        let adapter = CdkSellerReceive::new(&wallet, seller_key);
+
+        let amount = adapter
+            .receive_with(&token, &terms, &accepted(&[MINT, MINT2]), &mint(MINT2), |_| async {
+                Ok(Amount::from(5))
+            })
+            .await
+            .expect("redeem at realized non-default mint must succeed");
+        assert_eq!(amount, Amount::from(5));
+    }
+
+    // Z2 pre-fix symptom: a wallet opened at the DEFAULT mint refuses a payment realized at a
+    // different accepted mint — the "wallet mint ... does not match terms" failure the fix removes.
+    #[tokio::test]
+    async fn seller_receive_refuses_when_wallet_mint_differs_from_realized_terms() {
+        const MINT2: &str = "https://alt-testnut.example";
+        let seller_key = secret_key(1);
+        let keyset = test_keyset();
+        let proof = p2pk_proof_for_keyset(5, seller_key.public_key(), keyset.id);
+        let token = Token::new(mint(MINT2), vec![proof], None, CurrencyUnit::Sat);
+        // Wallet at the seller DEFAULT mint (the pre-fix behavior) vs terms at the realized MINT2.
+        let wallet = seller_wallet_at(MINT, InflatedSwapTransport::default(), keyset).await;
+        let terms = PaymentTerms::new(
+            mint(MINT2),
+            Amount::from(5),
+            CurrencyUnit::Sat,
+            nostr_key_for_p2pk(seller_key.public_key()),
+            seller_key.public_key(),
+        );
+        let adapter = CdkSellerReceive::new(&wallet, seller_key);
+
+        let result = adapter
+            .receive_with(&token, &terms, &accepted(&[MINT, MINT2]), &mint(MINT2), |_| async {
+                Ok(Amount::from(5))
+            })
+            .await;
+        assert!(
+            matches!(&result, Err(PaymentWalletError::Policy(msg)) if msg.contains("wallet mint")),
+            "expected wallet-mint mismatch policy refusal, got {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn seller_receive_surfaces_fee_mismatch_without_treating_as_underpay() {
         let seller_key = secret_key(1);
@@ -2872,14 +2933,24 @@ mod tests {
     }
 
     async fn seller_wallet(transport: InflatedSwapTransport, keyset: KeySet) -> Wallet {
+        seller_wallet_at(MINT, transport, keyset).await
+    }
+
+    /// Build a seller wallet bound to an EXPLICIT mint url (multi-mint tests). Mirrors
+    /// `seller_wallet` but lets the wallet bind to a non-default mint.
+    async fn seller_wallet_at(
+        mint_url: &str,
+        transport: InflatedSwapTransport,
+        keyset: KeySet,
+    ) -> Wallet {
         let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
         store
-            .add_mint(mint(MINT), Some(MintInfo::new()))
+            .add_mint(mint(mint_url), Some(MintInfo::new()))
             .await
             .unwrap();
         store
             .add_mint_keysets(
-                mint(MINT),
+                mint(mint_url),
                 vec![KeySetInfo {
                     id: keyset.id,
                     unit: keyset.unit.clone(),
@@ -2891,9 +2962,9 @@ mod tests {
             .await
             .unwrap();
         store.add_keys(keyset).await.unwrap();
-        let connector = Arc::new(BaseHttpClient::with_transport(mint(MINT), transport, None));
+        let connector = Arc::new(BaseHttpClient::with_transport(mint(mint_url), transport, None));
         WalletBuilder::new()
-            .mint_url(mint(MINT))
+            .mint_url(mint(mint_url))
             .unit(CurrencyUnit::Sat)
             .localstore(store)
             .seed([8; 64])
