@@ -457,9 +457,19 @@ impl PaymentJournalGuard for FsPaymentJournalGuard {
                     detail: error.to_string(),
                 }
             })?;
-            if record.key == self.key {
-                records.push(record);
+            // Fail closed on a foreign PaymentKey: this journal is keyed to ONE attempt
+            // (`append_sync` refuses to write a record for a different key), so a record whose key
+            // does not match is corruption — a misplaced or tampered journal — NOT absence. Silently
+            // skipping it would let a semantically-corrupt journal replay as EMPTY, which the caller
+            // would read as "no prior send" and could send AGAIN under an already-counted budget
+            // attempt. Reject instead so the corruption surfaces rather than double-spending.
+            if record.key != self.key {
+                return Err(JournalError::Corrupt {
+                    line: index + 1,
+                    detail: "record PaymentKey does not match this journal's attempt key".into(),
+                });
             }
+            records.push(record);
         }
         Ok(records)
     }
@@ -1906,6 +1916,69 @@ mod tests {
         ));
         drop(guard);
         std::fs::remove_file(path).unwrap();
+    }
+
+    // Finding EE: a record whose PaymentKey does NOT match this journal's attempt key is CORRUPTION
+    // (a misplaced/tampered journal), not absence. Silently filtering it would let the journal replay
+    // as EMPTY — the caller then reads "no prior send" and could send AGAIN under an already-counted
+    // budget attempt (double-spend). Replay must fail closed (Err) on the foreign record. A
+    // genuinely-empty/absent journal still reads as the legitimate empty case.
+    #[test]
+    fn fs_journal_rejects_foreign_payment_key_record() {
+        let path = std::env::temp_dir().join(format!(
+            "mobee-payment-journal-foreign-key-{}-{}.jsonl",
+            std::process::id(),
+            key().attempt_id().as_str()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        // A record keyed to a DIFFERENT attempt (different job id ⇒ different PaymentKey), written
+        // straight to disk — `append_sync` would refuse to write it through the guard (KeyMismatch),
+        // which is exactly why a foreign record on disk can only be corruption.
+        let foreign_terms = terms();
+        let foreign_key = PaymentKey::new(
+            JobId::new("other-job").unwrap(),
+            ResultId::new("result").unwrap(),
+            DeliveryIntegrityHash::from_hex("11".repeat(32)).unwrap(),
+            JobHash::from_hex("22".repeat(32)).unwrap(),
+            &foreign_terms,
+            None,
+        );
+        assert_ne!(foreign_key, key(), "foreign key must differ from the journal key");
+        let foreign = PaymentRecord {
+            key: foreign_key.clone(),
+            value: PaymentState::Intent {
+                attempt_id: foreign_key.attempt_id(),
+            },
+        };
+        let mut line = serde_json::to_string(&foreign).unwrap();
+        line.push('\n');
+        std::fs::write(&path, line.as_bytes()).unwrap();
+
+        let journal = FsPaymentJournal::new(&path);
+        let mut guard = journal.lock(&key()).unwrap();
+        assert!(
+            matches!(guard.replay(), Err(JournalError::Corrupt { line: 1, .. })),
+            "a foreign-key record must fail closed on replay, not read as empty"
+        );
+        drop(guard);
+        std::fs::remove_file(&path).unwrap();
+
+        // Control: a genuinely-absent journal (no file) still replays as the legitimate empty case.
+        let empty_path = std::env::temp_dir().join(format!(
+            "mobee-payment-journal-absent-{}-{}.jsonl",
+            std::process::id(),
+            key().attempt_id().as_str()
+        ));
+        let _ = std::fs::remove_file(&empty_path);
+        let empty_journal = FsPaymentJournal::new(&empty_path);
+        let mut empty_guard = empty_journal.lock(&key()).unwrap();
+        assert!(
+            empty_guard.replay().unwrap().is_empty(),
+            "an absent/empty journal must read as the legitimate empty case"
+        );
+        drop(empty_guard);
+        std::fs::remove_file(&empty_path).unwrap();
     }
 
     #[test]

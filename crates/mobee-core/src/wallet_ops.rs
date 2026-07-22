@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cashu::{MintUrl, Token};
+use sha2::{Digest, Sha256};
 use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod};
 use cdk::wallet::{ReceiveOptions, SendOptions, Wallet};
 use cdk::Amount;
@@ -89,12 +90,42 @@ pub enum MintFlow {
     NeedsPayment(MintQuote),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct SendOutcome {
     pub mint_url: String,
     pub sent_sats: u64,
     pub balance_sats: u64,
+    /// Bearer cashu token — spendable ecash. Never emitted by [`Debug`] (redacted below); read the
+    /// field directly to hand the token to the payee.
     pub token: String,
+}
+
+// Manual Debug: the `token` field is a BEARER cashu token (spendable ecash). A derived Debug would
+// print it verbatim, so any debug log of a `SendOutcome` would leak spendable funds. Redact it to a
+// SHA-256 hash prefix (identifies the token for correlation without exposing spendable material).
+// `Clone` is intentionally NOT derived: nothing needs to duplicate a bearer token, and each extra
+// copy is another place it can leak.
+impl std::fmt::Debug for SendOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SendOutcome")
+            .field("mint_url", &self.mint_url)
+            .field("sent_sats", &self.sent_sats)
+            .field("balance_sats", &self.balance_sats)
+            .field("token", &redact_secret(&self.token))
+            .finish()
+    }
+}
+
+/// Render a secret as `<redacted:sha256:HEX12>` — a stable 12-hex-char digest prefix that lets two
+/// log lines be correlated to the same secret without exposing any spendable material. An empty
+/// secret renders `<redacted:empty>` (no digest of nothing).
+fn redact_secret(secret: &str) -> String {
+    if secret.is_empty() {
+        return "<redacted:empty>".to_string();
+    }
+    let digest = Sha256::digest(secret.as_bytes());
+    format!("<redacted:sha256:{}>", &hex::encode(digest)[..12])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -834,6 +865,46 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    // Finding DD: `SendOutcome.token` is a BEARER cashu token (spendable ecash). Its `Debug` MUST
+    // redact the token — a derived Debug would print it verbatim, so any debug log of a SendOutcome
+    // would leak spendable funds. Assert the debug rendering contains neither the token nor any of
+    // its material, and that it carries the redaction marker + non-secret fields.
+    #[test]
+    fn send_outcome_debug_redacts_bearer_token() {
+        let token = "cashuAeyJ0b2tlbiI6c3BlbmRhYmxlLWJlYXJlci1lY2FzaC1zZWNyZXQ";
+        let outcome = SendOutcome {
+            mint_url: "https://testnut.cashudevkit.org".into(),
+            sent_sats: 21,
+            balance_sats: 100,
+            token: token.into(),
+        };
+        let rendered = format!("{outcome:?}");
+        assert!(
+            !rendered.contains(token),
+            "SendOutcome Debug must not contain the bearer token: {rendered}"
+        );
+        // No substring of the token beyond a trivial prefix leaks (guard against partial exposure).
+        assert!(
+            !rendered.contains("spendable-bearer-ecash-secret")
+                && !rendered.contains(&token[6..]),
+            "SendOutcome Debug must not leak token material: {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted:sha256:"),
+            "redaction marker expected: {rendered}"
+        );
+        // Non-secret fields remain visible for diagnostics.
+        assert!(rendered.contains("sent_sats: 21") && rendered.contains("balance_sats: 100"));
+    }
+
+    // An empty token renders the empty marker (no digest of nothing) — never a bare empty string
+    // that could be mistaken for "no field".
+    #[test]
+    fn redact_secret_empty_marks_empty() {
+        assert_eq!(redact_secret(""), "<redacted:empty>");
+        assert!(redact_secret("x").starts_with("<redacted:sha256:"));
+    }
 
     fn temp_home(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);

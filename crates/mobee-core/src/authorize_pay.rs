@@ -71,6 +71,13 @@ pub struct AuthorizePayRequest {
     /// a claim with no `creq` — the buyer then pays from the pinned default mint.
     #[allow(clippy::struct_field_names)]
     pub accepted_mints: Vec<String>,
+    /// The realized paying mint the buyer SELECTED for this job, sealed into the accept-bind at
+    /// accept time and threaded here. When `Some`, the pay path derives the realized mint from THIS
+    /// (still enforcing accepted-set membership + the real-mint fence) instead of the live config
+    /// default, so the attempt id is stable across retries even if the buyer's config default
+    /// changes between attempts (double-pay fence). `None` only for a legacy bind that predates the
+    /// sealed field — the pay path then falls back to the live config default.
+    pub realized_mint: Option<String>,
     /// Contribution binds. `None` ⇒ from-scratch job (no new verify, byte-identical produced
     /// artifacts). `Some(..)` ⇒ the fork contribution verify-path (store fetch + base-from-pin +
     /// descendant + content) + the authorship tuple seam run pre-pay, all against these
@@ -228,11 +235,18 @@ pub async fn authorize_pay_async(
     let seller_nostr = NostrPublicKey::parse(&request.seller_pubkey)
         .map_err(|error| AuthorizePayError::Input(format!("seller_pubkey: {error}")))?;
     let seller_p2pk = cashu_compressed_from_nostr(&seller_nostr)?;
-    // Choose the realized mint the buyer pays at from the seller's
-    // `creq` `m` list, keyed off the buyer's CONFIGURED mint (same source `buyer_fund` opens the
-    // spending wallet at) — never a compile-time pin.
+    // Choose the realized mint the buyer pays at from the seller's `creq` `m` list. The SELECTION is
+    // the mint FROZEN into the accept-bind at accept (`request.realized_mint`), not the live config
+    // default — so a config-default change between attempts cannot shift the mint and mint a second
+    // attempt id (double-pay). `resolve_realized_mint` still enforces accepted-set membership + the
+    // real-mint fence over that frozen selection. A legacy bind (no sealed mint) falls back to the
+    // live config default (pre-seal behavior).
+    let buyer_selected_mint = request
+        .realized_mint
+        .as_deref()
+        .unwrap_or_else(|| home.config.default_mint());
     let mint = resolve_realized_mint(
-        home.config.default_mint(),
+        buyer_selected_mint,
         &request.accepted_mints,
         home.config.allow_real_mints,
     )?;
@@ -435,7 +449,7 @@ fn contribution_policy(home: &MobeeHome) -> crate::contribution::ContentPolicy {
 /// - **configured mint NOT listed:** the single-mint buyer wallet holds no balance at any mint the
 ///   seller listed, so it cannot pay this claim and refuses `mint_unreachable_pay`; no funds move,
 ///   no binding is committed.
-fn resolve_realized_mint(
+pub(crate) fn resolve_realized_mint(
     buyer_mint_url: &str,
     accepted_mints: &[String],
     allow_real_mints: bool,
@@ -839,6 +853,7 @@ mod tests {
             seller_signature: String::new(),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         let err = authorize_pay_blocking(&home, &mut gate, request).expect_err("empty tip-match hash");
@@ -878,6 +893,7 @@ mod tests {
             seller_signature: String::new(),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         let err = authorize_pay_blocking(&home, &mut gate, request).expect_err("tip-match mismatch");
@@ -921,6 +937,7 @@ mod tests {
             seller_signature: String::new(),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         let err = authorize_pay_blocking(&home, &mut gate, request).expect_err("contribution no binds");
@@ -967,6 +984,7 @@ mod tests {
             seller_signature: valid_sig,
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         let err = authorize_pay_blocking(&home, &mut gate, request.clone()).expect_err("ext refused");
@@ -1036,6 +1054,77 @@ mod tests {
             default_mint.digest_hex(),
             other_mint.digest_hex(),
             "co-signed preimage digest must not depend on the realized mint"
+        );
+    }
+
+    // Finding CC (load-bearing): the pay-path attempt id is derived from the SEALED realized-mint
+    // SELECTION frozen in the accept-bind — NOT the live config default — so a config-default change
+    // BETWEEN attempts (e.g. after a receipt-publish failure, before the buyer retries) cannot shift
+    // the realized mint into a DIFFERENT attempt id and mint a SECOND payment for one job. Two
+    // attempts for the same accepted job under two different live config defaults must yield the SAME
+    // attempt id when the bind seals the mint (budget/journal idempotency then dedups the retry).
+    // The control asserts the pre-CC legacy (unsealed) path DIVERGES — exactly the double-pay vector.
+    #[test]
+    fn sealed_realized_mint_stabilizes_attempt_id_across_config_default_change() {
+        // Two distinct admissible paying mints, both in the seller's accepted set. `allow_real_mints`
+        // is on so two DIFFERENT mints can both pass the fence (with it off only DEFAULT_MINT_URL
+        // does, and there'd be no second admissible mint to shift to).
+        let m1 = "https://mint-a.example";
+        let m2 = "https://mint-b.example";
+        let accepted = vec![m1.to_string(), m2.to_string()];
+
+        let seller_nostr = Keys::generate().public_key();
+        let seller_p2pk = cashu_compressed_from_nostr(&seller_nostr).expect("p2pk");
+        let attempt_id_for = |mint: MintUrl| {
+            let terms = PaymentTerms::new(
+                mint,
+                Amount::from(7),
+                CurrencyUnit::Sat,
+                seller_nostr,
+                seller_p2pk,
+            );
+            PaymentKey::new(
+                JobId::new("job").expect("job id"),
+                ResultId::new("result").expect("result id"),
+                DeliveryIntegrityHash::from_hex(&"11".repeat(32)).expect("oid"),
+                JobHash::from_hex(&"22".repeat(32)).expect("job hash"),
+                &terms,
+                None,
+            )
+            .attempt_id()
+        };
+        // The pay path's mint selection, mirroring `authorize_pay_async`: the sealed selection wins;
+        // a legacy bind (`None`) falls back to the live config default.
+        let select = |sealed: Option<&str>, config_default: &str| {
+            let chosen = sealed.unwrap_or(config_default);
+            resolve_realized_mint(chosen, &accepted, true).expect("resolve")
+        };
+
+        // SEALED bind (realized_mint = Some(m1)): the first attempt runs with config default m1, then
+        // the buyer changes config default to m2 and RETRIES — both resolve to the sealed m1, so the
+        // attempt id is identical and the retry dedups against the already-counted attempt.
+        let sealed_first = attempt_id_for(select(Some(m1), m1));
+        let sealed_retry = attempt_id_for(select(Some(m1), m2));
+        assert_eq!(
+            sealed_first.as_str(),
+            sealed_retry.as_str(),
+            "sealed realized mint must keep the attempt id stable across a config-default change \
+             (retry dedups → no second payment)"
+        );
+        // The stable mint is the SEALED one (m1), never the changed config default (m2).
+        assert_eq!(select(Some(m1), m2), MintUrl::from_str(m1).unwrap());
+
+        // CONTROL — legacy unsealed bind (realized_mint = None): the selection follows the live
+        // config default, so the m1→m2 change shifts the mint → a DIFFERENT attempt id. This is the
+        // pre-CC double-pay vector (budget/journal see a brand-new identity → a second send);
+        // sealing (above) is what closes it.
+        let legacy_first = attempt_id_for(select(None, m1));
+        let legacy_retry = attempt_id_for(select(None, m2));
+        assert_ne!(
+            legacy_first.as_str(),
+            legacy_retry.as_str(),
+            "control: the unsealed path lets a config-default change shift the attempt id (the \
+             double-pay vector CC closes)"
         );
     }
 
@@ -1117,6 +1206,7 @@ mod tests {
             seller_signature: forged_sig,
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         let err = authorize_pay_blocking(&home, &mut gate, request).expect_err("forged sig refused pre-pay");
@@ -1173,6 +1263,7 @@ mod tests {
             seller_signature: forged_sig,
             creq_hash: Some(creq_hash.clone()),
             accepted_mints: vec![DEFAULT_MINT_URL.to_string()],
+            realized_mint: None,
             contribution: None,
         };
         let seller_pubkey = home::public_key_hex(&home).expect("pubkey");
@@ -1245,6 +1336,7 @@ mod tests {
             seller_signature: sig_over_2,
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         let err = authorize_pay_blocking(&home, &mut gate, tampered_amount).expect_err("tampered amount");
@@ -1275,6 +1367,7 @@ mod tests {
             seller_signature: sig_over_aa,
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         let err2 = authorize_pay_blocking(&home, &mut gate2, tampered_delivery).expect_err("tampered oid");

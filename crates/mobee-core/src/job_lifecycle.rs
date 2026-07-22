@@ -249,6 +249,14 @@ pub struct AcceptedBind {
     /// the buyer pay path chooses the realized mint from it. Empty for a claim with no `creq`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_mints: Vec<String>,
+    /// The realized paying mint the buyer SELECTED for this job, frozen at accept from the buyer's
+    /// then-configured default mint (validated against `accepted_mints` + the real-mint fence). The
+    /// pay path derives the realized mint from THIS on every attempt — including retries — so a
+    /// config-default change between attempts can never shift the mint and mint a second
+    /// [`crate::payment::AttemptId`] (double-pay). `None` only on a legacy bind serialized before
+    /// this field existed; the pay path then falls back to the live config default (legacy behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realized_mint: Option<String>,
     /// Contribution binds, recorded at accept when the OFFER is a contribution (authority
     /// = the buyer's signed offer; the result echo is equality-checked, never trusted). Absent ⇒
     /// from-scratch.
@@ -739,6 +747,20 @@ pub async fn accept_claim_async(
     let accepted_mints =
         verify_accepted_claim_creq(claim.creq.as_deref(), &request.job_id, offer.amount_sats)?;
 
+    // FREEZE the realized paying mint at accept from the buyer's then-configured default (validated
+    // against the accepted set + the real-mint fence). Sealing the SELECTION here — not just the
+    // accepted SET (finding V) — is what makes the pay-path attempt id stable across retries: a
+    // config-default change after accept can no longer shift the mint into a different attempt id and
+    // mint a second payment for one job (double-pay). A buyer whose configured mint is not payable
+    // for this claim is refused HERE (fail-closed), never accepted into an unpayable bind.
+    let realized_mint = crate::authorize_pay::resolve_realized_mint(
+        home.config.default_mint(),
+        &accepted_mints,
+        home.config.allow_real_mints,
+    )
+    .map_err(|error| JobLifecycleError::Input(error.to_string()))?
+    .to_string();
+
     let buyer_pubkey = keys.public_key().to_hex();
     let draft = accept_draft(
         &request.job_id,
@@ -773,6 +795,9 @@ pub async fn accept_claim_async(
         creq_hash: claim.creq.as_deref().map(crate::gateway::creq_hash_hex),
         // The creq's accepted-mint list (validated + parsed above, fail-closed).
         accepted_mints,
+        // The realized paying mint SELECTED for this job, frozen from the buyer's configured default
+        // above. Sealing the choice makes the pay-path attempt id stable across retries.
+        realized_mint: Some(realized_mint),
         contribution,
     };
     write_accepted_bind(home, &bind)?;
@@ -1046,6 +1071,9 @@ pub fn authorize_request_from_bind(
         // Thread the creq's accepted-mint list so the buyer chooses the realized
         // mint. Empty ⇒ a claim with no creq (pay from the pinned default mint).
         accepted_mints: bind.accepted_mints.clone(),
+        // Thread the SEALED realized-mint selection so the pay path derives the paying mint from the
+        // bind, not the live config default — stable attempt id across retries. `None` ⇒ legacy bind.
+        realized_mint: bind.realized_mint.clone(),
         // Thread the contribution binds so authorize_pay runs the contribution
         // verify-path + authorship seam. `None` ⇒ from-scratch.
         contribution: bind.contribution.as_ref().map(|c| {
@@ -1101,6 +1129,10 @@ pub fn fill_explicit_request_from_bind(
     // caller-supplied value. The seller cosig does not pin the realized mint (the preimage binds
     // only creq_hash), so a caller list must never be trusted to select the paying mint.
     request.accepted_mints = bind.accepted_mints.clone();
+    // Finding CC: same seal for the realized-mint SELECTION — derived SOLELY from the sealed bind,
+    // overwriting any caller value. A caller must not be able to pick the paying mint (which would
+    // shift the attempt id); the frozen selection makes retries dedup.
+    request.realized_mint = bind.realized_mint.clone();
     // Same seal for the delivery locator: repo/branch identify WHERE the paid commit is fetched
     // from, so they must come from the sealed bind (which `authorize_request_from_bind` already
     // does), never caller input — a caller must not be able to redirect the fetch to a different
@@ -1668,6 +1700,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         // Drifted amount → refuse.
@@ -1703,6 +1736,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         // A different result for the already-bound job → refused (one settlement per job).
@@ -1742,6 +1776,7 @@ mod tests {
             seller_signature: "dd".repeat(64),
             creq_hash: Some("2ad9b34cbf8c".to_string()),
             accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
+            realized_mint: None,
             contribution: None,
         };
 
@@ -1765,6 +1800,7 @@ mod tests {
             seller_signature: String::new(),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         fill_explicit_request_from_bind(&mut explicit, &bind);
@@ -1795,6 +1831,7 @@ mod tests {
             seller_signature: "dd".repeat(64),
             creq_hash: Some("2ad9b34cbf8c".to_string()),
             accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
+            realized_mint: None,
             contribution: None,
         };
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
@@ -1812,6 +1849,7 @@ mod tests {
             seller_signature: String::new(),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         fill_explicit_request_from_bind(&mut explicit, &bind);
@@ -1841,6 +1879,7 @@ mod tests {
             seller_signature: "dd".repeat(64),
             creq_hash: Some("2ad9b34c".repeat(8)),
             accepted_mints: vec!["https://mint.minibits.cash/Bitcoin".into()],
+            realized_mint: None,
             contribution: None,
         };
         let from_bind =
@@ -1861,6 +1900,7 @@ mod tests {
             seller_signature: bind.seller_signature.clone(),
             creq_hash: bind.creq_hash.clone(),
             accepted_mints: bind.accepted_mints.clone(),
+            realized_mint: None,
             contribution: None,
         };
         fill_explicit_request_from_bind(&mut explicit, &bind);
@@ -1897,6 +1937,8 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: Some("2ad9b34c".repeat(8)),
             accepted_mints: vec![bound_mint.clone()],
+            // The realized-mint SELECTION is sealed in the bind (finding CC).
+            realized_mint: Some(bound_mint.clone()),
             contribution: None,
         };
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
@@ -1912,8 +1954,10 @@ mod tests {
             commit_oid: bind.commit_oid.clone(),
             seller_signature: bind.seller_signature.clone(),
             creq_hash: bind.creq_hash.clone(),
-            // Caller substitutes a mint OUTSIDE the bound set.
+            // Caller substitutes a mint OUTSIDE the bound set — for BOTH the accepted set and the
+            // realized-mint selection.
             accepted_mints: vec![attacker_mint.clone()],
+            realized_mint: Some(attacker_mint.clone()),
             contribution: None,
         };
         fill_explicit_request_from_bind(&mut explicit, &bind);
@@ -1925,6 +1969,15 @@ mod tests {
             !explicit.accepted_mints.contains(&attacker_mint),
             "substituted mint must not survive into the pay request"
         );
+        // Finding CC: the caller-supplied realized-mint selection is likewise overwritten by the
+        // sealed bind — a caller must not be able to pick the paying mint (which would shift the
+        // attempt id).
+        assert_eq!(
+            explicit.realized_mint,
+            bind.realized_mint,
+            "caller realized_mint must be overwritten by the sealed bind"
+        );
+        assert_eq!(explicit.realized_mint.as_deref(), Some(bound_mint.as_str()));
     }
 
     #[test]
@@ -1954,6 +2007,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         write_accepted_bind(&home, &bind).expect("write");
@@ -1962,6 +2016,26 @@ mod tests {
             .expect("present");
         assert_eq!(loaded, bind);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Finding CC (back-compat): the `realized_mint` field is serde-defaulted, so a LEGACY bind JSON
+    // serialized before the field existed still deserializes — into `None`, the legacy pay-path
+    // fallback (live config default). Confirms the AcceptedBind change is not a wire break.
+    #[test]
+    fn accept_bind_deserializes_legacy_json_without_realized_mint() {
+        let legacy = r#"{
+            "job_id":"aa","claim_id":"bb","result_id":"cc","seller_pubkey":"dd",
+            "commit_oid":"ee","repo":"https://example.invalid/repo.git","branch":"master",
+            "job_hash":"ff","amount_sats":5,"accept_event_id":"11","accepted_at":1,
+            "seller_signature":"","accepted_mints":["https://mint.example"]
+        }"#;
+        let bind: AcceptedBind = serde_json::from_str(legacy).expect("legacy bind deserializes");
+        assert_eq!(bind.realized_mint, None, "missing field defaults to None (legacy)");
+        assert_eq!(bind.accepted_mints, vec!["https://mint.example".to_string()]);
+        // And a bind with realized_mint = None does not serialize the field (skip_serializing_if),
+        // so the on-disk shape is unchanged for legacy-equivalent binds.
+        let json = serde_json::to_string(&bind).expect("serialize");
+        assert!(!json.contains("realized_mint"), "None must not emit the field: {json}");
     }
 
     // Z1 (crash-safe durable bind write): the accept-bind is written via temp-file + sync + atomic
@@ -1997,6 +2071,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         write_accepted_bind(&home, &bind).expect("write pending");
@@ -2062,6 +2137,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
 
@@ -2148,6 +2224,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         // Phase 1: pending write is durable and reloads with the empty-id marker.
@@ -2189,6 +2266,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         let err = authorize_request_from_bind(&bind, 1, String::new()).expect_err("empty hash");
@@ -2226,6 +2304,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: None,
         };
         let bad_seller = "00".repeat(32);
@@ -2635,6 +2714,7 @@ mod tests {
             seller_signature: "ab".repeat(32),
             creq_hash: None,
             accepted_mints: Vec::new(),
+            realized_mint: None,
             contribution: Some(AcceptedContribution {
                 target_owner_pubkey: "aa".repeat(32),
                 target_clone_url: "https://mobee-relay.orveth.dev/git/owner/repo.git".into(),
