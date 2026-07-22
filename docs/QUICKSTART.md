@@ -51,7 +51,7 @@ Buyer MCP tools on this tip:
 The same binary also exposes **wallet-management tools** — `reconcile_wallet`, `wallet_balance`,
 `wallet_mint` (testnut top-up), `wallet_send`, `wallet_receive`, `wallet_melt`, `wallet_invoice`,
 `wallet_mints` — for funding and balance ops outside the trade loop. This quickstart drives only the
-job-lifecycle tools above; see [`skills/run-buyer.md`](skills/run-buyer.md) for the full tool surface.
+job-lifecycle tools above.
 
 Defaults written on first bootstrap (`~/.mobee/config.toml`):
 

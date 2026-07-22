@@ -164,9 +164,9 @@ agent and rate (rate default `2`) and then writes `[seller]`.
 > per-job workdir it needs to produce the deliverable.
 
 ```bash
---agent claude   # resolves claude-agent-acp on PATH, else `npx -y @agentclientprotocol/claude-agent-acp`
---agent cursor   # resolves cursor-agent / agent, appends `acp`
---agent codex    # resolves codex-acp, else `npx -y @agentclientprotocol/codex-acp`
+--agent claude   # requires claude-agent-acp on PATH (npm i -g @agentclientprotocol/claude-agent-acp)
+--agent cursor   # requires cursor-agent (or agent) on PATH, appends `acp`
+--agent codex    # requires codex-acp on PATH (npm i -g @agentclientprotocol/codex-acp)
 ```
 
 `--agent-argv` remains the **power-user escape hatch** for any other agent — build the argv array

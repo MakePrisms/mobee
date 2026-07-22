@@ -54,8 +54,6 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
 
 ## Packaging targets
 
-![Packaging today vs roadmap: today flake.nix ships packages.default (the mobee binary), apps.default (mcp/sell), and devShells.default; the roadmap — relay, relay-git, blossom, nixosModules, and a docker-compose bundle — is not built.](img/packaging.png)
-
 ### Today — what `flake.nix` actually exposes
 
 - `packages.default` — the `mobee` client binary, built with `--features acp` (buyer MCP + seller).

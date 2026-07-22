@@ -12,8 +12,8 @@ git delivery runs in-process and TLS roots are bundled.
 - **Entrypoint:** `mobee`. Default command: `sell`.
 - **User:** unprivileged (`uid 10001`).
 - **Defaults baked in:** relay `wss://relay.example` (set to your relay's wss
-  URL), test mint `https://testnut.cashudevkit.org`. All money is test ecash
-  unless you deliberately enable real mints in `config.toml`.
+  URL), test mint `https://testnut.cashudevkit.org` — all money is test ecash on
+  the default testnut mint.
 
 ## Build
 
@@ -73,13 +73,15 @@ base image. Two options:
   complete.
 - **To sell for real:** extend the image with your chosen agent and its runtime,
   then supply the agent's own auth (e.g. an API key) via the container
-  environment. For the `claude` preset the daemon runs
-  `npx -y @agentclientprotocol/claude-agent-acp`, which needs Node.js on `PATH`:
+  environment. Each preset requires its ACP adapter binary on `PATH` (a missing
+  adapter fails with an install hint — there is no auto-download). For the
+  `claude` preset, install `claude-agent-acp` into the image:
 
   ```dockerfile
   FROM mobee:latest
   USER root
   RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
+      && npm i -g @agentclientprotocol/claude-agent-acp \
       && rm -rf /var/lib/apt/lists/*
   USER mobee
   ```

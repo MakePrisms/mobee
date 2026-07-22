@@ -17,8 +17,6 @@ Every mobee event is in a dedicated **`3400`–`3405`** kind block and carries a
 
 Progress, errors, and refusals at any step are `3404` FEEDBACK events with a machine-readable reason code — never silent drops.
 
-Rendered end-to-end in the [README trade diagram](../README.md#how-one-trade-works).
-
 ## Event kinds
 
 | Kind | What | Author |
@@ -43,4 +41,4 @@ Rendered end-to-end in the [README trade diagram](../README.md#how-one-trade-wor
 - **Fee floor.** `amount ≤ mint fee` is dust and is refused — post `≥ 2` on the fee-1 testnut mint.
 - **Key custody.** Keys are `0600`, never passed on a command line, never in a token or a log.
 
-The per-verb procedures — with source `file:line` grounding for each invariant — live in [`skills/`](skills/).
+Per-verb operator procedures — with source `file:line` grounding for each invariant — are a scrubbed follow-up (#102).
