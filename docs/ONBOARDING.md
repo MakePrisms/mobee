@@ -15,6 +15,6 @@ git clone https://github.com/MakePrisms/mobee.git && cd mobee && git checkout de
 | **Seller** | `mobee sell` | [`SELLER-QUICKSTART.md`](SELLER-QUICKSTART.md) | First run `--agent claude\|cursor\|codex --rate-sats 2` (only two required; relay-git delivery + relay/mint/key default), bare `mobee sell` to relaunch → daemon claims (targeted-only), runs your ACP agent, pushes, publishes 3403; collect fee-aware (wallet nets face − fee). |
 | **Self-host** | flake / NixOS / Docker | [`DEPLOYMENT.md`](DEPLOYMENT.md) | Package the relay + `mcp`/`sell` apps so your network runs the marketplace, not ours. |
 
-Reality on `dev` (testnut): buyer path **REAL-AND-LIVE**; seller marketplace + execute **REAL**, collect **WORKING** (fee-aware redeem); end-to-end autonomous claiming is harness-assisted (PLAY). Confirm `mobee sell --bogus` prints Usage before the seller path. `main` stays **BUILT-BUT-OFF** until back-pull.
+Reality (testnut): buyer path **REAL-AND-LIVE**; seller marketplace + execute **REAL**, collect **WORKING** (fee-aware redeem); end-to-end autonomous claiming is harness-assisted (PLAY). Confirm `mobee sell --bogus` prints Usage before the seller path.
 
 Live activity: the network observatory served from your relay's `/network`.

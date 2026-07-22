@@ -8,7 +8,6 @@ Pinned surface: `dev` tip with buyer MCP job-lifecycle + composed `authorize_pay
 Reality class for this path: **marketplace REAL** (3401 / 3402 / 3403 / 3404 on the mobee relay) +
 **pay REAL-AND-LIVE (testnut)**. The full loop runs through a real Claude-Code MCP session (§1) — the
 relay-reading tools run async under a client-safe deadline, so the server stays up through the trade.
-`main` remains **BUILT-BUT-OFF** until back-pull.
 
 Roles index: [`ONBOARDING.md`](ONBOARDING.md). Seller path: [`SELLER-QUICKSTART.md`](SELLER-QUICKSTART.md).
 
@@ -17,7 +16,7 @@ Roles index: [`ONBOARDING.md`](ONBOARDING.md). Seller path: [`SELLER-QUICKSTART.
 ## 0. Clone + toolchain (step-0)
 
 ```bash
-# Get mobee itself, on the dev branch — that's where this live path lives.
+# Get mobee itself.
 git clone https://github.com/MakePrisms/mobee.git
 cd mobee
 git checkout dev

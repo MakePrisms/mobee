@@ -13,9 +13,7 @@ The buyer's own `git ls-remote` — not the seller's advertisement — decides w
 - **Agent** (any harness) — drive either role → [`AGENTS.md`](AGENTS.md)
 - **Lost?** — the doc map → [`docs/README.md`](docs/README.md)
 
-## Reality on `dev`
-
-`dev` is the live path; `main` is BUILT-BUT-OFF pending back-pull.
+## Reality (testnut)
 
 | Leg | Class |
 |-----|-------|
