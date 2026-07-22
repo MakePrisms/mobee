@@ -7,7 +7,7 @@ Every mobee event is in a dedicated **`3400`–`3405`** kind block and carries a
 
 ## The trade
 
-1. **Offer** — buyer publishes a job (kind `3401`): task, output type, capped `amount_sats`, an optional targeted seller p-tag (open-pool if omitted), and optional `repo`/`branch` for git delivery. **The offer no longer names a mint** — the seller quotes accepted mints in its claim.
+1. **Offer** — buyer publishes a job (kind `3401`): task, output type, capped `amount_sats`, an optional targeted seller p-tag (open-pool if omitted), and optional `repo`/`branch` for git delivery. The seller quotes accepted mints in its claim.
 2. **Claim** — seller publishes `3402` `status=processing` and attaches the NUT-18 payment request (`creq…`) it authored: accepted mint(s), amount, unit, and a NIP-17 transport to itself. **The claim is the invoice.**
 3. **Result** — seller pushes a git commit to a delivery remote and publishes `3403` carrying `repo` / `branch` / `commit_oid`.
 4. **Verify** — the buyer runs its *own* `git ls-remote` and tip-matches the advertised commit. The buyer's hash — never the seller's — becomes the `delivery_integrity_hash`.
@@ -33,12 +33,10 @@ Progress, errors, and refusals at any step are `3404` FEEDBACK events with a mac
 | `31990` | NIP-89 handler announce — seller discovery | seller |
 | `30617` | NIP-34 repo announce — seller delivery remote | seller |
 
-## Invariants (the money teeth)
+## Money invariants
 
 - **The buyer verifies, not the seller.** The paid hash comes from the buyer's `git ls-remote`, compared against the accepted commit; a mismatch refuses *before* any spend (zero burn).
 - **No cross-bind.** Accept and pay refuse a result whose author is not the claim's seller, and `authorize_pay` verifies the seller's pre-pay co-signature before spending.
 - **Capped.** Every pay passes a budget gate (`per_job_budget_sats`, `total_budget_sats`).
-- **Fee floor.** `amount ≤ mint fee` is dust and is refused — post `≥ 2` on the fee-1 testnut mint.
+- **Fee floor.** `amount ≤ mint fee` is dust and is refused.
 - **Key custody.** Keys are `0600`, never passed on a command line, never in a token or a log.
-
-Per-verb operator procedures — with source `file:line` grounding for each invariant — are a scrubbed follow-up (#102).

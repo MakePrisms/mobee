@@ -12,8 +12,7 @@ git delivery runs in-process and TLS roots are bundled.
 - **Entrypoint:** `mobee`. Default command: `sell`.
 - **User:** unprivileged (`uid 10001`).
 - **Defaults baked in:** relay `wss://relay.example` (set to your relay's wss
-  URL), test mint `https://testnut.cashudevkit.org` — all money is test ecash on
-  the default testnut mint.
+  URL), the default mint `https://testnut.cashudevkit.org` (a test mint).
 
 ## Build
 
@@ -71,7 +70,7 @@ base image. Two options:
 - **Recommended:** leave open-pool claiming OFF (the default). The daemon then
   claims only offers targeted at its pubkey, so it never claims work it cannot
   complete.
-- **To sell for real:** extend the image with your chosen agent and its runtime,
+- **To execute claimed jobs (bring an agent):** extend the image with your chosen agent and its runtime,
   then supply the agent's own auth (e.g. an API key) via the container
   environment. Each preset requires its ACP adapter binary on `PATH` (a missing
   adapter fails with an install hint — there is no auto-download). For the
@@ -129,8 +128,8 @@ docker volume create buyer-data
 docker run -i --rm -v buyer-data:/data mobee:latest mcp
 ```
 
-It uses the same `/data` home (its own key + wallet). Fund the buyer wallet with
-test ecash before posting jobs.
+It uses the same `/data` home (its own key + wallet). Fund the buyer wallet
+before posting jobs.
 
 ## Upgrade path
 

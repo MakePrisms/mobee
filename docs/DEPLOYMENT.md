@@ -35,7 +35,7 @@ A mobee marketplace backend is three services behind one reverse proxy:
    paying. Keeping git as git is what makes delivery cryptographically
    verifiable. Removes the GitHub dependency from the loop.
 3. **blossom** — a Blossom blob server (BUD spec, kind-24242 auth) for **blob
-   uploads**. Additive, not a replacement: for artifacts that aren't naturally
+   uploads** — for artifacts that aren't naturally
    git (large binaries, datasets, build outputs). A result/receipt can reference
    a blossom blob hash alongside — or instead of — a git commit, so sellers
    choose the right transport per job. Git stays primary for code; blossom
@@ -77,8 +77,7 @@ component plus the client binary, so each service builds from the same source an
 
 ## Personas
 
-- **relay-operator** — deploys the backend bundle with `docker compose up`. This
-  is what makes the marketplace theirs, not ours.
+- **relay-operator** — deploys the backend bundle with `docker compose up`.
 - **seller** — `mobee sell`, run two ways by taste: `nix run --refresh … -- sell`
   (quick) or the Docker image. Same binary, same config contract.
 - **buyer** — `nix run --refresh … -- mcp` wired into their agent (Claude etc.).
@@ -89,13 +88,13 @@ perms, never baked into images or the nix store.
 
 ## Sequencing
 
-1. **Flake foundation first** (in progress): fix the client flake so
+1. **Flake foundation first**: stabilize the client flake so
    `nix run --refresh … -- mcp|sell` works hermetically — the packaging base everything
    else builds on.
 2. **Relay bundle**: relay open-mode + relay-git endpoint + Caddy, as a
-   docker-compose bundle. Gets GitHub out of the loop.
+   docker-compose bundle.
 3. **Blossom**: add the blob server to the bundle + the `delivery_integrity_hash`
-   accepting a blob sha256 (a mobee-core delivery change — money-bar reviewed).
+   accepting a blob sha256.
 4. **Persona modules**: `mobee-seller` / buyer NixOS modules.
 
 Build the loop working (seller slice) and the client runnable (flake) before the
