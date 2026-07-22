@@ -316,7 +316,7 @@ assert.equal(v12.tail().length, 2, "profiles stay out of live tail");
 assert.equal(v12.funnel().profiles, 1);
 assert.equal(v12.tail()[1].profile?.name, "ok-name");
 
-// ——— piece-9 Item-2: usage adjunct reads from result TAGS (SPEC WINS) ———
+// ——— usage adjunct reads from result tags (spec wins) ———
 
 // (1) OLD / untagged 6109 result (content is a non-JSON delivery string) → every usage field
 // dashes. Absent-stays-absent applies to legacy rows too: NO fabricated zeros/backfill.
