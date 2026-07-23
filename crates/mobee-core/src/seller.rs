@@ -153,7 +153,7 @@ pub enum JournalEntry {
         reason: String,
         ts: u64,
     },
-    /// Delivered-but-unpaid (#57): the seller published a result and is awaiting the buyer's payment
+    /// Delivered-but-unpaid: the seller published a result and is awaiting the buyer's payment
     /// wrap. Durable so a restart rebuilds the job into `awaiting_payment` — a backfilled/buffered
     /// wrap can then bind and redeem. A matching `Receipt` supersedes it (paid); a matching
     /// `Release` cancels it. Carries the money-critical fields the redeem path needs.
@@ -194,7 +194,7 @@ pub enum JournalEntry {
 }
 
 /// A delivered-but-unpaid job recovered from the journal at boot, enough to rebuild an
-/// awaiting-payment binding so a stored/buffered wrap can redeem (#57).
+/// awaiting-payment binding so a stored/buffered wrap can redeem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveredUnpaid {
     pub job_id: String,
@@ -239,7 +239,7 @@ pub fn plan_orphaned_claims(entries: &[JournalEntry], now: u64) -> Vec<OrphanCla
         match entry {
             JournalEntry::Receipt { job_id, .. }
             | JournalEntry::Release { job_id, .. }
-            // #57: a delivered job is NOT an orphaned in-flight claim — it published a result and is
+            // A delivered job is NOT an orphaned in-flight claim — it published a result and is
             // awaiting payment (rebuilt into awaiting_payment on boot), so it must never be released.
             | JournalEntry::Delivery { job_id, .. }
             // An in-flight receive (swap initiated) is likewise not an orphaned claim.
@@ -358,8 +358,8 @@ impl SellerJournal {
         )))
     }
 
-    /// Newest `Receipt` timestamp in the journal — the `since` anchor for the boot wrap-backfill
-    /// (#57), so a restart re-fetches stored 1059 payments the live subscription did not replay.
+    /// Newest `Receipt` timestamp in the journal — the `since` anchor for the boot wrap-backfill,
+    /// so a restart re-fetches stored 1059 payments the live subscription did not replay.
     /// `Ok(None)` when there are no receipts yet (or no journal file exists).
     pub fn last_receipt_ts(&self) -> Result<Option<u64>, SellerError> {
         // Fail-closed: any read error propagates (see `entries`). A genuinely-absent journal folds to
@@ -539,7 +539,7 @@ impl SellerJournal {
         }))
     }
 
-    /// Journal a delivered-but-unpaid transition (#57) so a restart can rebuild the awaiting-payment
+    /// Journal a delivered-but-unpaid transition so a restart can rebuild the awaiting-payment
     /// binding and a stored/buffered wrap can redeem. Idempotent-safe to call more than once.
     pub fn append_delivery(
         &self,
@@ -561,7 +561,7 @@ impl SellerJournal {
         })
     }
 
-    /// Delivered-but-unpaid jobs to rebuild into `awaiting_payment` at boot (#57): every `Delivery`
+    /// Delivered-but-unpaid jobs to rebuild into `awaiting_payment` at boot: every `Delivery`
     /// whose `job_id` has no `Receipt` (paid) and no `Release` (cancelled). Deduped by `job_id`
     /// (latest Delivery wins).
     pub fn deliveries_awaiting_receipt(&self) -> Result<Vec<DeliveredUnpaid>, SellerError> {
@@ -956,7 +956,7 @@ offer_backfill_secs = {backfill}
         assert!(raw.contains("amount_received"));
     }
 
-    // #57: last_receipt_ts anchors the boot wrap-backfill `since`. None before any receipt (so
+    // last_receipt_ts anchors the boot wrap-backfill `since`. None before any receipt (so
     // backfill fetches all history), Some(ts) after — never a silent stranding.
     #[test]
     fn last_receipt_ts_none_then_some_after_receipt() {
@@ -1082,7 +1082,7 @@ offer_backfill_secs = {backfill}
         let _ = fs::remove_dir_all(&root);
     }
 
-    // #57: a delivered-but-unpaid job (Claim + Delivery, no Receipt) is NOT an orphaned in-flight
+    // A delivered-but-unpaid job (Claim + Delivery, no Receipt) is NOT an orphaned in-flight
     // claim (never released, even past deadline) AND is recoverable for awaiting_payment rebuild.
     #[test]
     fn delivered_unpaid_is_recoverable_and_not_orphaned() {

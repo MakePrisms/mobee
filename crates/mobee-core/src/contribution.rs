@@ -1,5 +1,4 @@
-//! Piece-10 Step-1 — freelance-PR (contribution) fork path (additive to the from-scratch money
-//! path). See `docs/meta/PIECE-10-FREELANCE-PR-DELIVERY.md`.
+//! Freelance-PR (contribution) fork path, additive to the from-scratch money path.
 //!
 //! A **contribution** job targets a buyer-owned repo (pinned by owner pubkey + clone URL) at an
 //! exact `base_oid`; the seller forks that target, works, and delivers a fork tip that MUST
@@ -37,7 +36,7 @@ pub const TAG_BASE: &str = "base";
 pub const TAG_ACCEPTS: &str = "accepts";
 pub const TAG_FORK_REF: &str = "fork-ref";
 /// `["sig","seller-contribution",<hex>]` — the tuple schnorr signature label. Distinct from the
-/// piece-9 `["sig","seller",..]` receipt cosig so both ride the same result without ambiguity.
+/// `["sig","seller",..]` receipt cosig so both ride the same result without ambiguity.
 pub const SIG_SELLER_CONTRIBUTION: &str = "seller-contribution";
 
 /// A target repo pinned by **owner pubkey + clone URL** — never a bare `d`-tag / name (the relay
@@ -112,11 +111,11 @@ pub struct ContributionBase {
 
 impl ContributionBase {
     /// Validate: branch non-empty (no leading `-` / control bytes), `base_oid` EXACTLY 40 lowercase
-    /// hex chars — a canonical git sha1 commit oid (issue #54).
+    /// hex chars — a canonical git sha1 commit oid.
     ///
     /// Strict and canonical, refusing fail-closed: mobee repos are sha1 (40-hex), so a 64-hex
     /// (sha256) oid can never resolve — accepting one lets a seller claim an offer it can only fail
-    /// at checkout (the #54 bug). Uppercase is refused rather than silently normalized so the oid
+    /// at checkout. Uppercase is refused rather than silently normalized so the oid
     /// published on the wire is byte-identical to what the seller's `rev-parse`/verify produces.
     pub fn new(branch: impl Into<String>, oid: impl Into<String>) -> Result<Self, ContributionError> {
         let branch = branch.into().trim().to_owned();
@@ -591,7 +590,7 @@ mod tests {
         assert!(ContributionBase::new("main", "a".repeat(40)).is_ok());
     }
 
-    // Issue #54: base_oid must be EXACTLY 40 lowercase hex — refuse the malformed shapes that let a
+    // base_oid must be EXACTLY 40 lowercase hex — refuse the malformed shapes that let a
     // seller claim an offer it can only fail at checkout (a 64-hex sha256 oid, a short oid), and
     // refuse uppercase rather than normalizing it (the wire oid must match the seller's rev-parse).
     #[test]

@@ -343,8 +343,8 @@ pub fn preflight_push_probe(
 
 /// Resolve `git-credential-nostr` absolute path (`MOBEE_GIT_CREDENTIAL_NOSTR` override, then PATH).
 ///
-/// Retained for `mobee doctor`'s informational check only — the seller itself no longer needs the
-/// helper (all git legs are in-process libgit2 with NIP-98 signed in this process).
+/// Used by `mobee doctor`'s informational check only — the seller's own git legs are all
+/// in-process libgit2 with NIP-98 signed in this process, so the helper is not required.
 pub fn resolve_git_credential_nostr() -> Option<PathBuf> {
     if let Ok(override_path) = std::env::var("MOBEE_GIT_CREDENTIAL_NOSTR") {
         let path = PathBuf::from(override_path);

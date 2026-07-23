@@ -794,10 +794,11 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
         self.run_delivery_gated(delivery, delivery_verifier, key, terms, authority, effects)
     }
 
-    /// Shared delivery-verify → tip-bind → [`Self::advance`] impl.
+    /// Shared delivery-verify → tip-bind → [`Self::advance`] impl for in-crate unit tests only.
     ///
     /// Private: not a production generic entry. Production callers verify via
     /// [`verify_pay_path_delivery`] (before budget) then call [`Self::run_verified`].
+    #[cfg(test)]
     fn run_delivery_gated<D: DeliveryVerifier, E: PaymentEffects>(
         &self,
         delivery: &GitDelivery,
@@ -930,7 +931,8 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
 /// Verify a pay-path delivery (allowlist + fetch + tip-match) and bind-check the verified commit
 /// against the payment key. The production pay path calls this BEFORE committing any budget, so a
 /// failed or hung verification burns ZERO budget (the invariant the budget-before-wallet-send
-/// ordering must not violate). Mirrors the verify + bind step of [`PaymentService::run_delivery_gated`].
+/// ordering must not violate). Runs the same verify + bind step the pay path performs before
+/// [`PaymentService::run_verified`].
 pub(crate) fn verify_pay_path_delivery(
     delivery_verifier: &mut PayPathDeliveryVerifier,
     delivery: &GitDelivery,

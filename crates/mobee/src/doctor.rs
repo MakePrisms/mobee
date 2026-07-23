@@ -104,8 +104,8 @@ mod checks {
     const AGENT_CHECK: &str = "agent preset";
     const TELEMETRY_CHECK: &str = "telemetry";
 
-    // Informational only (issue #55): the seller signs NIP-98 in-process (libgit2 transport), so the
-    // external `git-credential-nostr` helper is no longer required for delivery push / base fetch.
+    // Informational only: the seller signs NIP-98 in-process (libgit2 transport), so the
+    // external `git-credential-nostr` helper is not required for delivery push / base fetch.
     // We still report whether it resolves (useful for anyone driving raw `git` by hand) but never
     // fail on its absence.
     pub(super) fn check_credential_helper() -> Check {
