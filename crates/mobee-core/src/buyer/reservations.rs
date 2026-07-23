@@ -1,30 +1,53 @@
 //! The buyer's **reservation ledger** — the in-flight commitment half of the buyer's
 //! money accounting, layered on the daemon-owned state DB (`buyer.sqlite`).
 //!
-//! # The available invariant
+//! # The two-ceiling available model
+//!
+//! A reservation must fit under BOTH of two independent ceilings — one physical, one policy — so
+//! `available` is their minimum:
 //!
 //! ```text
-//! available = balance − reserved − spent
+//! available = min( wallet_balance − reserved ,  total_cap − spent − reserved )
+//!                  └─── wallet ceiling ───┘      └──── budget ceiling ─────┘
 //! ```
 //!
-//! - `balance`  — spendable ecash the wallet reports (passed in; the store never opens the wallet).
-//! - `spent`    — the EXISTING budget ledger's spent total (`crate::budget`, folded from
-//!                `spent.jsonl`); this crate is the ONLY spend authority. The reservation ledger
-//!                never adds to `spent` — a `spent`-state row is a *label*, not a second spend.
+//! - `wallet_balance` — spendable ecash the wallet reports RIGHT NOW (passed in; the store never
+//!   opens the wallet). A completed payment has ALREADY melted that ecash, so the live balance
+//!   is net of every completed spend.
+//! - `total_cap` — the policy budget cap ([`crate::budget::BudgetGate::total_cap`]); a spend limit
+//!   independent of how much ecash is on hand.
+//! - `spent` — the EXISTING budget ledger's spent total (`crate::budget`, folded from
+//!   `spent.jsonl`); that crate is the ONLY spend authority. The reservation ledger never adds to
+//!   `spent` — a `spent`-state row is a *label*, not a second spend.
 //! - `reserved` — the sum of reservations still `Reserved` (in-flight). This is the new concept.
 //!
-//! Award **reserves** `max_sats` for a job and is refused if that would push `reserved` past
-//! `available`; a successful collect **converts** the reservation `reserved → spent`; a job that
-//! can no longer be paid has its reservation **released** so the funds become available again.
+//! ## Why the wallet ceiling does NOT subtract `spent`
 //!
-//! # Why `reserved` counts ONLY `Reserved`-state rows (no double-count)
+//! `spent` is cumulative over the buyer's whole life, but `wallet_balance` is a live snapshot that
+//! already dropped by each completed melt. Subtracting `spent` from the wallet balance would
+//! double-count every completed payment — once in the melt the wallet already reflects, and again
+//! in the cumulative `spent` term — progressively refusing awards the buyer can actually afford as
+//! spend history grows. The wallet ceiling is therefore `wallet_balance − reserved` only.
 //!
-//! `reserved` sums rows whose state is [`ReservationState::Reserved`] and NOTHING else. When a
-//! collect converts a reservation to [`ReservationState::Spent`], the amount leaves the `reserved`
-//! term (the row is no longer counted) at the same time the budget ledger's `spent` term takes it
-//! up. The amount is therefore in exactly ONE term at a time — never subtracted twice. A
-//! [`ReservationState::Released`] row is likewise excluded from `reserved`, so a release frees the
-//! funds and a re-release can never free them a second time.
+//! ## Why the budget ceiling DOES subtract both `spent` and `reserved`
+//!
+//! `total_cap` is a fixed number that never moves, so the budget headroom must net out everything
+//! already committed against it: cumulative `spent` plus still-in-flight `reserved`. In-flight
+//! `reserved` therefore consumes BOTH ceilings — the funds are physically committed against the
+//! wallet AND count against the budget until the job resolves.
+//!
+//! The two terms of the budget ceiling never double-count each other because a given amount is in
+//! exactly ONE of `reserved`/`spent` at a time: `reserved` sums rows whose state is
+//! [`ReservationState::Reserved`] and NOTHING else, and a collect that converts a reservation to
+//! [`ReservationState::Spent`] moves the amount out of `reserved` at the same moment the budget
+//! ledger's `spent` takes it up (see [`crate::buyer::store::BuyerStore::convert_to_spent`] for the
+//! ordering obligation that keeps this handoff gapless). A [`ReservationState::Released`] row is
+//! likewise excluded from `reserved`, so a release frees the funds under both ceilings and a
+//! re-release can never free them a second time.
+//!
+//! Award **reserves** `max_sats` for a job and is refused if it exceeds `available`; a successful
+//! collect **converts** the reservation `reserved → spent`; a job that can no longer be paid has
+//! its reservation **released** so the funds become available again under both ceilings.
 //!
 //! # Atomicity
 //!
@@ -79,6 +102,24 @@ impl ReservationState {
     }
 }
 
+/// Which of the two independent ceilings bound `available` at a refusal (the smaller one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ceiling {
+    /// Physical ecash on hand bound it: `wallet_balance − reserved`.
+    Wallet,
+    /// The policy budget cap bound it: `total_cap − spent − reserved`.
+    Budget,
+}
+
+impl Ceiling {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Wallet => "wallet",
+            Self::Budget => "budget",
+        }
+    }
+}
+
 /// Success of a [`reserve`](crate::buyer::store::BuyerStore::reserve): the guard passed and the
 /// row is `Reserved`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,8 +136,13 @@ pub enum Reserved {
 /// ledger byte-for-byte unchanged (ZERO reserve written).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReserveRefused {
-    /// The reservation would push `reserved` past `available` — refused, nothing written.
-    InsufficientAvailable { requested: u64, available: u64 },
+    /// The reservation would exceed `available` — refused, nothing written. `bound` names which of
+    /// the two ceilings (wallet ecash vs budget cap) was the binding one.
+    InsufficientAvailable {
+        requested: u64,
+        available: u64,
+        bound: Ceiling,
+    },
     /// The job already holds a `Reserved` row for a DIFFERENT amount. A job's amount is fixed by
     /// its signed offer, so a divergent re-reserve is a bug, not an idempotent retry — refused.
     AmountMismatch {
@@ -117,10 +163,13 @@ impl std::fmt::Display for ReserveRefused {
             Self::InsufficientAvailable {
                 requested,
                 available,
+                bound,
             } => write!(
                 formatter,
                 "reservation refused: {requested} sat exceeds available {available} sat \
-                 (available = balance − reserved − spent)"
+                 (bound by the {} ceiling; available = min(wallet_balance − reserved, \
+                 total_cap − spent − reserved))",
+                bound.as_str()
             ),
             Self::AmountMismatch {
                 job_id,
@@ -209,17 +258,50 @@ pub struct ReconcileReport {
     pub kept: Vec<String>,
 }
 
-/// Compute `available = balance − reserved − spent`, saturating at 0.
+/// `available` plus which ceiling bound it — the min of the two independent ceilings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AvailableBreakdown {
+    /// `min(wallet_ceiling, budget_ceiling)`, saturated at 0.
+    pub available: u64,
+    /// The binding (smaller) ceiling. Wallet wins ties.
+    pub bound: Ceiling,
+}
+
+/// Compute the two-ceiling `available` and which ceiling bound it.
 ///
-/// Done in `i128` so a `reserved + spent` that exceeds `balance` yields 0 (never a wrapping
-/// underflow that would fabricate a huge available and let an award slip past).
-pub(crate) fn compute_available(balance: u64, reserved: u64, spent: u64) -> u64 {
-    let available = balance as i128 - reserved as i128 - spent as i128;
-    if available < 0 {
-        0
+/// ```text
+/// wallet ceiling = wallet_balance − reserved          (spent NOT subtracted — see module docs)
+/// budget ceiling = total_cap − spent − reserved
+/// available      = min(wallet ceiling, budget ceiling)
+/// ```
+///
+/// Each ceiling is computed in `i128` and saturated at 0, so a `reserved`/`spent` that exceeds its
+/// cap yields 0 rather than a wrapping underflow that would fabricate a huge available and let an
+/// award slip past.
+pub(crate) fn available_breakdown(
+    balance: u64,
+    total_cap: u64,
+    reserved: u64,
+    spent: u64,
+) -> AvailableBreakdown {
+    let wallet_ceiling = (balance as i128 - reserved as i128).max(0) as u64;
+    let budget_ceiling = (total_cap as i128 - spent as i128 - reserved as i128).max(0) as u64;
+    if wallet_ceiling <= budget_ceiling {
+        AvailableBreakdown {
+            available: wallet_ceiling,
+            bound: Ceiling::Wallet,
+        }
     } else {
-        available as u64
+        AvailableBreakdown {
+            available: budget_ceiling,
+            bound: Ceiling::Budget,
+        }
     }
+}
+
+/// `available = min(wallet_balance − reserved, total_cap − spent − reserved)`, saturating at 0.
+pub(crate) fn compute_available(balance: u64, total_cap: u64, reserved: u64, spent: u64) -> u64 {
+    available_breakdown(balance, total_cap, reserved, spent).available
 }
 
 /// A per-job disposition map for [`reconcile`](crate::buyer::store::BuyerStore::reconcile).
