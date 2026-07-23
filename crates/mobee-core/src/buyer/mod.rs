@@ -23,6 +23,7 @@
 pub mod client;
 pub mod lock;
 pub mod protocol;
+pub mod reservations;
 pub mod signer;
 pub mod store;
 pub mod wallet_actor;
