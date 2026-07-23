@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn unsigned_prepay_token_uses_spending_conditions_not_witness_signatures() {
         let seller = public_key(1);
-        let token = token(MINT, vec![proof(7, seller, 7)]);
+        let token = token(MINT, vec![proof(7, seller)]);
         let ys = token_ys(&token).unwrap();
 
         // The proof is deliberately unsigned. Calling Proof::verify_p2pk here
@@ -355,7 +355,7 @@ mod tests {
     fn verify_rejects_wrong_mint_amount_lock_and_spent_state() {
         let seller = public_key(1);
         let other = public_key(2);
-        let token = token(MINT, vec![proof(7, seller, 7)]);
+        let token = token(MINT, vec![proof(7, seller)]);
         let ys = token_ys(&token).unwrap();
         let states = unspent(&ys);
 
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn verify_rejects_equal_numeric_amount_in_wrong_currency_unit() {
         let seller = public_key(1);
-        let token = token_with_unit(MINT, vec![proof(7, seller, 7)], CurrencyUnit::Msat);
+        let token = token_with_unit(MINT, vec![proof(7, seller)], CurrencyUnit::Msat);
         let ys = token_ys(&token).unwrap();
 
         assert!(matches!(
@@ -403,7 +403,7 @@ mod tests {
     fn verify_rejects_mixed_seller_and_other_primary_locks() {
         let seller = public_key(1);
         let other = public_key(2);
-        let token = token(MINT, vec![proof(1, seller, 7), proof(1, other, 8)]);
+        let token = token(MINT, vec![proof(1, seller), proof(1, other)]);
         let ys = token_ys(&token).unwrap();
 
         assert!(matches!(
@@ -417,7 +417,7 @@ mod tests {
         let seller = public_key(1);
         let token = token(
             MINT,
-            vec![proof(1, seller, 7), plain_secret_proof(1, "not-nut10")],
+            vec![proof(1, seller), plain_secret_proof(1, "not-nut10")],
         );
         let ys = token_ys(&token).unwrap();
 
@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn duplicate_secret_and_y_are_rejected_by_native_token_value() {
         let seller = public_key(1);
-        let repeated = proof(1, seller, 7);
+        let repeated = proof(1, seller);
         let token = token(MINT, vec![repeated.clone(), repeated]);
 
         let error = verify_trade_p2pk(&token, &trade_lock(MINT, 2, seller), &[]).unwrap_err();
@@ -447,7 +447,7 @@ mod tests {
         let seller = public_key(1);
         let token = token(
             MINT,
-            vec![proof(u64::MAX - 3, seller, 7), proof(10, seller, 8)],
+            vec![proof(u64::MAX - 3, seller), proof(10, seller)],
         );
 
         let error = verify_trade_p2pk(&token, &trade_lock(MINT, 6, seller), &[]).unwrap_err();
@@ -528,7 +528,7 @@ mod tests {
         // keyset metadata. The connector path accepts no keysets and configures
         // only post_check_state, proving the pre-pay y calculation is
         // secret-only and never calls Token::proofs(&keysets).
-        let token = token(MINT, vec![proof(7, seller, 7)]);
+        let token = token(MINT, vec![proof(7, seller)]);
         assert!(token.proofs(&[]).is_err());
         let ys = vec![token_proofs(&token)[0].y().expect("valid proof secret")];
         let connector = BaseHttpClient::with_transport(
@@ -628,10 +628,9 @@ mod tests {
         MintUrl::from_str(url).expect("valid mint URL")
     }
 
-    // Canonical accepted shape: a single seller pubkey with NO extra conditions. The `_nonce`
-    // param is retained for call-site compatibility but no longer needed for uniqueness — the
-    // NUT-10 secret carries a random nonce, so repeated calls already yield distinct secrets.
-    fn proof(amount: u64, seller: PublicKey, _nonce: u8) -> Proof {
+    // Canonical accepted shape: a single seller pubkey with NO extra conditions. The NUT-10
+    // secret carries a random nonce, so repeated calls already yield distinct secrets.
+    fn proof(amount: u64, seller: PublicKey) -> Proof {
         proof_with_conditions(amount, seller, None)
     }
 
