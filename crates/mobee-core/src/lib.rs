@@ -30,6 +30,12 @@ pub mod kinds;
 pub mod log;
 #[cfg(feature = "wallet")]
 pub mod buyer_fund;
+/// Persistent per-home buyer daemon (exclusive lock, unix-socket RPC, wallet/identity
+/// behind serialized actors, durable state DB). See [`buyer`].
+// NOTE: the wallet/buyer feature-flag structure is under review in issue #133 —
+// do not restructure the flags here (that is #133's job).
+#[cfg(feature = "wallet")]
+pub mod buyer;
 #[cfg(feature = "wallet")]
 pub mod wallet_ops;
 #[cfg(feature = "wallet")]

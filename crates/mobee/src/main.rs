@@ -1,5 +1,6 @@
 mod accept_cli;
 mod agent_presets;
+mod buyer;
 mod cli;
 mod collect_cli;
 mod doctor;
