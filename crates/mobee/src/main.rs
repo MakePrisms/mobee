@@ -1,5 +1,6 @@
 mod agent_presets;
 mod cli;
+mod collect_cli;
 mod doctor;
 mod exec;
 mod mcp;
