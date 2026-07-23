@@ -220,6 +220,10 @@ mod tests {
         ))
     }
 
+    fn claim_draft() -> crate::gateway::EventDraft {
+        crate::gateway::claim_draft(&"e".repeat(64), &"b".repeat(64), &"s".repeat(64), "creqA")
+    }
+
     struct FakePublisher {
         calls: RefCell<Vec<String>>,
     }
@@ -288,7 +292,7 @@ mod tests {
             let node = SellerNode::open(home.clone()).await.expect("open");
             let store = node.store();
             store
-                .claim_and_enqueue(&job, &offer, 3402, "creq", 1000, 9_999, 1)
+                .claim_and_enqueue(&job, &offer, &claim_draft(), 1000, 9_999, 1)
                 .expect("claim");
             let confirmed = drain_once(store, &publisher, 2).await.expect("drain");
             assert_eq!(confirmed.confirmed, 1, "the claim was published pre-crash");
@@ -311,7 +315,7 @@ mod tests {
         // Re-enqueuing the same claim is a dedup no-op; a fresh drain publishes nothing new.
         let replay = node
             .store()
-            .claim_and_enqueue(&job, &offer, 3402, "creq", 1000, 9_999, 6)
+            .claim_and_enqueue(&job, &offer, &claim_draft(), 1000, 9_999, 6)
             .expect("replay claim");
         assert_eq!(replay, store::Claimed::Idempotent);
         let after = drain_once(node.store(), &publisher, 7).await.expect("drain2");

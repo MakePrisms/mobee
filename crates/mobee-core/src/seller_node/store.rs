@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+use crate::gateway::EventDraft;
+
 /// Current on-disk schema version.
 pub const SCHEMA_VERSION: i64 = 1;
 
@@ -111,13 +113,14 @@ pub enum Collected {
     Duplicate,
 }
 
-/// A pending outbox row the publisher must send.
+/// A pending outbox row the publisher must send. `draft` is the FULL event to sign — kind, content,
+/// and every protocol/routing tag (`["v","0"]`, `["t","mobee"]`, the `e`/`p` tags) — so what the
+/// publisher signs is wire-valid by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxItem {
     pub id: i64,
     pub dedup_key: String,
-    pub kind: u16,
-    pub payload: String,
+    pub draft: EventDraft,
     /// The fixed authored-at second: signing with this makes the event id deterministic, so a
     /// re-publish after a crash is idempotent at the relay.
     pub created_at_unix: i64,
@@ -213,15 +216,15 @@ impl SellerStore {
                  amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
                  received_at_unix INTEGER NOT NULL
              );
-             -- The nostr event outbox. `dedup_key` (UNIQUE) makes an enqueue idempotent; the
-             -- publisher drains `pending` rows, signs with the fixed `created_at_unix` (so the
-             -- event id is deterministic and re-publish is relay-idempotent), and marks each
-             -- `confirmed` or `expired`.
+             -- The nostr event outbox. `dedup_key` (UNIQUE) makes an enqueue idempotent; `draft_json`
+             -- is the full serialized EventDraft (kind + content + all protocol/routing tags) so the
+             -- publisher signs a wire-valid event. The publisher drains `pending` rows, signs with
+             -- the fixed `created_at_unix` (so the event id is deterministic and re-publish is
+             -- relay-idempotent), and marks each `confirmed` or `expired`.
              CREATE TABLE IF NOT EXISTS nostr_event_outbox (
                  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
                  dedup_key          TEXT NOT NULL UNIQUE,
-                 kind               INTEGER NOT NULL,
-                 payload            TEXT NOT NULL,
+                 draft_json         TEXT NOT NULL,
                  created_at_unix    INTEGER NOT NULL,
                  state              TEXT NOT NULL CHECK (state IN ('pending','confirmed','expired')),
                  attempts           INTEGER NOT NULL DEFAULT 0,
@@ -286,15 +289,14 @@ impl SellerStore {
     /// the outbox row land, or neither does. Idempotent — a replay for a `job_id` that already has
     /// a claim row changes nothing and re-enqueues nothing.
     ///
-    /// `kind`/`payload`/`created_at_unix` are the claim nostr event to publish; `expires_at_unix`
-    /// bounds how long the publisher retries before giving up.
-    #[allow(clippy::too_many_arguments)]
+    /// `draft` is the full claim nostr event to publish (kind + content + protocol/routing tags);
+    /// `created_at_unix` is its fixed authored-at second; `expires_at_unix` bounds how long the
+    /// publisher retries before giving up.
     pub fn claim_and_enqueue(
         &self,
         job_id: &str,
         offer_id: &str,
-        kind: u16,
-        payload: &str,
+        draft: &EventDraft,
         created_at_unix: i64,
         expires_at_unix: i64,
         now_unix: i64,
@@ -313,8 +315,7 @@ impl SellerStore {
         enqueue_event(
             &tx,
             &format!("claim:{job_id}"),
-            kind,
-            payload,
+            draft,
             created_at_unix,
             expires_at_unix,
             now_unix,
@@ -414,8 +415,7 @@ impl SellerStore {
         &self,
         job_id: &str,
         result_ref: &str,
-        kind: u16,
-        payload: &str,
+        draft: &EventDraft,
         created_at_unix: i64,
         expires_at_unix: i64,
         now_unix: i64,
@@ -445,8 +445,7 @@ impl SellerStore {
         enqueue_event(
             &tx,
             &format!("result:{job_id}"),
-            kind,
-            payload,
+            draft,
             created_at_unix,
             expires_at_unix,
             now_unix,
@@ -503,25 +502,34 @@ impl SellerStore {
     pub fn pending_outbox(&self, now_unix: i64) -> Result<Vec<OutboxItem>, StoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, dedup_key, kind, payload, created_at_unix, attempts, expires_at_unix
+            "SELECT id, dedup_key, draft_json, created_at_unix, attempts, expires_at_unix
              FROM nostr_event_outbox
              WHERE state = 'pending' AND expires_at_unix > ?1
              ORDER BY id",
         )?;
         let rows = stmt.query_map([now_unix], |row| {
-            Ok(OutboxItem {
-                id: row.get(0)?,
-                dedup_key: row.get(1)?,
-                kind: row.get::<_, i64>(2)? as u16,
-                payload: row.get(3)?,
-                created_at_unix: row.get(4)?,
-                attempts: row.get(5)?,
-                expires_at_unix: row.get(6)?,
-            })
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
         })?;
         let mut items = Vec::new();
         for row in rows {
-            items.push(row?);
+            let (id, dedup_key, draft_json, created_at_unix, attempts, expires_at_unix) = row?;
+            let draft: EventDraft = serde_json::from_str(&draft_json)
+                .map_err(|error| StoreError(format!("outbox draft decode: {error}")))?;
+            items.push(OutboxItem {
+                id,
+                dedup_key,
+                draft,
+                created_at_unix,
+                attempts,
+                expires_at_unix,
+            });
         }
         Ok(items)
     }
@@ -671,17 +679,18 @@ impl SellerStore {
 fn enqueue_event(
     tx: &rusqlite::Transaction<'_>,
     dedup_key: &str,
-    kind: u16,
-    payload: &str,
+    draft: &EventDraft,
     created_at_unix: i64,
     expires_at_unix: i64,
     now_unix: i64,
 ) -> Result<(), StoreError> {
+    let draft_json = serde_json::to_string(draft)
+        .map_err(|error| StoreError(format!("outbox draft encode: {error}")))?;
     tx.execute(
         "INSERT OR IGNORE INTO nostr_event_outbox
-             (dedup_key, kind, payload, created_at_unix, state, attempts, expires_at_unix, updated_at_unix)
-         VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6)",
-        params![dedup_key, kind as i64, payload, created_at_unix, expires_at_unix, now_unix],
+             (dedup_key, draft_json, created_at_unix, state, attempts, expires_at_unix, updated_at_unix)
+         VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?5)",
+        params![dedup_key, draft_json, created_at_unix, expires_at_unix, now_unix],
     )?;
     Ok(())
 }
@@ -724,6 +733,7 @@ fn read_meta_i64(conn: &Connection, key: &str) -> Result<Option<i64>, StoreError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway::TagSpec;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -755,6 +765,27 @@ mod tests {
         }
     }
 
+    /// A wire-valid draft carrying the protocol tags every mobee event needs.
+    fn wire_draft(kind: u16) -> EventDraft {
+        use crate::gateway::{MOBEE_TAG, PROTOCOL_VERSION};
+        EventDraft::new(
+            kind,
+            vec![
+                TagSpec::new(["t", MOBEE_TAG]),
+                TagSpec::new(["v", PROTOCOL_VERSION]),
+            ],
+            "content",
+        )
+    }
+
+    fn claim() -> EventDraft {
+        wire_draft(crate::gateway::JOB_CLAIM_KIND)
+    }
+
+    fn result() -> EventDraft {
+        wire_draft(crate::gateway::JOB_RESULT_KIND)
+    }
+
     #[test]
     fn open_is_wal_and_carries_schema_and_start() {
         let (store, path) = fresh_store("wal");
@@ -783,36 +814,48 @@ mod tests {
     }
 
     // TOOTH 2 (charter) — RED ON REVERT for the outbox. `claim_and_enqueue` must write the claim
-    // row AND the outbox row atomically. This asserts the outbox MUTATION LANDED (a pending row with
-    // the expected dedup key, kind, and payload), not merely that no error was returned. Deleting
-    // the `enqueue_event` call in `claim_and_enqueue` leaves the claim row but no outbox row, so the
-    // `is_some()` / kind / payload assertions fail — the revert turns this test red.
+    // row AND the outbox row atomically. This asserts the outbox MUTATION LANDED (a pending row
+    // carrying the full wire-valid draft — right kind AND the `["v","0"]` + `["t","mobee"]` protocol
+    // tags a live buyer requires), not merely that no error was returned. Deleting the
+    // `enqueue_event` call in `claim_and_enqueue` leaves the claim row but no outbox row, so the
+    // length / kind / tag assertions fail — the revert turns this test red.
     #[test]
     fn tooth_outbox_write_lands_atomically_with_the_claim() {
+        use crate::gateway::{JOB_CLAIM_KIND, MOBEE_TAG, PROTOCOL_VERSION};
         let (store, path) = fresh_store("outbox-redonrevert");
         let job = "j".repeat(64);
         let offer = "o".repeat(64);
         assert_eq!(
             store
-                .claim_and_enqueue(&job, &offer, 3402, "creq-payload", 500, 999, 1)
+                .claim_and_enqueue(&job, &offer, &claim(), 500, 999, 1)
                 .expect("claim"),
             Claimed::New
         );
 
-        // The outbox row LANDED — pending, right kind, right payload, not yet published.
+        // The outbox row LANDED — pending, the claim kind, and the protocol tags, not yet published.
         let pending = store.pending_outbox(2).expect("pending");
         assert_eq!(pending.len(), 1, "exactly one pending outbox row must exist");
         let item = &pending[0];
         assert_eq!(item.dedup_key, format!("claim:{job}"));
-        assert_eq!(item.kind, 3402);
-        assert_eq!(item.payload, "creq-payload");
+        assert_eq!(item.draft.kind, JOB_CLAIM_KIND);
         assert_eq!(item.created_at_unix, 500);
         assert_eq!(item.attempts, 0);
+        // The enqueued draft is wire-valid: it carries the version + namespace tags parse_offer/
+        // the buyer require, so a signed event from it is not rejected on the wire.
+        assert!(has_tag(&item.draft, "v", PROTOCOL_VERSION), "draft must carry [\"v\",\"0\"]");
+        assert!(has_tag(&item.draft, "t", MOBEE_TAG), "draft must carry [\"t\",\"mobee\"]");
 
         let row = store.outbox_row(&format!("claim:{job}")).expect("row").expect("exists");
         assert_eq!(row.0, "pending");
         assert!(row.2.is_none(), "not yet published");
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn has_tag(draft: &EventDraft, name: &str, value: &str) -> bool {
+        draft
+            .tags
+            .iter()
+            .any(|tag| tag.first() == Some(name) && tag.value() == Some(value))
     }
 
     #[test]
@@ -821,11 +864,11 @@ mod tests {
         let job = "j".repeat(64);
         let offer = "o".repeat(64);
         assert_eq!(
-            store.claim_and_enqueue(&job, &offer, 3402, "p", 1, 999, 1).expect("first"),
+            store.claim_and_enqueue(&job, &offer, &claim(), 1, 999, 1).expect("first"),
             Claimed::New
         );
         assert_eq!(
-            store.claim_and_enqueue(&job, &offer, 3402, "p", 1, 999, 2).expect("replay"),
+            store.claim_and_enqueue(&job, &offer, &claim(), 1, 999, 2).expect("replay"),
             Claimed::Idempotent
         );
         assert_eq!(store.pending_outbox(3).expect("pending").len(), 1, "no second enqueue");
@@ -839,7 +882,7 @@ mod tests {
         let offer = "o".repeat(64);
         let award = "w".repeat(64);
         let buyer = "b".repeat(64);
-        store.claim_and_enqueue(&job, &offer, 3402, "p", 1, 999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &offer, &claim(), 1, 999, 1).expect("claim");
 
         assert_eq!(
             store.record_award(&award, &job, &buyer, 2).expect("award"),
@@ -871,17 +914,17 @@ mod tests {
         let job = "j".repeat(64);
         let offer = "o".repeat(64);
         let buyer = "b".repeat(64);
-        store.claim_and_enqueue(&job, &offer, 3402, "claim", 1, 999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &offer, &claim(), 1, 999, 1).expect("claim");
         store.record_award(&"w".repeat(64), &job, &buyer, 2).expect("award");
         store.mark_executing(&job, 3).expect("exec");
 
         assert!(store
-            .deliver_and_enqueue(&job, "ref-1", 3403, "result", 4, 999, 5)
+            .deliver_and_enqueue(&job, "ref-1", &result(), 4, 999, 5)
             .expect("deliver"));
         assert_eq!(store.job_state(&job).expect("state"), Some(JobState::Delivered));
         // Replay: no second delivery, no second result enqueue.
         assert!(!store
-            .deliver_and_enqueue(&job, "ref-1", 3403, "result", 4, 999, 6)
+            .deliver_and_enqueue(&job, "ref-1", &result(), 4, 999, 6)
             .expect("replay"));
         assert_eq!(
             store.outbox_row(&format!("result:{job}")).expect("row").expect("exists").0,
@@ -897,7 +940,7 @@ mod tests {
         let job = "j".repeat(64);
         let offer = "o".repeat(64);
         let receipt = "r".repeat(64);
-        store.claim_and_enqueue(&job, &offer, 3402, "p", 1, 999, 1).expect("claim");
+        store.claim_and_enqueue(&job, &offer, &claim(), 1, 999, 1).expect("claim");
         store.record_award(&"w".repeat(64), &job, &"b".repeat(64), 2).expect("award");
 
         assert_eq!(
@@ -917,7 +960,7 @@ mod tests {
     fn expire_outbox_stops_the_publisher_from_sending() {
         let (store, path) = fresh_store("expire");
         let job = "j".repeat(64);
-        store.claim_and_enqueue(&job, &"o".repeat(64), 3402, "p", 1, 100, 1).expect("claim");
+        store.claim_and_enqueue(&job, &"o".repeat(64), &claim(), 1, 100, 1).expect("claim");
         // now=200 is past expires_at=100.
         assert_eq!(store.expire_outbox(200).expect("expire"), 1);
         assert!(store.pending_outbox(200).expect("pending").is_empty());

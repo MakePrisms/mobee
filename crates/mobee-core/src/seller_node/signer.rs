@@ -7,9 +7,10 @@
 //! second it passes makes the resulting event id deterministic, so a re-publish after a crash is
 //! idempotent at the relay.
 
-use nostr_sdk::{EventBuilder, JsonUtil, Keys, Kind, Timestamp};
+use nostr_sdk::{JsonUtil, Keys, Timestamp};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::gateway::{self, EventDraft};
 use crate::home::{self, HomeError, MobeeHome};
 
 /// A signed event, ready to publish.
@@ -23,11 +24,10 @@ enum Command {
     PublicKey {
         reply: oneshot::Sender<String>,
     },
-    /// Sign an event of `kind`/`content` authored at the fixed `created_at` second (deterministic
-    /// id for crash-idempotent re-publish).
+    /// Sign a full event `draft` (kind + content + protocol/routing tags) authored at the fixed
+    /// `created_at` second (deterministic id for crash-idempotent re-publish).
     Sign {
-        kind: u16,
-        content: String,
+        draft: EventDraft,
         created_at: i64,
         reply: oneshot::Sender<Result<SignedEvent, String>>,
     },
@@ -59,19 +59,18 @@ impl SignerHandle {
         &self.public_key_hex
     }
 
-    /// Sign an event through the serialized signer. `created_at` is the fixed authored-at second so
-    /// the event id is deterministic across retries.
+    /// Sign a full event draft through the serialized signer. `created_at` is the fixed authored-at
+    /// second so the event id is deterministic across retries. The draft's tags (version, namespace,
+    /// routing) are applied verbatim, so the signed event is wire-valid.
     pub async fn sign(
         &self,
-        kind: u16,
-        content: String,
+        draft: EventDraft,
         created_at: i64,
     ) -> Result<Result<SignedEvent, String>, SignerActorGone> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Command::Sign {
-                kind,
-                content,
+                draft,
                 created_at,
                 reply,
             })
@@ -108,12 +107,11 @@ pub fn spawn(home: &MobeeHome) -> Result<SignerHandle, HomeError> {
                     let _ = reply.send(keys.public_key().to_hex());
                 }
                 Command::Sign {
-                    kind,
-                    content,
+                    draft,
                     created_at,
                     reply,
                 } => {
-                    let result = sign_event(&keys, kind, &content, created_at);
+                    let result = sign_event(&keys, &draft, created_at);
                     let _ = reply.send(result);
                 }
             }
@@ -126,13 +124,11 @@ pub fn spawn(home: &MobeeHome) -> Result<SignerHandle, HomeError> {
     })
 }
 
-fn sign_event(
-    keys: &Keys,
-    kind: u16,
-    content: &str,
-    created_at: i64,
-) -> Result<SignedEvent, String> {
-    let event = EventBuilder::new(Kind::from(kind), content)
+fn sign_event(keys: &Keys, draft: &EventDraft, created_at: i64) -> Result<SignedEvent, String> {
+    // Reuse the canonical draft→builder conversion so the tags (version, namespace, routing) are
+    // applied exactly as the rest of the protocol builds them — no hand-rolled tag handling.
+    let event = gateway::nostr::event_builder(draft)
+        .map_err(|error| error.to_string())?
         .custom_created_at(Timestamp::from(created_at.max(0) as u64))
         .sign_with_keys(keys)
         .map_err(|error| error.to_string())?;
@@ -175,6 +171,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    fn claim_draft() -> EventDraft {
+        gateway::claim_draft(&"e".repeat(64), &"b".repeat(64), &"s".repeat(64), "creqA-test")
+    }
+
     // The fixed created_at makes the signed event id deterministic — the property the outbox relies
     // on for crash-idempotent re-publish.
     #[tokio::test(flavor = "current_thread")]
@@ -185,10 +185,37 @@ mod tests {
         let secret = home::read_secret_key_hex(&home).expect("secret");
         let signer = spawn(&home).expect("spawn");
 
-        let first = signer.sign(3402, "creq".to_owned(), 1000).await.expect("a").expect("sign");
-        let again = signer.sign(3402, "creq".to_owned(), 1000).await.expect("b").expect("sign");
-        assert_eq!(first.id, again.id, "same content + created_at ⇒ same event id");
+        let first = signer.sign(claim_draft(), 1000).await.expect("a").expect("sign");
+        let again = signer.sign(claim_draft(), 1000).await.expect("b").expect("sign");
+        assert_eq!(first.id, again.id, "same draft + created_at ⇒ same event id");
         assert!(!first.json.contains(&secret), "signed json must not leak the secret");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A signed event carries the protocol tags a live buyer requires (`parse_offer` rejects an event
+    // without `["v","0"]` / `["t","mobee"]`). Proves the outbox→signer path emits wire-valid events.
+    #[tokio::test(flavor = "current_thread")]
+    async fn signed_event_carries_the_protocol_tags() {
+        use crate::gateway::{MOBEE_TAG, PROTOCOL_VERSION};
+        let root = temp_home("wire-valid");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let signer = spawn(&home).expect("spawn");
+
+        let signed = signer.sign(claim_draft(), 1000).await.expect("actor").expect("sign");
+        // The claim_draft carries `["v","0"]` + `["t","mobee"]`; they must survive into the signed
+        // event's tags array (rendered in its JSON).
+        let value: serde_json::Value = serde_json::from_str(&signed.json).expect("event json");
+        let tags = value["tags"].as_array().expect("tags array");
+        let has = |name: &str, val: &str| {
+            tags.iter().any(|tag| {
+                tag.as_array()
+                    .and_then(|parts| Some((parts.first()?.as_str()?, parts.get(1)?.as_str()?)))
+                    == Some((name, val))
+            })
+        };
+        assert!(has("v", PROTOCOL_VERSION), "signed event must carry [\"v\",\"0\"]: {}", signed.json);
+        assert!(has("t", MOBEE_TAG), "signed event must carry [\"t\",\"mobee\"]: {}", signed.json);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
