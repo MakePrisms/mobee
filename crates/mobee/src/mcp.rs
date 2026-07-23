@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use mobee_core::authorize_pay::{self, AuthorizePayRequest};
 use mobee_core::budget::BudgetGate;
+#[cfg(feature = "wallet")]
+use mobee_core::collect;
 use mobee_core::home::{self, MobeeHome};
 #[cfg(feature = "wallet")]
 use mobee_core::job_lifecycle::{
@@ -270,6 +272,19 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "collect",
+            "description": "Single-call buyer collect for an accepted job: verify the delivery integrity (the delivered branch must tip at the accepted commit — the same PayPathDeliveryVerifier tip-match authorize_pay runs), auto-pay the seller through the sealed money path (BudgetGate → PaymentService::run, single-redeem + mint-compat intact), then materialize the paid files into <home>/results/<job_id>. Requires a prior accept_claim bind. On integrity mismatch: refuses and does NOT pay. Idempotent: re-collecting an already-paid job re-materializes the files without a second payment. Returns {amount_sats, attempt_id, spent_total_sats, remaining_sats, state, commit, path, files}. Never echoes secrets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "Offer event id (hex) with a prior accept_claim bind" },
+                    "out": { "type": "string", "description": "Optional folder NAME (no path separators) under <home>/results" }
+                },
+                "required": ["job_id"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "award_claim",
             "description": "Award a seller claim BEFORE work: publish the buyer AWARD (kind-3405, status=accepted) selecting one claim so that seller executes and every other claimant releases without spending compute. Verifies the claim is present, still processing, and (for a targeted offer) authored by the targeted seller. Returns quoted_mints — the mints the claim's creq will be paid at — so an incompatible award is visible before you commit. No pay-bind — settle after delivery with accept_claim. Never echoes secrets.",
             "inputSchema": {
@@ -480,6 +495,17 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
             {
                 let _ = arguments;
                 Err("get_result requires the wallet feature".into())
+            }
+        }
+        "collect" => {
+            #[cfg(feature = "wallet")]
+            {
+                collect_tool_async(state, &arguments).await
+            }
+            #[cfg(not(feature = "wallet"))]
+            {
+                let _ = arguments;
+                Err("collect requires the wallet feature".into())
             }
         }
         "award_claim" => award_claim_tool_async(state, &arguments).await,
@@ -1055,7 +1081,7 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
     // in the buyer store under refs/mobee/deliveries/<oid>; capture the locator before `request`
     // moves into the pay call.
     let paid_commit = request.commit_oid.clone();
-    let store_path = delivery_store_path(&state.home).display().to_string();
+    let store_path = state.home.root.join("store").display().to_string();
     let store_ref = mobee_core::delivery_git::PayPathDeliveryVerifier::store_ref_for(&paid_commit);
 
     let mut gate = state
@@ -1085,15 +1111,12 @@ async fn authorize_pay_tool_async(state: &McpState, arguments: &Value) -> Result
     Ok(tool_ok(body))
 }
 
-/// The buyer store: the local bare repository the pay path retains verified delivery objects in.
-/// Mirrors the path `authorize_pay` opens the [`PayPathDeliveryVerifier`] against.
-fn delivery_store_path(home: &MobeeHome) -> std::path::PathBuf {
-    home.root.join("store")
-}
-
 /// #98: materialize a PAID delivery's files. The accepted job's delivered commit is retained in the
 /// buyer store (during authorize_pay); this checks it out READ-ONLY into a folder under
 /// `<home>/results` so the buyer can find the result on disk. No network, no auth, no spend gate.
+///
+/// Lower-level primitive: the [`collect`](collect_tool_async) tool folds verify + pay + this
+/// materialize into one call. Kept standalone to re-materialize an already-paid delivery.
 #[cfg(feature = "wallet")]
 async fn get_result_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
     let job_id = arguments
@@ -1111,28 +1134,12 @@ async fn get_result_tool_async(state: &McpState, arguments: &Value) -> Result<Va
         })?;
     let commit_oid = bind.commit_oid.clone();
 
-    // Output folder: a simple name under <home>/results (default = the job id). Reject path
-    // separators / traversal so a caller can never write outside the results directory.
-    let dest = match arguments.get("out").and_then(Value::as_str) {
-        Some(name) => {
-            if name.is_empty()
-                || name.contains('/')
-                || name.contains('\\')
-                || name.contains("..")
-            {
-                return Err(
-                    "get_result 'out' must be a simple folder name (no path separators or '..')"
-                        .into(),
-                );
-            }
-            state.home.root.join("results").join(name)
-        }
-        None => state.home.root.join("results").join(&job_id),
-    };
-
-    let store = delivery_store_path(&state.home);
+    // Output folder: a simple name under <home>/results (default = the job id). Traversal is
+    // refused so a caller can never write outside the results directory.
+    let dest = collect::results_dest(&state.home, &job_id, arguments.get("out").and_then(Value::as_str))?;
+    let store = collect::delivery_store_path(&state.home);
     let store_ref = mobee_core::delivery_git::PayPathDeliveryVerifier::store_ref_for(&commit_oid);
-    let files = materialize_delivery(&store, &store_ref, &commit_oid, &dest)?;
+    let files = collect::materialize_delivery(&store, &store_ref, &commit_oid, &dest)?;
 
     Ok(tool_ok(json!({
         "job_id": job_id,
@@ -1142,74 +1149,46 @@ async fn get_result_tool_async(state: &McpState, arguments: &Value) -> Result<Va
     })))
 }
 
-/// Check out the tree of `commit_oid` from the buyer store (bare repo) into `dest`, writing each
-/// blob to its path and returning the sorted relative file list. Fail-closed: any read/write error
-/// aborts (never a partial-but-reported materialization). Resolves the retention ref first, then the
-/// raw oid as a fallback.
+/// Single-call buyer collect: verify integrity + pay + materialize, composing the sealed
+/// [`mobee_core::collect::collect_async`] money path. See the tool description for semantics.
 #[cfg(feature = "wallet")]
-fn materialize_delivery(
-    store: &std::path::Path,
-    store_ref: &str,
-    commit_oid: &str,
-    dest: &std::path::Path,
-) -> Result<Vec<String>, String> {
-    let repo = git2::Repository::open_bare(store)
-        .map_err(|error| format!("open buyer store {}: {error}", store.display()))?;
-    let commit = repo
-        .revparse_single(store_ref)
-        .or_else(|_| repo.revparse_single(commit_oid))
-        .map_err(|error| {
-            format!("delivery {commit_oid} not found in buyer store (ref {store_ref}): {error}")
-        })?
-        .peel_to_commit()
-        .map_err(|error| error.to_string())?;
-    let tree = commit.tree().map_err(|error| error.to_string())?;
+async fn collect_tool_async(state: &McpState, arguments: &Value) -> Result<Value, String> {
+    let job_id = arguments
+        .get("job_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "collect requires job_id".to_owned())?
+        .to_owned();
+    let out = arguments
+        .get("out")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
 
-    std::fs::create_dir_all(dest).map_err(|error| error.to_string())?;
-    let mut files: Vec<String> = Vec::new();
-    let mut walk_err: Option<String> = None;
-    tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-        if entry.kind() != Some(git2::ObjectType::Blob) {
-            return git2::TreeWalkResult::Ok;
-        }
-        let name = match entry.name() {
-            Some(name) => name,
-            None => {
-                walk_err = Some("non-UTF-8 tree entry name".into());
-                return git2::TreeWalkResult::Abort;
-            }
-        };
-        let rel = format!("{root}{name}");
-        let object = match entry.to_object(&repo) {
-            Ok(object) => object,
-            Err(error) => {
-                walk_err = Some(error.to_string());
-                return git2::TreeWalkResult::Abort;
-            }
-        };
-        let Some(blob) = object.as_blob() else {
-            return git2::TreeWalkResult::Ok;
-        };
-        let path = dest.join(&rel);
-        if let Some(parent) = path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                walk_err = Some(error.to_string());
-                return git2::TreeWalkResult::Abort;
-            }
-        }
-        if let Err(error) = std::fs::write(&path, blob.content()) {
-            walk_err = Some(error.to_string());
-            return git2::TreeWalkResult::Abort;
-        }
-        files.push(rel);
-        git2::TreeWalkResult::Ok
-    })
+    let mut gate = state
+        .gate
+        .lock()
+        .map_err(|_| "budget gate lock poisoned".to_owned())?;
+    let outcome = collect::collect_async(
+        &state.home,
+        &mut gate,
+        collect::CollectRequest { job_id, out },
+    )
+    .await
     .map_err(|error| error.to_string())?;
-    if let Some(error) = walk_err {
-        return Err(format!("get_result materialize failed: {error}"));
-    }
-    files.sort();
-    Ok(files)
+
+    let body = json!({
+        "ok": true,
+        "amount_sats": outcome.pay.amount_sats,
+        "attempt_id": outcome.pay.attempt_id,
+        "spent_total_sats": outcome.pay.spent_total_sats,
+        "remaining_sats": outcome.pay.remaining_sats,
+        "per_job_cap_sats": gate.per_job_cap(),
+        "total_cap_sats": gate.total_cap(),
+        "state": outcome.pay.state,
+        "commit": outcome.commit_oid,
+        "path": outcome.path,
+        "files": outcome.files,
+    });
+    Ok(tool_ok(body))
 }
 
 /// GAP-1: re-derive a paid job's OFFER `job-class` from the relay, reusing the job-view machinery
@@ -1805,6 +1784,8 @@ mod tests {
                 "post_job",
                 "get_job",
                 "get_result",
+                "collect",
+                "award_claim",
                 "accept_claim",
                 "stub_pay",
                 "authorize_pay",

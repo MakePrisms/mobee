@@ -2,6 +2,8 @@ pub mod announce;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 pub mod authorize_pay;
 pub mod budget;
+#[cfg(feature = "wallet")]
+pub mod collect;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 pub mod job_lifecycle;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
