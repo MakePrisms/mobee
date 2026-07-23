@@ -30,6 +30,10 @@ pub mod kinds;
 pub mod log;
 #[cfg(feature = "wallet")]
 pub mod buyer_fund;
+/// Persistent per-home node daemon (exclusive lock, unix-socket RPC, wallet/identity
+/// behind serialized actors, durable state DB). See [`node`].
+#[cfg(feature = "wallet")]
+pub mod node;
 #[cfg(feature = "wallet")]
 pub mod wallet_ops;
 #[cfg(feature = "wallet")]
