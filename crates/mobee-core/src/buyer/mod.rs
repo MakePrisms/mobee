@@ -21,6 +21,7 @@
 //! in-process concurrency boundary, mirroring the home lock across processes.
 
 pub mod client;
+pub mod lifecycle;
 pub mod lock;
 pub mod protocol;
 pub mod reservations;
@@ -28,21 +29,37 @@ pub mod signer;
 pub mod store;
 pub mod wallet_actor;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Mutex;
 
+use crate::budget::BudgetGate;
 use crate::buyer_fund::{self, FundError};
-use crate::home::{HomeError, MobeeHome};
+use crate::collect::{self, CollectRequest};
+use crate::home::{self, HomeError, MobeeHome};
+use crate::job_lifecycle::{
+    self, AwardClaimRequest, GetJobRequest, JobKind, PostJobRequest, WaitFor,
+};
+use crate::payment::{PaymentMachine, PaymentRecord, PaymentState};
+use lifecycle::{AwardError, AwardFilters, PaymentProgress, SettleError};
 use lock::{HomeLock, LockError};
 use protocol::{CODE_INTERNAL, CODE_METHOD_NOT_FOUND, CODE_NOT_IMPLEMENTED, Request, Response};
+use reservations::Dispositions;
 use signer::SignerHandle;
 use store::{BuyerStore, StoreError};
 use wallet_actor::WalletHandle;
+
+/// A recognized trade method was refused by its money guard (reservation refused, budget refused).
+pub const CODE_REFUSED: i64 = -32002;
+/// Timeout for the daemon's relay fetches (job view / auto-award selection / reconcile liveness).
+const RELAY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Lock file leaf under the home.
 pub const LOCK_FILE: &str = "buyer.lock";
@@ -103,6 +120,10 @@ struct BuyerContext {
     wallet: WalletHandle,
     signer: SignerHandle,
     started_at_unix: i64,
+    /// Serializes the money-state-mutating RPCs (`award` reserves, `collect` flips) so a
+    /// reservation's balance/spent snapshot is never read while a concurrent collect is melting.
+    /// The wallet actor's balance reads run independently (reads never race a serialized send).
+    money_lock: Mutex<()>,
 }
 
 fn now_unix() -> i64 {
@@ -139,6 +160,7 @@ async fn bootstrap(home: MobeeHome) -> Result<(HomeLock, Arc<BuyerContext>, Path
         wallet,
         signer,
         started_at_unix,
+        money_lock: Mutex::new(()),
     });
     Ok((lock, context, socket_path))
 }
@@ -164,6 +186,14 @@ fn bind_socket(path: &std::path::Path) -> Result<UnixListener, BuyerError> {
 pub async fn run(home: MobeeHome) -> Result<(), BuyerError> {
     // `_lock` is held for the whole run; dropping it releases the OS lock.
     let (_lock, context, socket_path) = bootstrap(home).await?;
+    // Reconcile the reservation ledger against relay + journal truth before serving: a reservation
+    // orphaned by a prior crash (dead job → release, paid job → spent) is resolved here, so the
+    // daemon starts from a converged ledger. A failure is logged, not fatal — an unreachable relay
+    // must not keep the daemon from coming up (the stale reservation is conservative until the next
+    // reconcile).
+    if let Err(error) = reconcile_on_start(&context).await {
+        eprintln!("buyer: reconcile-on-start did not complete ({error}); serving with the ledger as-is");
+    }
     let listener = bind_socket(&socket_path)?;
     accept_loop(listener, context).await
 }
@@ -215,15 +245,396 @@ async fn dispatch(context: &BuyerContext, request: Request) -> Response {
     let id = request.id.clone();
     match request.method.as_str() {
         "status" | "health" => status(context, id).await,
-        "post_job" | "get_job" | "accept_claim" | "authorize_pay" => Response::err(
+        "post_job" => post_job(context, id, request.params).await,
+        "get_job" => get_job(context, id, request.params).await,
+        "award" => award(context, id, request.params).await,
+        "collect" => collect(context, id, request.params).await,
+        "accept_claim" | "authorize_pay" => Response::err(
             id,
             CODE_NOT_IMPLEMENTED,
             format!(
-                "{} is deferred to a later phase; step 1 ships the daemon shell (lock, socket, wallet/identity actors, state DB) only",
+                "{} is folded into collect (accept-if-needed + pay); call collect",
                 request.method
             ),
         ),
         other => Response::err(id, CODE_METHOD_NOT_FOUND, format!("unknown method: {other}")),
+    }
+}
+
+/// Params for the `post_job` RPC — a from-scratch offer's fields (the daemon's default flow;
+/// contribution offers stay on the CLI/MCP path). `job_id` returned is the offer event id.
+#[derive(Debug, Deserialize)]
+struct PostJobParams {
+    task: String,
+    output: String,
+    amount_sats: u64,
+    #[serde(default)]
+    seller_pubkey: Option<String>,
+    #[serde(default)]
+    untargeted: bool,
+    #[serde(default)]
+    deadline_unix: Option<u64>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+/// Publish a from-scratch offer (reuses [`job_lifecycle::post_job_async`], the same money-checked
+/// post path the CLI/MCP use). No reservation is taken at post — funds are reserved at award.
+async fn post_job(context: &BuyerContext, id: Value, params: Value) -> Response {
+    let params: PostJobParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("post_job params: {error}")),
+    };
+    let request = PostJobRequest {
+        task: params.task,
+        output: params.output,
+        amount_sats: params.amount_sats,
+        seller_pubkey: params.seller_pubkey,
+        untargeted: params.untargeted,
+        deadline_unix: params.deadline_unix,
+        repo: params.repo,
+        branch: params.branch,
+        job: JobKind::FromScratch,
+    };
+    match job_lifecycle::post_job_async(&context.home, request).await {
+        Ok(outcome) => Response::ok(id, json!(outcome)),
+        Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
+    }
+}
+
+/// Params for the `get_job` RPC — the reconcile/pull primitive (#127): read one job's relay view,
+/// optionally long-polling for a claim/result.
+#[derive(Debug, Deserialize)]
+struct GetJobParams {
+    job_id: String,
+    #[serde(default)]
+    wait_for: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
+    let params: GetJobParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("get_job params: {error}")),
+    };
+    let wait_for = match params.wait_for.as_deref().map(WaitFor::parse).transpose() {
+        Ok(wait_for) => wait_for,
+        Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, error.to_string()),
+    };
+    let request = GetJobRequest {
+        job_id: params.job_id,
+        wait_for,
+        timeout_secs: params.timeout_secs,
+    };
+    match job_lifecycle::get_job_async(&context.home, request).await {
+        Ok(view) => Response::ok(id, json!(view)),
+        Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
+    }
+}
+
+/// Params for the `award` RPC. `claim_id` present ⇒ MANUAL award of that claim (the fine-grain
+/// flag from #126); absent ⇒ AUTO-award the first claim passing the hard filters. `max_sats`
+/// caps the price the buyer will commit to (defaults to the offer amount).
+#[derive(Debug, Deserialize)]
+struct AwardParams {
+    job_id: String,
+    #[serde(default)]
+    claim_id: Option<String>,
+    #[serde(default)]
+    max_sats: Option<u64>,
+}
+
+/// Award a claim, reserving its funds FIRST. Reserve refusal ⇒ no award is published and no row is
+/// written (the #126 mandatory guard). Snapshots are honest: live wallet balance, budget cap, and
+/// budget spent total.
+async fn award(context: &BuyerContext, id: Value, params: Value) -> Response {
+    let params: AwardParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("award params: {error}")),
+    };
+    let keys = match buyer_keys(&context.home) {
+        Ok(keys) => keys,
+        Err(error) => return Response::err(id, CODE_INTERNAL, error),
+    };
+
+    // Serialize with collect: the reserve below reads a balance/spent snapshot that must not race a
+    // concurrent melt.
+    let _guard = context.money_lock.lock().await;
+
+    let view = match job_lifecycle::fetch_job_view_async(
+        &context.home,
+        &keys,
+        &params.job_id,
+        RELAY_TIMEOUT,
+        now_unix() as u64,
+    )
+    .await
+    {
+        Ok(view) => view,
+        Err(error) => return Response::err(id, CODE_INTERNAL, error.to_string()),
+    };
+    let Some(offer) = view.offer.as_ref() else {
+        return Response::err(id, CODE_INTERNAL, format!("no offer on the relay for job {}", params.job_id));
+    };
+    let offer_amount = offer.amount_sats;
+    let max_sats = params.max_sats.unwrap_or(offer_amount);
+
+    // Manual award names the claim; auto-award selects the first payable one.
+    let claim_id = match params.claim_id {
+        Some(claim_id) => claim_id,
+        None => {
+            let filters = AwardFilters {
+                offer_amount_sats: offer_amount,
+                max_sats,
+                buyer_mint: context.home.config.default_mint(),
+                allow_real_mints: context.home.config.allow_real_mints,
+            };
+            match lifecycle::select_awardable_claim(&view, &filters) {
+                Some(claim_id) => claim_id,
+                None => {
+                    return Response::err(
+                        id,
+                        CODE_REFUSED,
+                        format!("no awardable claim for job {} (none live/payable/mint-compatible)", params.job_id),
+                    );
+                }
+            }
+        }
+    };
+
+    let (balance, total_cap, spent) = match money_snapshot(context).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return Response::err(id, CODE_INTERNAL, error),
+    };
+
+    let job_id = params.job_id.clone();
+    let home = context.home.clone();
+    let publish_claim = claim_id.clone();
+    let result = lifecycle::award_with_reservation(
+        &context.store,
+        &params.job_id,
+        offer_amount,
+        balance,
+        total_cap,
+        spent,
+        now_unix(),
+        move || async move {
+            job_lifecycle::award_claim_async(
+                &home,
+                AwardClaimRequest { job_id, claim_id: publish_claim },
+            )
+            .await
+        },
+    )
+    .await;
+
+    match result {
+        Ok(outcome) => Response::ok(
+            id,
+            json!({
+                "awarded": outcome,
+                "reserved_sats": offer_amount,
+                "reserved_for": params.job_id,
+            }),
+        ),
+        Err(AwardError::Reserve(refused)) => Response::err(id, CODE_REFUSED, refused.to_string()),
+        Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
+    }
+}
+
+/// Params for the `collect` RPC.
+#[derive(Debug, Deserialize)]
+struct CollectParams {
+    job_id: String,
+    #[serde(default)]
+    out: Option<String>,
+}
+
+/// Collect a delivered job: run the sealed pay path ([`collect::collect_async`] — accept-if-needed,
+/// verify integrity, budget-append + wallet melt, materialize) and, ONLY after it succeeds, flip
+/// the reservation `reserved → spent` via [`lifecycle::settle_after_pay`]. The flip is never
+/// reached on a pay refusal, so a failed pay never over-states `available`.
+async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
+    let params: CollectParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("collect params: {error}")),
+    };
+
+    // Serialize with award + other collects: at most one wallet-melting op in flight daemon-wide.
+    let _guard = context.money_lock.lock().await;
+
+    let mut gate = match BudgetGate::from_home(&context.home) {
+        Ok(gate) => gate,
+        Err(error) => return Response::err(id, CODE_INTERNAL, error.to_string()),
+    };
+    let request = CollectRequest {
+        job_id: params.job_id.clone(),
+        out: params.out,
+    };
+
+    // Pay FIRST (append + melt), flip AFTER — the #123/#126 ordering, via the tested seam.
+    let settled = lifecycle::settle_after_pay(
+        &context.store,
+        &params.job_id,
+        now_unix(),
+        || collect::collect_async(&context.home, &mut gate, request),
+        |outcome| outcome.pay.amount_sats,
+    )
+    .await;
+
+    match settled {
+        Ok((outcome, _converted)) => Response::ok(
+            id,
+            json!({
+                "pay": {
+                    "state": format!("{:?}", outcome.pay.state),
+                    "attempt_id": outcome.pay.attempt_id,
+                    "amount_sats": outcome.pay.amount_sats,
+                    "spent_total_sats": outcome.pay.spent_total_sats,
+                    "remaining_sats": outcome.pay.remaining_sats,
+                },
+                "commit_oid": outcome.commit_oid,
+                "path": outcome.path,
+                "files": outcome.files,
+            }),
+        ),
+        Err(SettleError::Pay(error)) => Response::err(id, CODE_REFUSED, error.to_string()),
+        Err(SettleError::Store(error)) => Response::err(id, CODE_INTERNAL, error.to_string()),
+    }
+}
+
+/// Honest reserve snapshot: the live wallet balance (through the actor), the budget cap, and the
+/// budget spent total (fresh fold). Never a sentinel or a stale cached value.
+async fn money_snapshot(context: &BuyerContext) -> Result<(u64, u64, u64), String> {
+    let balance = context
+        .wallet
+        .balance()
+        .await
+        .map_err(|error| error.to_string())??;
+    let gate = BudgetGate::from_home(&context.home).map_err(|error| error.to_string())?;
+    Ok((balance, gate.total_cap(), gate.spent()))
+}
+
+/// The buyer nostr identity, parsed from the home secret (the same source the signer actor loads).
+fn buyer_keys(home: &MobeeHome) -> Result<nostr_sdk::Keys, String> {
+    let secret = home::read_secret_key_hex(home).map_err(|error| error.to_string())?;
+    nostr_sdk::Keys::parse(&secret).map_err(|error| format!("buyer key parse: {error}"))
+}
+
+/// Reconcile every still-`Reserved` job against relay + payment-journal truth: a job the relay no
+/// longer shows payable (and that has left no funds) is released; a job whose payment journal shows
+/// a `Closed` attempt is converted to `spent`; an ambiguous (Sent-not-Closed) payment is KEPT (the
+/// phase-3 saga owns it). Pure classification is [`lifecycle::classify_disposition`]; this gathers
+/// its inputs and applies the batch through [`BuyerStore::reconcile`].
+async fn reconcile_on_start(context: &BuyerContext) -> Result<(), String> {
+    let reserved = context
+        .store
+        .reserved_job_ids()
+        .map_err(|error| error.to_string())?;
+    if reserved.is_empty() {
+        return Ok(());
+    }
+    let keys = buyer_keys(&context.home)?;
+    let progress = scan_payment_progress(&context.home);
+
+    let mut dispositions: Dispositions = BTreeMap::new();
+    for job_id in reserved {
+        let payment = progress.get(&job_id).copied().unwrap_or(PaymentProgress::None);
+        // Relay liveness: is a claim still live/deliverable for this job? An unreachable relay is
+        // treated as still-payable (conservative — never release a reservation we cannot verify is
+        // dead). A Closed/Uncertain payment ignores liveness in the classifier anyway.
+        let claim_payable = match job_lifecycle::fetch_job_view_async(
+            &context.home,
+            &keys,
+            &job_id,
+            RELAY_TIMEOUT,
+            now_unix() as u64,
+        )
+        .await
+        {
+            Ok(view) => view.live_claim_id.is_some(),
+            Err(_) => true,
+        };
+        dispositions.insert(job_id, lifecycle::classify_disposition(payment, claim_payable));
+    }
+
+    context
+        .store
+        .reconcile(&dispositions, now_unix())
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Fold every payment-journal attempt under the home into a `job_id → progress` map. Each record
+/// carries its [`crate::payment::PaymentKey`] (hence its `job_id`), so no attempt-id recomputation
+/// is needed. A journal that cannot be read/folded is treated as `Uncertain` (kept, never
+/// released) — reconcile must fail safe, never free funds on ambiguous evidence.
+fn scan_payment_progress(home: &MobeeHome) -> BTreeMap<String, PaymentProgress> {
+    let mut progress: BTreeMap<String, PaymentProgress> = BTreeMap::new();
+    let dir = home.root.join("payment-journal");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return progress; // no journal yet ⇒ no payments
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let records: Result<Vec<PaymentRecord>, _> = contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(serde_json::from_str::<PaymentRecord>)
+            .collect();
+        let Ok(records) = records else { continue };
+        let Some(first) = records.first() else { continue };
+        let job_id = first.key.job_id.as_str().to_owned();
+        let folded = match PaymentMachine::fold(&first.key, &records) {
+            Ok(state) => progress_from_state(state.as_ref()),
+            // A journal that will not fold is ambiguous — keep the reservation, never release it.
+            Err(_) => PaymentProgress::Uncertain,
+        };
+        // If two journals map to one job (retries under distinct attempt ids), the more-advanced
+        // progress wins so a Closed attempt is never masked by an earlier Intent.
+        let merged = merge_progress(progress.get(&job_id).copied(), folded);
+        progress.insert(job_id, merged);
+    }
+    progress
+}
+
+/// Map a folded payment state to reconcile progress. `Closed` ⇒ funds+receipt durable;
+/// `Sent`/`ReceiptPublished` ⇒ ambiguous (funds may have left); `Intent`/`Locked`/none ⇒ no funds
+/// left yet.
+fn progress_from_state(state: Option<&PaymentState>) -> PaymentProgress {
+    match state {
+        Some(PaymentState::Closed { .. }) => PaymentProgress::Closed,
+        Some(PaymentState::Sent { .. }) | Some(PaymentState::ReceiptPublished { .. }) => {
+            PaymentProgress::Uncertain
+        }
+        Some(PaymentState::Intent { .. }) | Some(PaymentState::Locked { .. }) | None => {
+            PaymentProgress::None
+        }
+    }
+}
+
+/// The more-advanced of two progresses (`Closed` > `Uncertain` > `None`) — a job with any Closed
+/// attempt is Paid regardless of an earlier abandoned attempt.
+fn merge_progress(existing: Option<PaymentProgress>, next: PaymentProgress) -> PaymentProgress {
+    fn rank(progress: PaymentProgress) -> u8 {
+        match progress {
+            PaymentProgress::None => 0,
+            PaymentProgress::Uncertain => 1,
+            PaymentProgress::Closed => 2,
+        }
+    }
+    match existing {
+        Some(existing) if rank(existing) >= rank(next) => existing,
+        _ => next,
     }
 }
 
@@ -305,15 +716,18 @@ mod tests {
         // The socket surface must never leak the secret key.
         assert!(!response_contains(&result, &secret), "status must not echo the secret key");
 
-        // A deferred trade method is recognized but not implemented in step 1.
+        // A recognized-but-folded trade method (accept_claim is folded into collect) returns a
+        // structured NOT_IMPLEMENTED error, never a silent success. The live trade methods
+        // (post_job/get_job/award/collect) are exercised end to end elsewhere; this only asserts
+        // the daemon still answers a recognized-but-unrouted method with a structured error.
         let sock = socket_path.clone();
         let deferred = tokio::task::spawn_blocking(move || {
-            client::call(&sock, "post_job", json!({}))
+            client::call(&sock, "accept_claim", json!({}))
         })
         .await
         .expect("join")
         .expect("call");
-        let error = deferred.error.expect("post_job must be a structured error in step 1");
+        let error = deferred.error.expect("accept_claim must be a structured error");
         assert_eq!(error.code, CODE_NOT_IMPLEMENTED);
 
         // Socket is user-only (0600).
