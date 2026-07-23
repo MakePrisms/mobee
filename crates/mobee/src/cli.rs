@@ -31,9 +31,12 @@ where
         }
         Some("mcp") if args.len() == 2 => crate::mcp::run(out, err),
         Some("sell") => crate::sell::run(&args[2..], out, err),
+        Some("accept") => crate::accept_cli::run(&args[2..], out, err),
         Some("collect") => crate::collect_cli::run(&args[2..], out, err),
         Some("doctor") => crate::doctor::run(&args[2..], out, err),
         Some("wallet") => crate::wallet_cli::run(&args[2..], out, err),
+        Some("profile") => crate::profile_cli::run(&args[2..], out, err),
+        Some("stub-pay") => crate::stub_pay_cli::run(&args[2..], out, err),
         Some("log") => run_log(&args[2..], out, err),
         Some("mock") => run_mock(&args[2..], out, err),
         Some("run") => run_agent(&args[2..], out, err),
@@ -249,7 +252,7 @@ fn write_json_line<T: Serialize + ?Sized>(out: &mut dyn Write, value: &T) -> std
 fn usage(err: &mut dyn Write) -> i32 {
     let _ = writeln!(
         err,
-        "Usage:\n  mobee version\n  mobee mcp\n  mobee doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  mobee wallet <balance|mint|send|receive|melt|invoice|mints> ...\n  mobee sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool]\n  mobee sell   # zero-prompt relaunch from config.toml\n  mobee collect <job_id> [--out <folder>]   # buyer: verify + pay + materialize an accepted delivery\n  mobee log replay <path>\n  mobee mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  mobee run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
+        "Usage:\n  mobee version\n  mobee mcp\n  mobee doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  mobee wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  mobee profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  mobee stub-pay <amount_sats>   # exercise the config-bound budget gate\n  mobee sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool]\n  mobee sell   # zero-prompt relaunch from config.toml\n  mobee accept <job_id> <claim_id> [--result-id <id>]   # buyer: bind a delivered result (collect folds this in)\n  mobee collect <job_id> [--out <folder>]   # buyer: accept-if-needed + verify + pay + materialize\n  mobee log replay <path>\n  mobee mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  mobee run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
     );
     USAGE_ERROR
 }
