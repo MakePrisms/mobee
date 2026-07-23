@@ -32,9 +32,23 @@ const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 5;
 /// cap-hit returns PENDING for re-poll instead of starving the client read-timeout (~60s).
 const WAIT_FOR_CAP_SECS: u64 = 10;
 const DEFAULT_DEADLINE_SECS: u64 = 3_600;
-/// Derived claim status surfaced when a `processing` claim is past its offer deadline.
+/// Derived claim status surfaced when a `processing` claim is past its offer deadline and its
+/// seller has published NO payable delivery (or the delivery's pay window has itself lapsed).
 /// Never a relay status value — it is computed by [`derive_claim_liveness`] from `now`.
 pub const CLAIM_STATUS_EXPIRED: &str = "expired";
+/// Derived claim status surfaced when a `processing` claim is past its offer deadline BUT its
+/// seller has published a delivery that is still inside the pay window. The offer deadline is a
+/// scheduling clock (stop accepting new work); it must not invalidate work already delivered, so
+/// such a claim stays payable — [`accept_claim`] treats `delivered` exactly like `processing`.
+/// Never a relay status value — computed by [`derive_claim_liveness`] from `now` + the results.
+pub const CLAIM_STATUS_DELIVERED: &str = "delivered";
+/// How long after a delivery the buyer may still accept + pay for it, measured from the delivery
+/// event's `created_at`. Decoupled from — and far more generous than — the offer deadline
+/// ([`DEFAULT_DEADLINE_SECS`]): a gate-verified delivery proves the work happened, so a slow buyer
+/// must not be able to strand it on the short scheduling clock. The relaxation is ONLY about not
+/// rejecting a proven delivery on a timer; every money gate (creq/cosig/tip-match/budget/
+/// single-redeem) still fires downstream in [`accept_claim`] / [`crate::authorize_pay`].
+const DELIVERY_PAY_WINDOW_SECS: u64 = 7 * 24 * 3_600;
 
 /// Inputs for posting a offer-kind offer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -736,8 +750,10 @@ pub async fn accept_claim_async(
 ) -> Result<AcceptClaimOutcome, JobLifecycleError> {
     let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
     let keys = buyer_keys(home)?;
-    // Injected `now` derives expiry: an expired claim surfaces as non-processing and is
-    // refused below (cannot accept a claim past its deadline).
+    // Injected `now` derives the claim status: past the offer deadline a claim reads `expired`
+    // (refused below) UNLESS its seller delivered inside the pay window, in which case it reads
+    // `delivered` and stays acceptable — the offer deadline is a scheduling clock and must not
+    // strand a completed, gate-verifiable delivery. Every money gate still fires below.
     let view = fetch_job_view_async(home, &keys, &request.job_id, timeout, now_unix()).await?;
     let offer = view
         .offer
@@ -749,9 +765,9 @@ pub async fn accept_claim_async(
         .iter()
         .find(|claim| claim.claim_id == request.claim_id)
         .ok_or_else(|| JobLifecycleError::NotFound(format!("claim {}", request.claim_id)))?;
-    if claim.status != "processing" {
+    if claim.status != "processing" && claim.status != CLAIM_STATUS_DELIVERED {
         return Err(JobLifecycleError::Input(format!(
-            "claim {} status is {}, expected processing",
+            "claim {} status is {}, expected processing or delivered",
             claim.claim_id, claim.status
         )));
     }
@@ -1371,31 +1387,54 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Derive claim liveness from status + offer deadline + the injected `now`.
+/// Latest instant a delivery from `seller_pubkey` is still payable: the newest matching result's
+/// `created_at` plus [`DELIVERY_PAY_WINDOW_SECS`]. A "delivery" here is the cheap relay-truth
+/// signal — a result the seller authored that carries a `commit_oid`; the FULL gate-verify
+/// (git tip-match / cosig / tip-match / budget) stays downstream in the pay path and is never
+/// skipped. `None` when the seller has published no such result (nothing delivered to pay for).
+fn delivery_pay_deadline(results: &[ResultView], seller_pubkey: &str) -> Option<u64> {
+    results
+        .iter()
+        .filter(|result| result.seller_pubkey == seller_pubkey && result.commit_oid.is_some())
+        .map(|result| result.created_at)
+        .max()
+        .map(|created_at| created_at.saturating_add(DELIVERY_PAY_WINDOW_SECS))
+}
+
+/// Derive claim liveness from status + offer deadline + published results + the injected `now`.
 ///
-/// A `processing` claim whose offer deadline has passed (`now > deadline`) is EXPIRED:
-/// its status is surfaced as [`CLAIM_STATUS_EXPIRED`], it is marked `live = false`, and it
-/// is excluded from `live_claim_id`. Expiry is DERIVED — never stored, never read from the
-/// wall clock inside this function (tests pass a fixed `now`). `claims` must be pre-sorted
-/// newest-first; the newest still-`processing` claim becomes the live one.
+/// A `processing` claim whose offer deadline has passed (`now > deadline`) is reclassified:
+/// - if its seller has a delivery still inside the pay window ([`delivery_pay_deadline`]), it
+///   surfaces as [`CLAIM_STATUS_DELIVERED`] — payable, and counted as the live claim, because the
+///   offer deadline is a scheduling clock and must not invalidate work already delivered;
+/// - otherwise (no delivery, or its pay window has also lapsed) it surfaces as
+///   [`CLAIM_STATUS_EXPIRED`], `live = false`, excluded from `live_claim_id`.
+///
+/// Both reclassifications are DERIVED — never stored, never read from the wall clock inside this
+/// function (tests pass a fixed `now`). `claims` must be pre-sorted newest-first; the newest claim
+/// that is still `processing` or `delivered` becomes the live one.
 ///
 /// `offer_deadline_unix == None` (offer not yet on the relay) means expiry cannot be derived,
 /// so status-based liveness is preserved unchanged.
 fn derive_claim_liveness(
     claims: &mut [ClaimView],
+    results: &[ResultView],
     offer_deadline_unix: Option<u64>,
     now: u64,
 ) -> Option<String> {
     if let Some(deadline) = offer_deadline_unix {
         for claim in claims.iter_mut() {
             if claim.status == "processing" && now > deadline {
-                claim.status = CLAIM_STATUS_EXPIRED.to_string();
+                claim.status = match delivery_pay_deadline(results, &claim.seller_pubkey) {
+                    Some(pay_deadline) if now <= pay_deadline => CLAIM_STATUS_DELIVERED.to_string(),
+                    _ => CLAIM_STATUS_EXPIRED.to_string(),
+                };
             }
         }
     }
     let live_claim_id = claims
         .iter()
-        .find(|claim| claim.status == "processing")
+        .find(|claim| claim.status == "processing" || claim.status == CLAIM_STATUS_DELIVERED)
         .map(|claim| claim.claim_id.clone());
     for claim in claims.iter_mut() {
         claim.live = live_claim_id.as_deref() == Some(claim.claim_id.as_str());
@@ -1514,10 +1553,6 @@ pub(crate) async fn fetch_job_view_async(
         });
     }
     claims.sort_by_key(|c| std::cmp::Reverse(c.created_at));
-    // Liveness is DERIVED from `now` vs the offer deadline — a processing claim past its
-    // deadline is EXPIRED and must not read live.
-    let offer_deadline_unix = offer.as_ref().map(|o| o.deadline_unix);
-    let live_claim_id = derive_claim_liveness(&mut claims, offer_deadline_unix, now);
 
     let mut results = Vec::new();
     for event in result_events {
@@ -1543,6 +1578,13 @@ pub(crate) async fn fetch_job_view_async(
         });
     }
     results.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+
+    // Liveness is DERIVED from `now` vs the offer deadline AND the published deliveries: a
+    // processing claim past its deadline reads EXPIRED unless its seller delivered inside the pay
+    // window, in which case it stays payable (DELIVERED). Derived after results so the pay-window
+    // decision can see them.
+    let offer_deadline_unix = offer.as_ref().map(|o| o.deadline_unix);
+    let live_claim_id = derive_claim_liveness(&mut claims, &results, offer_deadline_unix, now);
 
     let accepted = load_accepted_bind(home, job_id)?;
 
@@ -2587,11 +2629,13 @@ mod tests {
         assert_eq!(auto.seller_pubkey, seller_a);
     }
 
+    const SELLER_HEX: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
     fn claim_view(claim_id: &str, created_at: u64, status: &str) -> ClaimView {
         ClaimView {
             claim_id: claim_id.to_owned(),
             created_at,
-            seller_pubkey: "dd".repeat(32),
+            seller_pubkey: SELLER_HEX.to_owned(),
             display_name: None,
             status: status.to_owned(),
             live: false,
@@ -2599,20 +2643,89 @@ mod tests {
         }
     }
 
-    // A processing claim past its offer deadline surfaces as EXPIRED and is not
+    /// A minimal delivery result authored by `seller_pubkey` at `created_at` — carries a
+    /// `commit_oid` so [`delivery_pay_deadline`] counts it as a delivery.
+    fn delivery_result(seller_pubkey: &str, created_at: u64) -> ResultView {
+        ResultView {
+            result_id: format!("res-{created_at}"),
+            created_at,
+            seller_pubkey: seller_pubkey.to_owned(),
+            display_name: None,
+            job_hash: Some("jh".to_owned()),
+            repo: Some("relay://repo".to_owned()),
+            branch: Some("mobee/delivery".to_owned()),
+            commit_oid: Some("cc".repeat(20)),
+            amount_sats: Some(10),
+            seller_signature: Some("sig".to_owned()),
+            contribution: None,
+        }
+    }
+
+    // A processing claim past its offer deadline with NO delivery surfaces as EXPIRED and is not
     // live. REAL claim/deadline path — a fixed `now` (injected), no relay, no wall-clock.
     #[test]
-    fn processing_claim_past_deadline_is_expired_not_live() {
+    fn processing_claim_past_deadline_without_delivery_is_expired_not_live() {
         let deadline = 1_700_000_000u64;
         let mut claims = vec![claim_view("orphan-claim", 100, "processing")];
-        // now well past the deadline (still "processing" 25 min later).
-        let live = derive_claim_liveness(&mut claims, Some(deadline), deadline + 1_500);
+        // now well past the deadline (still "processing" 25 min later), no result published.
+        let live = derive_claim_liveness(&mut claims, &[], Some(deadline), deadline + 1_500);
         assert_eq!(live, None, "an expired claim must never be the live claim");
         assert_eq!(
             claims[0].status, CLAIM_STATUS_EXPIRED,
-            "past-deadline processing claim must surface as EXPIRED"
+            "past-deadline processing claim with no delivery must surface as EXPIRED"
         );
         assert!(!claims[0].live, "expired claim must not read live/processing");
+    }
+
+    // A claim past the offer deadline whose seller DELIVERED inside the pay window stays payable
+    // (DELIVERED, live) — the scheduling clock must not strand completed work.
+    #[test]
+    fn delivered_claim_past_deadline_within_pay_window_stays_payable() {
+        let deadline = 1_700_000_000u64;
+        let mut claims = vec![claim_view("delivered-claim", 100, "processing")];
+        // Seller delivered right at the deadline; buyer collects a day later — past the offer
+        // deadline but comfortably inside the pay window.
+        let results = vec![delivery_result(SELLER_HEX, deadline)];
+        let now = deadline + 24 * 3_600;
+        let live = derive_claim_liveness(&mut claims, &results, Some(deadline), now);
+        assert_eq!(
+            claims[0].status, CLAIM_STATUS_DELIVERED,
+            "a delivered claim past the offer deadline but within the pay window is payable"
+        );
+        assert_eq!(live.as_deref(), Some("delivered-claim"), "a delivered claim reads live");
+        assert!(claims[0].live);
+    }
+
+    // Past the offer deadline AND past the delivery pay window ⇒ EXPIRED even with a delivery.
+    // The pay window is generous but bounded.
+    #[test]
+    fn delivered_claim_past_pay_window_is_expired() {
+        let deadline = 1_700_000_000u64;
+        let mut claims = vec![claim_view("stale-claim", 100, "processing")];
+        let results = vec![delivery_result(SELLER_HEX, deadline)];
+        let now = deadline + DELIVERY_PAY_WINDOW_SECS + 1;
+        let live = derive_claim_liveness(&mut claims, &results, Some(deadline), now);
+        assert_eq!(
+            claims[0].status, CLAIM_STATUS_EXPIRED,
+            "a delivery whose pay window has itself lapsed is no longer payable"
+        );
+        assert_eq!(live, None);
+    }
+
+    // A delivery published by a DIFFERENT seller must not rescue this claim from expiry — the
+    // pay window keys on the claim's own seller (guards against a stranger's result reviving a
+    // lapsed claim into a pay path).
+    #[test]
+    fn foreign_seller_delivery_does_not_rescue_expired_claim() {
+        let deadline = 1_700_000_000u64;
+        let mut claims = vec![claim_view("mine", 100, "processing")];
+        let results = vec![delivery_result(&"ee".repeat(32), deadline)];
+        let live = derive_claim_liveness(&mut claims, &results, Some(deadline), deadline + 10);
+        assert_eq!(
+            claims[0].status, CLAIM_STATUS_EXPIRED,
+            "a foreign seller's delivery never keeps this claim payable"
+        );
+        assert_eq!(live, None);
     }
 
     #[test]
@@ -2622,7 +2735,7 @@ mod tests {
             claim_view("newest", 200, "processing"),
             claim_view("older", 100, "processing"),
         ];
-        let live = derive_claim_liveness(&mut claims, Some(deadline), deadline - 10);
+        let live = derive_claim_liveness(&mut claims, &[], Some(deadline), deadline - 10);
         assert_eq!(live.as_deref(), Some("newest"), "newest processing claim is live");
         assert!(claims[0].live && !claims[1].live);
         assert_eq!(claims[0].status, "processing", "not expired before the deadline");
@@ -2636,12 +2749,12 @@ mod tests {
         let make = || vec![claim_view("c1", 100, "processing")];
 
         let mut before = make();
-        let live_before = derive_claim_liveness(&mut before, Some(deadline), deadline - 1);
+        let live_before = derive_claim_liveness(&mut before, &[], Some(deadline), deadline - 1);
         assert_eq!(live_before.as_deref(), Some("c1"));
         assert!(before[0].live && before[0].status == "processing");
 
         let mut after = make();
-        let live_after = derive_claim_liveness(&mut after, Some(deadline), deadline + 1);
+        let live_after = derive_claim_liveness(&mut after, &[], Some(deadline), deadline + 1);
         assert_eq!(live_after, None);
         assert!(!after[0].live && after[0].status == CLAIM_STATUS_EXPIRED);
     }
@@ -2654,7 +2767,7 @@ mod tests {
             claim_view("proc", 200, "processing"),
             claim_view("err", 100, "error"),
         ];
-        let live = derive_claim_liveness(&mut claims, None, 9_999_999_999);
+        let live = derive_claim_liveness(&mut claims, &[], None, 9_999_999_999);
         assert_eq!(live.as_deref(), Some("proc"));
         assert!(claims[0].live, "processing claim stays live when no deadline is known");
         assert!(!claims[1].live, "error claim is never live");
