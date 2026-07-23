@@ -924,6 +924,89 @@
         }
     }
 
+    // ── Award match logic ────────────────────────────────────────────────────────────────
+    // `active_job` parks a claim with buyer_pubkey="bb"*32 and claim_id="claim-<job_id>".
+
+    /// The buyer's award naming our parked claim selects it for execution.
+    #[test]
+    fn award_for_our_parked_claim_executes() {
+        let root = temp("award-exec");
+        let jobs = vec![active_job("job-a", &"aa".repeat(32), None, 0, &root)];
+        let award = ParsedAward {
+            offer_id: "job-a".into(),
+            claim_id: "claim-job-a".into(),
+        };
+        assert_eq!(
+            match_award(&jobs, &award, &"bb".repeat(32)),
+            AwardMatch::Execute(0)
+        );
+    }
+
+    /// The buyer awarding a DIFFERENT claim for our offer releases ours (we lost).
+    #[test]
+    fn award_for_a_different_claim_releases_ours() {
+        let root = temp("award-release");
+        let jobs = vec![active_job("job-a", &"aa".repeat(32), None, 0, &root)];
+        let award = ParsedAward {
+            offer_id: "job-a".into(),
+            claim_id: "claim-some-other-seller".into(),
+        };
+        assert_eq!(
+            match_award(&jobs, &award, &"bb".repeat(32)),
+            AwardMatch::Release(0)
+        );
+    }
+
+    /// An award authored by anyone other than the offer buyer is ignored — only the buyer awards.
+    #[test]
+    fn award_from_a_non_buyer_is_ignored() {
+        let root = temp("award-spoof");
+        let jobs = vec![active_job("job-a", &"aa".repeat(32), None, 0, &root)];
+        let award = ParsedAward {
+            offer_id: "job-a".into(),
+            claim_id: "claim-job-a".into(),
+        };
+        assert_eq!(
+            match_award(&jobs, &award, &"cc".repeat(32)),
+            AwardMatch::Ignored
+        );
+    }
+
+    /// An award for an offer we never claimed is ignored.
+    #[test]
+    fn award_for_an_unclaimed_offer_is_ignored() {
+        let root = temp("award-unknown");
+        let jobs = vec![active_job("job-a", &"aa".repeat(32), None, 0, &root)];
+        let award = ParsedAward {
+            offer_id: "job-zzz".into(),
+            claim_id: "claim-job-zzz".into(),
+        };
+        assert_eq!(
+            match_award(&jobs, &award, &"bb".repeat(32)),
+            AwardMatch::Ignored
+        );
+    }
+
+    /// With several parked claims the award binds to the one rooted on its offer.
+    #[test]
+    fn award_selects_the_matching_offer_among_several() {
+        let root = temp("award-many");
+        let seller = "aa".repeat(32);
+        let jobs = vec![
+            active_job("job-a", &seller, None, 0, &root),
+            active_job("job-b", &seller, None, 0, &root),
+            active_job("job-c", &seller, None, 0, &root),
+        ];
+        let award = ParsedAward {
+            offer_id: "job-b".into(),
+            claim_id: "claim-job-b".into(),
+        };
+        assert_eq!(
+            match_award(&jobs, &award, &"bb".repeat(32)),
+            AwardMatch::Execute(1)
+        );
+    }
+
     fn test_daemon(label: &str) -> (PathBuf, SellerDaemon) {
         let root = temp(label);
         let _ = std::fs::remove_dir_all(&root);
@@ -951,6 +1034,7 @@
             seller_pubkey,
             journal,
             pay_buffer: VecDeque::new(),
+            awaiting_award: Vec::new(),
             active: None,
             awaiting_payment: Vec::new(),
         };

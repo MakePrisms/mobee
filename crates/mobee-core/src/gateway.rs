@@ -384,9 +384,10 @@ pub fn claim_draft(
 }
 
 /// Kind-award AWARD draft (`status=accepted`). Buyer-authored selection of a claim — e-tags the
-/// offer (root) + the winning claim. This is its own buyer-authored award kind — a buyer
-/// selection must not ride the seller's feedback kind.
-pub fn accept_draft(
+/// offer (root) + the winning claim, p-tags the buyer and the awarded seller. The seller runs its
+/// agent only once this award names its own claim, so a job drawing many claims burns compute on
+/// one seller. Its own buyer-authored kind — a selection must not ride the seller's feedback kind.
+pub fn award_draft(
     offer_id: &str,
     claim_id: &str,
     buyer_pubkey: &str,
@@ -402,6 +403,42 @@ pub fn accept_draft(
             TagSpec::new(["p", seller_pubkey]),
         ],
     )
+}
+
+/// The two ids a kind-award AWARD selects: the offer it roots on and the winning claim. Both are
+/// read from the award's `e` tags — the `root`-marked `e` is the offer, the other `e` the claim.
+/// A seller matches `claim_id` against its own published claim to decide execute-versus-release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedAward {
+    pub offer_id: String,
+    pub claim_id: String,
+}
+
+/// Parse a kind-award AWARD event into the offer + winning-claim ids it selects, or `None` when the
+/// event is not an award or lacks the two `e` tags. The `root`-marked `e` is the offer; the other
+/// `e` is the awarded claim. Pure over the draft so the seller's match logic is unit-testable.
+pub fn parse_award(event: &EventDraft) -> Option<ParsedAward> {
+    if event.kind != JOB_AWARD_KIND {
+        return None;
+    }
+    let e_tags: Vec<&TagSpec> = event
+        .tags
+        .iter()
+        .filter(|tag| tag.first() == Some("e"))
+        .collect();
+    let is_root = |tag: &TagSpec| tag.0.get(3).map(String::as_str) == Some("root");
+    let offer_id = e_tags
+        .iter()
+        .find(|tag| is_root(tag))
+        .and_then(|tag| tag.value())?;
+    let claim_id = e_tags
+        .iter()
+        .find(|tag| !is_root(tag))
+        .and_then(|tag| tag.value())?;
+    Some(ParsedAward {
+        offer_id: offer_id.to_owned(),
+        claim_id: claim_id.to_owned(),
+    })
 }
 
 /// Optional git delivery tags on a result-kind result (`delivery=git` + repo/branch/commit).
@@ -841,8 +878,8 @@ mod tests {
     }
 
     #[test]
-    fn claim_and_accept_use_split_mobee_kinds() {
-        // The claim (processing) is its own claim kind, and the buyer-authored accept (award)
+    fn claim_and_award_use_split_mobee_kinds() {
+        // The claim (processing) is its own claim kind, and the buyer-authored award
         // is the award kind — each distinct from the seller's feedback kind.
         assert_eq!(
             claim_draft("offer", BUYER, SELLER, "creqAtest"),
@@ -862,7 +899,7 @@ mod tests {
         );
 
         assert_eq!(
-            accept_draft("offer", "claim", BUYER, SELLER),
+            award_draft("offer", "claim", BUYER, SELLER),
             EventDraft::new(
                 JOB_AWARD_KIND,
                 vec![
@@ -876,6 +913,20 @@ mod tests {
                 ],
                 ""
             )
+        );
+
+        // The awarded seller reads back the offer + winning-claim ids from that same award.
+        assert_eq!(
+            parse_award(&award_draft("offer", "claim", BUYER, SELLER)),
+            Some(ParsedAward {
+                offer_id: "offer".into(),
+                claim_id: "claim".into(),
+            })
+        );
+        // A non-award event yields no selection.
+        assert_eq!(
+            parse_award(&claim_draft("offer", BUYER, SELLER, "creqAtest")),
+            None
         );
     }
 

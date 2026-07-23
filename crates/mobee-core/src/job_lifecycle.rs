@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::gateway::{
-    self, accept_draft, parse_git_result_delivery, parse_offer, EventDraft, OfferDraft, TagSpec,
+    self, award_draft, parse_git_result_delivery, parse_offer, EventDraft, OfferDraft, TagSpec,
     JOB_CLAIM_KIND, JOB_FEEDBACK_KIND, JOB_OFFER_KIND, JOB_RESULT_KIND,
 };
 use crate::home::{self, HomeError, MobeeHome};
@@ -291,6 +291,23 @@ pub struct AcceptClaimRequest {
 pub struct AcceptClaimOutcome {
     pub accept_event_id: String,
     pub bind: AcceptedBind,
+}
+
+pub struct AwardClaimRequest {
+    pub job_id: String,
+    pub claim_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AwardClaimOutcome {
+    pub award_event_id: String,
+    pub job_id: String,
+    pub claim_id: String,
+    pub seller_pubkey: String,
+    /// The accepted mints the awarded claim's `creq` quotes. Surfaced so the buyer sees which mints
+    /// the award commits it to paying at — awarding a claim it cannot settle is visible here, not a
+    /// surprise at pay time. Empty when the claim carried no parseable `creq`.
+    pub quoted_mints: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -646,6 +663,72 @@ pub fn accept_claim(
     runtime.block_on(accept_claim_async(home, request))
 }
 
+/// Publish the buyer's kind-award AWARD selecting `claim_id` for `job_id` BEFORE the seller runs.
+/// The awarded seller executes; every other claimant releases its claim without spending compute.
+///
+/// This is the pre-work counterpart to [`accept_claim_async`], which runs AFTER delivery to bind
+/// payment to a verified result. The award carries no pay-bind — it only names the winning claim.
+/// The claim must be present and still `processing`, and (for a targeted offer) authored by the
+/// targeted seller; otherwise the award is refused.
+pub async fn award_claim_async(
+    home: &MobeeHome,
+    request: AwardClaimRequest,
+) -> Result<AwardClaimOutcome, JobLifecycleError> {
+    let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+    let keys = buyer_keys(home)?;
+    // Injected `now` derives claim liveness — a claim past the offer deadline surfaces as
+    // non-processing and is refused below.
+    let view = fetch_job_view_async(home, &keys, &request.job_id, timeout, now_unix()).await?;
+    let offer = view
+        .offer
+        .as_ref()
+        .ok_or_else(|| JobLifecycleError::NotFound(format!("offer {}", request.job_id)))?;
+    let claim = view
+        .claims
+        .iter()
+        .find(|claim| claim.claim_id == request.claim_id)
+        .ok_or_else(|| JobLifecycleError::NotFound(format!("claim {}", request.claim_id)))?;
+    if claim.status != "processing" {
+        return Err(JobLifecycleError::Input(format!(
+            "claim {} status is {}, expected processing",
+            claim.claim_id, claim.status
+        )));
+    }
+    if let Some(target) = &offer.seller_pubkey {
+        if target != &claim.seller_pubkey {
+            return Err(JobLifecycleError::Targeting(format!(
+                "offer targets seller {target}, claim seller is {}",
+                claim.seller_pubkey
+            )));
+        }
+    }
+
+    // Surface the mints the claim's creq quotes so an incompatible award is visible before the
+    // buyer commits (informational — the pay path's mint checks remain the settlement authority).
+    let quoted_mints = claim
+        .creq
+        .as_deref()
+        .and_then(|creq| crate::gateway::creq::parse_creq(creq).ok())
+        .map(|request| request.mints.iter().map(|mint| mint.to_string()).collect())
+        .unwrap_or_default();
+
+    let buyer_pubkey = keys.public_key().to_hex();
+    let draft = award_draft(
+        &request.job_id,
+        &request.claim_id,
+        &buyer_pubkey,
+        &claim.seller_pubkey,
+    );
+    let award_event_id = publish_draft_async(home, &keys, &draft).await?;
+    Ok(AwardClaimOutcome {
+        award_event_id,
+        job_id: request.job_id,
+        claim_id: request.claim_id,
+        seller_pubkey: claim.seller_pubkey.clone(),
+        quoted_mints,
+    })
+}
+
 /// Async `accept_claim` for callers already on a Tokio runtime (MCP dispatch).
 pub async fn accept_claim_async(
     home: &MobeeHome,
@@ -762,7 +845,7 @@ pub async fn accept_claim_async(
     .to_string();
 
     let buyer_pubkey = keys.public_key().to_hex();
-    let draft = accept_draft(
+    let draft = award_draft(
         &request.job_id,
         &request.claim_id,
         &buyer_pubkey,

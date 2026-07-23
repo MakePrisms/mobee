@@ -195,6 +195,15 @@ impl AnnounceEvent {
         event
     }
 
+    /// A parked claim released without executing — the buyer awarded another claim, or the offer
+    /// deadline passed with no award. The seller committed no compute; the award gate did its job.
+    pub fn released(ts: u64, seller_pubkey: &str, job_id: &str, reason: &str) -> Self {
+        let mut event = Self::base("released", ts, seller_pubkey);
+        event.job_id = Some(job_id.to_owned());
+        event.reason = Some(reason.to_owned());
+        event
+    }
+
     /// A claimed job that failed before/at delivery (agent/git/publish error or deadline).
     pub fn job_failed(ts: u64, seller_pubkey: &str, job_id: &str, reason: &str) -> Self {
         let mut event = Self::base("job_failed", ts, seller_pubkey);

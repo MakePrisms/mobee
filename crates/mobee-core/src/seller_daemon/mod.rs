@@ -23,8 +23,8 @@ use crate::contribution::ContributionOffer;
 use crate::driver::UsageMetadata;
 use crate::episode::{Episode, EpisodeKind, EpisodeLog, EpisodeOutcome, UsageRecord};
 use crate::gateway::{
-    self, claim_draft, error_draft, git_result_draft, parse_offer, EventDraft, ParsedOffer,
-    TagSpec, JOB_OFFER_KIND,
+    self, claim_draft, error_draft, git_result_draft, parse_award, parse_offer, EventDraft,
+    ParsedAward, ParsedOffer, TagSpec, JOB_AWARD_KIND, JOB_OFFER_KIND,
 };
 use crate::home::{self, HomeError, MobeeHome, DEFAULT_MINT_URL};
 use crate::job_lifecycle::{event_to_draft, job_hash_for_offer};
@@ -45,6 +45,21 @@ static FLIGHT: AtomicBool = AtomicBool::new(false);
 /// Upper bound on delivered-but-unpaid jobs tracked concurrently (bounded memory).
 /// Reaching it back-pressures new claims with a logged skip reason (never a silent drop).
 const AWAITING_PAYMENT_CAP: usize = 16;
+
+/// Upper bound on claims awaiting a buyer award concurrently (bounded memory). A claim is cheap —
+/// no compute runs until the award arrives — so a seller may hold several at once; reaching this
+/// cap back-pressures new claims with a logged skip reason (never a silent drop).
+const AWAITING_AWARD_CAP: usize = 16;
+
+/// Cadence (seconds) of the periodic sweep that releases claims whose offer deadline passed with no
+/// award. A pure per-job check (`offer.deadline_unix <= now`) rides the select loop on this tick, so
+/// a claim never waits for an award past the offer it was made against. A FIXED constant, not a user
+/// config knob; the env override below is a test seam only (mirrors the wrap-backfill cadence).
+const AWARD_SWEEP_INTERVAL_SECS: u64 = 30;
+
+/// Test-only env seam overriding [`AWARD_SWEEP_INTERVAL_SECS`] (NOT a user config knob; mirrors
+/// [`WRAP_BACKFILL_INTERVAL_ENV`]). A `0` or unparseable value is ignored. No production path sets it.
+const AWARD_SWEEP_INTERVAL_ENV: &str = "MOBEE_AWARD_SWEEP_INTERVAL_SECS";
 
 /// Bound on agent attempts per job. A transient agent error is retried up to
 /// this many times, but only while the job deadline still has room — the retry loop never
@@ -319,6 +334,41 @@ pub enum OfferDisposition {
     Skip(OfferSkip),
 }
 
+/// What [`SellerDaemon::on_award_event`] did with a kind-award AWARD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AwardOutcome {
+    /// The award named this seller's claim — the job is now in the `active` slot, ready to execute.
+    Execute { job_id: String },
+    /// The award named a DIFFERENT claim — this seller's claim was released without executing.
+    Released { job_id: String, reason: String },
+    /// No outstanding claim of ours matched (late, unrelated, or author not the offer buyer).
+    Ignored,
+}
+
+/// The pure award-match decision over the parked claims — no I/O, so the security-critical
+/// selection is unit-testable. An award binds to a parked claim ONLY when it roots on that claim's
+/// offer AND its author is that offer's buyer (a third party cannot drive execute or release).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AwardMatch {
+    /// The matched claim (by index) is the one the award names — execute it.
+    Execute(usize),
+    /// The award names a different claim than the matched one — release ours.
+    Release(usize),
+    /// No parked claim matches this award — ignore it.
+    Ignored,
+}
+
+fn match_award(awaiting_award: &[ActiveJob], award: &ParsedAward, award_author: &str) -> AwardMatch {
+    match awaiting_award
+        .iter()
+        .position(|job| job.job_id == award.offer_id && job.buyer_pubkey == award_author)
+    {
+        Some(index) if awaiting_award[index].claim_id == award.claim_id => AwardMatch::Execute(index),
+        Some(index) => AwardMatch::Release(index),
+        None => AwardMatch::Ignored,
+    }
+}
+
 /// Everything needed to publish a claim + journal it, resolved without relay I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimIntent {
@@ -353,6 +403,8 @@ pub enum OfferSkip {
     ProcessingBusy { job_id: String },
     /// Too many delivered-but-unpaid jobs pending payment (bounded-memory back-pressure).
     AwaitingPaymentFull { capacity: usize },
+    /// Too many claims awaiting a buyer award (bounded-memory back-pressure).
+    AwaitingAwardFull { capacity: usize },
     /// A `job-class=contribution` offer arrived but this seller has contribution support
     /// disabled (`contribution_enabled=false`). Emits a feedback-kind error (interop courtesy) instead
     /// of running it as from-scratch.
@@ -373,6 +425,7 @@ impl OfferSkip {
             Self::AlreadyProcessed => "AlreadyProcessed",
             Self::ProcessingBusy { .. } => "ProcessingBusy",
             Self::AwaitingPaymentFull { .. } => "AwaitingPaymentFull",
+            Self::AwaitingAwardFull { .. } => "AwaitingAwardFull",
             Self::ContributionUnsupported => "ContributionUnsupported",
             Self::ContributionMalformed { .. } => "ContributionMalformed",
         }
@@ -393,6 +446,9 @@ impl OfferSkip {
             }
             Self::AwaitingPaymentFull { capacity } => {
                 format!("awaiting-payment backlog full (cap {capacity}); back-pressuring new claims")
+            }
+            Self::AwaitingAwardFull { capacity } => {
+                format!("awaiting-award backlog full (cap {capacity}); back-pressuring new claims")
             }
             Self::ContributionUnsupported => {
                 "contribution offer refused: seller contribution support is disabled (feedback-kind interop courtesy)".to_string()
@@ -428,7 +484,12 @@ pub struct SellerDaemon {
     journal: SellerJournal,
     /// Early / unmatched 1059 payments awaiting reconcile (ids only logged).
     pay_buffer: VecDeque<BufferedPay>,
-    /// The PROCESSING-phase job (holds single-flight). `None` when idle or only awaiting pay.
+    /// Claims published and awaiting the buyer's kind-award AWARD. These hold NO single-flight and
+    /// run NO compute: the awarded seller moves its job to `active` and executes, every other
+    /// claimant releases quietly. Bounded by [`AWAITING_AWARD_CAP`].
+    awaiting_award: Vec<ActiveJob>,
+    /// The PROCESSING-phase job (holds single-flight). `None` when idle, only awaiting award, or
+    /// only awaiting pay.
     active: Option<ActiveJob>,
     /// DELIVERED-but-unpaid jobs (result-kind published, payment not yet redeemed). These do
     /// NOT hold single-flight, so new offers can still be claimed while payment is pending.
@@ -466,6 +527,7 @@ impl SellerDaemon {
             seller_pubkey,
             journal,
             pay_buffer: VecDeque::new(),
+            awaiting_award: Vec::new(),
             active: None,
             awaiting_payment: Vec::new(),
         })
@@ -506,15 +568,17 @@ impl SellerDaemon {
         FLIGHT.load(Ordering::SeqCst)
     }
 
-    /// Handle one offer-kind offer event. Returns Ok(Some(active)) when claimed.
+    /// Handle one offer-kind offer event: publish + journal a claim and park it awaiting the
+    /// buyer's award. Returns `Ok(Some(job_id))` when claimed, `Ok(None)` when skipped.
     ///
-    /// Skips are NEVER silent — every non-claim path is logged with its reason
-    /// ([`OfferSkip::reason`]). A delivered-but-unpaid job does not block here (its
-    /// binding lives in `awaiting_payment`, not the single-flight slot).
+    /// Claiming runs NO compute and takes NO single-flight slot — the claim only says "I would do
+    /// this". Execution waits for a kind-award AWARD naming this claim ([`Self::on_award_event`]),
+    /// so a job drawing many claims never burns compute on more than the one seller the buyer picks.
+    /// Skips are NEVER silent — every non-claim path is logged with its reason ([`OfferSkip::reason`]).
     pub async fn on_offer_event(
         &mut self,
         event: &nostr_sdk::Event,
-    ) -> Result<Option<&ActiveJob>, DaemonError> {
+    ) -> Result<Option<String>, DaemonError> {
         let now = now_unix();
         let intent = match self.classify_offer(event, now)? {
             OfferDisposition::Skip(skip) => {
@@ -566,15 +630,6 @@ impl SellerDaemon {
             OfferDisposition::Claim(intent) => intent,
         };
 
-        // Atomic reservation of the PROCESSING single-flight slot.
-        if !Self::try_begin_flight() {
-            eprintln!(
-                "seller skip offer {}: single-flight busy (a job is already in the processing phase)",
-                event.id.to_hex()
-            );
-            return Ok(None);
-        }
-
         // The seller authors the claim's payment terms as a NUT-18 payment
         // request (`creq…`) — accepted mints from its OWN config (not the offer), amount/unit
         // copied from the offer, single-use, addressed to the seller's key. The claim is the
@@ -588,7 +643,6 @@ impl SellerDaemon {
         ) {
             Ok(creq) => creq,
             Err(error) => {
-                Self::end_flight();
                 return Err(DaemonError::Seller(SellerError::Io(error.to_string())));
             }
         };
@@ -607,7 +661,6 @@ impl SellerDaemon {
         let claim_event = match sign_draft(&self.keys, &claim) {
             Ok(event) => event,
             Err(error) => {
-                Self::end_flight();
                 return Err(error);
             }
         };
@@ -620,26 +673,23 @@ impl SellerDaemon {
             &intent.buyer_pubkey,
             intent.deadline_unix,
         ) {
-            Self::end_flight();
             return Err(error.into());
         }
         // Publish only AFTER the durable claim record exists.
         if let Err(error) = send_signed_event(&self.home, &self.keys, &claim_event).await {
-            Self::end_flight();
             return Err(error);
         }
 
         let workdir = job_workdir(&self.home, &intent.job_id);
         if let Err(error) = std::fs::create_dir_all(&workdir) {
-            Self::end_flight();
             return Err(DaemonError::Seller(SellerError::Io(error.to_string())));
         }
 
         // CLAIMED visibility: emit the claim signal on BOTH surfaces so a claim is observable
-        // (not merely journaled) ahead of `delivered` — a stderr line (for the log-tailing
+        // (not merely journaled) ahead of the award — a stderr line (for the log-tailing
         // sidecar) and the structured announce event.
         eprintln!(
-            "seller claimed offer job_id={} claim_id={claim_id} buyer={} amount={} deadline={}",
+            "seller claimed offer job_id={} claim_id={claim_id} buyer={} amount={} deadline={} (awaiting award)",
             intent.job_id, intent.buyer_pubkey, intent.offer.amount, intent.deadline_unix
         );
         self.announce(crate::announce::AnnounceEvent::claimed(
@@ -651,7 +701,9 @@ impl SellerDaemon {
             intent.deadline_unix,
         ));
 
-        self.active = Some(ActiveJob {
+        let job_id = intent.job_id.clone();
+        // Park the claim awaiting the buyer's award — no single-flight, no compute yet.
+        self.awaiting_award.push(ActiveJob {
             job_id: intent.job_id,
             buyer_pubkey: intent.buyer_pubkey,
             offer: intent.offer,
@@ -665,7 +717,118 @@ impl SellerDaemon {
             // guard reads config directly (see the redeem path). Populated only on restore.
             accepted_mints: Vec::new(),
         });
-        Ok(self.active.as_ref())
+        Ok(Some(job_id))
+    }
+
+    /// Handle one kind-award AWARD event: the buyer's selection among a job's claims.
+    ///
+    /// Matches the award against the seller's outstanding claims by the award author (which MUST be
+    /// the offer buyer) and the offer it roots on. When the award names THIS seller's claim, the job
+    /// moves into the single-flight `active` slot and [`AwardOutcome::Execute`] tells the loop to run
+    /// it. When it names a DIFFERENT claim, the seller's claim is released without running (the buyer
+    /// picked someone else). An award for no outstanding claim of ours — a late, unrelated, or
+    /// spoofed one (author ≠ buyer) — is ignored. Never runs relay I/O beyond the release feedback.
+    pub async fn on_award_event(&mut self, event: &nostr_sdk::Event) -> AwardOutcome {
+        let Some(award) = parse_award(&event_to_draft(event)) else {
+            return AwardOutcome::Ignored;
+        };
+        let award_author = event.pubkey.to_hex();
+        match match_award(&self.awaiting_award, &award, &award_author) {
+            AwardMatch::Ignored => {
+                eprintln!(
+                    "seller award ignored event={} offer={} claim={}: no matching outstanding claim (late, unrelated, or author not the offer buyer)",
+                    event.id.to_hex(),
+                    award.offer_id,
+                    award.claim_id
+                );
+                AwardOutcome::Ignored
+            }
+            AwardMatch::Execute(index) => {
+                // We won. Take the single-flight slot and promote to the executing slot; the loop
+                // runs the existing execute path next. `try_begin_flight` succeeds here because the
+                // loop is single-tasked (an in-progress execution blocks it, so nothing else holds
+                // the slot).
+                if !Self::try_begin_flight() {
+                    eprintln!(
+                        "seller award job_id={}: single-flight busy; leaving claim parked for the next award",
+                        award.offer_id
+                    );
+                    return AwardOutcome::Ignored;
+                }
+                let job = self.awaiting_award.remove(index);
+                let job_id = job.job_id.clone();
+                eprintln!(
+                    "seller awarded job_id={} claim_id={} by buyer={award_author}; executing",
+                    job.job_id, job.claim_id
+                );
+                self.active = Some(job);
+                AwardOutcome::Execute { job_id }
+            }
+            AwardMatch::Release(index) => {
+                // The buyer awarded a different seller — release our claim without ever executing.
+                let job = self.awaiting_award.remove(index);
+                let reason = format!("buyer awarded a different claim ({})", award.claim_id);
+                self.release_claim(&job, &reason).await;
+                AwardOutcome::Released {
+                    job_id: job.job_id,
+                    reason,
+                }
+            }
+        }
+    }
+
+    /// Release every parked claim whose offer deadline has passed with no award (pure per-job check
+    /// against injected `now`). The seller ran no compute — the award never came in time — so each is
+    /// released quietly. Rides the periodic award-sweep tick; returns the `(job_id, reason)` of each.
+    pub async fn release_expired_awaiting_award(&mut self, now: u64) -> Vec<(String, String)> {
+        let mut kept = Vec::with_capacity(self.awaiting_award.len());
+        let mut expired = Vec::new();
+        for job in std::mem::take(&mut self.awaiting_award) {
+            if job.offer.deadline_unix <= now {
+                expired.push(job);
+            } else {
+                kept.push(job);
+            }
+        }
+        self.awaiting_award = kept;
+        let mut released = Vec::with_capacity(expired.len());
+        for job in &expired {
+            let reason = "offer deadline passed with no award".to_owned();
+            self.release_claim(job, &reason).await;
+            released.push((job.job_id.clone(), reason));
+        }
+        released
+    }
+
+    /// Release a parked claim: journal a terminal RELEASE (so it never reads live or re-claims),
+    /// announce it, and best-effort publish a feedback-kind error so the buyer sees the claim is
+    /// gone. Reuses the same release/orphan machinery as restart-reconcile. Never takes or frees the
+    /// single-flight slot — a parked claim never held it.
+    async fn release_claim(&mut self, job: &ActiveJob, reason: &str) {
+        if let Err(error) = self.journal.append_release(&job.job_id, reason) {
+            eprintln!(
+                "seller WARN: failed to journal release for job_id={} (continuing): {error}",
+                job.job_id
+            );
+        }
+        eprintln!(
+            "seller released claim job_id={} claim_id={}: {reason}",
+            job.job_id, job.claim_id
+        );
+        self.announce(crate::announce::AnnounceEvent::released(
+            now_unix(),
+            &self.seller_pubkey,
+            &job.job_id,
+            reason,
+        ));
+        let content = seller_error_content(ErrorReasonCode::ClaimReleased, reason);
+        let draft = error_draft(
+            &job.job_id,
+            &job.buyer_pubkey,
+            &self.seller_pubkey,
+            content,
+        );
+        let _ = publish_draft(&self.home, &self.keys, &draft).await;
     }
 
     /// Decide, WITHOUT any relay I/O, whether an offer event should be claimed.
@@ -752,6 +915,11 @@ impl SellerDaemon {
         if self.awaiting_payment.len() >= AWAITING_PAYMENT_CAP {
             return Ok(OfferDisposition::Skip(OfferSkip::AwaitingPaymentFull {
                 capacity: AWAITING_PAYMENT_CAP,
+            }));
+        }
+        if self.awaiting_award.len() >= AWAITING_AWARD_CAP {
+            return Ok(OfferDisposition::Skip(OfferSkip::AwaitingAwardFull {
+                capacity: AWAITING_AWARD_CAP,
             }));
         }
         let deadline_unix = job_deadline_unix(&offer, seller_cfg, now);
@@ -3035,6 +3203,17 @@ fn wrap_subscription_filter(seller_pubkey: nostr_sdk::PublicKey) -> nostr_sdk::F
         .pubkey(seller_pubkey)
 }
 
+/// The seller's kind-award AWARD filter: p-tagged to the seller and namespace-guarded with
+/// `t=mobee` (awards carry the mobee hashtag), so the seller learns when a buyer selects a claim.
+/// LIVE only — the pre-work award is meaningful only while the claim is still parked; a restart
+/// releases parked claims via reconcile, so there is no award backfill to serve.
+fn award_subscription_filter(seller_pubkey: nostr_sdk::PublicKey) -> nostr_sdk::Filter {
+    nostr_sdk::Filter::new()
+        .kind(nostr_sdk::prelude::Kind::Custom(JOB_AWARD_KIND))
+        .hashtag(gateway::MOBEE_TAG)
+        .pubkey(seller_pubkey)
+}
+
 /// Cap on the number of most-recently-seen offer ids retained for in-loop dedup.
 ///
 /// The dedup set is DEFENSE-IN-DEPTH only (see [`offer_event_should_process`]): it collapses an
@@ -3117,6 +3296,13 @@ pub(crate) struct RunHooks {
     /// fetch returned. The integration test uses it to prove the periodic timer fires and re-runs
     /// the stored-wrap backfill (test seam, not a stderr scrape). `None` in production.
     pub wrap_backfill_done: Option<tokio::sync::mpsc::UnboundedSender<usize>>,
+    /// Fires with the job_id when a kind-award AWARD for THIS seller's claim promotes the job to
+    /// execution. The award tests assert the AWARDED seller runs (vs a released/ignored one)
+    /// without scraping stderr. `None` in production.
+    pub awarded: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Fires with `(job_id, reason)` when a parked claim is released without executing — the buyer
+    /// awarded another claim, or the offer deadline passed with no award. `None` in production.
+    pub released: Option<tokio::sync::mpsc::UnboundedSender<(String, String)>>,
 }
 
 /// Long-running seller loop: NIP-42 AUTH, then subscribe offers+1059 from START.
@@ -3155,6 +3341,19 @@ fn resolve_wrap_backfill_interval_secs() -> u64 {
             _ => WRAP_BACKFILL_INTERVAL_SECS,
         },
         Err(_) => WRAP_BACKFILL_INTERVAL_SECS,
+    }
+}
+
+/// Effective award-sweep cadence (seconds): the [`AWARD_SWEEP_INTERVAL_ENV`] test seam wins over
+/// the [`AWARD_SWEEP_INTERVAL_SECS`] constant; a `0` or unparseable value falls back to the constant.
+/// Extracted so the timing is unit-testable (no production config path sets the env).
+fn resolve_award_sweep_interval_secs() -> u64 {
+    match std::env::var(AWARD_SWEEP_INTERVAL_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => secs,
+            _ => AWARD_SWEEP_INTERVAL_SECS,
+        },
+        Err(_) => AWARD_SWEEP_INTERVAL_SECS,
     }
 }
 
@@ -3406,6 +3605,13 @@ pub(crate) async fn run_forever_hooked(
                 .map_err(|error| DaemonError::Relay(format!("subscribe offers: {error}")))?;
             offer_sub_ids.push(output.val);
         }
+        // Award subscription rides alongside offers (same claim-enabled gate): a seller that
+        // claims must hear the buyer's award to know when to execute. Skipped in receive-only mode
+        // (no claims ⇒ no awards to await).
+        client
+            .subscribe(award_subscription_filter(seller_pubkey), None)
+            .await
+            .map_err(|error| DaemonError::Relay(format!("subscribe awards: {error}")))?;
     } else {
         eprintln!(
             "seller receive-only: offer subscription SKIPPED (journal unreadable) — no new claims \
@@ -3533,6 +3739,17 @@ pub(crate) async fn run_forever_hooked(
         "seller wrap backfill (periodic) enabled: re-fetch stored kind-1059(s) every {wrap_backfill_interval_secs}s"
     );
 
+    // Award sweep: release parked claims whose offer deadline passed with no award. Rides the same
+    // select loop (never a blocking side-thread); `interval_at` starts one period out.
+    let award_sweep_interval_secs = resolve_award_sweep_interval_secs();
+    let mut award_sweep_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(award_sweep_interval_secs),
+        Duration::from_secs(award_sweep_interval_secs),
+    );
+    eprintln!(
+        "seller award sweep enabled: release claims past their offer deadline with no award every {award_sweep_interval_secs}s"
+    );
+
     loop {
         // Resilient recv: a broadcast LAG (the loop fell behind while blocked in a long agent
         // turn) must NOT permanently deafen the daemon. tokio's broadcast drops the overflowed
@@ -3561,6 +3778,15 @@ pub(crate) async fn run_forever_hooked(
                 .await;
                 if let Some(tx) = &hooks.wrap_backfill_done {
                     let _ = tx.send(count);
+                }
+                continue;
+            }
+            // Award sweep tick: release parked claims whose offer deadline passed with no award.
+            _ = award_sweep_interval.tick() => {
+                for (job_id, reason) in daemon.release_expired_awaiting_award(now_unix()).await {
+                    if let Some(tx) = &hooks.released {
+                        let _ = tx.send((job_id, reason));
+                    }
                 }
                 continue;
             }
@@ -3600,24 +3826,15 @@ pub(crate) async fn run_forever_hooked(
                     }
                     continue;
                 }
-                // An offer (offer-kind) routes to `on_offer_event` REGARDLESS of p-tag — open-pool
-                // offers carry none, so a p-tag gate here would silently drop them. Deduped by
-                // event id so each offer is processed once (see `offer_event_should_process`).
-                if offer_event_should_process(event.kind.as_u16(), event.id, &mut seen_offers) {
-                    // BACKFILL money-safety pre-claim check (guards #c/#d), for offers posted
-                    // BEFORE we came online (`created_at < daemon_start_unix`). A live offer
-                    // (posted while we run) keeps the byte-identical fast path — no relay query.
-                    // This gates on backfilled-vs-live, NOT on window size, so it holds for ANY
-                    // `offer_backfill_secs`. Fail-closed: an inconclusive relay read SKIPS. Every
-                    // outcome is logged with a reason (never a silent drop).
-                    if event.created_at.as_secs() < daemon_start_unix {
-                        if let Some(reason) = daemon.backfill_offer_blocked(&event).await {
-                            eprintln!("seller skip offer {}: {reason}", event.id.to_hex());
-                            continue;
-                        }
-                    }
-                    match daemon.on_offer_event(&event).await {
-                        Ok(Some(_)) => {
+                // A kind-award AWARD (buyer selection) decides whether a parked claim executes or
+                // releases. Awards are p-tagged to us + mobee-hashtagged, so they never reach the
+                // offer routing below. Execution lives HERE now — a claim runs ONLY once awarded.
+                if event.kind.as_u16() == JOB_AWARD_KIND {
+                    match daemon.on_award_event(&event).await {
+                        AwardOutcome::Execute { job_id } => {
+                            if let Some(tx) = &hooks.awarded {
+                                let _ = tx.send(job_id);
+                            }
                             match daemon.execute_active_job().await {
                                 Ok(result_id) => {
                                     eprintln!("seller published result_id={result_id}");
@@ -3643,6 +3860,36 @@ pub(crate) async fn run_forever_hooked(
                                 }
                                 Err(error) => eprintln!("seller job failed: {error}"),
                             }
+                        }
+                        AwardOutcome::Released { job_id, reason } => {
+                            if let Some(tx) = &hooks.released {
+                                let _ = tx.send((job_id, reason));
+                            }
+                        }
+                        AwardOutcome::Ignored => {}
+                    }
+                    continue;
+                }
+                // An offer (offer-kind) routes to `on_offer_event` REGARDLESS of p-tag — open-pool
+                // offers carry none, so a p-tag gate here would silently drop them. Deduped by
+                // event id so each offer is processed once (see `offer_event_should_process`).
+                if offer_event_should_process(event.kind.as_u16(), event.id, &mut seen_offers) {
+                    // BACKFILL money-safety pre-claim check (guards #c/#d), for offers posted
+                    // BEFORE we came online (`created_at < daemon_start_unix`). A live offer
+                    // (posted while we run) keeps the byte-identical fast path — no relay query.
+                    // This gates on backfilled-vs-live, NOT on window size, so it holds for ANY
+                    // `offer_backfill_secs`. Fail-closed: an inconclusive relay read SKIPS. Every
+                    // outcome is logged with a reason (never a silent drop).
+                    if event.created_at.as_secs() < daemon_start_unix {
+                        if let Some(reason) = daemon.backfill_offer_blocked(&event).await {
+                            eprintln!("seller skip offer {}: {reason}", event.id.to_hex());
+                            continue;
+                        }
+                    }
+                    // Publish + park the claim; execution waits for the buyer's award above.
+                    match daemon.on_offer_event(&event).await {
+                        Ok(Some(job_id)) => {
+                            eprintln!("seller awaiting award job_id={job_id}")
                         }
                         Ok(None) => {}
                         Err(error) => eprintln!("seller offer path: {error}"),
