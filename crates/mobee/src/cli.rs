@@ -30,7 +30,7 @@ where
             SUCCESS
         }
         Some("mcp") if args.len() == 2 => crate::mcp::run(out, err),
-        Some("node") => crate::node::run(&args[2..], out, err),
+        Some("buyer") => crate::buyer::run(&args[2..], out, err),
         Some("sell") => crate::sell::run(&args[2..], out, err),
         Some("accept") => crate::accept_cli::run(&args[2..], out, err),
         Some("collect") => crate::collect_cli::run(&args[2..], out, err),
@@ -253,7 +253,7 @@ fn write_json_line<T: Serialize + ?Sized>(out: &mut dyn Write, value: &T) -> std
 fn usage(err: &mut dyn Write) -> i32 {
     let _ = writeln!(
         err,
-        "Usage:\n  mobee version\n  mobee mcp\n  mobee node     # persistent per-home daemon (exclusive lock, unix-socket RPC); `mobee node status` = thin client\n  mobee doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  mobee wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  mobee profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  mobee stub-pay <amount_sats>   # exercise the config-bound budget gate\n  mobee sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool]\n  mobee sell   # zero-prompt relaunch from config.toml\n  mobee accept <job_id> <claim_id> [--result-id <id>]   # buyer: bind a delivered result (collect folds this in)\n  mobee collect <job_id> [--out <folder>]   # buyer: accept-if-needed + verify + pay + materialize\n  mobee log replay <path>\n  mobee mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  mobee run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
+        "Usage:\n  mobee version\n  mobee mcp\n  mobee buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `mobee buyer status` = thin client\n  mobee doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  mobee wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  mobee profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  mobee stub-pay <amount_sats>   # exercise the config-bound budget gate\n  mobee sell --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool]\n  mobee sell   # zero-prompt relaunch from config.toml\n  mobee accept <job_id> <claim_id> [--result-id <id>]   # buyer: bind a delivered result (collect folds this in)\n  mobee collect <job_id> [--out <folder>]   # buyer: accept-if-needed + verify + pay + materialize\n  mobee log replay <path>\n  mobee mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  mobee run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error"
     );
     USAGE_ERROR
 }

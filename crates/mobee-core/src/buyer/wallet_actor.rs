@@ -1,4 +1,4 @@
-//! The serialized wallet actor — the node's single owner of the CDK wallet.
+//! The serialized wallet actor — the buyer's single owner of the CDK wallet.
 //!
 //! One task owns the [`Wallet`] and pulls commands from an mpsc queue, servicing
 //! exactly one at a time. Because the receiver loop `await`s each command to
@@ -117,7 +117,7 @@ mod tests {
 
     fn temp_home(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("mobee-node-wactor-{label}-{}-{id}", std::process::id()))
+        std::env::temp_dir().join(format!("mobee-buyer-wactor-{label}-{}-{id}", std::process::id()))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

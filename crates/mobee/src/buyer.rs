@@ -1,10 +1,10 @@
-//! `mobee node` — the persistent per-home daemon and its thin client.
+//! `mobee buyer` — the persistent per-home daemon and its thin client.
 //!
-//! - `mobee node` (or `mobee node serve`) runs the daemon: it takes the exclusive
+//! - `mobee buyer` (or `mobee buyer serve`) runs the daemon: it takes the exclusive
 //!   home lock, opens the wallet + identity behind serialized actors and the
 //!   durable state DB, and serves the local unix socket until terminated. A second
 //!   daemon on the same home fails closed.
-//! - `mobee node status` is the thin client: it connects to the running daemon's
+//! - `mobee buyer status` is the thin client: it connects to the running daemon's
 //!   socket and prints its status. It holds no wallet, key, or state — proving the
 //!   thin-client boundary.
 
@@ -25,7 +25,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 fn usage(err: &mut dyn Write) -> i32 {
     let _ = writeln!(
         err,
-        "Usage:\n  mobee node          # run the persistent per-home daemon (exclusive lock)\n  mobee node serve    # alias for `mobee node`\n  mobee node status   # thin client: query the running daemon over its socket"
+        "Usage:\n  mobee buyer          # run the persistent per-home daemon (exclusive lock)\n  mobee buyer serve    # alias for `mobee buyer`\n  mobee buyer status   # thin client: query the running daemon over its socket"
     );
     USAGE_ERROR
 }
@@ -52,28 +52,28 @@ fn serve(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(2)
-        .thread_name("mobee-node")
+        .thread_name("mobee-buyer")
         .build()
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            let _ = writeln!(err, "node runtime: {error}");
+            let _ = writeln!(err, "buyer runtime: {error}");
             return RUNTIME_ERROR;
         }
     };
 
     let _ = writeln!(
         err,
-        "mobee node online (home={}, socket={})",
+        "mobee buyer online (home={}, socket={})",
         home.root.display(),
-        home.root.join(mobee_core::node::SOCKET_FILE).display()
+        home.root.join(mobee_core::buyer::SOCKET_FILE).display()
     );
     let _ = out.flush();
 
-    match runtime.block_on(mobee_core::node::run(home)) {
+    match runtime.block_on(mobee_core::buyer::run(home)) {
         Ok(()) => SUCCESS,
         Err(error) => {
-            let _ = writeln!(err, "mobee node: {error}");
+            let _ = writeln!(err, "mobee buyer: {error}");
             RUNTIME_ERROR
         }
     }
@@ -82,7 +82,7 @@ fn serve(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 #[cfg(feature = "wallet")]
 fn status(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     use mobee_core::home;
-    use mobee_core::node::{SOCKET_FILE, client};
+    use mobee_core::buyer::{SOCKET_FILE, client};
 
     let root = match home::default_home_dir() {
         Ok(root) => root,
@@ -116,7 +116,7 @@ fn status(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 fn serve(_out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let _ = writeln!(
         err,
-        "mobee node requires the wallet feature: rebuild with `--features wallet` (on by default)"
+        "mobee buyer requires the wallet feature: rebuild with `--features wallet` (on by default)"
     );
     USAGE_ERROR
 }
@@ -125,7 +125,7 @@ fn serve(_out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 fn status(_out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let _ = writeln!(
         err,
-        "mobee node requires the wallet feature: rebuild with `--features wallet` (on by default)"
+        "mobee buyer requires the wallet feature: rebuild with `--features wallet` (on by default)"
     );
     USAGE_ERROR
 }

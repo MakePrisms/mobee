@@ -1,7 +1,7 @@
-//! Wire types for the node's local JSON-RPC surface.
+//! Wire types for the buyer's local JSON-RPC surface.
 //!
 //! One request and one response per line (newline-delimited JSON) over the
-//! [`crate::node`] Unix socket. Deliberately small: a shell for the thin-client
+//! [`crate::buyer`] Unix socket. Deliberately small: a shell for the thin-client
 //! boundary, not the buyer lifecycle (later phases add the trade methods).
 
 use serde::{Deserialize, Serialize};

@@ -1,4 +1,4 @@
-//! The signer actor — the node's single owner of the Nostr identity.
+//! The signer actor — the buyer's single owner of the Nostr identity.
 //!
 //! The buyer key is read from `$MOBEE_HOME/key` once at startup and lives only
 //! inside this task. Marketplace-event signing (awards, receipts) routes through
@@ -92,7 +92,7 @@ mod tests {
 
     fn temp_home(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("mobee-node-signer-{label}-{}-{id}", std::process::id()))
+        std::env::temp_dir().join(format!("mobee-buyer-signer-{label}-{}-{id}", std::process::id()))
     }
 
     #[tokio::test(flavor = "current_thread")]

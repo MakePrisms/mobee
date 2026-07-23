@@ -14,7 +14,7 @@ gateway = ["dep:nostr-sdk"]
 # via libgit2 — NO system `git` on any product path (issue #55). Needs nostr-sdk (NIP-98 signing)
 # so it composes gateway; git2 (rustls-backed) + reqwest + base64 carry the smart-HTTP transport.
 git-delivery = ["gateway", "dep:git2", "dep:reqwest", "dep:base64"]
-# The `wallet` feature also brings up the persistent node daemon (crate::node): the
+# The `wallet` feature also brings up the persistent buyer daemon (crate::buyer): the
 # exclusive home lock (libc flock), the durable state DB (rusqlite, bundled sqlite so
 # there is no system dependency), and the async unix-socket surface (tokio net + io-util).
 wallet = ["git-delivery", "gateway", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "dep:rusqlite", "dep:libc", "tokio/sync", "tokio/time", "tokio/net", "tokio/io-util"]
@@ -30,10 +30,10 @@ cdk = { version = "=0.17.2", default-features = false, features = ["wallet"], op
 cdk-sqlite = { version = "=0.17.2", optional = true }
 getrandom = "0.3"
 hex = "0.4.3"
-# Exclusive home lock (flock) for the node daemon; unix-only, gated to `wallet`.
+# Exclusive home lock (flock) for the buyer daemon; unix-only, gated to `wallet`.
 libc = { version = "0.2", optional = true }
-# Durable node state DB (node.sqlite). `bundled` compiles sqlite from source so the
-# node needs no system libsqlite3. Gated to `wallet`.
+# Durable buyer state DB (buyer.sqlite). `bundled` compiles sqlite from source so the
+# buyer needs no system libsqlite3. Gated to `wallet`.
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 nostr-sdk = { version = "0.44.1", features = ["nip59", "nip98"], optional = true }
 serde.workspace = true

@@ -1,18 +1,21 @@
-//! The persistent per-home **mobee node** (step 1 of the stateful-buyer design, #127).
+//! The persistent per-home **mobee buyer** (step 1 of the stateful-buyer design, #127).
 //!
-//! One daemon owns a home. It takes an exclusive OS lock on `$MOBEE_HOME/node.lock`
+//! One daemon owns a home. It takes an exclusive OS lock on `$MOBEE_HOME/buyer.lock`
 //! (a second daemon on the same home fails closed), opens the CDK wallet and the
 //! Nostr identity behind serialized in-process actors, opens the durable state DB
-//! `$MOBEE_HOME/node.sqlite`, and serves a small JSON-RPC surface over the
-//! user-only Unix socket `$MOBEE_HOME/node.sock`. Every other process is a thin,
+//! `$MOBEE_HOME/buyer.sqlite`, and serves a small JSON-RPC surface over the
+//! user-only Unix socket `$MOBEE_HOME/buyer.sock`. Every other process is a thin,
 //! stateless [`client`] over that socket.
 //!
 //! This module is deliberately the *shell*: the boundary that makes financial
 //! authority singular and durable. The reservation ledger, auto-award, lifecycle
 //! engine, and crash-safe payment saga are later phases that build on this state
-//! home. Symmetry: the pieces here (lock / socket / wallet + signer actors /
-//! state DB) are named for the node, not the buyer, so a seller service can share
-//! the same core in a later phase.
+//! home.
+//!
+//! This is the **buyer** daemon. If a seller daemon is ever built, a shared
+//! buyer/seller core can be extracted then — do not generalize preemptively. The
+//! structure (this module, the `wallet` feature flag) is under reassessment in
+//! issue #133.
 //!
 //! Concurrency is 1: the queue behind each actor — not SQLite locking — is the
 //! in-process concurrency boundary, mirroring the home lock across processes.
@@ -37,19 +40,19 @@ use crate::home::{HomeError, MobeeHome};
 use lock::{HomeLock, LockError};
 use protocol::{CODE_INTERNAL, CODE_METHOD_NOT_FOUND, CODE_NOT_IMPLEMENTED, Request, Response};
 use signer::SignerHandle;
-use store::{NodeStore, StoreError};
+use store::{BuyerStore, StoreError};
 use wallet_actor::WalletHandle;
 
 /// Lock file leaf under the home.
-pub const LOCK_FILE: &str = "node.lock";
+pub const LOCK_FILE: &str = "buyer.lock";
 /// State DB leaf under the home.
-pub const STATE_DB_FILE: &str = "node.sqlite";
+pub const STATE_DB_FILE: &str = "buyer.sqlite";
 /// Socket leaf under the home.
-pub const SOCKET_FILE: &str = "node.sock";
+pub const SOCKET_FILE: &str = "buyer.sock";
 
-/// Node startup / run failure.
+/// Buyer startup / run failure.
 #[derive(Debug)]
-pub enum NodeError {
+pub enum BuyerError {
     Lock(LockError),
     Store(StoreError),
     Wallet(FundError),
@@ -57,45 +60,45 @@ pub enum NodeError {
     Io(String),
 }
 
-impl std::fmt::Display for NodeError {
+impl std::fmt::Display for BuyerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Lock(error) => write!(formatter, "{error}"),
             Self::Store(error) => write!(formatter, "{error}"),
-            Self::Wallet(error) => write!(formatter, "node wallet error: {error}"),
-            Self::Identity(error) => write!(formatter, "node identity error: {error}"),
-            Self::Io(message) => write!(formatter, "node io error: {message}"),
+            Self::Wallet(error) => write!(formatter, "buyer wallet error: {error}"),
+            Self::Identity(error) => write!(formatter, "buyer identity error: {error}"),
+            Self::Io(message) => write!(formatter, "buyer io error: {message}"),
         }
     }
 }
 
-impl std::error::Error for NodeError {}
+impl std::error::Error for BuyerError {}
 
-impl From<LockError> for NodeError {
+impl From<LockError> for BuyerError {
     fn from(value: LockError) -> Self {
         Self::Lock(value)
     }
 }
-impl From<StoreError> for NodeError {
+impl From<StoreError> for BuyerError {
     fn from(value: StoreError) -> Self {
         Self::Store(value)
     }
 }
-impl From<FundError> for NodeError {
+impl From<FundError> for BuyerError {
     fn from(value: FundError) -> Self {
         Self::Wallet(value)
     }
 }
-impl From<HomeError> for NodeError {
+impl From<HomeError> for BuyerError {
     fn from(value: HomeError) -> Self {
         Self::Identity(value)
     }
 }
 
 /// Shared, immutable-after-startup handles the connection handlers reach into.
-struct NodeContext {
+struct BuyerContext {
     home: MobeeHome,
-    store: NodeStore,
+    store: BuyerStore,
     wallet: WalletHandle,
     signer: SignerHandle,
     started_at_unix: i64,
@@ -108,16 +111,16 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Bring up the node's owned resources: take the exclusive lock, open the state
+/// Bring up the buyer's owned resources: take the exclusive lock, open the state
 /// DB and record the start, then open the wallet and identity behind their
-/// serialized actors. Returns the held lock (keep it alive for the node's life),
+/// serialized actors. Returns the held lock (keep it alive for the buyer's life),
 /// the shared context, and the socket path to bind.
 ///
 /// Fails closed at the lock step if another daemon already owns this home.
-async fn bootstrap(home: MobeeHome) -> Result<(HomeLock, Arc<NodeContext>, PathBuf), NodeError> {
+async fn bootstrap(home: MobeeHome) -> Result<(HomeLock, Arc<BuyerContext>, PathBuf), BuyerError> {
     let lock = HomeLock::acquire(home.root.join(LOCK_FILE))?;
 
-    let store = NodeStore::open(home.root.join(STATE_DB_FILE))?;
+    let store = BuyerStore::open(home.root.join(STATE_DB_FILE))?;
     let started_at_unix = now_unix();
     store.record_start(started_at_unix)?;
 
@@ -129,7 +132,7 @@ async fn bootstrap(home: MobeeHome) -> Result<(HomeLock, Arc<NodeContext>, PathB
     let signer = signer::spawn(&home)?;
 
     let socket_path = home.root.join(SOCKET_FILE);
-    let context = Arc::new(NodeContext {
+    let context = Arc::new(BuyerContext {
         home,
         store,
         wallet,
@@ -141,23 +144,23 @@ async fn bootstrap(home: MobeeHome) -> Result<(HomeLock, Arc<NodeContext>, PathB
 
 /// Bind the user-only Unix socket, replacing a stale socket file left by a prior
 /// run (safe: we already hold the exclusive lock, so no live daemon owns it).
-fn bind_socket(path: &std::path::Path) -> Result<UnixListener, NodeError> {
+fn bind_socket(path: &std::path::Path) -> Result<UnixListener, BuyerError> {
     if path.exists() {
-        std::fs::remove_file(path).map_err(|error| NodeError::Io(error.to_string()))?;
+        std::fs::remove_file(path).map_err(|error| BuyerError::Io(error.to_string()))?;
     }
-    let listener = UnixListener::bind(path).map_err(|error| NodeError::Io(error.to_string()))?;
+    let listener = UnixListener::bind(path).map_err(|error| BuyerError::Io(error.to_string()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|error| NodeError::Io(error.to_string()))?;
+            .map_err(|error| BuyerError::Io(error.to_string()))?;
     }
     Ok(listener)
 }
 
-/// Run the node until the process is terminated. Acquires the home lock (fail
+/// Run the buyer until the process is terminated. Acquires the home lock (fail
 /// closed if held), binds the socket, and serves connections forever.
-pub async fn run(home: MobeeHome) -> Result<(), NodeError> {
+pub async fn run(home: MobeeHome) -> Result<(), BuyerError> {
     // `_lock` is held for the whole run; dropping it releases the OS lock.
     let (_lock, context, socket_path) = bootstrap(home).await?;
     let listener = bind_socket(&socket_path)?;
@@ -165,12 +168,12 @@ pub async fn run(home: MobeeHome) -> Result<(), NodeError> {
 }
 
 /// Accept connections and service each on its own task.
-async fn accept_loop(listener: UnixListener, context: Arc<NodeContext>) -> Result<(), NodeError> {
+async fn accept_loop(listener: UnixListener, context: Arc<BuyerContext>) -> Result<(), BuyerError> {
     loop {
         let (stream, _addr) = listener
             .accept()
             .await
-            .map_err(|error| NodeError::Io(error.to_string()))?;
+            .map_err(|error| BuyerError::Io(error.to_string()))?;
         let context = context.clone();
         tokio::spawn(async move {
             // A handler failure never takes down the daemon; the connection is
@@ -181,7 +184,7 @@ async fn accept_loop(listener: UnixListener, context: Arc<NodeContext>) -> Resul
 }
 
 /// One request line in, one response line out.
-async fn handle_connection(stream: UnixStream, context: Arc<NodeContext>) -> std::io::Result<()> {
+async fn handle_connection(stream: UnixStream, context: Arc<BuyerContext>) -> std::io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
@@ -207,7 +210,7 @@ async fn handle_connection(stream: UnixStream, context: Arc<NodeContext>) -> std
 /// Map a request to a response. `status`/`health` is live; the buyer trade
 /// methods are recognized but deferred to later phases (they return a structured
 /// not-implemented error rather than silently succeeding).
-async fn dispatch(context: &NodeContext, request: Request) -> Response {
+async fn dispatch(context: &BuyerContext, request: Request) -> Response {
     let id = request.id.clone();
     match request.method.as_str() {
         "status" | "health" => status(context, id).await,
@@ -226,7 +229,7 @@ async fn dispatch(context: &NodeContext, request: Request) -> Response {
 /// The health/status method: prove the boundary end to end — the state DB, the
 /// wallet actor, and the signer actor all answered through the socket. The secret
 /// key is never included.
-async fn status(context: &NodeContext, id: Value) -> Response {
+async fn status(context: &BuyerContext, id: Value) -> Response {
     let store = context.store.clone();
     let health = tokio::task::spawn_blocking(move || store.health()).await;
 
@@ -271,7 +274,7 @@ mod tests {
 
     fn temp_home(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("mobee-node-mod-{label}-{}-{id}", std::process::id()))
+        std::env::temp_dir().join(format!("mobee-buyer-mod-{label}-{}-{id}", std::process::id()))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -281,7 +284,7 @@ mod tests {
         let home = bootstrap_home(&root).expect("bootstrap home");
         let secret = crate::home::read_secret_key_hex(&home).expect("secret");
 
-        let (_lock, context, socket_path) = bootstrap(home).await.expect("node bootstrap");
+        let (_lock, context, socket_path) = bootstrap(home).await.expect("buyer bootstrap");
         let listener = bind_socket(&socket_path).expect("bind socket");
         let server = tokio::spawn(accept_loop(listener, context));
 
@@ -321,7 +324,7 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777;
-            assert_eq!(mode, 0o600, "node.sock must be user-only");
+            assert_eq!(mode, 0o600, "buyer.sock must be user-only");
         }
 
         server.abort();
@@ -333,23 +336,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn second_node_on_same_home_fails_closed() {
+    async fn second_buyer_on_same_home_fails_closed() {
         let root = temp_home("exclusive");
         let _ = std::fs::remove_dir_all(&root);
         let home = bootstrap_home(&root).expect("bootstrap home");
 
-        // First node holds the lock and the wallet.
-        let (_lock, _context, _sock) = bootstrap(home.clone()).await.expect("first node");
+        // First buyer holds the lock and the wallet.
+        let (_lock, _context, _sock) = bootstrap(home.clone()).await.expect("first buyer");
 
         // A second bootstrap on the same home must fail closed at the lock — before
         // it ever opens the wallet.
         let second = bootstrap(home).await;
-        let failed_closed = matches!(&second, Err(NodeError::Lock(LockError::Held { .. })));
+        let failed_closed = matches!(&second, Err(BuyerError::Lock(LockError::Held { .. })));
         // Drop any accidentally-acquired context without needing Debug on it.
         drop(second);
         assert!(
             failed_closed,
-            "second node must fail closed on the home lock (LockError::Held)"
+            "second buyer must fail closed on the home lock (LockError::Held)"
         );
 
         let _ = std::fs::remove_dir_all(&root);

@@ -1,8 +1,8 @@
 //! Exclusive per-home process lock.
 //!
-//! The node holds an OS advisory lock (`flock(LOCK_EX | LOCK_NB)`) on
-//! `$MOBEE_HOME/node.lock` for its whole lifetime. This is the money-safety
-//! keystone of the node: it guarantees a single owner of the wallet, identity,
+//! The buyer holds an OS advisory lock (`flock(LOCK_EX | LOCK_NB)`) on
+//! `$MOBEE_HOME/buyer.lock` for its whole lifetime. This is the money-safety
+//! keystone of the buyer: it guarantees a single owner of the wallet, identity,
 //! and state DB per home. A second daemon on the same home fails closed here —
 //! before it ever opens `cdk-wallet.sqlite` — so two processes can never select
 //! proofs or sign concurrently.
@@ -18,7 +18,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-/// A held exclusive lock. Keep it alive for as long as the node owns the home;
+/// A held exclusive lock. Keep it alive for as long as the buyer owns the home;
 /// dropping it (or exiting) releases the OS lock.
 #[derive(Debug)]
 pub struct HomeLock {
@@ -41,13 +41,13 @@ pub enum LockError {
 impl std::fmt::Display for LockError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Open(message) => write!(formatter, "node lock open error: {message}"),
+            Self::Open(message) => write!(formatter, "buyer lock open error: {message}"),
             Self::Held { path } => write!(
                 formatter,
-                "another mobee node already owns this home (lock held: {}); refusing to start a second owner",
+                "another mobee buyer already owns this home (lock held: {}); refusing to start a second owner",
                 path.display()
             ),
-            Self::Flock(message) => write!(formatter, "node lock flock error: {message}"),
+            Self::Flock(message) => write!(formatter, "buyer lock flock error: {message}"),
         }
     }
 }
@@ -98,7 +98,7 @@ mod tests {
 
     fn temp_lock(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("mobee-node-lock-{label}-{}-{id}.lock", std::process::id()))
+        std::env::temp_dir().join(format!("mobee-buyer-lock-{label}-{}-{id}.lock", std::process::id()))
     }
 
     #[test]

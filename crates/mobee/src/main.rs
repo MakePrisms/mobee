@@ -1,11 +1,11 @@
 mod accept_cli;
 mod agent_presets;
+mod buyer;
 mod cli;
 mod collect_cli;
 mod doctor;
 mod exec;
 mod mcp;
-mod node;
 mod profile_cli;
 mod sell;
 mod stub_pay_cli;

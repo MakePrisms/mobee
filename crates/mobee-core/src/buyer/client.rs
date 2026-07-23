@@ -1,10 +1,10 @@
-//! The thin client half of the node boundary.
+//! The thin client half of the buyer boundary.
 //!
 //! A client (an MCP session, the CLI, a future seller surface) connects to
-//! `$MOBEE_HOME/node.sock`, writes one JSON request line, and reads one JSON
+//! `$MOBEE_HOME/buyer.sock`, writes one JSON request line, and reads one JSON
 //! response line. It holds no wallet, no key, and no state — the daemon is the
 //! single owner. This is a plain synchronous `UnixStream`, so a caller needs no
-//! async runtime to talk to the node.
+//! async runtime to talk to the buyer.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use super::protocol::{Request, Response};
 
-/// Client-side failure talking to the node.
+/// Client-side failure talking to the buyer.
 #[derive(Debug)]
 pub enum ClientError {
     /// No daemon is listening on the socket (not started, or wrong home).
@@ -30,10 +30,10 @@ impl std::fmt::Display for ClientError {
         match self {
             Self::NotRunning(message) => write!(
                 formatter,
-                "no mobee node is listening ({message}); start it with `mobee node`"
+                "no mobee buyer is listening ({message}); start it with `mobee buyer`"
             ),
-            Self::Io(message) => write!(formatter, "node client io error: {message}"),
-            Self::Decode(message) => write!(formatter, "node client decode error: {message}"),
+            Self::Io(message) => write!(formatter, "buyer client io error: {message}"),
+            Self::Decode(message) => write!(formatter, "buyer client decode error: {message}"),
         }
     }
 }
@@ -70,7 +70,7 @@ pub fn call(
         .read_line(&mut response_line)
         .map_err(|error| ClientError::Io(error.to_string()))?;
     if response_line.trim().is_empty() {
-        return Err(ClientError::Io("empty response from node".into()));
+        return Err(ClientError::Io("empty response from buyer".into()));
     }
     serde_json::from_str(response_line.trim()).map_err(|error| ClientError::Decode(error.to_string()))
 }

@@ -1,9 +1,9 @@
-//! The node's durable application state: `$MOBEE_HOME/node.sqlite`.
+//! The buyer's durable application state: `$MOBEE_HOME/buyer.sqlite`.
 //!
 //! Opened only by the daemon (guaranteed single-owner by the home lock). This is
 //! the state home the later phases build on — the reservation ledger, payment
 //! attempts, and lifecycle tables all land here. Step 1 ships the minimal shell:
-//! a `node_meta` schema-version row and a `jobs` stub table, in WAL mode with
+//! a `buyer_meta` schema-version row and a `jobs` stub table, in WAL mode with
 //! foreign keys and `synchronous=FULL` so the money-adjacent state that follows
 //! inherits crash-safe defaults from day one.
 //!
@@ -20,7 +20,7 @@ pub const SCHEMA_VERSION: i64 = 1;
 
 /// A cloneable handle to the daemon-owned SQLite state.
 #[derive(Clone)]
-pub struct NodeStore {
+pub struct BuyerStore {
     conn: Arc<Mutex<Connection>>,
 }
 
@@ -30,7 +30,7 @@ pub struct StoreError(pub String);
 
 impl std::fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "node store error: {}", self.0)
+        write!(formatter, "buyer store error: {}", self.0)
     }
 }
 
@@ -50,7 +50,7 @@ pub struct HealthSnapshot {
     pub jobs: i64,
 }
 
-impl NodeStore {
+impl BuyerStore {
     /// Open (creating if absent) the state DB at `path` with WAL + crash-safe pragmas
     /// and ensure the schema is present.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -70,7 +70,7 @@ impl NodeStore {
 
     fn init_schema(conn: &Connection) -> Result<(), StoreError> {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS node_meta (
+            "CREATE TABLE IF NOT EXISTS buyer_meta (
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL
              );
@@ -83,7 +83,7 @@ impl NodeStore {
              );",
         )?;
         conn.execute(
-            "INSERT INTO node_meta (key, value) VALUES ('schema_version', ?1)
+            "INSERT INTO buyer_meta (key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO NOTHING",
             [SCHEMA_VERSION.to_string()],
         )?;
@@ -94,7 +94,7 @@ impl NodeStore {
     pub fn record_start(&self, now_unix: i64) -> Result<(), StoreError> {
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO node_meta (key, value) VALUES ('started_at_unix', ?1)
+            "INSERT INTO buyer_meta (key, value) VALUES ('started_at_unix', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [now_unix.to_string()],
         )?;
@@ -123,7 +123,7 @@ impl NodeStore {
 
 fn read_meta_i64(conn: &Connection, key: &str) -> Result<Option<i64>, StoreError> {
     let value: Option<String> = conn
-        .query_row("SELECT value FROM node_meta WHERE key = ?1", [key], |row| {
+        .query_row("SELECT value FROM buyer_meta WHERE key = ?1", [key], |row| {
             row.get::<_, String>(0)
         })
         .ok();
@@ -131,7 +131,7 @@ fn read_meta_i64(conn: &Connection, key: &str) -> Result<Option<i64>, StoreError
         Some(text) => text
             .parse::<i64>()
             .map(Some)
-            .map_err(|error| StoreError(format!("node_meta.{key} not an integer: {error}"))),
+            .map_err(|error| StoreError(format!("buyer_meta.{key} not an integer: {error}"))),
         None => Ok(None),
     }
 }
@@ -145,14 +145,14 @@ mod tests {
 
     fn temp_db(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("mobee-node-store-{label}-{}-{id}.sqlite", std::process::id()))
+        std::env::temp_dir().join(format!("mobee-buyer-store-{label}-{}-{id}.sqlite", std::process::id()))
     }
 
     #[test]
     fn open_is_wal_and_carries_schema_and_start() {
         let path = temp_db("wal");
         let _ = std::fs::remove_file(&path);
-        let store = NodeStore::open(&path).expect("open");
+        let store = BuyerStore::open(&path).expect("open");
         store.record_start(1234).expect("record start");
 
         let health = store.health().expect("health");
