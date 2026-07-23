@@ -21,9 +21,13 @@ struct CommonOpts {
     amount: Option<u64>,
 }
 
+/// Default testnut fund amount for `mobee wallet setup` (mirrors the old setup_wallet MCP tool).
+const SETUP_FUND_SATS: u64 = 21;
+
 /// Entry from `cli::run` for `mobee wallet ...`.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     match args.first().map(String::as_str) {
+        Some("setup") => cmd_setup(&args[1..], out, err),
         Some("balance") => cmd_balance(&args[1..], out, err),
         Some("mint") => cmd_mint(&args[1..], out, err),
         Some("mint-complete") => cmd_mint_complete(&args[1..], out, err),
@@ -32,6 +36,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         Some("melt") => cmd_melt(&args[1..], out, err),
         Some("invoice") => cmd_invoice(&args[1..], out, err),
         Some("mints") => cmd_mints(&args[1..], out, err),
+        Some("reconcile") => cmd_reconcile(&args[1..], out, err),
         _ => {
             wallet_usage(err);
             USAGE_ERROR
@@ -43,6 +48,7 @@ fn wallet_usage(err: &mut dyn Write) {
     let _ = writeln!(
         err,
         "Usage:\n\
+         \x20 mobee wallet setup [<amount>] [--mint <url>] [--home <path>]   # bootstrap ~/.mobee + fund (default testnut, 21 sat)\n\
          \x20 mobee wallet balance [--mint <url>] [--home <path>]\n\
          \x20 mobee wallet mint <amount> [--mint <url>] [--home <path>]\n\
          \x20 mobee wallet mint-complete <quote_id> [--amount <sats>] [--mint <url>] [--home <path>]\n\
@@ -53,6 +59,7 @@ fn wallet_usage(err: &mut dyn Write) {
          \x20 mobee wallet mints list [--home <path>]\n\
          \x20 mobee wallet mints add <url> [--home <path>]\n\
          \x20 mobee wallet mints remove <url> [--home <path>]\n\
+         \x20 mobee wallet reconcile [--home <path>]   # retire eligible incomplete send sagas (no receipt/credit)\n\
          \n\
          Default mint is testnut (pinned). Extra mints are opt-in via `mints add`.\n\
          Exit codes: 0 success, 1 usage error, 2 runtime error"
@@ -126,6 +133,14 @@ fn parse_amount(raw: &str) -> Result<u64, String> {
 fn cmd_balance(_args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let _ = writeln!(err, "mobee wallet requires the wallet feature");
     USAGE_ERROR
+}
+#[cfg(not(feature = "wallet"))]
+fn cmd_setup(_args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    cmd_balance(_args, _out, err)
+}
+#[cfg(not(feature = "wallet"))]
+fn cmd_reconcile(_args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    cmd_balance(_args, _out, err)
 }
 #[cfg(not(feature = "wallet"))]
 fn cmd_mint(_args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i32 {
@@ -218,6 +233,122 @@ fn cmd_balance(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
     }
     let _ = writeln!(out, "total_sats={total}");
     SUCCESS
+}
+
+#[cfg(feature = "wallet")]
+fn cmd_setup(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let (opts, positional) = match parse_common(args) {
+        Ok(value) => value,
+        Err(message) => {
+            let _ = writeln!(err, "{message}");
+            wallet_usage(err);
+            return USAGE_ERROR;
+        }
+    };
+    let amount = match positional.as_slice() {
+        [] => SETUP_FUND_SATS,
+        [raw] => match parse_amount(raw) {
+            Ok(amount) => amount,
+            Err(message) => {
+                let _ = writeln!(err, "{message}");
+                return USAGE_ERROR;
+            }
+        },
+        _ => {
+            wallet_usage(err);
+            return USAGE_ERROR;
+        }
+    };
+    // Bootstrap ~/.mobee (config + autogen key + wallet dir), then fund. `home::bootstrap` never
+    // prints the secret key.
+    let home = match bootstrap_home(&opts, err) {
+        Ok(home) => home,
+        Err(code) => return code,
+    };
+    match wallet_ops::mint_blocking(&home, amount, opts.mint.as_deref()) {
+        Ok(wallet_ops::MintFlow::Funded(outcome)) => {
+            let _ = writeln!(
+                out,
+                "status=funded home={} funded_sats={} balance_sats={} mint={}",
+                home.root.display(),
+                outcome.funded_sats,
+                outcome.balance_sats,
+                outcome.mint_url
+            );
+            SUCCESS
+        }
+        Ok(wallet_ops::MintFlow::NeedsPayment(quote)) => {
+            // Non-testnut mint: emit the bolt11 to pay, then complete with mint-complete.
+            let _ = writeln!(
+                err,
+                "status=needs_payment amount_sats={} mint={} quote_id={} (pay the invoice, then `mobee wallet mint-complete {}`)",
+                quote.amount_sats, quote.mint_url, quote.quote_id, quote.quote_id
+            );
+            let _ = writeln!(out, "{}", quote.invoice);
+            SUCCESS
+        }
+        Err(error) => {
+            let _ = writeln!(err, "{error}");
+            RUNTIME_ERROR
+        }
+    }
+}
+
+#[cfg(feature = "wallet")]
+fn cmd_reconcile(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    use mobee_core::{buyer_fund, payment_wallet};
+
+    let (opts, positional) = match parse_common(args) {
+        Ok(value) => value,
+        Err(message) => {
+            let _ = writeln!(err, "{message}");
+            wallet_usage(err);
+            return USAGE_ERROR;
+        }
+    };
+    if !positional.is_empty() {
+        wallet_usage(err);
+        return USAGE_ERROR;
+    }
+    let home = match bootstrap_home(&opts, err) {
+        Ok(home) => home,
+        Err(code) => return code,
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(err, "reconcile runtime: {error}");
+            return RUNTIME_ERROR;
+        }
+    };
+    let report = runtime.block_on(async {
+        let wallet = buyer_fund::open_wallet_async(&home)
+            .await
+            .map_err(|error| error.to_string())?;
+        payment_wallet::retire_eligible_incomplete_sagas(&wallet)
+            .await
+            .map_err(|error| error.to_string())
+    });
+    match report {
+        Ok(report) => {
+            let _ = writeln!(
+                out,
+                "retired={} mapped_token_created={} swap_rolled_back={} swap_recovered={}",
+                report.retired,
+                report.mapped_token_created,
+                report.swap_rolled_back,
+                report.swap_recovered
+            );
+            SUCCESS
+        }
+        Err(error) => {
+            let _ = writeln!(err, "{error}");
+            RUNTIME_ERROR
+        }
+    }
 }
 
 #[cfg(feature = "wallet")]

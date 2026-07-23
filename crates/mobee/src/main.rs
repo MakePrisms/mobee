@@ -1,10 +1,13 @@
+mod accept_cli;
 mod agent_presets;
 mod cli;
 mod collect_cli;
 mod doctor;
 mod exec;
 mod mcp;
+mod profile_cli;
 mod sell;
+mod stub_pay_cli;
 mod wallet_cli;
 
 fn main() {

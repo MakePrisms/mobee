@@ -1,8 +1,8 @@
-//! `mobee collect` — single-call buyer collect: verify integrity + pay + materialize.
-//!
-//! Thin adapter over [`mobee_core::collect`]. The money authority (spend gate, budget,
-//! single-redeem, mint-compat) lives in the core path; this only parses args and renders the
-//! outcome. Never echoes the secret key.
+//! `mobee accept` — lower-level buyer primitive: accept a seller claim and record the local
+//! co-signed pay-bind (seller / result / commit / repo / branch / job-hash / creq_hash) for a
+//! later `mobee collect` / authorize_pay. `collect` folds this step in automatically, so `accept`
+//! is only needed to bind a specific result up front (e.g. to disambiguate multiple deliveries).
+//! Never echoes the secret key.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -13,34 +13,39 @@ const RUNTIME_ERROR: i32 = 2;
 
 struct Opts {
     job_id: String,
-    out: Option<String>,
+    claim_id: String,
+    result_id: Option<String>,
     home: Option<PathBuf>,
 }
 
 fn parse(args: &[String]) -> Result<Opts, String> {
-    let mut job_id: Option<String> = None;
-    let mut out: Option<String> = None;
-    let mut home: Option<PathBuf> = None;
+    let mut result_id = None;
+    let mut home = None;
+    let mut positional: Vec<String> = Vec::new();
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
-            "--out" => {
+            "--result-id" => {
                 idx += 1;
-                out = Some(args.get(idx).ok_or("--out requires a value")?.clone());
+                result_id = Some(args.get(idx).ok_or("--result-id requires a value")?.clone());
             }
             "--home" => {
                 idx += 1;
                 home = Some(PathBuf::from(args.get(idx).ok_or("--home requires a value")?));
             }
             other if other.starts_with('-') => return Err(format!("unknown flag {other}")),
-            other if job_id.is_none() => job_id = Some(other.to_owned()),
-            other => return Err(format!("unexpected argument {other}")),
+            other => positional.push(other.to_owned()),
         }
         idx += 1;
     }
+    let (job_id, claim_id) = match positional.as_slice() {
+        [job_id, claim_id] => (job_id.clone(), claim_id.clone()),
+        _ => return Err("accept requires <job_id> <claim_id>".into()),
+    };
     Ok(Opts {
-        job_id: job_id.ok_or("collect requires <job_id>")?,
-        out,
+        job_id,
+        claim_id,
+        result_id,
         home,
     })
 }
@@ -49,22 +54,19 @@ fn usage(err: &mut dyn Write) {
     let _ = writeln!(
         err,
         "Usage:\n\
-         \x20 mobee collect <job_id> [--out <folder>] [--home <path>]\n\
+         \x20 mobee accept <job_id> <claim_id> [--result-id <id>] [--home <path>]\n\
          \n\
-         Accepts the delivered claim if no bind exists yet, verifies the delivery integrity\n\
-         (delivered branch must tip at the accepted commit), pays the seller through the sealed\n\
-         money path, then materializes the files under <home>/results/<job_id>. Idempotent:\n\
-         re-collecting an already-paid job re-materializes without a second payment.\n\
+         Records the local co-signed pay-bind for a delivered result. Optional; `mobee collect`\n\
+         accepts the delivered claim itself when no bind exists. Never echoes the secret key.\n\
          Exit codes: 0 success, 1 usage error, 2 runtime error"
     );
 }
 
-/// Entry from `cli::run` for `mobee collect ...`.
+/// Entry from `cli::run` for `mobee accept ...`.
 #[cfg(feature = "wallet")]
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    use mobee_core::budget::BudgetGate;
-    use mobee_core::collect::{self, CollectRequest};
     use mobee_core::home;
+    use mobee_core::job_lifecycle::{self, AcceptClaimRequest};
 
     let opts = match parse(args) {
         Ok(opts) => opts,
@@ -74,7 +76,6 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return USAGE_ERROR;
         }
     };
-
     let root = match opts.home {
         Some(path) => path,
         None => match home::default_home_dir() {
@@ -92,20 +93,12 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return RUNTIME_ERROR;
         }
     };
-    let mut gate = match BudgetGate::from_home(&home) {
-        Ok(gate) => gate,
-        Err(error) => {
-            let _ = writeln!(err, "{error}");
-            return RUNTIME_ERROR;
-        }
-    };
-
-    let outcome = match collect::collect_blocking(
+    let outcome = match job_lifecycle::accept_claim(
         &home,
-        &mut gate,
-        CollectRequest {
+        AcceptClaimRequest {
             job_id: opts.job_id,
-            out: opts.out,
+            claim_id: opts.claim_id,
+            result_id: opts.result_id,
         },
     ) {
         Ok(outcome) => outcome,
@@ -114,23 +107,15 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return RUNTIME_ERROR;
         }
     };
-
     let body = serde_json::json!({
         "ok": true,
-        "amount_sats": outcome.pay.amount_sats,
-        "attempt_id": outcome.pay.attempt_id,
-        "spent_total_sats": outcome.pay.spent_total_sats,
-        "remaining_sats": outcome.pay.remaining_sats,
-        "state": outcome.pay.state,
-        "commit": outcome.commit_oid,
-        "path": outcome.path,
-        "files": outcome.files,
+        "accept_event_id": outcome.accept_event_id,
+        "bind": outcome.bind,
     });
     let rendered = body.to_string();
-    // Defense in depth: never let the secret key appear on stdout.
     if let Ok(secret) = home::read_secret_key_hex(&home) {
         if !secret.is_empty() && rendered.contains(&secret) {
-            let _ = writeln!(err, "collect refused: response would echo secret key");
+            let _ = writeln!(err, "accept refused: response would echo secret key");
             return RUNTIME_ERROR;
         }
     }
@@ -144,6 +129,6 @@ pub fn run(args: &[String], _out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         usage(err);
         return USAGE_ERROR;
     }
-    let _ = writeln!(err, "mobee collect requires the wallet feature");
+    let _ = writeln!(err, "mobee accept requires the wallet feature");
     USAGE_ERROR
 }
